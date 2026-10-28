@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -27,11 +28,21 @@ struct Request {
     std::string path;
     std::string query;
     std::string body;
+    std::string remote;   // 对端 IP（用于判断是否本机访问）
     std::map<std::string, std::string> headers;
 
+    // HTTP 头名大小写不敏感
     std::string header(const std::string& k) const {
         auto it = headers.find(k);
-        return it == headers.end() ? "" : it->second;
+        if (it != headers.end()) return it->second;
+        auto low = [](std::string s) {
+            for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+            return s;
+        };
+        const std::string want = low(k);
+        for (auto& kv : headers)
+            if (low(kv.first) == want) return kv.second;
+        return "";
     }
     std::string param(const std::string& k) const {
         // 从 query 中取 ?a=1&b=2
@@ -163,7 +174,10 @@ public:
             }
             int one = 1;
             setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-            std::thread([this, cfd] { handle(cfd); }).detach();
+            char ipbuf[64] = {0};
+            inet_ntop(AF_INET, &cli.sin_addr, ipbuf, sizeof(ipbuf));
+            const std::string peer = ipbuf;
+            std::thread([this, cfd, peer] { handle(cfd, peer); }).detach();
         }
     }
 
@@ -174,7 +188,7 @@ public:
     }
 
 private:
-    void handle(int cfd) {
+    void handle(int cfd, const std::string& peer) {
         std::string raw;
         char buf[8192];
         size_t header_end = std::string::npos;
@@ -206,6 +220,7 @@ private:
         }
 
         Request req;
+        req.remote = peer;
         size_t line_end = raw.find("\r\n");
         std::string line = raw.substr(0, line_end);
         {

@@ -6,6 +6,40 @@
 
 ---
 
+## [0.1.0] · 2026-10-29 · M0 交付
+
+### 新增
+- **引擎**：GGUF v2/v3 解析（mmap 零拷贝）、11 种量化类型内核、
+  GPT-2 字节级 BPE + Qwen2 pre-tokenize、Llama/Qwen2 前向
+  （RMSNorm → QKV → RoPE → GQA → SwiGLU）、C ABI（`dubhe.h` 0.1.0）。
+- **NEON 整数点积**：量化激活（Q8_0）+ `vdotq_s32`，覆盖 Q4_0/Q4_1/Q5_0/
+  Q5_1/Q8_0/Q4_K/Q6_K。实测 1.4–3.8x，端到端 7.7 → 20.0 tok/s。
+- **CLI**：`inspect` / `run` / `chat` / `bench`。
+- **服务**：`dubhed`，OpenAI 兼容 `/v1/chat/completions`（含 SSE 流式）、
+  `/v1/models`、`/api/state`。
+- **Web UI**：iOS 风格单页应用（会话管理、Markdown + 代码块、工具卡片、
+  设置面板、API 网关面板）。
+- **工具调用**：`read_file` / `list_dir` / `write_file` / `shell`，
+  模型输出 `<tool_call>` → 执行 → 结果回灌。
+- **API 网关**：`--share` 监听 0.0.0.0 并自动生成 `sk-dubhe-…`；
+  局域网需 `Authorization: Bearer`，本机回环免鉴权。
+- **自检**：`tests/test_quant.cpp`（位解包 + 整数路径一致性）、
+  `tools/selftest.cpp`、`tools/ggufdump.cpp`、`tools/ui_shot.mjs`。
+- `bench/matvec_bench.cpp`：按真实模型形状测各类型吞吐。
+
+### 修复（都是会让结果静默错掉的真实 bug）
+- 字节映射表对 161–255 的字节用了原始字节而非其 UTF-8 编码，导致中文切不开。
+- BPE 初始符号按 UTF-8 字符而非字节切分，merges 永不命中。
+- Makefile 缺头文件依赖跟踪，改结构体后部分目标文件不重编 → ABI 错位段错误。
+- KV cache 按训练上下文预分配（805 MB），改为按需翻倍。
+- EOS / `<|im_end|>` 被当正文输出；HTTP 头名大小写敏感导致鉴权失效。
+
+### 变更
+- **首期范围扩大**：UI 从"推迟到 M5"提前到 M0（产品形态要求）。
+- `dubhed` 从 M2 提前到 M0。
+
+---
+
 ## [Unreleased] · v2.0 计划基线
 
 ### 变更（重要：v1 计划作废）

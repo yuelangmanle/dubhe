@@ -232,7 +232,7 @@ int dubhe_generate(dubhe_engine* e,
     const int eos = e->model.tok().eos_id();
     int32_t n_gen = 0;
     int32_t pos = n_prompt;
-    const int n_ctx = e->model.cfg().n_ctx_train;
+    const int n_ctx = e->model.n_ctx_limit();
 
     while (n_gen < s.max_tokens) {
         if (e->abort.load()) break;
@@ -241,13 +241,16 @@ int dubhe_generate(dubhe_engine* e,
         int32_t tok = sample_token(logits.data(), n_vocab, s, hist, rng);
         hist.push_back(tok);
 
-        if (on_token) {
+        // EOS 与 <|im_start|> 这类控制 token 不能当成正文吐给用户
+        if (tok == eos) break;
+        const bool special = e->model.tok().is_special(tok);
+
+        if (on_token && !special) {
             std::string piece = e->model.tok().decode_piece(tok);
             on_token(ud, tok, piece.c_str());
         }
-        n_gen++;
+        if (!special) n_gen++;
 
-        if (tok == eos) break;
         if (pos >= n_ctx) break;
 
         if (!e->model.forward(tok, pos, logits.data(), &err)) {

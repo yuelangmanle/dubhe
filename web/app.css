@@ -109,12 +109,18 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: r
 .title-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; }
 .title { font-size: 15.5px; font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-chip {
-  border: none; background: none; color: var(--secondary); font-size: 11.5px; font-family: inherit;
-  cursor: pointer; padding: 1px 6px; border-radius: 6px; max-width: 320px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  border: none; background: var(--fill); color: var(--secondary); font-size: 11.5px;
+  font-family: inherit; cursor: pointer; padding: 2px 9px; border-radius: 999px;
+  max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 5px; transition: background .15s;
 }
-.model-chip:hover { background: var(--fill); }
-.model-chip.live { color: var(--green); }
+.model-chip::before {
+  content: ''; width: 5px; height: 5px; border-radius: 50%;
+  background: var(--tertiary); flex: 0 0 auto;
+}
+.model-chip:hover { background: var(--fill-strong, rgba(120,120,128,.16)); }
+.model-chip.live::before { background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 22%, transparent); }
+.model-chip.live { color: var(--label); }
 
 /* ---------------- 消息 ---------------- */
 .messages { flex: 1; overflow-y: auto; padding: 24px 16px 8px; scroll-behavior: smooth; }

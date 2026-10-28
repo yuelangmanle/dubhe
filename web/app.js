@@ -436,25 +436,33 @@
 
   function openApi() {
     openSheet('API 网关', (body) => {
-      const origin = location.origin;
-      body.appendChild(el('div', 'desc', '本机服务已兼容 OpenAI 协议，任何客户端都可直接接入。'));
+      const s = state.server || {};
+      const origin = s.lan_url || location.origin;
+      body.appendChild(el('div', 'desc', s.auth
+        ? '已开启鉴权。其他设备（手机、平板、同局域网的电脑）用下面的地址和密钥接入，本机访问免鉴权。'
+        : '本机服务已兼容 OpenAI 协议。若要让手机接入，用 --share 启动会自动生成密钥。'));
+
       body.appendChild(el('div', 'group-title', 'Base URL'));
       body.appendChild(codeBox(origin + '/v1'));
+      if (s.auth) {
+        body.appendChild(el('div', 'group-title', 'API Key'));
+        body.appendChild(codeBox(s.api_key || '（仅本机可见）'));
+      }
       body.appendChild(el('div', 'group-title', '模型 ID'));
-      body.appendChild(codeBox(state.server && state.server.model ? state.server.model : 'dubhe'));
+      body.appendChild(codeBox(s.model_id || s.model || 'dubhe'));
       body.appendChild(el('div', 'group-title', 'cURL 示例'));
       body.appendChild(codeBox(
-        `curl ${origin}/v1/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -d '{"messages":[{"role":"user","content":"你好"}],"stream":true}'`
+        `curl ${origin}/v1/chat/completions \\\n  -H "Content-Type: application/json" \\\n` +
+        (s.auth && s.api_key ? `  -H "Authorization: Bearer ${s.api_key}" \\\n` : '') +
+        `  -d '{"messages":[{"role":"user","content":"你好"}],"stream":true}'`
       ));
       body.appendChild(el('div', 'group-title', '运行时'));
-      if (state.server) {
-        const kv = (k, v) => { const d = el('div', 'kv'); d.appendChild(el('span', 'k', k)); d.appendChild(el('span', 'v', v)); body.appendChild(d); };
-        kv('硬件', state.server.hardware);
-        kv('请求数', String(state.server.requests));
-        kv('累计 token', String(state.server.tokens));
-        kv('最近解码', (state.server.decode_tps || 0).toFixed(1) + ' tok/s');
-        kv('版本', state.server.version);
-      }
+      const kv = (k, v) => { const d = el('div', 'kv'); d.appendChild(el('span', 'k', k)); d.appendChild(el('span', 'v', v)); body.appendChild(d); };
+      kv('硬件', s.hardware || '—');
+      kv('请求数', String(s.requests || 0));
+      kv('累计 token', String(s.tokens || 0));
+      kv('最近解码', (s.decode_tps || 0).toFixed(1) + ' tok/s');
+      kv('版本', s.version || '—');
     });
   }
 

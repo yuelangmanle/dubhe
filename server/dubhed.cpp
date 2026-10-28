@@ -14,6 +14,9 @@
 #include "http.h"
 #include "json.h"
 
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -25,6 +28,7 @@
 #include <ctime>
 #include <fstream>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -34,9 +38,12 @@ namespace {
 struct AppState {
     dubhe_engine* engine = nullptr;
     std::string model_path;
+    std::string model_id;     // 对外暴露的短模型名
     std::string model_dir;
     std::string web_root;
     std::string workspace;
+    std::string api_key;      // 为空表示不校验（仅建议本机使用）
+    std::string lan_url;      // 局域网可访问的 base url
     bool allow_shell = false;
     std::mutex mu;
     std::atomic<bool> busy{false};
@@ -46,6 +53,45 @@ struct AppState {
 };
 
 AppState g;
+
+// 取本机局域网 IPv4（用于"分享给手机用"）
+std::string lan_ip() {
+    struct ifaddrs* ifs = nullptr;
+    if (getifaddrs(&ifs) != 0) return "";
+    std::string best;
+    for (auto* p = ifs; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+        const std::string name = p->ifa_name;
+        if (name == "lo0" || name.rfind("utun", 0) == 0 || name.rfind("awdl", 0) == 0) continue;
+        char buf[64];
+        auto* sin = (struct sockaddr_in*)p->ifa_addr;
+        if (!inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) continue;
+        const std::string ip = buf;
+        if (ip.rfind("169.254.", 0) == 0) continue;
+        // 优先 en0（Wi-Fi）
+        if (name == "en0") return ip;
+        if (best.empty()) best = ip;
+    }
+    freeifaddrs(ifs);
+    return best;
+}
+
+// 从路径推导对外的模型 id：去目录、去扩展名
+std::string model_id_of(const std::string& path) {
+    size_t a = path.find_last_of('/');
+    std::string n = (a == std::string::npos) ? path : path.substr(a + 1);
+    if (n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0) n.resize(n.size() - 5);
+    return n.empty() ? "dubhe" : n;
+}
+
+std::string random_key() {
+    static const char* cs = "abcdefghijkmnopqrstuvwxyz23456789";
+    std::mt19937_64 rng(std::random_device{}());
+    std::uniform_int_distribution<int> d(0, 31);
+    std::string s = "sk-dubhe-";
+    for (int i = 0; i < 24; i++) s += cs[d(rng)];
+    return s;
+}
 
 // ---------------------------------------------------------------- 工具函数
 std::string read_file(const std::string& path, size_t max_bytes = 256 * 1024) {
@@ -235,6 +281,23 @@ void on_piece(void* ud, int32_t /*tok*/, const char* piece) {
     emit_delta(x, piece);
 }
 
+// /v1/* 的鉴权：设了 key 就必须带 Authorization: Bearer <key>
+// 本机回环访问免鉴权——自己电脑上的 UI 不该再让人粘贴一次密钥。
+bool authorized(const http::Request& req) {
+    if (g.api_key.empty()) return true;
+    if (req.remote == "127.0.0.1" || req.remote == "::1" || req.remote.empty()) return true;
+    std::string h = req.header("authorization");
+    const std::string p = "Bearer ";
+    if (h.size() > p.size() && h.compare(0, p.size(), p) == 0) h = h.substr(p.size());
+    else if (h.empty()) h = req.param("api_key");
+    return h == g.api_key;
+}
+
+// /api/state 里的密钥只给本机看
+bool is_local(const http::Request& req) {
+    return req.remote == "127.0.0.1" || req.remote == "::1" || req.remote.empty();
+}
+
 std::string now_id() {
     static std::atomic<long long> n{0};
     return "chatcmpl-" + std::to_string((long long)time(nullptr)) + "-" + std::to_string(n++);
@@ -263,14 +326,33 @@ int main(int argc, char** argv) {
         else if (a == "-t" || a == "--threads") threads = atoi(next().c_str());
         else if (a == "--allow-shell") g.allow_shell = true;
         else if (a == "--no-gpu") no_gpu = true;
+        else if (a == "--api-key") g.api_key = next();
+        else if (a == "--share") {
+            // 对外分享：监听所有网卡，并自动生成访问密钥
+            host = "0.0.0.0";
+            if (g.api_key.empty()) g.api_key = random_key();
+        }
         else if (a == "-h" || a == "--help") {
             std::printf(
                 "dubhed %s\n\n"
                 "用法: dubhed -m <model.gguf> [--port 7777] [--host 127.0.0.1]\n"
-                "             [--web web] [-c 4096] [-t N] [--allow-shell] [--no-gpu]\n",
+                "             [--web web] [-c 4096] [-t N] [--allow-shell] [--no-gpu]\n"
+                "             [--share] [--api-key <key>]\n\n"
+                "  --share        监听 0.0.0.0 并自动生成 API Key（手机/其他设备可接入）\n"
+                "  --api-key K    指定 API Key（/v1/* 需要 Authorization: Bearer K）\n",
                 dubhe_version());
             return 0;
         }
+    }
+
+    // 监听非本机地址却不设密钥，等于把模型白送出去——自动补一个
+    if (host != "127.0.0.1" && host != "localhost" && g.api_key.empty()) {
+        g.api_key = random_key();
+        std::fprintf(stderr, "提示: 已监听 %s，自动生成 API Key\n", host.c_str());
+    }
+    if (host != "127.0.0.1" && host != "localhost") {
+        const std::string ip = lan_ip();
+        if (!ip.empty()) g.lan_url = "http://" + ip + ":" + std::to_string(port);
     }
 
     g.web_root = web_root;
@@ -295,6 +377,7 @@ int main(int argc, char** argv) {
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - t0).count();
         g.model_path = model;
+        g.model_id = model_id_of(model);
         dubhe_model_info mi{};
         dubhe_model_info_get(g.engine, &mi);
         std::fprintf(stderr, "就绪 %.0f ms · %s · %s · %.2fB\n", (double)ms, mi.arch, mi.quant_desc,
@@ -332,14 +415,18 @@ int main(int argc, char** argv) {
         c.send(200, "application/json", "{\"ok\":true}");
     });
 
-    srv.get("/api/state", [](const http::Request&, http::Conn& c) {
+    srv.get("/api/state", [](const http::Request& req, http::Conn& c) {
         json::Value o = json::Value::make_obj();
         o.set("hardware", json::Value::make_str(dubhe_hardware_info()));
         o.set("version", json::Value::make_str(dubhe_version()));
         o.set("model", json::Value::make_str(g.model_path));
+        o.set("model_id", json::Value::make_str(g.model_id.empty() ? "dubhe" : g.model_id));
         o.set("loaded", json::Value::make_bool(!g.model_path.empty()));
         o.set("workspace", json::Value::make_str(g.workspace));
         o.set("shell", json::Value::make_bool(g.allow_shell));
+        o.set("api_key", json::Value::make_str(is_local(req) ? g.api_key : ""));
+        o.set("lan_url", json::Value::make_str(g.lan_url));
+        o.set("auth", json::Value::make_bool(!g.api_key.empty()));
         o.set("requests", json::Value::make_num((double)g.total_requests));
         o.set("tokens", json::Value::make_num((double)g.total_tokens));
         o.set("decode_tps", json::Value::make_num(g.last_decode_tps));
@@ -362,12 +449,13 @@ int main(int argc, char** argv) {
         c.send(200, "application/json", json::dump(o));
     });
 
-    srv.get("/v1/models", [](const http::Request&, http::Conn& c) {
+    srv.get("/v1/models", [](const http::Request& req, http::Conn& c) {
+        if (!authorized(req)) { c.send(401, "application/json", "{\"error\":{\"message\":\"无效的 API Key\",\"type\":\"invalid_request_error\"}}"); return; }
         json::Value root = json::Value::make_obj();
         root.set("object", json::Value::make_str("list"));
         json::Value arr = json::Value::make_arr();
         json::Value m = json::Value::make_obj();
-        m.set("id", json::Value::make_str(g.model_path.empty() ? "dubhe" : g.model_path));
+        m.set("id", json::Value::make_str(g.model_id.empty() ? "dubhe" : g.model_id));
         m.set("object", json::Value::make_str("model"));
         m.set("owned_by", json::Value::make_str("dubhe"));
         arr.arr.push_back(m);
@@ -377,6 +465,7 @@ int main(int argc, char** argv) {
 
     // ---- 核心：chat completions
     srv.post("/v1/chat/completions", [](const http::Request& req, http::Conn& c) {
+        if (!authorized(req)) { c.send(401, "application/json", "{\"error\":{\"message\":\"无效的 API Key\",\"type\":\"invalid_request_error\"}}"); return; }
         if (g.model_path.empty()) {
             c.send(400, "application/json", "{\"error\":\"未加载模型\"}");
             return;
@@ -512,7 +601,10 @@ int main(int argc, char** argv) {
         c.send(200, "application/json", json::dump(root));
     });
 
-    std::fprintf(stderr, "\n  Dubhe 已启动 →  http://%s:%d\n\n", host.c_str(), port);
+    std::fprintf(stderr, "\n  Dubhe 已启动 →  http://%s:%d\n", host.c_str(), port);
+    if (!g.lan_url.empty()) std::fprintf(stderr, "  局域网网关   %s/v1\n", g.lan_url.c_str());
+    if (!g.api_key.empty()) std::fprintf(stderr, "  API Key      %s\n", g.api_key.c_str());
+    std::fprintf(stderr, "\n");
     if (!srv.listen(host, port)) return 1;
     srv.run();
     return 0;

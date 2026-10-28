@@ -204,6 +204,10 @@ public:
     int32_t eos_id() const { return eos_; }
     int32_t im_start_id() const { return im_start_; }
     int32_t im_end_id() const { return im_end_; }
+    // 该 token 是否是特殊 token（<|im_start|> 之类），不应输出给用户
+    bool    is_special(int32_t id) const {
+        return id >= 0 && id < (int32_t)special_flag_.size() && special_flag_[(size_t)id] != 0;
+    }
     bool    is_chatml() const { return im_start_ >= 0 && im_end_ >= 0; }
     const std::string& chat_template() const { return chat_template_; }
 
@@ -216,6 +220,7 @@ private:
     std::unordered_map<std::string, int32_t> token_to_id_;
     std::map<std::pair<std::string, std::string>, int> merges_;
     std::vector<int32_t> specials_;
+    std::vector<uint8_t> special_flag_;
     std::string byte_to_char_[256];
     std::unordered_map<std::string, uint8_t> char_to_byte_;
     std::string chat_template_;
@@ -260,6 +265,7 @@ public:
 
     // 供 UI / 统计使用
     uint64_t n_params() const { return n_params_; }
+    int      n_ctx_limit() const { return n_ctx_; }
     const char* quant_desc() const { return quant_desc_.c_str(); }
     bool gpu_active() const { return gpu_active_; }
 
