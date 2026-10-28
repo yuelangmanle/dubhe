@@ -1,6 +1,6 @@
-# engine/ · Aether Engine
+# engine/ · Dubhe Engine
 
-推理内核。许可：Apache-2.0。技术规格见 [AETHER-DEV-001](../docs/01-推理引擎开发书-索引.md)。
+推理内核。许可：闭源（Proprietary，见根目录 LICENSE）。技术规格见 [DUBHE-DEV-001](../docs/01-推理引擎开发书-索引.md)。
 
 ## 边界
 
@@ -11,7 +11,7 @@
 ## 目录
 
 ```
-include/aether/     公开 C ABI（唯一对外接口）
+include/dubhe/     公开 C ABI（唯一对外接口）
 src/
   runtime/          scheduler · state · execution · sampler · constrained · speculative
   model/            ir · gguf · mlx · safetensors · tokenizer
@@ -25,7 +25,7 @@ tests/              单测 · 数值 parity · fuzz
 
 1. **公开头文件里不出现 C++ 类型、STL 容器、异常。** 所有错误通过 `ae_status_t`。
 2. **decode hot path 不穿过 Python，也不做逐 token 的跨进程回调。**
-3. **任何 Kernel 变更必须附 AetherBench 前后对比**，否则 review 打回。
+3. **任何 Kernel 变更必须附 DubheBench 前后对比**，否则 review 打回。
 
 ## 状态
 

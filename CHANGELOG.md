@@ -1,32 +1,50 @@
 # CHANGELOG
 
-本项目从立项（2026-10-29）起记录所有对外可见的变更。
-格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
+从立项（2026-10-29）起记录所有变更。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
 分类：`新增` `变更` `废弃` `移除` `修复` `安全` `文档` `基准`
 
 ---
 
-## [Unreleased]
+## [Unreleased] · v2.0 计划基线
+
+### 变更（重要：v1 计划作废）
+
+- **定名**：项目由代号 Aether 定名为 **天枢 / Dubhe**（北斗第一星 + 中枢；Dubhe 为该星天文名）。
+- **开发模式**：由"8 人团队 × 63 周"改为 **AI 主开发 + 人类验证**，里程碑按 Round 计（27–43 轮，5–8 个月）。
+- **首期范围收敛**：只交付引擎 + CLI + 本地 HTTP，**UI 推迟到 M5**。
+- **许可证**：由 open-core（引擎 Apache-2.0）改为 **全闭源**，保留 4 条开源复审条件。
+- **进程模型**：ADR-0005 引擎独立进程 **推迟到 M5**，M0–M4 单进程。
 
 ### 文档
-- 新增《Aether 项目开发书（总纲）》v1.0：产品定义、分层架构、进程模型、Git 治理、M0–M6 里程碑、质量门禁、合规与商业边界。
-- 新增《Aether 项目进度书》v1.0：W0 立项记录、M0 任务分解（20 项 / 约 1,244 h）、里程碑看板。
-- 新增《推理引擎开发书索引》：章节索引、9 条已生效结论、Markdown 迁移计划。
-- 新增 ADR-0001 ～ ADR-0006（monorepo、不 fork 单引擎、三图 IR、文档即代码、独立进程、许可证策略）。
-- 归档《Aether 自适应本地 AI 推理引擎开发书》v1.0 至 `docs/references/`。
+- 重写《总项目开发书》v2.0：新增 §7 开发模式（协作协议）、§9 需你提供的环境信息、按 Round 排的里程碑。
+- 重写《进度书》v2.0：M0 任务重切（9 项）、阻塞项 B1–B4、轮次记录模板。
+- 新增 ADR-0007：AI 主开发 + 人类验证。
+- 重写 ADR-0006：全闭源策略与"闭源 ≠ 不能用开源"的关键澄清。
+- 新增 `LICENSE`（Proprietary）与 `THIRD_PARTY_NOTICES.md`（含排除清单）。
 
 ### 新增
-- 初始化仓库骨架：`engine/` `sdk/` `apps/` `tools/` `bench/` `docs/`。
+- 仓库骨架：`engine/` `sdk/` `cli/` `server/` `apps/` `tools/` `bench/` `docs/`。
+- `tools/docs/build_docx.sh` + 表格列宽预处理器（Markdown → docx，备用）。
 
 ---
 
-## 版本规划（预告，非承诺）
+## 版本规划
 
-| 版本 | 对应里程碑 | 内容 |
+| 版本 | 里程碑 | 内容 |
 | --- | --- | --- |
-| 0.1.0 | M1 | 引擎可加载 GGUF / MLX，单路对话可用 |
-| 0.5.0 | M2 | 并发调度、state 管理、AetherKit 0.5、Desktop Alpha |
-| 0.8.0 | M3 | Android Beta、热控 |
-| 0.9.0 | M4 | NPU 插件、Studio 微调闭环 |
-| 1.0.0 | M6 | 公开发布 |
+| 0.1.0 | M0 | GGUF 加载 + CPU reference + `dubhe run` 出字 |
+| 0.2.0 | M1 | Metal 加速，B=1 追上 llama.cpp |
+| 0.3.0 | M2 | 并发调度 + `dubhed` |
+| 0.4.0 | M3 | MLX 直读 + 长上下文 + 结构化输出 |
+| 0.5.0 | M4 | Android（CPU + Vulkan） |
+| 1.0.0 | M5 | 双端 App + 打包发布 |
+
+---
+
+## v0.0.1-docs · 2026-10-29
+
+### 文档
+- 首版《总项目开发书》《进度书》《推理引擎开发书索引》。
+- ADR-0001..0006 首批落档。
+- 归档引擎开发书 v1.0 docx 至 `docs/references/`（正文仍用旧代号，属历史原貌）。

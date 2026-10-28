@@ -1,6 +1,6 @@
-# bench/ · AetherBench
+# bench/ · DubheBench
 
-性能与正确性基准套件。规格见 AETHER-DEV-001 §6。
+性能与正确性基准套件。规格见 DUBHE-DEV-001 §6。
 
 > 这是项目的"裁判"，不是"啦啦队"。它的第一职责是让团队在真实 workload 上被打脸，而不是产出好看的图表。
 

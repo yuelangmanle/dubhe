@@ -38,7 +38,7 @@ if [[ ! -f "$REF" ]]; then
 fi
 
 # 预处理：按内容宽度重算表格分隔行，避免长文本列被压成窄条
-TMP="$(mktemp -t aether_md).md"
+TMP="$(mktemp -t dubhe_md).md"
 trap 'rm -f "$TMP"' EXIT
 python3 "$ROOT/tools/docs/md_table_widths.py" "$IN" "$TMP"
 

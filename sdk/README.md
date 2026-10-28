@@ -1,13 +1,13 @@
-# sdk/ · AetherKit
+# sdk/ · DubheKit
 
-引擎对外的稳定接口层。许可：Apache-2.0。
+引擎对外的稳定接口层。许可：闭源（Proprietary，见根目录 LICENSE）。
 
 ## 组成
 
 | 目录 | 内容 |
 | --- | --- |
-| `include/aether.h` | 稳定 C ABI（与 `engine/include/aether/` 同源，此处为发布快照） |
-| `swift/` | Swift Package：`AetherKit`，供 macOS 宿主与第三方 App 使用 |
+| `include/dubhe.h` | 稳定 C ABI（与 `engine/include/dubhe/` 同源，此处为发布快照） |
+| `swift/` | Swift Package：`DubheKit`，供 macOS 宿主与第三方 App 使用 |
 | `kotlin/` | Android AAR：JNI 封装 + Kotlin 协程接口 |
 | `tests/abi/` | ABI 兼容性测试（`abi-compliance-checker`） |
 

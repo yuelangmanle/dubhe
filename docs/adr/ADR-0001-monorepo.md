@@ -3,7 +3,7 @@
 - 状态：Accepted
 - 日期：2026-10-29
 - 决策者：Tech Lead
-- 关联：AETHER-DEV-000 §6.1
+- 关联：DUBHE-DEV-000 §6.1
 
 ## 背景
 

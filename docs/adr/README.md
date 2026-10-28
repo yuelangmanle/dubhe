@@ -11,7 +11,7 @@
 - 状态：Proposed / Accepted / Superseded by ADR-000M / Deprecated
 - 日期：YYYY-MM-DD
 - 决策者：
-- 关联：AETHER-DEV-000 §X / RFC-000N
+- 关联：DUBHE-DEV-000 §X / RFC-000N
 
 ## 背景
 （约束是什么，不做什么会出什么问题）
@@ -37,5 +37,6 @@
 | [0002](ADR-0002-不fork单一引擎.md) | 不 fork 单一现有引擎，新建格式无关运行时 | Accepted | 2026-10-29 |
 | [0003](ADR-0003-格式无关IR.md) | IR 拆分为 Compute / Quant / State 三图 | Accepted | 2026-10-29 |
 | [0004](ADR-0004-文档即代码.md) | 文档即代码：开发书与进度书纳入 Git | Accepted | 2026-10-29 |
-| [0005](ADR-0005-引擎独立进程.md) | 引擎运行在独立进程，零拷贝 IPC | Proposed | — |
-| [0006](ADR-0006-许可证策略.md) | 引擎 Apache-2.0，应用商业许可 | Proposed | — |
+| [0005](ADR-0005-引擎独立进程.md) | 引擎运行在独立进程，零拷贝 IPC | Deferred（M5） | 2026-10-29 |
+| [0006](ADR-0006-许可证策略.md) | 全闭源，保留开源复审条件（v2） | Accepted | 2026-10-29 |
+| [0007](ADR-0007-AI主开发模式.md) | 开发模式：AI 主开发 + 人类验证 | Accepted | 2026-10-29 |

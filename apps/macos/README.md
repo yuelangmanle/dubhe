@@ -1,6 +1,6 @@
-# apps/macos/ · Aether Desktop
+# apps/macos/ · Dubhe Desktop
 
-macOS 宿主（SwiftUI）。许可：商业。
+macOS 宿主（SwiftUI）。许可：闭源（Proprietary，见根目录 LICENSE）。
 
 ## 关键约束
 
@@ -9,7 +9,7 @@ macOS 宿主（SwiftUI）。许可：商业。
 | 最低系统 | macOS 14 Sonoma | Metal 特性与 SwiftUI 能力 |
 | 硬件 | Apple Silicon only（M1 起），Intel 不支持 | 统一内存是架构前提 |
 | 分发 | DMG 直分发（签名 + 公证）为主；MAS 版本后置评估 | 沙盒限制模型目录与大文件下载 |
-| 引擎承载 | XPC Service `com.aether.engine` | ADR-0005 |
+| 引擎承载 | XPC Service `com.dubhe.engine` | ADR-0005 |
 | 与引擎通信 | XPC + 共享内存 ring buffer | ADR-0005 |
 
 ## 模块
@@ -24,4 +24,5 @@ AgentRunner/    多 agent 并发调度与进度展示
 
 ## 状态
 
-M0：技术选型验证（SwiftUI + XPC 最小 demo）。M2 交付 Alpha。
+**推迟到 M5。** M0–M4 只做引擎 + CLI + 本地 HTTP，不投入 UI。
+到 M5 时引擎已有 `dubhed`，App 只需做外壳（进程模型届时按 ADR-0005 拆分）。

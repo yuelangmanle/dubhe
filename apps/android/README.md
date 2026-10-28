@@ -1,6 +1,6 @@
-# apps/android/ · Aether Mobile
+# apps/android/ · Dubhe Mobile
 
-Android 宿主（Kotlin + Compose）。许可：商业。
+Android 宿主（Kotlin + Compose）。许可：闭源（Proprietary，见根目录 LICENSE）。
 
 ## 关键约束
 
@@ -25,4 +25,5 @@ Android 宿主（Kotlin + Compose）。许可：商业。
 
 ## 状态
 
-M0：最小 demo（前台 Service + JNI 加载 GGUF）。M3 交付 Beta。
+**推迟到 M5。** M4 先在设备上跑通 CLI（`dubhe run`），验证 Vulkan/CPU 路径；
+M5 再做 App 外壳。先有引擎能跑，才有 App 可包。
