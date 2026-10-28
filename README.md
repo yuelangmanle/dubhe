@@ -25,6 +25,12 @@ make check                  # 一条命令自检：加载 → 分词 → 前向 
 实测（Qwen2.5-0.5B-Instruct-Q4_K_M，M4）：加载 107 ms，decode **20 tok/s**，
 prefill 20 tok/s，首 token 延迟 < 1 s。
 
+## 界面
+
+| 对话 | API 网关 | 设置（移动端） |
+| --- | --- | --- |
+| ![chat](docs/screenshots/chat.png) | ![gateway](docs/screenshots/gateway.png) | ![settings](docs/screenshots/settings-mobile.png) |
+
 ## 一句话
 
 让个人设备把大模型真正跑起来、跑得久、跑得省，并且不要求用户"先转换一下"。
