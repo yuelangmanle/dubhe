@@ -175,6 +175,9 @@ int dubhe_model_info_get(const dubhe_engine* e, dubhe_model_info* out) {
     std::snprintf(out->quant_desc, sizeof(out->quant_desc), "%s", e->model.quant_desc());
     out->has_chat_template = e->model.tok().is_chatml() ? 1 : 0;
     out->is_gpu = e->model.gpu_active() ? 1 : 0;
+    const char* note = e->model.gpu_note();
+    std::snprintf(out->backend, sizeof(out->backend), "%s",
+                  (note && note[0]) ? note : "CPU · NEON");
     return DUBHE_OK;
 }
 

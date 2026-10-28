@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 int main(int argc, char** argv) {
@@ -12,7 +13,7 @@ int main(int argc, char** argv) {
 
     dubhe_config cfg{};
     cfg.n_ctx = 512;
-    cfg.use_gpu = 0;
+    cfg.use_gpu = std::getenv("DUBHE_NO_GPU") ? 0 : 1;   // 默认用 GPU，DUBHE_NO_GPU=1 可关
     dubhe_engine* e = dubhe_create(&cfg);
     std::printf("[1] engine %p\n", (void*)e);
     if (dubhe_load_model(e, path) != DUBHE_OK) {
@@ -24,6 +25,7 @@ int main(int argc, char** argv) {
     std::printf("[2] loaded: %s vocab=%d ctx=%d layer=%d embd=%d head=%d/%d ff=%d\n",
                 mi.arch, mi.n_vocab, mi.n_ctx_train, mi.n_layer, mi.n_embd, mi.n_head,
                 mi.n_head_kv, mi.n_ff);
+    std::printf("    backend: %s\n", mi.backend);
 
     int32_t n = dubhe_tokenize(e, text, 0, nullptr, 0);
     std::printf("[3] tokenize(%s) -> %d tokens\n", text, n);

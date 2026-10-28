@@ -6,6 +6,49 @@
 
 ---
 
+## [0.2.0] · 2026-10-29 · Metal GPU 后端
+
+### 基准（Qwen2.5-0.5B-Instruct Q4_K_M，M4 24GB，本机）
+| 指标 | CPU (NEON) | Metal GPU | 倍数 |
+|---|---|---|---|
+| decode | 20.6 tok/s | **60.9 tok/s** | 2.96x |
+| prefill | 21.3 tok/s | **70.0 tok/s** | 3.29x |
+| 与纯 f32 基准的 logits 差 | 3e-2（Q8 激活量化） | **1e-4** | — |
+
+### 新增
+- **Metal 计算后端**（`engine/src/metal.mm` + `metal_kernels.h`）：
+  - **运行时编译 MSL**（`newLibraryWithSource:`）。绕开缺失的离线 Metal
+    Toolchain（`xcodebuild -downloadComponent MetalToolchain`），任何装了
+    Xcode CLT 的机器都能跑。
+  - **权重零拷贝**：整块 GGUF mmap 直接包成 `MTLStorageModeShared` buffer，
+    每张量用字节偏移定位。内存占用与 CPU 路径相同，不翻倍。
+  - 量化内核：`mv_f32/f16/q4_0/q5_0/q8_0/q4_k/q6_k`（一线程一行，按 GGUF
+    原始量化格式直读，不解包）。
+  - 融合算子：`k_rmsnorm` / `k_rope` / `k_attn`（GQA + 在线 softmax）/
+    `k_silu_mul` / `k_add` / `k_bias` / `k_copy`。
+  - **整层前向编进一个 command buffer**，每 token 只同步一次。
+  - **加载期交叉校验**：用真实权重跑 GPU vs 纯 f32 基准，相对误差 > 1e-3
+    就整体退回 CPU（避免"能跑但胡言乱语"的静默错误）。
+- `dubhe_model_info.backend`：暴露计算后端与校验误差。
+- `DUBHE_F32_REF=1`：强制 CPU 走纯 f32 点积（校验 GPU 数值时必须关掉 Q8 激活
+  量化，否则量的是 CPU 自己的近似误差）。
+- `make gpu`：一条命令对比 CPU / GPU 吞吐。`make check` 现在两条路径都跑。
+
+### 关键发现
+- 本机 **单次 command buffer commit+wait 延迟 201 µs**。0.5B 模型单 token 有
+  169 次 matvec，逐算子同步 = 34 ms，把 GPU 算力全埋掉。实测逐 matvec 同步
+  的版本只比 CPU 快 8%。改成整层一个 command buffer 后才有 3x。
+- 本机 GPU 实测读带宽 47 GB/s、CPU 17 GB/s（真机 M4 应分别在 100 GB/s 量级），
+  环境受限，绝对数值不可当真机结论，加速比可信。
+
+### 修复
+- `k_attn` 的在线 softmax 在最大值更新时只缩放了分母 `l`，**忘了同步缩放已累加
+  的 `acc`**——flash-attention 最经典的坑。表现为部分 head 输出错、部分正确
+  （数据相关），输出乱码但程序不崩。
+- MSL 里 `half` 是内建 16 位浮点类型名，不能当变量名。
+
+---
+
 ## [0.1.0] · 2026-10-29 · M0 交付
 
 ### 新增

@@ -2,7 +2,7 @@
 
 > Apple Silicon MacBook 与 Android 手机上的本地大模型推理引擎。GGUF 原生直读，单路与多路都不掉速。
 
-状态：M0 已交付（引擎 + CLI + HTTP + Web UI 全链路可跑）· 闭源 · 私有仓库
+状态：M0 已交付（引擎 + CLI + HTTP + Web UI 全链路可跑）· **M1 Metal GPU 后端已上线** · 闭源 · 私有仓库
 
 ---
 
@@ -22,8 +22,15 @@ make check                  # 一条命令自检：加载 → 分词 → 前向 
 ./build/dubhed -m <model.gguf> --share
 ```
 
-实测（Qwen2.5-0.5B-Instruct-Q4_K_M，M4）：加载 107 ms，decode **20 tok/s**，
-prefill 20 tok/s，首 token 延迟 < 1 s。
+实测（Qwen2.5-0.5B-Instruct-Q4_K_M，M4 24GB）：
+
+| 后端 | decode | prefill |
+| --- | --- | --- |
+| CPU · NEON | 20.6 tok/s | 21.3 tok/s |
+| **Metal GPU** | **60.9 tok/s** | **70.0 tok/s** |
+
+GPU 路径的 logits 与纯 f32 基准最大差 **1e-4**，比 CPU 的 Q8 激活量化路径
+（3e-2）还准。`make gpu` 一条命令复现这个对比。
 
 ## 界面
 
@@ -55,28 +62,30 @@ prefill 20 tok/s，首 token 延迟 < 1 s。
 | 工具调用 | `read_file` `list_dir` `write_file` `shell` | ✅ M0 |
 | API 网关 | `--share` 局域网共享 + `sk-dubhe-…` 密钥 | ✅ M0 |
 | `dubhe-bench` | 与 llama.cpp / MLX 对打的基准客户端 | M1 |
-| Metal 后端 | GPU 加速，B=1 追平 llama.cpp 的 90% | M1 |
+| Metal 后端 | 运行时编译 MSL，整层前向单 command buffer，权重零拷贝 | ✅ M1 |
 | Android | NDK + NEON + NPU | M4 |
 | 双端原生 App | SwiftUI / Compose | M5 |
 
 ## 已实现的量化内核
 
-| 类型 | 位解包 | f32 路径 | NEON 整数路径 |
-| --- | --- | --- | --- |
-| F32 / F16 / BF16 | ✅ | ✅ | — |
-| Q4_0 / Q4_1 | ✅ | ✅ | ✅ |
-| Q5_0 / Q5_1 | ✅ | ✅ | ✅ |
-| Q8_0 | ✅ | ✅ | ✅ |
-| Q4_K / Q6_K | ✅ | ✅ | ✅ |
-| Q5_K | ✅ | ✅ | 待补 |
+| 类型 | 位解包 | f32 路径 | NEON 整数路径 | Metal |
+| --- | --- | --- | --- | --- |
+| F32 / F16 | ✅ | ✅ | — | ✅ |
+| BF16 | ✅ | ✅ | — | — |
+| Q4_0 / Q4_1 | ✅ | ✅ | ✅ | ✅ / — |
+| Q5_0 / Q5_1 | ✅ | ✅ | ✅ | ✅ / — |
+| Q8_0 | ✅ | ✅ | ✅ | ✅ |
+| Q4_K / Q6_K | ✅ | ✅ | ✅ | ✅ |
+| Q5_K | ✅ | ✅ | 待补 | 待补 |
 
 全部通过 `tests/test_quant.cpp` 的位解包自检（相对误差 ≤ 1.6e-7）
 与整数路径一致性自检（≤ 9.1e-4，属激活量化噪声）。
 
 ## 技术栈
 
-C++20（内核）· ARM NEON + `vdotq_s32`（整数点积）· libdispatch（行并行）·
-Metal（计划中）· 零外部依赖构建（只用系统 clang）
+C++20 / Objective-C++（内核）· ARM NEON + `vdotq_s32`（整数点积）·
+libdispatch（行并行）· Metal Shading Language（运行时编译，零拷贝统一内存）·
+零外部依赖构建（只用系统 clang）
 
 ## 目录
 

@@ -138,6 +138,7 @@ int cmd_inspect(const Args& a) {
     std::printf("词表        %d\n", mi.n_vocab);
     std::printf("训练上下文  %d\n", mi.n_ctx_train);
     std::printf("Chat 模板   %s\n", mi.has_chat_template ? "ChatML" : "无");
+    std::printf("计算后端    %s\n", mi.backend);
     std::printf("硬件        %s\n", dubhe_hardware_info());
 
     dubhe_destroy(e);

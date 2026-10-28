@@ -60,6 +60,7 @@ typedef struct {
     char     quant_desc[64];
     int32_t  has_chat_template;
     int32_t  is_gpu;
+    char     backend[96];   /* 计算后端说明，如 "Metal · Apple M4（校验误差 1.2e-07）" */
 } dubhe_model_info;
 
 /* ---------- 采样参数 ---------- */

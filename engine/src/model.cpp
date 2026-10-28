@@ -1,15 +1,18 @@
-// model.cpp — 模型加载与前向（CPU reference 路径）
+// model.cpp — 模型加载与前向
 //
 // 设计取舍（M0）：
 //   * 权重全程 mmap，不复制、不反量化到内存，避免 4B 模型吃掉 16 GB。
 //   * 矩阵乘用"量化行 · f32 向量"的融合点积，逐行多线程。
-//   * 这条路径是数值基准（oracle）。Metal 后端必须与它逐 token 一致。
+//   * 这条路径是数值基准（oracle）。Metal 后端必须与它逐 token 一致，
+//     所以 load() 里会用真实权重跑一次 GPU/CPU 交叉校验，不达标就不上 GPU。
 #include "internal.h"
+#include "metal.h"
 
 #include <dispatch/dispatch.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace dubhe {
 
@@ -75,6 +78,10 @@ void attn_work(void* ctx, size_t h) {
 
 inline float silu(float x) { return x / (1.f + std::exp(-x)); }
 
+// 低于这个乘加量，一次 GPU 提交 + 同步的开销就大于收益，直接走 CPU。
+// 0.5B 模型里最小的 attn_q 是 896×896 ≈ 8e5，远高于阈值，所以全部走 GPU。
+constexpr int64_t kGpuMinMac = 1 << 18;
+
 }  // namespace
 
 bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
@@ -130,8 +137,131 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
     logits_.assign(cfg_.n_vocab, 0.f);
 
     loaded_ = true;
-    gpu_active_ = false;  // Metal 后端接入后置 true
-    (void)use_gpu;
+    gpu_active_ = false;
+    if (use_gpu) enable_gpu(nullptr);
+    return true;
+}
+
+// 打开 GPU 并做一次交叉校验。
+//
+// 为什么要校验：Metal 内核是手写的位解包，任何一个 nibble 位移写错都会
+// 让模型"能跑但胡言乱语"，这种 bug 从输出上几乎看不出来。所以加载时
+// 用真实权重跑一遍 GPU vs CPU 基准，误差超阈值就整体退回 CPU。
+bool Model::enable_gpu(std::string* err) {
+    gpu_active_ = false;
+    if (!metal::available()) {
+        gpu_note_ = "无 Metal 设备";
+        if (err) *err = gpu_note_;
+        return false;
+    }
+    std::string e;
+    if (!metal::init(&e)) {
+        gpu_note_ = "Metal 初始化失败: " + e;
+        if (err) *err = gpu_note_;
+        return false;
+    }
+    if (!metal::bind_weights(file_.mapping(), file_.file_size(), &e)) {
+        gpu_note_ = "权重零拷贝绑定失败: " + e;
+        if (err) *err = gpu_note_;
+        return false;
+    }
+
+    // 校验：抽三张有代表性的权重（注意力投影 / FFN 下投影 / 输出层），
+    // GPU 算全量，CPU 只算前 64 行，成本可忽略。
+    struct Probe { const TensorInfo* t; int n_out, n_in; const char* tag; };
+    const Probe probes[] = {
+        {&layers_[0].attn_q,   cfg_.n_head * cfg_.head_dim, cfg_.n_embd, "attn_q"},
+        {&layers_[0].ffn_down, cfg_.n_embd, cfg_.n_ff,                    "ffn_down"},
+        {&out_w_,              cfg_.n_vocab, cfg_.n_embd,                 "output"},
+    };
+
+    double worst = 0.0;
+    const char* worst_tag = "";
+    for (const Probe& p : probes) {
+        if (!metal::supports(p.t->type, p.n_in)) continue;
+
+        std::vector<float> xv((size_t)p.n_in), yg((size_t)p.n_out);
+        for (int i = 0; i < p.n_in; i++)
+            xv[(size_t)i] = std::sin((float)i * 0.017f) * 0.5f + 0.1f;  // 确定性、有正有负
+
+        const char* tb = (const char*)file_.tensor_data(*p.t);
+        const uint64_t woff = (uint64_t)(tb - (const char*)file_.mapping());
+        if (!metal::mfvec(p.t->type, xv.data(), yg.data(), p.n_out, p.n_in, woff)) {
+            gpu_note_ = std::string("GPU 校验无法执行（") + p.tag + "）: " + metal::last_error();
+            if (err) *err = gpu_note_;
+            return false;
+        }
+
+        const size_t rb = type_row_bytes(p.t->type, p.n_in);
+        const int rows = std::min(p.n_out, 64);
+        double max_err = 0.0, max_ref = 0.0;
+        for (int r = 0; r < rows; r++) {
+            const float ref = vec_dot(p.t->type, xv.data(), tb + (size_t)r * rb, p.n_in);
+            max_err = std::max(max_err, std::fabs((double)yg[(size_t)r] - (double)ref));
+            max_ref = std::max(max_ref, std::fabs((double)ref));
+        }
+        const double rel = max_err / (max_ref + 1e-6);
+        if (rel > worst) { worst = rel; worst_tag = p.tag; }
+    }
+
+    if (worst > 1e-3) {
+        char b[256];
+        std::snprintf(b, sizeof(b), "GPU 校验未通过（%s 相对误差 %.2e），已回退 CPU",
+                      worst_tag, worst);
+        gpu_note_ = b;
+        if (err) *err = gpu_note_;
+        return false;
+    }
+
+    gpu_active_ = true;
+    {
+        char b[256];
+        std::snprintf(b, sizeof(b), "Metal · %s（校验误差 %.1e）", metal::device_name(), worst);
+        gpu_note_ = b;
+    }
+
+    // 起全 GPU 前向：整层所有算子编进一个 command buffer，每 token 只同步一次。
+    auto off = [&](const TensorInfo& t) -> uint64_t {
+        return (uint64_t)((const char*)file_.tensor_data(t) - (const char*)file_.mapping());
+    };
+    metal::Spec sp;
+    sp.n_embd = cfg_.n_embd;
+    sp.n_ff = cfg_.n_ff;
+    sp.n_vocab = cfg_.n_vocab;
+    sp.n_layer = cfg_.n_layer;
+    sp.n_head = cfg_.n_head;
+    sp.n_head_kv = cfg_.n_head_kv;
+    sp.hd = cfg_.head_dim;
+    sp.rms_eps = cfg_.rms_eps;
+    sp.rope_theta = cfg_.rope_theta;
+    sp.kv_cap = kv_cap_;
+    sp.off_out_norm = off(out_norm_);
+    sp.off_out_w = off(out_w_);
+    sp.type_out_w = out_w_.type;
+    sp.layers.resize((size_t)cfg_.n_layer);
+    for (int l = 0; l < cfg_.n_layer; l++) {
+        const Layer& L = layers_[(size_t)l];
+        metal::LayerSpec& d = sp.layers[(size_t)l];
+        d.off[metal::S_ATTN_NORM] = off(L.attn_norm);  d.type[metal::S_ATTN_NORM] = L.attn_norm.type;
+        d.off[metal::S_Q]  = off(L.attn_q);            d.type[metal::S_Q]  = L.attn_q.type;
+        d.off[metal::S_K]  = off(L.attn_k);            d.type[metal::S_K]  = L.attn_k.type;
+        d.off[metal::S_V]  = off(L.attn_v);            d.type[metal::S_V]  = L.attn_v.type;
+        d.off[metal::S_OUT] = off(L.attn_output);      d.type[metal::S_OUT] = L.attn_output.type;
+        d.off[metal::S_FFN_NORM] = off(L.ffn_norm);    d.type[metal::S_FFN_NORM] = L.ffn_norm.type;
+        d.off[metal::S_GATE] = off(L.ffn_gate);        d.type[metal::S_GATE] = L.ffn_gate.type;
+        d.off[metal::S_UP]   = off(L.ffn_up);          d.type[metal::S_UP]   = L.ffn_up.type;
+        d.off[metal::S_DOWN] = off(L.ffn_down);        d.type[metal::S_DOWN] = L.ffn_down.type;
+        if (L.has_q_bias) d.bias[0] = off(L.attn_q_b);
+        if (L.has_k_bias) d.bias[1] = off(L.attn_k_b);
+        if (L.has_v_bias) d.bias[2] = off(L.attn_v_b);
+    }
+
+    if (!metal::fwd_init(sp, &e)) {
+        gpu_active_ = false;
+        gpu_note_ = "GPU 前向不可用: " + e;
+        if (err) *err = gpu_note_;
+        return false;
+    }
     return true;
 }
 
@@ -222,6 +352,9 @@ bool Model::load_weights(std::string* err) {
 
 void Model::unload() {
     loaded_ = false;
+    gpu_active_ = false;
+    // 必须在 file_.close() 之前释放：MTLBuffer 引用的就是那块 mmap
+    metal::shutdown();
     layers_.clear();
     k_cache_.clear();
     v_cache_.clear();
@@ -247,6 +380,13 @@ bool Model::grow_kv(int need) {
     int cap = kv_cap_ > 0 ? kv_cap_ : 256;
     while (cap < need) cap *= 2;
     if (cap > n_ctx_) cap = n_ctx_;
+
+    if (gpu_active_) {
+        std::string e;
+        if (!metal::fwd_grow_kv(cap, &e)) return false;
+        kv_cap_ = cap;
+        return true;
+    }
 
     const size_t kv_dim = (size_t)cfg_.n_head_kv * cfg_.head_dim;
     const size_t old_row = (size_t)kv_cap_ * kv_dim;
@@ -284,7 +424,19 @@ void Model::rmsnorm(float* out, const float* x, const TensorInfo& w, int n) cons
 }
 
 void Model::matvec(float* out, const float* x, const TensorInfo& w, int n_out, int n_in) const {
-    if (act_q8_supported(w.type)) {
+    // DUBHE_F32_REF=1 时强制走纯 f32 点积。CPU 的默认路径会把激活量化成
+    // Q8（快 2~4 倍，但有 ~1e-3 的相对误差），所以校验 GPU 数值时必须关掉它，
+    // 否则量的是 CPU 自己的近似误差，不是 GPU 的。
+    static const bool f32_ref = std::getenv("DUBHE_F32_REF") != nullptr;
+    if (gpu_active_ && (int64_t)n_out * n_in >= kGpuMinMac && metal::supports(w.type, n_in)) {
+        const uint64_t woff =
+            (uint64_t)((const char*)file_.tensor_data(w) - (const char*)file_.mapping());
+        if (metal::mfvec(w.type, x, out, n_out, n_in, woff)) return;
+        // GPU 一旦出错就永久降级，避免每层都白试一次、把速度拖死。
+        gpu_active_ = false;
+        std::fprintf(stderr, "[dubhe] GPU 矩阵乘失败，已回退 CPU：%s\n", metal::last_error());
+    }
+    if (!f32_ref && act_q8_supported(w.type)) {
         // 激活只量化一次，所有行共用
         aq_.resize(act_q8_bytes(w.type, n_in));
         quantize_act(w.type, x, aq_.data(), n_in);
@@ -326,11 +478,23 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
     const int kv_dim = n_kv * hd;
     const int kv_mul = n_head / n_kv;
 
-    // 1) embedding
+    // 1) embedding（CPU 反量化一行，之后整层都留在 GPU 侧）
     {
         const void* row = (const char*)file_.tensor_data(tok_embd_) +
                           (size_t)token * type_row_bytes(tok_embd_.type, n_embd);
         dequant_row(tok_embd_.type, row, x_.data(), n_embd);
+    }
+
+    if (gpu_active_) {
+        // 整层前向一次提交、一次同步。失败就整体报错——此时 GPU 的 KV 已经
+        // 前进了一步，切回 CPU 会得到错误结果，静默降级比报错更危险。
+        if (!metal::fwd_token(x_.data(), pos, logits, err)) {
+            gpu_active_ = false;
+            if (err && err->empty()) *err = "GPU 前向失败";
+            return false;
+        }
+        kv_len_ = pos + 1;
+        return true;
     }
 
     for (int l = 0; l < cfg_.n_layer; l++) {

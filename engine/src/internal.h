@@ -128,6 +128,7 @@ public:
     const void* tensor_data(const TensorInfo& t) const;
 
     const std::vector<TensorInfo>& tensors() const { return tensors_; }
+    const void* mapping() const { return base_; }   // mmap 起始地址（页对齐，可直接包成 MTLBuffer）
     const std::map<std::string, GgufValue>& kv() const { return kv_; }
     size_t file_size() const { return file_size_; }
     size_t data_size() const { return data_size_; }
@@ -268,9 +269,11 @@ public:
     int      n_ctx_limit() const { return n_ctx_; }
     const char* quant_desc() const { return quant_desc_.c_str(); }
     bool gpu_active() const { return gpu_active_; }
+    const char* gpu_note() const { return gpu_note_.c_str(); }
 
 private:
     bool load_weights(std::string* err);
+    bool enable_gpu(std::string* err);
     bool grow_kv(int need);
     void rmsnorm(float* out, const float* x, const TensorInfo& w, int n) const;
     void matvec(float* out, const float* x, const TensorInfo& w, int n_out, int n_in) const;
@@ -280,7 +283,8 @@ private:
     Tokenizer tok_;
     ModelConfig cfg_;
     bool loaded_ = false;
-    bool gpu_active_ = false;
+    mutable bool gpu_active_ = false;   // GPU 出错时 matvec 会就地降级，故 mutable
+    std::string gpu_note_;              // GPU 状态说明（供 UI / 日志展示）
     int  n_ctx_ = 0;    // 可用上下文上限
     int  kv_cap_ = 0;   // KV cache 已分配槽位
 

@@ -591,7 +591,7 @@ int main(int argc, char** argv) {
         if (stream) {
             c.begin_stream();
             std::string acc;
-            StreamCtx ctx{&c, &acc, &id, created};
+            StreamCtx ctx{&c, &acc, &id, created, true, false, false, {}};
 
             dubhe_stats st{};
             dubhe_generate(g.engine, toks.data(), n, &sp, on_piece, nullptr, &ctx, &st);
