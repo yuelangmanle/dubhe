@@ -47,7 +47,8 @@ typedef struct {
     char     arch[32];
     char     name[128];
     int32_t  n_vocab;
-    int32_t  n_ctx_train;
+    int32_t  n_ctx_train;   /* 模型训练时的上下文长度 */
+    int32_t  n_ctx_limit;   /* 当前实际可用的上下文长度 */
     int32_t  n_embd;
     int32_t  n_layer;
     int32_t  n_head;

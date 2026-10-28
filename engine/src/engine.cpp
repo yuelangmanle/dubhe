@@ -163,6 +163,7 @@ int dubhe_model_info_get(const dubhe_engine* e, dubhe_model_info* out) {
     std::snprintf(out->name, sizeof(out->name), "%s", c.arch.c_str());
     out->n_vocab = c.n_vocab;
     out->n_ctx_train = c.n_ctx_train;
+    out->n_ctx_limit = e->model.n_ctx_limit();
     out->n_embd = c.n_embd;
     out->n_layer = c.n_layer;
     out->n_head = c.n_head;

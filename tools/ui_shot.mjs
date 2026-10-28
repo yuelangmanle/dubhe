@@ -42,6 +42,13 @@ function send(method, params = {}) {
 
 await send('Page.enable');
 await send('Runtime.enable');
+const W = parseInt(process.env.SHOT_W || '0', 10);
+const H = parseInt(process.env.SHOT_H || '0', 10);
+if (W && H) {
+  await send('Emulation.setDeviceMetricsOverride', {
+    width: W, height: H, deviceScaleFactor: 2, mobile: W < 600,
+  });
+}
 await send('Page.navigate', { url });
 await sleep(1500);
 

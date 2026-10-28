@@ -195,22 +195,64 @@ const char* kToolPrompt =
     "- shell(command): 执行 shell 命令（可能被禁用）\n"
     "不需要工具时直接回答，不要输出 tool_call。";
 
-// 从文本中提取第一个 <tool_call>...</tool_call>
+// 从 p 开始截取第一个配平的 {...}（考虑字符串内的括号与转义）
+bool first_json_object(const std::string& text, size_t p, std::string* out, size_t* end) {
+    if (p >= text.size() || text[p] != '{') return false;
+    int depth = 0;
+    bool in_str = false, esc = false;
+    for (size_t i = p; i < text.size(); i++) {
+        const char ch = text[i];
+        if (in_str) {
+            if (esc) esc = false;
+            else if (ch == '\\') esc = true;
+            else if (ch == '"') in_str = false;
+            continue;
+        }
+        if (ch == '"') in_str = true;
+        else if (ch == '{') depth++;
+        else if (ch == '}') {
+            if (--depth == 0) {
+                *out = text.substr(p, i - p + 1);
+                if (end) *end = i + 1;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// 从文本中提取第一个工具调用。
+// 两种形态都接受：<tool_call>{...}</tool_call> 和裸的 {"name":...}
 bool extract_tool_call(const std::string& text, std::string* name, json::Value* args,
                        size_t* end_pos) {
     const std::string open = "<tool_call>";
     const std::string close = "</tool_call>";
     size_t a = text.find(open);
-    if (a == std::string::npos) return false;
-    size_t b = text.find(close, a);
-    if (b == std::string::npos) return false;
-    std::string body = text.substr(a + open.size(), b - a - open.size());
+    if (a != std::string::npos) {
+        size_t b = text.find(close, a);
+        if (b == std::string::npos) return false;
+        std::string body = text.substr(a + open.size(), b - a - open.size());
+        json::Value v;
+        if (!json::parse(body, &v)) return false;
+        *name = v.s("name");
+        if (auto* a2 = v.get("arguments")) *args = *a2;
+        if (end_pos) *end_pos = b + close.size();
+        return !name->empty();
+    }
+    // 裸 JSON：模型常常吐出 {"name":...} 后面还跟着一串解释文字，
+    // 所以只截取第一个配平的对象来判断。
+    size_t p = text.find_first_not_of(" \t\r\n");
+    if (p == std::string::npos || text[p] != '{') return false;
+    std::string obj;
+    size_t obj_end = 0;
+    if (!first_json_object(text, p, &obj, &obj_end)) return false;
     json::Value v;
-    if (!json::parse(body, &v)) return false;
+    if (!json::parse(obj, &v)) return false;
     *name = v.s("name");
+    if (name->empty()) return false;
     if (auto* a2 = v.get("arguments")) *args = *a2;
-    if (end_pos) *end_pos = b + close.size();
-    return !name->empty();
+    if (end_pos) *end_pos = obj_end;
+    return true;
 }
 
 // ---------------------------------------------------------------- ChatML
@@ -263,6 +305,11 @@ struct StreamCtx {
     const std::string* id;
     long long created;
     bool first = true;
+    // 工具调用判定：模型有时会直接吐 {"name":...} 而不加 <tool_call> 包裹，
+    // 那样原始 JSON 会先流到用户眼前。所以先攒几个字符再决定要不要抑制。
+    bool decided = false;
+    bool suppress = false;
+    std::string pending;
 };
 
 void emit_delta(StreamCtx* x, const std::string& delta) {
@@ -274,11 +321,48 @@ void emit_delta(StreamCtx* x, const std::string& delta) {
     x->first = false;
 }
 
+// 前 16 个字符足以判断"这是不是一段工具调用"
 void on_piece(void* ud, int32_t /*tok*/, const char* piece) {
     auto* x = (StreamCtx*)ud;
     if (!piece) return;
     x->acc->append(piece);
-    emit_delta(x, piece);
+    if (x->suppress) return;
+
+    if (x->decided) {
+        emit_delta(x, piece);
+        return;
+    }
+    x->pending += piece;
+    // 去掉前导空白后再判断
+    size_t i = 0;
+    while (i < x->pending.size() && (x->pending[i] == ' ' || x->pending[i] == '\n' ||
+                                     x->pending[i] == '\r' || x->pending[i] == '\t')) i++;
+    const std::string head = x->pending.substr(i);
+    if (head.empty()) return;  // 还全是空白，继续等
+    const bool looks_tool = head.rfind("<tool_call", 0) == 0 || head.rfind("{\"name\"", 0) == 0 ||
+                            head.rfind("{ \"name\"", 0) == 0;
+    if (looks_tool) {
+        x->suppress = true;
+        x->decided = true;
+        x->pending.clear();
+        return;
+    }
+    if (head.size() >= 16) {
+        x->decided = true;
+        const std::string all = x->pending;
+        x->pending.clear();
+        emit_delta(x, all);
+    }
+}
+
+// 流结束后把还没吐出去的缓冲补发
+void flush_pending(StreamCtx* x) {
+    if (!x->decided && !x->pending.empty()) {
+        const std::string all = x->pending;
+        x->pending.clear();
+        x->decided = true;
+        emit_delta(x, all);
+    }
 }
 
 // /v1/* 的鉴权：设了 key 就必须带 Authorization: Bearer <key>
@@ -437,7 +521,8 @@ int main(int argc, char** argv) {
                 m.set("arch", json::Value::make_str(mi.arch));
                 m.set("params", json::Value::make_num((double)mi.n_params));
                 m.set("quant", json::Value::make_str(mi.quant_desc));
-                m.set("n_ctx", json::Value::make_num(mi.n_ctx_train));
+                m.set("n_ctx", json::Value::make_num(mi.n_ctx_limit));
+                m.set("n_ctx_train", json::Value::make_num(mi.n_ctx_train));
                 m.set("n_layer", json::Value::make_num(mi.n_layer));
                 m.set("n_embd", json::Value::make_num(mi.n_embd));
                 m.set("n_vocab", json::Value::make_num(mi.n_vocab));
@@ -510,6 +595,7 @@ int main(int argc, char** argv) {
 
             dubhe_stats st{};
             dubhe_generate(g.engine, toks.data(), n, &sp, on_piece, nullptr, &ctx, &st);
+            flush_pending(&ctx);
 
             // 工具调用：一轮
             std::string tname;
@@ -542,8 +628,13 @@ int main(int argc, char** argv) {
                 std::vector<int32_t> t2((size_t)n2);
                 dubhe_tokenize(g.engine, p2.c_str(), 1, t2.data(), n2);
 
+                // 第二轮重新判定：这次应该是正常回答了
+                ctx.decided = false;
+                ctx.suppress = false;
+                ctx.pending.clear();
                 dubhe_stats st2{};
                 dubhe_generate(g.engine, t2.data(), n2, &sp, on_piece, nullptr, &ctx, &st2);
+                flush_pending(&ctx);
                 st.n_generated += st2.n_generated;
                 st.decode_tps = st2.decode_tps;
             }
@@ -588,9 +679,30 @@ int main(int argc, char** argv) {
         ch.set("index", json::Value::make_num(0));
         json::Value msg = json::Value::make_obj();
         msg.set("role", json::Value::make_str("assistant"));
-        msg.set("content", json::Value::make_str(acc));
+
+        // 非流式 + 工具：按 OpenAI 协议把 tool_calls 交给客户端执行，
+        // 而不是在服务端偷偷跑一遍再拼一段文本回去。
+        std::string tname;
+        json::Value targs;
+        size_t endpos = 0;
+        if (with_tools && extract_tool_call(acc, &tname, &targs, &endpos)) {
+            msg.set("content", json::Value::make_str(""));
+            json::Value calls = json::Value::make_arr();
+            json::Value call = json::Value::make_obj();
+            call.set("id", json::Value::make_str("call_" + std::to_string(created)));
+            call.set("type", json::Value::make_str("function"));
+            json::Value fn = json::Value::make_obj();
+            fn.set("name", json::Value::make_str(tname));
+            fn.set("arguments", json::Value::make_str(json::dump(targs)));
+            call.set("function", fn);
+            calls.arr.push_back(call);
+            msg.set("tool_calls", calls);
+            ch.set("finish_reason", json::Value::make_str("tool_calls"));
+        } else {
+            msg.set("content", json::Value::make_str(acc));
+            ch.set("finish_reason", json::Value::make_str("stop"));
+        }
         ch.set("message", msg);
-        ch.set("finish_reason", json::Value::make_str("stop"));
         choices.arr.push_back(ch);
         root.set("choices", choices);
         json::Value usage = json::Value::make_obj();

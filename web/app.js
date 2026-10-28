@@ -406,7 +406,7 @@
         kv('量化', i.quant);
         kv('层数 / 维度', `${i.n_layer} / ${i.n_embd}`);
         kv('词表', String(i.n_vocab));
-        kv('上下文', String(i.n_ctx));
+        kv('上下文', i.n_ctx + (i.n_ctx_train > i.n_ctx ? ' / 训练 ' + i.n_ctx_train : ''));
         kv('Chat 模板', i.chatml ? 'ChatML' : '无');
         body.appendChild(box);
       } else {
