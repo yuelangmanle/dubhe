@@ -37,12 +37,15 @@ if [[ ! -f "$REF" ]]; then
   pandoc --print-default-data-file reference.docx > "$REF"
 fi
 
-pandoc "$IN" \
-  --from=gfm \
+# 预处理：按内容宽度重算表格分隔行，避免长文本列被压成窄条
+TMP="$(mktemp -t aether_md).md"
+trap 'rm -f "$TMP"' EXIT
+python3 "$ROOT/tools/docs/md_table_widths.py" "$IN" "$TMP"
+
+pandoc "$TMP" \
+  --from=markdown+pipe_tables+task_lists+strikeout+footnotes+autolink_bare_uris \
   --to=docx \
   --reference-doc="$REF" \
-  --toc \
-  --toc-depth=2 \
   --resource-path="$ROOT" \
   -o "$OUT"
 
