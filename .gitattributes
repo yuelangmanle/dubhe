@@ -1,0 +1,29 @@
+# 统一换行，避免跨平台 diff 噪声
+* text=auto eol=lf
+
+# 明确二进制（不做文本 diff、不做换行转换）
+*.gguf      binary
+*.safetensors binary
+*.bin       binary
+*.pte       binary
+*.litertlm  binary
+*.onnx      binary
+*.docx      binary
+*.xlsx      binary
+*.pptx      binary
+*.png       binary
+*.jpg       binary
+*.pdf       binary
+
+# 语言统计
+*.c   linguist-language=C
+*.h   linguist-language=C
+*.cc  linguist-language=C++
+*.cpp linguist-language=C++
+*.mm  linguist-language=Objective-C++
+*.metal linguist-language=Objective-C++
+*.kt  linguist-language=Kotlin
+*.swift linguist-language=Swift
+
+# 文档默认折叠生成物
+docs/references/** linguist-documentation
