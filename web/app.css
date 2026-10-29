@@ -1655,9 +1655,10 @@ body[data-glass="off"] .edge::before { display: none; }
 }
 .vnote.bad { background: rgba(196,85,63,.10); color: var(--red); }
 
-/* ---- 窄屏：视图铺满，头部收紧 */
+/* ---- 窄屏：.chat 本身就是全屏单列，视图继续用 absolute 铺满即可。
+ *      层级必须留在 24 —— 侧栏抽屉是 30、遮罩 25、设置面板 40，
+ *      视图盖过它们的话，在视图里点"设置"会弹在下面看不见。 */
 @media (max-width: 860px) {
-  .views { position: fixed; inset: 0; z-index: 60; }
   .view-head { padding: 11px 13px 9px; }
   .view-body { padding: 12px 13px 24px; }
 }
