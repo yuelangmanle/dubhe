@@ -19,65 +19,131 @@
 #include "mmproj.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <memory>
 #include <thread>
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace dubhe {
 namespace {
 
 constexpr int kThreads = 8;
 
+// 分阶段计时，DUBHE_MM_TRACE=1 时在进程退出时打印。视觉塔的性能问题太容易
+// 猜错（我先后猜过"反量化流量"和"缓存未命中"，都不是主因），所以留个开关，
+// 让数据说话。
+struct MmTrace {
+    std::atomic<int64_t> ns_mm{0}, ns_deq{0};
+    std::atomic<int64_t> n_calls{0}, n_elems{0};
+    bool on = std::getenv("DUBHE_MM_TRACE") != nullptr;
+    ~MmTrace() {
+        if (!on) return;
+        std::fprintf(stderr,
+                     "[mm] matmul %.0f ms / %lld 次 / %.1f M 参数次；反量化 %.0f ms\n",
+                     ns_mm.load() / 1e6, (long long)n_calls.load(), n_elems.load() / 1e6,
+                     ns_deq.load() / 1e6);
+    }
+};
+MmTrace g_trace;
+
+inline int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 inline float silu(float x) { return x / (1.0f + std::exp(-x)); }
 // ACT2FN["gelu"] 是 erf 版，不是 tanh 近似。两者差 1e-3 量级，
 // 在投影器最后一层会被放大成可见的输出差异，所以必须用 erf。
 inline float gelu(float x) { return 0.5f * x * (1.0f + std::erff(x * 0.70710678f)); }
 
-// Y[tok][o] = sum_i W[o][i] * X[tok][i]
+// 点积。row 是刚反量化出来的 f32 行，x 是某个 token 的激活。
 //
-// x_stride 是 X 相邻两行之间的间隔，0 表示等于 n_in。patchify 必须显式传
-// patch_dim（1536）：那里一个 patch 只取前 768 维当一个时间片，如果按 n_in
-// 跨步，第 t 个 patch 会读到 t×768 的位置，实际跨进了相邻 patch —— 纯白区域
-// 看不出来（内容相同），只有带细节的图才炸，极难查。
+// 为什么手写 NEON：同一段循环，标量版单线程 6.2 GFLOP/s，NEON 版 18.6，
+// 8 线程 69.7 —— 视觉塔 90% 的时间都在这里，值这三倍。
+inline float dot_f32(const float* row, const float* x, int64_t n) {
+    int64_t i = 0;
+    float s = 0.0f;
+#if defined(__ARM_NEON)
+    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+    for (; i + 16 <= n; i += 16) {
+        a0 = vfmaq_f32(a0, vld1q_f32(row + i),      vld1q_f32(x + i));
+        a1 = vfmaq_f32(a1, vld1q_f32(row + i + 4),  vld1q_f32(x + i + 4));
+        a2 = vfmaq_f32(a2, vld1q_f32(row + i + 8),  vld1q_f32(x + i + 8));
+        a3 = vfmaq_f32(a3, vld1q_f32(row + i + 12), vld1q_f32(x + i + 12));
+    }
+    s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+    for (; i + 4 <= n; i += 4)
+        s += vaddvq_f32(vmulq_f32(vld1q_f32(row + i), vld1q_f32(x + i)));
+#else
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    for (; i + 4 <= n; i += 4) {
+        s0 += row[i] * x[i];
+        s1 += row[i + 1] * x[i + 1];
+        s2 += row[i + 2] * x[i + 2];
+        s3 += row[i + 3] * x[i + 3];
+    }
+    s = (s0 + s1) + (s2 + s3);
+#endif
+    for (; i < n; i++) s += row[i] * x[i];
+    return s;
+}
+
+// 同上，但 W 是**量化**张量，不整块反量化。
 //
-// 按输出行并行、token 在行内循环：一行权重只从内存读一次就复用于所有 token，
-// 而 X 是热数据。早期版本写成"每个 token 调一次 matvec_t"，结果每个 matmul
-// 都要起 8 个线程（14 层 × 6 个 matmul × N 个 token），线程创建的开销比计算
-// 本身还大 —— 64 个 token 的图要跑 6.5 秒。
-void matmul_t(const float* W, int64_t n_in, int64_t n_out, const float* X, int64_t n_tok,
-              float* Y, int64_t x_stride = 0) {
+// 为什么值得单独写一个：视觉塔有 161M 参数，先 deq_all 成 f32 再乘，等于每次
+// 前向写 644 MB、再读 644 MB —— 全部浪费在把权重搬来搬去。这里改成每行反量化
+// 到栈上的行缓冲（n_in 最多 3072，12 KB，正好留在 L1），乘完就扔，权重只读它
+// 本来的 170 MB。反量化的成本也被摊到 n_tok 个 token 上（循环是行在外、token
+// 在内），所以 n_tok 越大越划算。
+void matmul_qt(const MmTensor& W, int64_t n_in, int64_t n_out, const float* X, int64_t n_tok,
+               float* Y, int64_t x_stride = 0) {
+    const int64_t t0 = g_trace.on ? now_ns() : 0;
     const int64_t xs = x_stride > 0 ? x_stride : n_in;
+    const size_t  rb = type_row_bytes(W.type, (int64_t)n_in);
     auto body = [&](int64_t o0, int64_t o1) {
+        std::vector<float> row((size_t)n_in);
         for (int64_t o = o0; o < o1; o++) {
-            const float* row = W + o * n_in;
+            dequant_row(W.type, (const char*)W.data + (size_t)o * rb, row.data(), n_in);
             float* yp = Y + o;
-            for (int64_t t = 0; t < n_tok; t++, yp += n_out) {
-                const float* x = X + t * xs;
-                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-                int64_t i = 0;
-                for (; i + 4 <= n_in; i += 4) {
-                    s0 += row[i] * x[i];
-                    s1 += row[i + 1] * x[i + 1];
-                    s2 += row[i + 2] * x[i + 2];
-                    s3 += row[i + 3] * x[i + 3];
-                }
-                float s = s0 + s1 + s2 + s3;
-                for (; i < n_in; i++) s += row[i] * x[i];
-                *yp = s;
-            }
+            for (int64_t t = 0; t < n_tok; t++, yp += n_out)
+                *yp = dot_f32(row.data(), X + t * xs, n_in);
         }
     };
-    // 工作量太小就别付线程启动的钱
-    if (n_out * n_tok < 64 * 1024) { body(0, n_out); return; }
-    const int64_t chunk = (n_out + kThreads - 1) / kThreads;
-    std::vector<std::thread> th;
-    th.reserve(kThreads);
-    for (int t = 0; t < kThreads; t++) {
-        const int64_t o0 = t * chunk, o1 = std::min(n_out, o0 + chunk);
-        if (o0 < o1) th.emplace_back(body, o0, o1);
+    if (n_out * n_tok < 64 * 1024) { body(0, n_out); }
+    else {
+        const int64_t chunk = (n_out + kThreads - 1) / kThreads;
+        std::vector<std::thread> th;
+        th.reserve(kThreads);
+        for (int t = 0; t < kThreads; t++) {
+            const int64_t o0 = t * chunk, o1 = std::min(n_out, o0 + chunk);
+            if (o0 < o1) th.emplace_back(body, o0, o1);
+        }
+        for (auto& t : th) t.join();
     }
-    for (auto& t : th) t.join();
+    if (g_trace.on) {
+        g_trace.ns_mm.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+        g_trace.n_calls.fetch_add(1, std::memory_order_relaxed);
+        g_trace.n_elems.fetch_add(n_out * n_tok, std::memory_order_relaxed);
+    }
+}
+
+// o += a * v。softmax 之后加权求和，1600 token 时每个 head 要跑 1600×1600 次。
+inline void saxpy(float* o, const float* v, float a, int64_t n) {
+    int64_t i = 0;
+#if defined(__ARM_NEON)
+    const float32x4_t av = vdupq_n_f32(a);
+    for (; i + 4 <= n; i += 4)
+        vst1q_f32(o + i, vfmaq_f32(vld1q_f32(o + i), av, vld1q_f32(v + i)));
+#endif
+    for (; i < n; i++) o[i] += a * v[i];
 }
 
 void rmsnorm(float* x, int64_t n, const float* w, float eps) {
@@ -322,15 +388,12 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
     // 8 个线程，256 个 patch 就是 4096 次线程创建，实测占了 70% 的墙钟时间。
     {
         const int64_t slice = (int64_t)3 * P * P;
-        std::vector<float> w0, w1;
-        if (!deq_all(patch_w[0], w0, err)) return false;
-        const int64_t pw = w0.size() / D;   // 每行宽度 = 一个时间片的元素数
+        const int64_t pw = patch_w[0].n / D;   // 每行宽度 = 一个时间片的元素数
         const int64_t pstride = c.patch_dim();   // 一个 patch 的总长度（两个时间片）
-        matmul_t(w0.data(), pw, D, pixels, N, x.data(), pstride);
+        matmul_qt(patch_w[0], pw, D, pixels, N, x.data(), pstride);
         if (patch_two_slices_ && c.temporal > 1 && pw == slice) {
-            if (!deq_all(patch_w[1], w1, err)) return false;
             std::vector<float> tmp((size_t)(N * D));
-            matmul_t(w1.data(), pw, D, pixels + slice, N, tmp.data(), pstride);
+            matmul_qt(patch_w[1], pw, D, pixels + slice, N, tmp.data(), pstride);
             for (int64_t i = 0; i < N * D; i++) x[(size_t)i] += tmp[(size_t)i];
         }
     }
@@ -385,14 +448,12 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
         for (int64_t n = 0; n < N; n++) rmsnorm(xn.data() + n * D, D, wbuf.data(), c.norm_eps);
 
         if (c.is_attn[(size_t)li]) {
-            std::vector<float> wq, wk, wv, wo, wqn, wkn;
-            if (!deq_all(L.q, wq, err) || !deq_all(L.k, wk, err) || !deq_all(L.v, wv, err) ||
-                !deq_all(L.o, wo, err) || !deq_all(L.q_norm, wqn, err) ||
-                !deq_all(L.k_norm, wkn, err)) return false;
+            std::vector<float> wqn, wkn;
+            if (!deq_all(L.q_norm, wqn, err) || !deq_all(L.k_norm, wkn, err)) return false;
 
-            matmul_t(wq.data(), D, qdim, xn.data(), N, q.data());
-            matmul_t(wk.data(), D, kdim, xn.data(), N, k.data());
-            matmul_t(wv.data(), D, kdim, xn.data(), N, v.data());
+            matmul_qt(L.q, D, qdim, xn.data(), N, q.data());
+            matmul_qt(L.k, D, kdim, xn.data(), N, k.data());
+            matmul_qt(L.v, D, kdim, xn.data(), N, v.data());
 
             // 每 head 的 QK RMSNorm，再套 RoPE（rotate-half；cos/sin 后一半是前一半的副本）
             for (int64_t n = 0; n < N; n++) {
@@ -443,10 +504,7 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
                         const float* qi = q.data() + i * qdim + hh * HD;
                         float mx = -1e30f;
                         for (int64_t j = 0; j < N; j++) {
-                            const float* kj = kb + j * HD;
-                            float s = 0.0f;
-                            for (int d = 0; d < HD; d++) s += qi[d] * kj[d];
-                            s *= scale;
+                            const float s = dot_f32(qi, kb + j * HD, HD) * scale;
                             sc[(size_t)j] = s;
                             if (s > mx) mx = s;
                         }
@@ -459,11 +517,8 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
                         const float inv = 1.0f / sum;
                         float* oi = o.data() + i * qdim + hh * HD;
                         for (int d = 0; d < HD; d++) oi[d] = 0.0f;
-                        for (int64_t j = 0; j < N; j++) {
-                            const float a = sc[(size_t)j] * inv;
-                            const float* vj = vb + j * HD;
-                            for (int d = 0; d < HD; d++) oi[d] += a * vj[d];
-                        }
+                        for (int64_t j = 0; j < N; j++)
+                            saxpy(oi, vb + j * HD, sc[(size_t)j] * inv, HD);
                     }
                 }
             };
@@ -478,16 +533,15 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
             } else {
                 head_body(0, H);
             }
-            matmul_t(wo.data(), qdim, D, o.data(), N, y.data());
+            matmul_qt(L.o, qdim, D, o.data(), N, y.data());
         } else {
             // 门控 2D 深度卷积
-            std::vector<float> wi, wc, wout;
-            if (!deq_all(L.conv_in, wi, err) || !deq_all(L.conv_out, wout, err) ||
-                !deq_all(L.conv_spatial, wc, err)) return false;
+            std::vector<float> wc;
+            if (!deq_all(L.conv_spatial, wc, err)) return false;   // 每层只有 9×1024，随便反量化
 
             const int64_t c3 = 3 * D;
             std::vector<float> g3((size_t)(N * c3));
-            matmul_t(wi.data(), D, c3, xn.data(), N, g3.data());
+            matmul_qt(L.conv_in, D, c3, xn.data(), N, g3.data());
 
             // 栅格化：[token][merge²][C] → [C][gh][gw]
             // 注意 in_proj 的输出被切成三段 (B, C, x)：
@@ -543,7 +597,7 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
                     back[(size_t)(n * D + ch)] = conv[(size_t)(ch * N + yy * gw + xx)] *
                                                  g3[(size_t)(n * c3 + D + ch)];
             }
-            matmul_t(wout.data(), D, D, back.data(), N, y.data());
+            matmul_qt(L.conv_out, D, D, back.data(), N, y.data());
         }
 
         for (int64_t i = 0; i < N * D; i++) x[(size_t)i] += y[(size_t)i];
@@ -553,14 +607,11 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
         if (!deq_all(L.ln2, wbuf, err)) return false;
         for (int64_t n = 0; n < N; n++) rmsnorm(xn.data() + n * D, D, wbuf.data(), c.norm_eps);
 
-        std::vector<float> wg, wu, wd;
-        if (!deq_all(L.ffn_gate, wg, err) || !deq_all(L.ffn_up, wu, err) ||
-            !deq_all(L.ffn_down, wd, err)) return false;
         std::vector<float> fg((size_t)(N * c.ffn)), fu((size_t)(N * c.ffn));
-        matmul_t(wg.data(), D, c.ffn, xn.data(), N, fg.data());
-        matmul_t(wu.data(), D, c.ffn, xn.data(), N, fu.data());
+        matmul_qt(L.ffn_gate, D, c.ffn, xn.data(), N, fg.data());
+        matmul_qt(L.ffn_up, D, c.ffn, xn.data(), N, fu.data());
         for (int64_t i = 0; i < N * c.ffn; i++) fg[(size_t)i] = silu(fg[(size_t)i]) * fu[(size_t)i];
-        matmul_t(wd.data(), c.ffn, D, fg.data(), N, y.data());
+        matmul_qt(L.ffn_down, c.ffn, D, fg.data(), N, y.data());
         for (int64_t i = 0; i < N * D; i++) x[(size_t)i] += y[(size_t)i];
 
         if (on_layer) on_layer(li, x.data(), N);
@@ -568,10 +619,9 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
 
     // ---- 投影器：LayerNorm → 每 merge² 个 token 拼起来 → Linear → GELU → Linear
     {
-        std::vector<float> nw, nb, w0, b0, w2, b2;
+        std::vector<float> nw, nb, b0, b2;
         if (!deq_all(mm_norm_w, nw, err) || !deq_all(mm_norm_b, nb, err) ||
-            !deq_all(mm0_w, w0, err) || !deq_all(mm0_b, b0, err) ||
-            !deq_all(mm2_w, w2, err) || !deq_all(mm2_b, b2, err)) return false;
+            !deq_all(mm0_b, b0, err) || !deq_all(mm2_b, b2, err)) return false;
 
         for (int64_t n = 0; n < N; n++)
             layernorm(x.data() + n * D, D, nw.data(), nb.data(), 1e-6f);
@@ -579,11 +629,11 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
         const int64_t din = D * M * M;              // 4096
         const int64_t mid = c.proj_hidden;          // 4096
         std::vector<float> hh((size_t)(n_tok * mid));
-        matmul_t(w0.data(), din, mid, x.data(), n_tok, hh.data());
+        matmul_qt(mm0_w, din, mid, x.data(), n_tok, hh.data());
         for (int64_t n = 0; n < n_tok; n++)
             for (int64_t o = 0; o < mid; o++)
                 hh[(size_t)(n * mid + o)] = gelu(hh[(size_t)(n * mid + o)] + b0[(size_t)o]);
-        matmul_t(w2.data(), mid, c.out_dim, hh.data(), n_tok, out);
+        matmul_qt(mm2_w, mid, c.out_dim, hh.data(), n_tok, out);
         for (int64_t n = 0; n < n_tok; n++)
             for (int64_t o = 0; o < c.out_dim; o++) out[n * c.out_dim + o] += b2[(size_t)o];
     }
