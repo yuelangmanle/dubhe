@@ -1365,6 +1365,135 @@ kernel void mm3_f16(device const uchar* w      [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------- Q8_0
+//
+// Q8_0 块：32 元素 / 34 字节 —— d(fp16)@0、qs[32] int8@2。v[i] = d * qs[i]。
+//
+// 一个线程负责 16 个元素 = 半个块，所以 scale 每块只读一次。
+// 块跨度 34 ≡ 2 (mod 4)，起始地址只有 2 字节对齐 → 只能按 ushort 读
+// （8 条换 16 字节）。这是格式决定的，不是没优化：34 字节的块头让
+// uint4 永远落不到 16 字节边界上，ld16s 那种"退 4 字节再拼"实测在
+// Q6_K 上比 ushort 还慢 1.5%。
+//
+// Q8_0 之前走 mm2_q8_0：1.7B 上 prefill 184.6 tok/s，折合
+// 2×1.7e9×184.6 ≈ 628 GFLOP/s —— 只有 Q4_K MMA 路径的 1/3，
+// 而 Q8_0 每元素的解包指令数比 Q4_K 还少。差的全在没用 MMA。
+kernel void mm3_q8_0(device const uchar* w      [[buffer(0)]],
+                     device const float* XT     [[buffer(1)]],
+                     device float* Y            [[buffer(2)]],
+                     constant uint& n_in        [[buffer(3)]],
+                     constant ulong& woff       [[buffer(4)]],
+                     constant uint& n_out       [[buffer(5)]],
+                     constant uint& nrow        [[buffer(6)]],
+                     constant uint& xstride     [[buffer(7)]],
+                     constant ulong& yoff       [[buffer(8)]],
+                     uint tgid [[threadgroup_position_in_grid]],
+                     uint tid  [[thread_position_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]],
+                     uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half smem[MMA_BM * MMA_BN * 2];
+    threadgroup half* ws = smem;
+    threadgroup half* xs = smem + MMA_BN * MMA_NK;
+
+    const uint row0 = tgid * MMA_BN;
+    const uint nb   = n_in / MMA_NK;
+    const ulong rbytes = (ulong)(n_in >> 5) * 34u;     // 每行 (n_in/32) 个块
+
+    const uint lr     = tid >> 1;
+    const uint half16 = tid & 1u;
+    const uint grow   = row0 + lr;
+    device const uchar* prow = w + woff + (ulong)min(grow, n_out - 1u) * rbytes;
+
+    simdgroup_float8x8 acc[2][4];
+    #pragma unroll
+    for (uint i = 0; i < 2u; i++)
+        #pragma unroll
+        for (uint j = 0; j < 4u; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    for (uint b = 0; b < nb; b++) {
+        const uint k0 = b * MMA_NK;
+
+        // ---- 16 个元素：半个 Q8_0 块，scale 只算一次
+        {
+            const uint e0  = k0 + (half16 << 4);
+            const uint blk = e0 >> 5;          // 32 元素块号
+            const uint inb = e0 & 31u;         // 0 / 16
+            device const uchar* q = prow + (ulong)blk * 34u;
+            const float d = f16_to_f32(*(device const ushort*)q);
+            device const ushort* qs = (device const ushort*)(q + 2u + inb);
+
+            half4 h4[4];
+            #pragma unroll
+            for (uint t = 0; t < 4u; t++) {
+                const uint w0 = uint(qs[t * 2u]);
+                const uint w1 = uint(qs[t * 2u + 1u]);
+                h4[t][0] = (half)(d * float(int((char)(w0 & 0xFFu))));
+                h4[t][1] = (half)(d * float(int((char)(w0 >> 8))));
+                h4[t][2] = (half)(d * float(int((char)(w1 & 0xFFu))));
+                h4[t][3] = (half)(d * float(int((char)(w1 >> 8))));
+            }
+            threadgroup half4* dst = (threadgroup half4*)(ws + lr * MMA_NK + (half16 << 4));
+            #pragma unroll
+            for (uint t = 0; t < 4u; t++) dst[t] = h4[t];
+        }
+
+        #pragma unroll
+        for (uint t = 0; t < 2u; t++) {
+            const uint i4 = tid * 2u + t;
+            const uint m0 = (i4 & 7u) << 2;
+            const uint k  = i4 >> 3;
+            const float4 v = *(device const float4*)(XT + (ulong)(k0 + k) * xstride + m0);
+            *(threadgroup half4*)(xs + k * MMA_BM + m0) =
+                half4((half)v.x, (half)v.y, (half)v.z, (half)v.w);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint kk = 0; kk < 4u; kk++) {
+            simdgroup_half8x8 ma[4];
+            #pragma unroll
+            for (uint j = 0; j < 4u; j++)
+                simdgroup_load(ma[j], xs, MMA_BM, ulong2(j << 3, kk << 3), true);
+
+            simdgroup_half8x8 mb[2];
+            #pragma unroll
+            for (uint i = 0; i < 2u; i++)
+                simdgroup_load(mb[i], ws, MMA_NK, ulong2(kk << 3, (sg << 4) + (i << 3)), true);
+
+            #pragma unroll
+            for (uint i = 0; i < 2u; i++) {
+                #pragma unroll
+                for (uint j = 0; j < 4u; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], ma[j], mb[i], acc[i][j]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float* cs = (threadgroup float*)smem;
+    #pragma unroll
+    for (uint i = 0; i < 2u; i++) {
+        #pragma unroll
+        for (uint j = 0; j < 4u; j++)
+            simdgroup_store(acc[i][j], cs, MMA_BN,
+                            ulong2((sg << 4) + (i << 3), j << 3), false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    #pragma unroll
+    for (uint t = 0; t < 16u; t++) {
+        const uint idx = tid * 16u + t;
+        const uint m = idx >> 6;
+        const uint n = idx & 63u;
+        if (m < nrow && row0 + n < n_out)
+            Y[yoff + (ulong)m * n_out + row0 + n] = cs[m * MMA_BN + n];
+    }
+}
+
 // ---------------------------------------------------------------- Q6_K
 //
 // Q6_K 块：256 元素 / 210 字节 —— ql[128]、qh[64]、sc[16]（int8）、d(fp16)@208。
