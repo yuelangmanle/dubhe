@@ -319,6 +319,26 @@ static inline void k4_scale_min(int j, device const uchar* q, thread uchar& d, t
     }
 }
 
+// 同一个映射，但整块头已经作为 uint4 读进寄存器了。
+static inline uint hdr_byte(uint4 h, uint i) {
+    const uint w = (i < 4u) ? h.x : (i < 8u) ? h.y : (i < 12u) ? h.z : h.w;
+    return (w >> ((i & 3u) << 3)) & 0xFFu;
+}
+
+// 注意偏移：k4_scale_min(j, q, ...) 传进来的 q 是**块头第 4 字节**（scales 起点），
+// 而 hdr_byte 的下标从**块头第 0 字节**算 —— 所以下面每个下标都要 +4。
+// 第一次写这里时照抄了 k4_scale_min 的下标、忘了这 4 个字节，
+// 结果 scale/min 全部错位 → 融合校验 rel=1.3e+01 → 静默回退 CPU（16 tok/s）。
+static inline void k4_scale_min_h(uint j, uint4 h, thread uint& s, thread uint& m) {
+    if (j < 4u) {
+        s = hdr_byte(h, j + 4u) & 63u;
+        m = hdr_byte(h, j + 8u) & 63u;
+    } else {
+        s = (hdr_byte(h, j + 8u) & 0x0Fu) | ((hdr_byte(h, j) >> 6) << 4);
+        m = (hdr_byte(h, j + 8u) >> 4)    | ((hdr_byte(h, j + 4u) >> 6) << 4);
+    }
+}
+
 kernel void mv_q4_k(device const uchar* w     [[buffer(0)]],
                     device const float* x     [[buffer(1)]],
                     device float* y           [[buffer(2)]],
@@ -342,50 +362,82 @@ kernel void mv_q4_k(device const uchar* w     [[buffer(0)]],
 
     // 分工方式决定一切。
     //
-    // 旧写法：一个 lane 在**每个** sub-block 里取一个元素 → 一个块要 8 次
-    // k4_scale_min（每次约 10 条指令，带分支和 3 次字节读）。一个 lane 每块
-    // 只算 8 个元素，却付了 80 条指令的账 → **10 条指令/元素**。
-    // Q8_0 那边是 1 条指令/元素，于是 Q4_K 的 decode 只有 14.5 GB/s，
-    // 而 Q8_0 能到 58 GB/s —— 差的不是带宽，是 ALU。
+    // 历史：最早一个 lane 在每个 sub-block 里取一个元素，一个块要算 8 次
+    // k4_scale_min，10 条指令/元素，decode 只有 14.5 GB/s。
+    // 后来改成"一个 lane 固定管一个 sub-block 的 8 个元素"，1 次 k4_scale_min
+    // 摊到 8 个元素，约 3 条指令/元素，提到 59 GB/s。
     //
-    // 新写法：一个 lane **固定负责一个 sub-block 的 8 个元素**。
-    //   s = lane/4  → 第几个 sub-block（0..7）
-    //   h = lane%4  → sub-block 内第几个 8 元素组
-    // 于是每块只需 1 次 k4_scale_min，8 个元素 → **约 3 条指令/元素**。
+    // 但 59 GB/s 仍然低于 F16 的 83 GB/s，而两者的 MVR / 线程组形状完全一样。
+    // 差别只在**一条 load 覆盖多少元素**：
+    //   mv_f16   一条 16 字节 load  → 8 个元素，每 8 元素 3 条 load
+    //   mv_q4_k  一条 8 字节 uint2  → 8 个元素，外加 8 条块头字节读
+    // 于是同样的元素量，Q4_K 要多发 3 倍以上的 load 指令。
     //
-    // 字节布局（GGUF Q4_K 的 qs 是 64 元素交错，不是"每个 sub-block 16 字节"）：
-    //   64 元素块 k 占字节 [16+32k, 16+32k+32)，
-    //   元素 64k+i        → 第 i 字节的**低**半字节
-    //   元素 64k+32+i     → 第 i 字节的**高**半字节
-    // 所以 sub-block 为偶数取低半字节、奇数取高半字节，两者读的是同一段 8 字节。
-    const uint sb   = lane >> 2;              // 0..7
-    const uint h    = lane & 3u;              // 0..3
-    const uint chunk = sb >> 1;               // 64 元素块号 0..3
-    const bool take_hi = (sb & 1u) != 0u;
-    const uint boff = 16u + (chunk << 5) + (h << 3);   // 本 lane 的 8 字节起点
-    const uint xoff = (sb << 5) + (h << 3);            // 本 lane 的 8 元素起点
+    // 这一版让每个 lane 用**一条 uint4** 管 32 个元素：
+    //   blk = lane/8  → warp 内第几个块（一个 warp 覆盖 4 个块）
+    //   m   = lane%8  → 块内第几个 16 字节组（一个块正好 8 组）
+    //   k   = m/2     → 64 元素块号 0..3
+    //   g   = m%2     → 组内前半 / 后半
+    // 一个 16 字节组覆盖 32 个元素：低半字节 = 元素 64k+16g+i（sub-block 2k），
+    // 高半字节 = 元素 64k+32+16g+i（sub-block 2k+1）。所以只需 2 次
+    // k4_scale_min，摊到 32 个元素。load 指令数：每 32 元素 1 条 uint4 + 8 条
+    // 块头字节读，而旧版要 4 条 uint2 + 32 条字节读。
+    //
+    // 尾部：nb 不一定是 4 的倍数。用 min() 夹住块下标避免越界，再用 msk 把
+    // 多出来的块贡献清零 —— 分支-free，代价是每条 lane 两次乘法。
+    const uint blk  = lane >> 3;             // 0..3
+    const uint m    = lane & 7u;             // 0..7
+    const uint k    = m >> 1;                // 0..3
+    const uint g    = m & 1u;                // 0..1
+    const uint boff = 16u + (k << 5) + (g << 4);
+    const uint xlo  = (k << 6) + (g << 4);
+    const uint xhi  = xlo + 32u;
+    const uint sb0  = k << 1;
 
-    for (uint b = 0; b < nb; b++) {
-        device const float* xb = x + (b << 8) + xoff;
+    const uint nbi = (nb + 3u) >> 2;
+    for (uint bi = 0; bi < nbi; bi++) {
+        const uint braw = (bi << 2) + blk;
+        const bool ok   = (braw < nb);
+        const uint b    = ok ? braw : (nb - 1u);
+        const float msk = ok ? 1.0f : 0.0f;
+        const ulong xb  = (ulong)b * 256u;
+
+        float xl[16], xh[16];
+        #pragma unroll
+        for (uint t = 0; t < 4u; t++) {
+            const float4 v = *(device const float4*)(x + xb + xlo + (t << 2));
+            xl[t*4u+0] = v.x; xl[t*4u+1] = v.y; xl[t*4u+2] = v.z; xl[t*4u+3] = v.w;
+            const float4 w = *(device const float4*)(x + xb + xhi + (t << 2));
+            xh[t*4u+0] = w.x; xh[t*4u+1] = w.y; xh[t*4u+2] = w.z; xh[t*4u+3] = w.w;
+        }
+
         for (uint r = 0; r < MVR; r++) {
-            device const uchar* q = p[r] + b * 144u;
-            uchar s1, m1;
-            k4_scale_min(int(sb), q + 4u, s1, m1);
-            const float sc = rd_f16(q)      * float(s1);
-            const float mn = rd_f16(q + 2u) * float(m1);
-            // 8 个字节一次读进来（uint2 = 8 字节，地址 8 字节对齐：
-            // 块跨度 144 与 boff = 16+32k+8h 都是 8 的倍数，GGUF 张量基址
-            // 按 32 对齐，所以成立）。逐个 uchar 读是 8 条 load 指令，
-            // 一条 uint2 就够 —— 解码时 load 指令数才是真正的天花板。
-            const uint2 raw = *(device const uint2*)(q + boff);
+            device const uchar* q = p[r] + (ulong)b * 144u;
+            // 块头**不要**改成一条 uint4 —— 两种形状都试过，都更慢：
+            //   全 warp 广播（32 lane 读同一块头）：56.2 vs 59.4
+            //   8 lane 一组（warp 内 4 组各读各的）：61.3 vs 63.2
+            // 字节读虽然条数多，但全部命中 L1，比 16 字节向量读更划算。
+            uchar s0, n0, s1, n1;
+            k4_scale_min(int(sb0), q + 4u, s0, n0);
+            k4_scale_min(int(sb0 + 1u), q + 4u, s1, n1);
+            const float dl = rd_f16(q);
+            const float dm = rd_f16(q + 2u);
+            const float scl = dl * float(s0) * msk;
+            const float mnl = dm * float(n0) * msk;
+            const float sch = dl * float(s1) * msk;
+            const float mnh = dm * float(n1) * msk;
+            const uint4 raw = *(device const uint4*)(q + boff);
+            float a = 0.0f;
             // min 项折进逐元素 fma：sum(d*sc*v - dm*m)*x 省掉单独的 x 求和
             #pragma unroll
-            for (uint i = 0; i < 8u; i++) {
-                const uint word = (i < 4u) ? raw.x : raw.y;
+            for (uint i = 0; i < 16u; i++) {
+                const uint word = (i < 4u) ? raw.x : (i < 8u) ? raw.y
+                                : (i < 12u) ? raw.z : raw.w;
                 const uint byte = (word >> ((i & 3u) << 3)) & 0xFFu;
-                const int v = take_hi ? int(byte >> 4) : int(byte & 0x0Fu);
-                acc[r] += (sc * float(v) - mn) * xb[i];
+                a += (scl * float(byte & 0x0Fu) - mnl) * xl[i];
+                a += (sch * float(byte >> 4) - mnh) * xh[i];
             }
+            acc[r] += a;
         }
     }
     for (uint r = 0; r < MVR; r++) {
