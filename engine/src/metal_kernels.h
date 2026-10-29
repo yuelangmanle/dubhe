@@ -613,6 +613,7 @@ kernel void k_rope(device float* q          [[buffer(0)]],
                    constant uint& hd        [[buffer(6)]],
                    constant uint& pos0      [[buffer(7)]],
                    constant float& theta    [[buffer(8)]],
+                   constant uint& angles    [[buffer(9)]],
                    uint2 gid [[thread_position_in_grid]])
 {
     const uint hh = hd >> 1;   // 注意：half 是 MSL 内建的 16 位浮点类型名，不能用作变量
@@ -620,7 +621,9 @@ kernel void k_rope(device float* q          [[buffer(0)]],
     const uint row = gid.y;
     const uint h = gid.x / hh;
     const uint i = gid.x - h * hh;
-    const float freq = 1.0f / pow(theta, float(2u * i) / float(hd));
+    // partial RoPE（zero-tail）：只有前 angles 个角度真的转，其余频率取 0，
+    // cos=1/sin=0 退化成恒等拷贝。这样 k 仍然会照常落到 cache 的正确槽位。
+    const float freq = (i < angles) ? (1.0f / pow(theta, float(2u * i) / float(hd))) : 0.0f;
     const float a = float(pos0 + row) * freq;
     const float c = cos(a), s = sin(a);
     const uint qdim = n_head * hd, kdim = n_kvh * hd;
@@ -681,6 +684,7 @@ kernel void k_attn(device const float* q  [[buffer(0)]],
                    constant uint& nlen0   [[buffer(8)]],
                    constant uint& kv_dim  [[buffer(9)]],
                    constant float& scale  [[buffer(10)]],
+                   constant uint& win     [[buffer(11)]],
                    uint2 tgid [[threadgroup_position_in_grid]],
                    uint lane [[thread_index_in_simdgroup]],
                    uint sg   [[simdgroup_index_in_threadgroup]])
@@ -694,12 +698,14 @@ kernel void k_attn(device const float* q  [[buffer(0)]],
     device const float* kb = fatc(kc, coff) + kvh * hd;
     device const float* vb = fatc(vc, coff) + kvh * hd;
     const uint nlen = nlen0 + row;
+    // 滑窗：只回看最近 win 个位置（win == 0 表示全量）
+    const uint t0 = (win > 0u && nlen > win) ? (nlen - win) : 0u;
 
     float m = -1e30f, l = 0.0f;
     float acc[4];
     for (int j = 0; j < 4; j++) acc[j] = 0.0f;
 
-    for (uint t = 0; t < nlen; t++) {
+    for (uint t = t0; t < nlen; t++) {
         device const float* kk = kb + (ulong)t * kv_dim;
         float partial = 0.0f;
         for (uint d = lane; d < hd; d += 32u) partial += qh[d] * kk[d];
@@ -742,6 +748,7 @@ kernel void k_attn_split(device const float* q  [[buffer(0)]],
                          constant uint& kv_dim  [[buffer(9)]],
                          constant float& scale  [[buffer(10)]],
                          constant uint& nsp     [[buffer(11)]],
+                         constant uint& win     [[buffer(12)]],
                          uint3 tgid [[threadgroup_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]],
                          uint sg   [[simdgroup_index_in_threadgroup]])
@@ -753,8 +760,12 @@ kernel void k_attn_split(device const float* q  [[buffer(0)]],
 
     const uint nlen = nlen0 + row;
     const uint chunk = (nlen + nsp - 1u) / nsp;
-    const uint k0 = sp * chunk;
-    uint k1 = k0 + chunk;
+    // 滑窗：本段的下界不能早于 t0。段被完全裁掉时 l 保持 0，
+    // combine 阶段按 exp 权重 0 处理，不影响结果。
+    const uint t0 = (win > 0u && nlen > win) ? (nlen - win) : 0u;
+    uint k0 = sp * chunk;
+    if (k0 < t0) k0 = t0;
+    uint k1 = sp * chunk + chunk;
     if (k1 > nlen) k1 = nlen;
 
     const uint W = hd + 2u;
@@ -840,5 +851,134 @@ kernel void k_attn_comb(device const float* part [[buffer(0)]],
     device float* o = out + ((ulong)row * n_head + head) * hd;
     int j = 0;
     for (uint d = lane; d < hd; d += 32u, j++) o[d] = acc[j] * inv;
+}
+
+// ================================================================ LFM3 专用
+//
+// LFM3 在 llama 那套子层之外还多四件事：每 head 的 QK RMSNorm、
+// 逐 head 的 sigmoid 输出门、门控短卷积、sandwich norm。
+// sandwich norm 复用 k_rmsnorm（只是权重偏移不同），所以这里只补三个 kernel
+// 和一个带偏移的乘法。
+
+// 每 head 独立 RMSNorm。一个 threadgroup 处理一个 head，
+// 权重只有 hd 长、所有 head 共用。原地（out == x）安全：
+// 归约全部做完并过了 barrier 才开始写。
+//
+// 网格用一维：threadgroup id 展开成 (row, head)。Metal 要求同一个 kernel 里
+// 的网格属性要么全是标量、要么全是同宽度向量——threads_per_threadgroup 是
+// 标量，所以这里不能写成 uint2 的二维网格。
+kernel void k_headnorm(device const float* x [[buffer(0)]],
+                       device const uchar* w [[buffer(1)]],
+                       device float* out     [[buffer(2)]],
+                       constant uint& n_head [[buffer(3)]],
+                       constant uint& hd     [[buffer(4)]],
+                       constant float& eps   [[buffer(5)]],
+                       constant ulong& woff  [[buffer(6)]],
+                       uint tg   [[threadgroup_position_in_grid]],
+                       uint tid  [[thread_position_in_threadgroup]],
+                       uint tgs  [[threads_per_threadgroup]])
+{
+    const uint head = tg % n_head;
+    const uint row  = tg / n_head;
+    device const float* xr = x + ((ulong)row * n_head + head) * hd;
+    device float* orow = out + ((ulong)row * n_head + head) * hd;
+    float ss = 0.0f;
+    for (uint i = tid; i < hd; i += tgs) ss += xr[i] * xr[i];
+    threadgroup float sm[32];
+    ss = simd_sum(ss);
+    if ((tid & 31u) == 0u) sm[tid >> 5] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32u) {
+        float v = (tid < (tgs >> 5)) ? sm[tid] : 0.0f;
+        v = simd_sum(v);
+        if (tid == 0u) sm[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float scale = rsqrt(sm[0] / float(hd) + eps);
+    device const float* wf = (device const float*)(w + woff);
+    for (uint i = tid; i < hd; i += tgs) orow[i] = xr[i] * scale * wf[i];
+}
+
+// 逐 head 的 sigmoid 输出门：att[head] *= sigmoid(gate[head])
+kernel void k_gate_mul(device float* att         [[buffer(0)]],
+                       device const float* g     [[buffer(1)]],
+                       constant uint& n_head     [[buffer(2)]],
+                       constant uint& hd         [[buffer(3)]],
+                       uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= n_head * hd) return;
+    const uint h = gid.x / hd;
+    const float s = 1.0f / (1.0f + exp(-g[(ulong)gid.y * n_head + h]));
+    att[(ulong)gid.y * n_head * hd + gid.x] *= s;
+}
+
+// 带偏移的逐元素乘法：dst[r][i] = a[ao + r*n + i] * b[bo + r*n + i]
+// ShortConv 用它做 hidden = B ⊙ X 和 y = C ⊙ conv_out，省掉两次额外搬运。
+// ao/bo 是**字节**偏移（和其余 kernel 的 woff/coff 一致），所以必须过 fatc，
+// 不能直接写 a[ao + o]——那是按元素下标算的，会把偏移放大 4 倍。
+// sa/sb 是 a/b 的**行**跨度（字节）。g_bconv 每行是 3*n_embd 而不是 n_embd，
+// 把行跨度写死成 n 会让 row 0 正确、row≥1 全错——prefill 时表现为
+// "nrow=1 精确、nrow=2 就开始崩"。
+kernel void k_mul(device float* dst        [[buffer(0)]],
+                  device const float* a    [[buffer(1)]],
+                  device const float* b    [[buffer(2)]],
+                  constant uint& n         [[buffer(3)]],
+                  constant ulong& ao       [[buffer(4)]],
+                  constant ulong& bo       [[buffer(5)]],
+                  constant ulong& sa       [[buffer(6)]],
+                  constant ulong& sb       [[buffer(7)]],
+                  uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= n) return;
+    const ulong row = (ulong)gid.y;
+    dst[row * n + gid.x] = fatc(a, ao + row * sa)[gid.x] * fatc(b, bo + row * sb)[gid.x];
+}
+
+// LFM3 ShortConv 的深度可分离因果卷积。
+//
+//   state 存 h(t-K+1) .. h(t-1)（K-1 个），state[0] 最旧；
+//   y[c] = Σ_k W[c*K+k] * buf[k][c]，buf = [state..., h(t)]
+//
+// 卷积**先算**、state **后滚**（见 k_conv_shift）。反过来的话核会整体偏移
+// 一位，而且 h(t) 会被 W[K-2] 和 W[K-1] 各算一次——CPU 参考路径踩过这个坑。
+// 一次 dispatch 只处理一行；多行时主机侧按行序连续派发，
+// 同一 command buffer 内的 compute dispatch 顺序执行，state 能逐行正确递推。
+kernel void k_conv(device const float* h        [[buffer(0)]],
+                   device float* y              [[buffer(1)]],
+                   device const uchar* w        [[buffer(2)]],
+                   device float* state          [[buffer(3)]],
+                   constant uint& n             [[buffer(4)]],
+                   constant uint& K             [[buffer(5)]],
+                   constant ulong& kwoff        [[buffer(6)]],
+                   constant ulong& soff         [[buffer(7)]],
+                   constant ulong& hoff         [[buffer(8)]],
+                   constant ulong& yoff         [[buffer(9)]],
+                   uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    const uint c = gid;
+    device const float* wi = (device const float*)(w + kwoff) + (ulong)c * K;
+    device const float* st = fatc(state, soff);
+    device const float* hh = fatc(h, hoff);
+    float acc = 0.0f;
+    for (uint k = 0; k + 1u < K; k++) acc += wi[k] * st[(ulong)k * n + c];
+    acc += wi[K - 1u] * hh[c];
+    fat(y, yoff)[c] = acc;   // 多行时必须按行落，否则所有行都写进第 0 行
+}
+
+// state 滚动：丢掉最旧的一格，把 h(t) 放到末尾
+kernel void k_conv_shift(device const float* h    [[buffer(0)]],
+                         device float* state       [[buffer(1)]],
+                         constant uint& n          [[buffer(2)]],
+                         constant uint& K          [[buffer(3)]],
+                         constant ulong& soff      [[buffer(4)]],
+                         constant ulong& hoff      [[buffer(5)]],
+                         uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    device float* st = fat(state, soff);
+    device const float* hh = fatc(h, hoff);
+    for (uint k = 0; k + 2u < K; k++) st[(ulong)k * n + gid] = st[(ulong)(k + 1u) * n + gid];
+    st[(ulong)(K - 2u) * n + gid] = hh[gid];
 }
 )MSL";

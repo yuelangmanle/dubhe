@@ -329,6 +329,10 @@ private:
     ModelConfig cfg_;
     bool loaded_ = false;
     mutable bool gpu_active_ = false;   // GPU 出错时 matvec 会就地降级，故 mutable
+    // CPU 参考路径是否强制用纯 f32 点积（关掉激活 Q8 量化）。
+    // GPU 校验时必须打开：Q8 激活本身就有 ~1e-2 的相对误差，
+    // 不关掉的话对拍测的是 CPU 自己的近似，量不出 GPU 的问题。
+    mutable bool f32_ref_ = false;
     // 整层前向是否由 Metal 融合内核接管。LFM3 还没有对应的融合内核，
     // 但逐算子的 matvec 仍然走 GPU，所以这两个标志必须分开。
     bool gpu_fused_ = false;

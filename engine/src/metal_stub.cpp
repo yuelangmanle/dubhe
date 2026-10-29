@@ -33,6 +33,8 @@ bool fwd_batch(const float*, int, int, float*, std::string* err) {
     return false;
 }
 int fwd_batch_max() { return 1; }
+void fwd_reset_conv() {}
+bool fwd_copy_x(float*, int) { return false; }
 
 }  // namespace metal
 }  // namespace dubhe

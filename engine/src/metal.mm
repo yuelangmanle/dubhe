@@ -257,11 +257,13 @@ constexpr int kAttnSplits = 8;  // 注意力 key 区间最多切几段（split-K
 
 enum FwdKernel {
     F_RMSNORM = 0, F_ADD, F_BIAS, F_SILU, F_ROPE, F_COPY,
-    F_ATTN, F_ATTN_SPLIT, F_ATTN_COMB, F_TRANS, F_COUNT
+    F_ATTN, F_ATTN_SPLIT, F_ATTN_COMB, F_TRANS,
+    F_HEADNORM, F_GATE_MUL, F_MUL, F_CONV, F_CONV_SHIFT, F_COUNT
 };
 const char* const kFwdNames[F_COUNT] = {
     "k_rmsnorm", "k_add", "k_bias", "k_silu_mul", "k_rope", "k_copy",
-    "k_attn", "k_attn_split", "k_attn_comb", "k_trans"
+    "k_attn", "k_attn_split", "k_attn_comb", "k_trans",
+    "k_headnorm", "k_gate_mul", "k_mul", "k_conv", "k_conv_shift"
 };
 id<MTLComputePipelineState> g_fpipe[F_COUNT] = {nil};
 
@@ -282,6 +284,12 @@ id<MTLBuffer> g_bkc = nil, g_bvc = nil;
 id<MTLBuffer> g_bfinal = nil;   // 最后一行的 norm 输出（避免原地 aliasing）
 id<MTLBuffer> g_bxt = nil;      // 转置后的激活 [n_in][BMAX]（prefill 用）
 id<MTLBuffer> g_bpart = nil;    // 注意力的 split-K 局部结果
+// ---- LFM3 ShortConv 专用
+id<MTLBuffer> g_bconv = nil;    // in_proj 的 B/C/x 输出，3*n_embd
+id<MTLBuffer> g_bconvh = nil;   // hidden = B⊙X，n_embd
+id<MTLBuffer> g_bconvy = nil;   // y = C⊙conv，n_embd
+id<MTLBuffer> g_bconvst = nil;  // 各 conv 层的历史缓冲 [n_conv][K-1][n_embd]
+id<MTLBuffer> g_bgateatt = nil; // 逐 head 的注意力输出门，n_head
 
 id<MTLBuffer> make_buf(size_t bytes) {
     return [g_dev newBufferWithLength:(bytes ? bytes : 256) options:MTLResourceStorageModeShared];
@@ -295,6 +303,7 @@ void fwd_release() {
     g_bfinal = nil;
     g_bxt = nil;
     g_bpart = nil;
+    g_bconv = g_bconvh = g_bconvy = g_bconvst = g_bgateatt = nil;
     for (int i = 0; i < F_COUNT; i++) g_fpipe[i] = nil;
     for (int i = 0; i < K_COUNT; i++) g_mpipe[i] = nil;
 }
@@ -308,11 +317,23 @@ bool fwd_init(const Spec& s, std::string* err) {
     // 融合内核不支持的情况直接拒绝，让调用方退回 CPU
     if (s.hd > 128) { if (err) *err = "head_dim > 128，注意力内核未覆盖"; return false; }
     if (s.n_head % s.n_head_kv != 0) { if (err) *err = "n_head 不是 n_head_kv 的整数倍"; return false; }
+    if (s.n_conv > 0 && (s.conv_l_cache < 2 || s.conv_l_cache > 32)) {
+        if (err) *err = "ShortConv 核宽超出范围";
+        return false;
+    }
     for (int l = 0; l < s.n_layer; l++) {
-        if (s.layers[(size_t)l].type[metal::S_ATTN_NORM] != T_F32 ||
-            s.layers[(size_t)l].type[metal::S_FFN_NORM] != T_F32) {
+        const LayerSpec& L = s.layers[(size_t)l];
+        if (L.type[metal::S_ATTN_NORM] != T_F32 ||
+            L.type[metal::S_FFN_NORM] != T_F32) {
             if (err) *err = "norm 权重不是 F32，融合内核未覆盖";
             return false;
+        }
+        // conv 层没有 q/k/v，其余层必须有
+        if (L.kind == G_CONV) {
+            if (L.ex_off[metal::X_CONV_IN] == ~0ull || L.ex_off[metal::X_CONV_OUT] == ~0ull) {
+                if (err) *err = "ShortConv 张量缺失";
+                return false;
+            }
         }
     }
 
@@ -364,13 +385,27 @@ bool fwd_init(const Spec& s, std::string* err) {
     g_bkc     = make_buf(kvb);
     g_bvc     = make_buf(kvb);
 
+    // LFM3 的 ShortConv 缓冲。llama 系 n_conv == 0，这几个只占 256 字节。
+    const size_t nconv = (size_t)std::max(0, s.n_conv);
+    const size_t lcache = (size_t)std::max(1, s.conv_l_cache);
+    g_bconv    = make_buf(B * 3 * n_embd * 4);
+    g_bconvh   = make_buf(B * n_embd * 4);
+    g_bconvy   = make_buf(B * n_embd * 4);
+    g_bconvst  = make_buf(nconv * (lcache > 1 ? lcache - 1 : 1) * n_embd * 4);
+    g_bgateatt = make_buf(B * (size_t)s.n_head * 4);
+
     if (!g_bx || !g_bxb || !g_bq || !g_bk || !g_bv || !g_batt || !g_bgate || !g_bup ||
-        !g_bffn || !g_blogits || !g_bfinal || !g_bxt || !g_bpart || !g_bkc || !g_bvc) {
+        !g_bffn || !g_blogits || !g_bfinal || !g_bxt || !g_bpart || !g_bkc || !g_bvc ||
+        !g_bconv || !g_bconvh || !g_bconvy || !g_bconvst || !g_bgateatt) {
         if (err) *err = "前向缓冲分配失败";
         return false;
     }
     std::memset([g_bkc contents], 0, kvb);
     std::memset([g_bvc contents], 0, kvb);
+    if (g_bconvst) {
+        std::memset([g_bconvst contents], 0,
+                    nconv * (lcache > 1 ? lcache - 1 : 1) * n_embd * 4);
+    }
 
     g_fwd_ready = true;
     return true;
@@ -506,116 +541,246 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     };
 
+    // ---- LFM3 专用算子
+
+    // 每 head 的 QK RMSNorm：一个 threadgroup 一个 head。
+    // nh 是这张张量的 head 数——q 是 n_head，k 只有 n_head_kv，两者不能混用。
+    auto headnorm = [&](id<MTLBuffer> x, uint64_t woff, int nh, int rows) {
+        uint32_t nhv = (uint32_t)nh, d = (uint32_t)hd;
+        float eps = g_spec.rms_eps;
+        [en setComputePipelineState:g_fpipe[F_HEADNORM]];
+        [en setBuffer:x offset:0 atIndex:0];
+        [en setBuffer:g_w offset:0 atIndex:1];
+        [en setBuffer:x offset:0 atIndex:2];   // 原地
+        [en setBytes:&nhv length:4 atIndex:3];
+        [en setBytes:&d length:4 atIndex:4];
+        [en setBytes:&eps length:4 atIndex:5];
+        [en setBytes:&woff length:8 atIndex:6];
+        [en dispatchThreadgroups:MTLSizeMake((NSUInteger)(nh * rows), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    };
+
+    // 逐 head 的 sigmoid 输出门
+    auto gate_mul = [&](int rows) {
+        uint32_t nh = (uint32_t)n_head, d = (uint32_t)hd;
+        [en setComputePipelineState:g_fpipe[F_GATE_MUL]];
+        [en setBuffer:g_batt offset:0 atIndex:0];
+        [en setBuffer:g_bgateatt offset:0 atIndex:1];
+        [en setBytes:&nh length:4 atIndex:2];
+        [en setBytes:&d length:4 atIndex:3];
+        [en dispatchThreads:MTLSizeMake((NSUInteger)q_dim, (NSUInteger)rows, 1)
+      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
+
+    // dst[r][i] = a[ao + r*sa + i] * b[bo + r*sb + i]，dst 的行跨度固定是 n
+    auto mul = [&](id<MTLBuffer> dst, id<MTLBuffer> a, uint64_t ao, uint64_t sa,
+                   id<MTLBuffer> b, uint64_t bo, uint64_t sb, int n) {
+        uint32_t nn = (uint32_t)n;
+        [en setComputePipelineState:g_fpipe[F_MUL]];
+        [en setBuffer:dst offset:0 atIndex:0];
+        [en setBuffer:a offset:0 atIndex:1];
+        [en setBuffer:b offset:0 atIndex:2];
+        [en setBytes:&nn length:4 atIndex:3];
+        [en setBytes:&ao length:8 atIndex:4];
+        [en setBytes:&bo length:8 atIndex:5];
+        [en setBytes:&sa length:8 atIndex:6];
+        [en setBytes:&sb length:8 atIndex:7];
+        [en dispatchThreads:MTLSizeMake((NSUInteger)n, (NSUInteger)nrow, 1)
+      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
+
+    // ShortConv 的卷积 + 历史滚动。
+    // 一行一个 dispatch，多行时按行序连续派发——同一 command buffer 内的
+    // compute dispatch 顺序执行，所以 state 能逐行正确递推。
+    auto conv_step = [&](uint64_t slot_off, uint64_t kwoff, int rows) {
+        const uint32_t n = (uint32_t)n_embd;
+        const uint32_t K = (uint32_t)g_spec.conv_l_cache;
+        for (int r = 0; r < rows; r++) {
+            const uint64_t hoff = (uint64_t)r * (uint64_t)n_embd * sizeof(float);
+            const uint64_t yoff = hoff;
+            [en setComputePipelineState:g_fpipe[F_CONV]];
+            [en setBuffer:g_bconvh offset:0 atIndex:0];
+            [en setBuffer:g_bconvy offset:0 atIndex:1];
+            [en setBuffer:g_w offset:0 atIndex:2];
+            [en setBuffer:g_bconvst offset:0 atIndex:3];
+            [en setBytes:&n length:4 atIndex:4];
+            [en setBytes:&K length:4 atIndex:5];
+            [en setBytes:&kwoff length:8 atIndex:6];
+            [en setBytes:&slot_off length:8 atIndex:7];
+            [en setBytes:&hoff length:8 atIndex:8];
+            [en setBytes:&yoff length:8 atIndex:9];
+            [en dispatchThreads:MTLSizeMake((NSUInteger)n_embd, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            [en setComputePipelineState:g_fpipe[F_CONV_SHIFT]];
+            [en setBuffer:g_bconvh offset:0 atIndex:0];
+            [en setBuffer:g_bconvst offset:0 atIndex:1];
+            [en setBytes:&n length:4 atIndex:2];
+            [en setBytes:&K length:4 atIndex:3];
+            [en setBytes:&slot_off length:8 atIndex:4];
+            [en setBytes:&hoff length:8 atIndex:5];
+            [en dispatchThreads:MTLSizeMake((NSUInteger)n_embd, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+    };
+
     for (int l = 0; l < g_spec.n_layer; l++) {
         const LayerSpec& L = g_spec.layers[(size_t)l];
         const uint64_t coff = (uint64_t)l * kv_row * sizeof(float);
         const uint64_t kpos = coff + (uint64_t)pos0 * (uint64_t)kv_dim * sizeof(float);
 
         rmsnorm(g_bx, L.off[metal::S_ATTN_NORM], g_bxb, nrow);
-        gemm(L.type[metal::S_Q], g_bxb, g_bq, L.off[metal::S_Q], q_dim,  n_embd, nrow);
-        gemm(L.type[metal::S_K], g_bxb, g_bk, L.off[metal::S_K], kv_dim, n_embd, nrow);
-        gemm(L.type[metal::S_V], g_bxb, g_bv, L.off[metal::S_V], kv_dim, n_embd, nrow);
 
-        bias(g_bq, L.bias[0], q_dim);
-        bias(g_bk, L.bias[1], kv_dim);
-        bias(g_bv, L.bias[2], kv_dim);
+        if (L.kind == G_CONV) {
+            // ---- LFM3 ShortConv 子层
+            // in_proj 一次算出 [B|C|X]（各 n_embd），hidden = B⊙X，
+            // 因果卷积，y = C⊙conv，最后 out_proj 落到 g_bxb（与 o_proj 同位置）。
+            const int n3 = 3 * n_embd;
+            gemm(L.ex_type[metal::X_CONV_IN], g_bxb, g_bconv,
+                 L.ex_off[metal::X_CONV_IN], n3, n_embd, nrow);
+            // 每行 3*n_embd：B 在 [0,n)，C 在 [n,2n)，X 在 [2n,3n)
+            const uint64_t rowstride = (uint64_t)3 * n_embd * 4;
+            mul(g_bconvh, g_bconv, 0, rowstride,
+                g_bconv, (uint64_t)2 * n_embd * 4, rowstride, n_embd);
+            conv_step((uint64_t)L.conv_slot * (uint64_t)(g_spec.conv_l_cache - 1) *
+                          (uint64_t)n_embd * 4,
+                      L.ex_off[metal::X_CONV_K], nrow);
+            mul(g_bconvy, g_bconvy, 0, (uint64_t)n_embd * 4,
+                g_bconv, (uint64_t)n_embd * 4, rowstride, n_embd);
+            gemm(L.ex_type[metal::X_CONV_OUT], g_bconvy, g_bxb,
+                 L.ex_off[metal::X_CONV_OUT], n_embd, n_embd, nrow);
+        } else {
+            gemm(L.type[metal::S_Q], g_bxb, g_bq, L.off[metal::S_Q], q_dim,  n_embd, nrow);
+            gemm(L.type[metal::S_K], g_bxb, g_bk, L.off[metal::S_K], kv_dim, n_embd, nrow);
+            gemm(L.type[metal::S_V], g_bxb, g_bv, L.off[metal::S_V], kv_dim, n_embd, nrow);
 
-        // RoPE：q 就地，k 旋转后直接落到 cache 的 pos 槽
-        {
-            uint32_t a = (uint32_t)n_head, b = (uint32_t)n_kvh, c = (uint32_t)hd;
-            uint32_t p0 = (uint32_t)pos0;
-            float th = g_spec.rope_theta;
-            [en setComputePipelineState:g_fpipe[F_ROPE]];
-            [en setBuffer:g_bq offset:0 atIndex:0];
-            [en setBuffer:g_bk offset:0 atIndex:1];
-            [en setBuffer:g_bkc offset:0 atIndex:2];
-            [en setBytes:&kpos length:8 atIndex:3];
-            [en setBytes:&a length:4 atIndex:4];
-            [en setBytes:&b length:4 atIndex:5];
-            [en setBytes:&c length:4 atIndex:6];
-            [en setBytes:&p0 length:4 atIndex:7];
-            [en setBytes:&th length:4 atIndex:8];
-            const uint32_t tot = (a + b) * (c / 2);
-            [en dispatchThreads:MTLSizeMake(tot, (NSUInteger)nrow, 1)
-          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        }
+            bias(g_bq, L.bias[0], q_dim);
+            bias(g_bk, L.bias[1], kv_dim);
+            bias(g_bv, L.bias[2], kv_dim);
 
-        // v → cache
-        {
-            uint32_t n = (uint32_t)kv_dim;
-            uint64_t zero = 0;
-            [en setComputePipelineState:g_fpipe[F_COPY]];
-            [en setBuffer:g_bvc offset:0 atIndex:0];
-            [en setBytes:&kpos length:8 atIndex:1];
-            [en setBuffer:g_bv offset:0 atIndex:2];
-            [en setBytes:&zero length:8 atIndex:3];
-            [en setBytes:&n length:4 atIndex:4];
-            [en dispatchThreads:MTLSizeMake((NSUInteger)kv_dim, (NSUInteger)nrow, 1)
-          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        }
+            // LFM3：QK RMSNorm 在 RoPE 之前
+            if (L.ex_off[metal::X_QNORM] != ~0ull)
+                headnorm(g_bq, L.ex_off[metal::X_QNORM], n_head, nrow);
+            if (L.ex_off[metal::X_KNORM] != ~0ull)
+                headnorm(g_bk, L.ex_off[metal::X_KNORM], n_kvh, nrow);
 
-        // 注意力（行 r 的可见长度 = pos0 + r + 1）
-        //
-        // split-K：按上下文长度决定切几段。段数太少时只有 n_head 个
-        // simdgroup，长上下文会被串行延迟拖死（实测 631 token 时注意力
-        // 独占 18 ms/token）。段数随长度增长，直到把 SIMD 单元喂满。
-        {
-            uint32_t a = (uint32_t)n_head, b = (uint32_t)n_kvh, c = (uint32_t)hd;
-            uint32_t nlen0 = (uint32_t)(pos0 + 1);
-            uint32_t kvd = (uint32_t)kv_dim;
-            float sc = 1.0f / std::sqrt((float)hd);
-            const int nlen_max = pos0 + nrow;   // 最后一行最长
-            uint32_t nsp = (uint32_t)std::min(kAttnSplits, std::max(1, nlen_max / 96));
-
-            if (nsp == 1) {
-                // 短上下文：融合版一步到位，省掉 partial 缓冲与 combine
-                [en setComputePipelineState:g_fpipe[F_ATTN]];
+            // RoPE：q 就地，k 旋转后直接落到 cache 的 pos 槽
+            {
+                uint32_t a = (uint32_t)n_head, b = (uint32_t)n_kvh, c = (uint32_t)hd;
+                uint32_t p0 = (uint32_t)pos0;
+                float th = L.rope_theta_l;
+                uint32_t ang = (g_spec.rope_angles > 0 && g_spec.rope_angles < hd / 2)
+                                   ? (uint32_t)g_spec.rope_angles : (uint32_t)(hd / 2);
+                [en setComputePipelineState:g_fpipe[F_ROPE]];
                 [en setBuffer:g_bq offset:0 atIndex:0];
-                [en setBuffer:g_bkc offset:0 atIndex:1];
-                [en setBuffer:g_bvc offset:0 atIndex:2];
-                [en setBuffer:g_batt offset:0 atIndex:3];
-                [en setBytes:&coff length:8 atIndex:4];
-                [en setBytes:&a length:4 atIndex:5];
-                [en setBytes:&b length:4 atIndex:6];
-                [en setBytes:&c length:4 atIndex:7];
-                [en setBytes:&nlen0 length:4 atIndex:8];
-                [en setBytes:&kvd length:4 atIndex:9];
-                [en setBytes:&sc length:4 atIndex:10];
-                [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
-                                                     (NSUInteger)nrow, 1)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-            } else {
-            [en setComputePipelineState:g_fpipe[F_ATTN_SPLIT]];
-            [en setBuffer:g_bq offset:0 atIndex:0];
-            [en setBuffer:g_bkc offset:0 atIndex:1];
-            [en setBuffer:g_bvc offset:0 atIndex:2];
-            [en setBuffer:g_bpart offset:0 atIndex:3];
-            [en setBytes:&coff length:8 atIndex:4];
-            [en setBytes:&a length:4 atIndex:5];
-            [en setBytes:&b length:4 atIndex:6];
-            [en setBytes:&c length:4 atIndex:7];
-            [en setBytes:&nlen0 length:4 atIndex:8];
-            [en setBytes:&kvd length:4 atIndex:9];
-            [en setBytes:&sc length:4 atIndex:10];
-            [en setBytes:&nsp length:4 atIndex:11];
-            [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
-                                                 (NSUInteger)nrow, (NSUInteger)nsp)
-                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-
-            [en setComputePipelineState:g_fpipe[F_ATTN_COMB]];
-            [en setBuffer:g_bpart offset:0 atIndex:0];
-            [en setBuffer:g_batt offset:0 atIndex:1];
-            [en setBytes:&a length:4 atIndex:2];
-            [en setBytes:&c length:4 atIndex:3];
-            [en setBytes:&nsp length:4 atIndex:4];
-            [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
-                                                 (NSUInteger)nrow, 1)
-                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [en setBuffer:g_bk offset:0 atIndex:1];
+                [en setBuffer:g_bkc offset:0 atIndex:2];
+                [en setBytes:&kpos length:8 atIndex:3];
+                [en setBytes:&a length:4 atIndex:4];
+                [en setBytes:&b length:4 atIndex:5];
+                [en setBytes:&c length:4 atIndex:6];
+                [en setBytes:&p0 length:4 atIndex:7];
+                [en setBytes:&th length:4 atIndex:8];
+                [en setBytes:&ang length:4 atIndex:9];
+                const uint32_t tot = (a + b) * (c / 2);
+                [en dispatchThreads:MTLSizeMake(tot, (NSUInteger)nrow, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
+
+            // v → cache
+            {
+                uint32_t n = (uint32_t)kv_dim;
+                uint64_t zero = 0;
+                [en setComputePipelineState:g_fpipe[F_COPY]];
+                [en setBuffer:g_bvc offset:0 atIndex:0];
+                [en setBytes:&kpos length:8 atIndex:1];
+                [en setBuffer:g_bv offset:0 atIndex:2];
+                [en setBytes:&zero length:8 atIndex:3];
+                [en setBytes:&n length:4 atIndex:4];
+                [en dispatchThreads:MTLSizeMake((NSUInteger)kv_dim, (NSUInteger)nrow, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
+
+            // 注意力（行 r 的可见长度 = pos0 + r + 1）
+            //
+            // split-K：按上下文长度决定切几段。段数太少时只有 n_head 个
+            // simdgroup，长上下文会被串行延迟拖死（实测 631 token 时注意力
+            // 独占 18 ms/token）。段数随长度增长，直到把 SIMD 单元喂满。
+            {
+                uint32_t a = (uint32_t)n_head, b = (uint32_t)n_kvh, c = (uint32_t)hd;
+                uint32_t nlen0 = (uint32_t)(pos0 + 1);
+                uint32_t kvd = (uint32_t)kv_dim;
+                float sc = 1.0f / std::sqrt((float)hd);
+                // 滑窗层：每行只能看最近 n_swa 个位置
+                uint32_t win = 0;
+                if (L.kind == G_ATTN_SWA && g_spec.n_swa > 0) win = (uint32_t)g_spec.n_swa;
+                const int nlen_max = std::min(pos0 + nrow,
+                                              win > 0 ? (int)win : (pos0 + nrow));
+                uint32_t nsp = (uint32_t)std::min(kAttnSplits, std::max(1, nlen_max / 96));
+
+                if (nsp == 1) {
+                    // 短上下文：融合版一步到位，省掉 partial 缓冲与 combine
+                    [en setComputePipelineState:g_fpipe[F_ATTN]];
+                    [en setBuffer:g_bq offset:0 atIndex:0];
+                    [en setBuffer:g_bkc offset:0 atIndex:1];
+                    [en setBuffer:g_bvc offset:0 atIndex:2];
+                    [en setBuffer:g_batt offset:0 atIndex:3];
+                    [en setBytes:&coff length:8 atIndex:4];
+                    [en setBytes:&a length:4 atIndex:5];
+                    [en setBytes:&b length:4 atIndex:6];
+                    [en setBytes:&c length:4 atIndex:7];
+                    [en setBytes:&nlen0 length:4 atIndex:8];
+                    [en setBytes:&kvd length:4 atIndex:9];
+                    [en setBytes:&sc length:4 atIndex:10];
+                    [en setBytes:&win length:4 atIndex:11];
+                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
+                                                         (NSUInteger)nrow, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                } else {
+                    [en setComputePipelineState:g_fpipe[F_ATTN_SPLIT]];
+                    [en setBuffer:g_bq offset:0 atIndex:0];
+                    [en setBuffer:g_bkc offset:0 atIndex:1];
+                    [en setBuffer:g_bvc offset:0 atIndex:2];
+                    [en setBuffer:g_bpart offset:0 atIndex:3];
+                    [en setBytes:&coff length:8 atIndex:4];
+                    [en setBytes:&a length:4 atIndex:5];
+                    [en setBytes:&b length:4 atIndex:6];
+                    [en setBytes:&c length:4 atIndex:7];
+                    [en setBytes:&nlen0 length:4 atIndex:8];
+                    [en setBytes:&kvd length:4 atIndex:9];
+                    [en setBytes:&sc length:4 atIndex:10];
+                    [en setBytes:&nsp length:4 atIndex:11];
+                    [en setBytes:&win length:4 atIndex:12];
+                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
+                                                         (NSUInteger)nrow, (NSUInteger)nsp)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [en setComputePipelineState:g_fpipe[F_ATTN_COMB]];
+                    [en setBuffer:g_bpart offset:0 atIndex:0];
+                    [en setBuffer:g_batt offset:0 atIndex:1];
+                    [en setBytes:&a length:4 atIndex:2];
+                    [en setBytes:&c length:4 atIndex:3];
+                    [en setBytes:&nsp length:4 atIndex:4];
+                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
+                                                         (NSUInteger)nrow, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
+            }
+
+            // LFM3：逐 head 的 sigmoid 输出门，在 o_proj 之前
+            if (L.ex_off[metal::X_AGATE] != ~0ull) {
+                gemm(L.ex_type[metal::X_AGATE], g_bxb, g_bgateatt,
+                     L.ex_off[metal::X_AGATE], n_head, n_embd, nrow);
+                gate_mul(nrow);
+            }
+
+            // 输出投影 → g_bxb（与 conv 路径统一落点）
+            gemm(L.type[metal::S_OUT], g_batt, g_bxb, L.off[metal::S_OUT], n_embd, n_embd, nrow);
         }
 
-        // 输出投影（复用 xb）+ 残差
-        gemm(L.type[metal::S_OUT], g_batt, g_bxb, L.off[metal::S_OUT], n_embd, n_embd, nrow);
+        // sandwich norm：子层输出先归一化再加残差
+        if (L.ex_off[metal::X_POST_ATTN] != ~0ull)
+            rmsnorm(g_bxb, L.ex_off[metal::X_POST_ATTN], g_bxb, nrow);
         add(g_bx, g_bxb);
 
         // FFN
@@ -624,6 +789,8 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         gemm(L.type[metal::S_UP],   g_bxb, g_bup,   L.off[metal::S_UP],   n_ff, n_embd, nrow);
         silu_mul();
         gemm(L.type[metal::S_DOWN], g_bffn, g_bxb, L.off[metal::S_DOWN], n_embd, n_ff, nrow);
+        if (L.ex_off[metal::X_POST_FFN] != ~0ull)
+            rmsnorm(g_bxb, L.ex_off[metal::X_POST_FFN], g_bxb, nrow);
         add(g_bx, g_bxb);
     }
 
@@ -681,6 +848,21 @@ bool fwd_token(const float* x0, int pos, float* logits, std::string* err) {
 }
 
 int fwd_batch_max() { return kBmax; }
+
+bool fwd_copy_x(float* dst, int n) {
+    if (!g_fwd_ready || !g_bx) return false;
+    const int m = std::min(n, g_spec.n_embd);
+    std::memcpy(dst, [g_bx contents], sizeof(float) * (size_t)m);
+    return true;
+}
+
+void fwd_reset_conv() {
+    if (!g_fwd_ready || !g_bconvst || g_spec.n_conv <= 0) return;
+    const size_t lcache = (size_t)std::max(1, g_spec.conv_l_cache);
+    const size_t bytes = (size_t)g_spec.n_conv * (lcache > 1 ? lcache - 1 : 1) *
+                         (size_t)g_spec.n_embd * sizeof(float);
+    std::memset([g_bconvst contents], 0, bytes);
+}
 
 }  // namespace metal
 }  // namespace dubhe

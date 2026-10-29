@@ -88,6 +88,7 @@ constexpr int64_t kGpuMinMac = 1 << 18;
 
 bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
     unload();
+    f32_ref_ = std::getenv("DUBHE_F32_REF") != nullptr;
     if (!file_.open(path, err)) return false;
 
     cfg_.arch = file_.get_str("general.architecture", "llama");
@@ -142,6 +143,20 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
     if (!tok_.init(file_, err)) return false;
 
     if (!load_weights(err)) return false;
+
+    // DUBHE_LAYERS=N：只跑前 N 层。调试用——LFM3 的三种子层交错排布，
+    // 逐层截断配合 GPU/CPU 对拍，可以一步定位是哪类层写错了。
+    if (const char* lv = std::getenv("DUBHE_LAYERS")) {
+        const int n = std::atoi(lv);
+        if (n > 0 && n < cfg_.n_layer) {
+            cfg_.n_layer = n;
+            cfg_.n_conv = 0;
+            conv_slot_.assign((size_t)cfg_.n_layer, -1);
+            for (int i = 0; i < cfg_.n_layer; i++) {
+                if (layers_[(size_t)i].kind == LK_CONV) conv_slot_[(size_t)i] = cfg_.n_conv++;
+            }
+        }
+    }
 
     // KV cache（可增长）
     const size_t kv_dim = (size_t)cfg_.n_head_kv * cfg_.head_dim;
@@ -263,14 +278,11 @@ bool Model::enable_gpu(std::string* err) {
 
     // LFM3 还没有整层融合内核。逐算子的 matvec 照样走 GPU（占前向时间的 99%），
     // 只是不接管整层，所以这里到此为止。
-    if (arch_is_lfm3()) {
-        gpu_fused_ = false;
-        gpu_note_ += " · LFM3 逐算子";
-        return true;
-    }
+    // （融合内核已覆盖 LFM3，这段保留给将来不支持的新架构。）
 
     // 起全 GPU 前向：整层所有算子编进一个 command buffer，每 token 只同步一次。
     auto off = [&](const TensorInfo& t) -> uint64_t {
+        if (t.ne[0] <= 0) return ~0ull;   // 该层没有这张张量
         return (uint64_t)((const char*)file_.tensor_data(t) - (const char*)file_.mapping());
     };
     metal::Spec sp;
@@ -287,32 +299,202 @@ bool Model::enable_gpu(std::string* err) {
     sp.off_out_norm = off(out_norm_);
     sp.off_out_w = off(out_w_);
     sp.type_out_w = out_w_.type;
+    sp.n_swa = cfg_.n_swa;
+    sp.rope_angles = cfg_.rope_angles;
+    sp.conv_l_cache = cfg_.conv_l_cache;
+    sp.n_conv = cfg_.n_conv;
     sp.layers.resize((size_t)cfg_.n_layer);
     for (int l = 0; l < cfg_.n_layer; l++) {
         const Layer& L = layers_[(size_t)l];
         metal::LayerSpec& d = sp.layers[(size_t)l];
+        d.kind = (L.kind == LK_CONV) ? metal::G_CONV
+               : (L.kind == LK_ATTN_SWA) ? metal::G_ATTN_SWA : metal::G_ATTN_FULL;
+        d.rope_theta_l = (L.kind == LK_ATTN_SWA && cfg_.rope_theta_swa > 0.f)
+                             ? cfg_.rope_theta_swa : cfg_.rope_theta;
+        d.conv_slot = (L.kind == LK_CONV) ? conv_slot_[(size_t)l] : -1;
+
         d.off[metal::S_ATTN_NORM] = off(L.attn_norm);  d.type[metal::S_ATTN_NORM] = L.attn_norm.type;
-        d.off[metal::S_Q]  = off(L.attn_q);            d.type[metal::S_Q]  = L.attn_q.type;
-        d.off[metal::S_K]  = off(L.attn_k);            d.type[metal::S_K]  = L.attn_k.type;
-        d.off[metal::S_V]  = off(L.attn_v);            d.type[metal::S_V]  = L.attn_v.type;
-        d.off[metal::S_OUT] = off(L.attn_output);      d.type[metal::S_OUT] = L.attn_output.type;
         d.off[metal::S_FFN_NORM] = off(L.ffn_norm);    d.type[metal::S_FFN_NORM] = L.ffn_norm.type;
         d.off[metal::S_GATE] = off(L.ffn_gate);        d.type[metal::S_GATE] = L.ffn_gate.type;
         d.off[metal::S_UP]   = off(L.ffn_up);          d.type[metal::S_UP]   = L.ffn_up.type;
         d.off[metal::S_DOWN] = off(L.ffn_down);        d.type[metal::S_DOWN] = L.ffn_down.type;
-        if (L.has_q_bias) d.bias[0] = off(L.attn_q_b);
-        if (L.has_k_bias) d.bias[1] = off(L.attn_k_b);
-        if (L.has_v_bias) d.bias[2] = off(L.attn_v_b);
+
+        if (L.kind == LK_CONV) {
+            d.ex_off[metal::X_CONV_IN]  = off(L.conv_in);     d.ex_type[metal::X_CONV_IN]  = L.conv_in.type;
+            d.ex_off[metal::X_CONV_K]   = off(L.conv_kernel);
+            d.ex_off[metal::X_CONV_OUT] = off(L.conv_out);    d.ex_type[metal::X_CONV_OUT] = L.conv_out.type;
+        } else {
+            d.off[metal::S_Q]  = off(L.attn_q);            d.type[metal::S_Q]  = L.attn_q.type;
+            d.off[metal::S_K]  = off(L.attn_k);            d.type[metal::S_K]  = L.attn_k.type;
+            d.off[metal::S_V]  = off(L.attn_v);            d.type[metal::S_V]  = L.attn_v.type;
+            d.off[metal::S_OUT] = off(L.attn_output);      d.type[metal::S_OUT] = L.attn_output.type;
+            if (L.has_q_bias) d.bias[0] = off(L.attn_q_b);
+            if (L.has_k_bias) d.bias[1] = off(L.attn_k_b);
+            if (L.has_v_bias) d.bias[2] = off(L.attn_v_b);
+            if (L.has_qk_norm) {
+                d.ex_off[metal::X_QNORM] = off(L.attn_q_norm);
+                d.ex_off[metal::X_KNORM] = off(L.attn_k_norm);
+            }
+            if (L.has_attn_gate) {
+                d.ex_off[metal::X_AGATE] = off(L.attn_gate);
+                d.ex_type[metal::X_AGATE] = L.attn_gate.type;
+            }
+        }
+        if (L.has_sandwich) {
+            d.ex_off[metal::X_POST_ATTN] = off(L.post_attn_norm);
+            d.ex_off[metal::X_POST_FFN] = off(L.post_ffn_norm);
+        }
     }
 
     if (!metal::fwd_init(sp, &e)) {
-        gpu_active_ = false;
+        // 融合内核接不了就退回逐算子 GPU（比 CPU 快不了多少，但至少不用改 KV）
         gpu_fused_ = false;
-        gpu_note_ = "GPU 前向不可用: " + e;
-        if (err) *err = gpu_note_;
-        return false;
+        gpu_note_ += " · 融合内核未覆盖，退回逐算子";
+        return true;
     }
+    // LFM3 的短卷积历史缓冲必须清零，否则第一步会吃到脏数据
+    if (cfg_.n_conv > 0) metal::fwd_reset_conv();
     gpu_fused_ = true;
+
+    // 融合内核的端到端对拍。
+    //
+    // mfvec 那轮校验只覆盖单个矩阵乘，覆盖不到层结构（谁在谁前面、残差加在哪、
+    // 门乘在哪个位置）。LFM3 的层结构比 llama 复杂得多，这里用同一个 token
+    // 跑一遍 GPU 融合前向和 CPU 参考前向，比 logits。差太多就整体退回 CPU——
+    // 宁可慢，也不能让用户拿到"能跑但胡言乱语"的输出。
+    if (!std::getenv("DUBHE_NO_FUSED_CHECK")) {
+        std::vector<float> lg((size_t)cfg_.n_vocab), lc((size_t)cfg_.n_vocab);
+        // 用一小段真实 token 跑多步：只对第一步的话，KV cache 与 ShortConv
+        // 历史这些"递推状态"完全没被覆盖，而它们正是 LFM3 最容易写错的地方。
+        std::vector<int32_t> seq = tok_.encode("The capital of France is", false);
+        if (seq.empty()) seq.push_back(tok_.bos_id() >= 0 ? tok_.bos_id() : 1);
+        if (seq.size() > 8) seq.resize(8);
+        const int nstep = (int)seq.size();
+
+        std::string e2;
+        std::vector<float> gpu_steps, cpu_steps;
+        bool okg = true, okc = true;
+        reset_kv();
+        for (int i = 0; i < nstep && okg; i++) {
+            okg = forward(seq[(size_t)i], i, lg.data(), &e2);
+            if (okg) gpu_steps.insert(gpu_steps.end(), lg.begin(), lg.end());
+        }
+        // 残差流只在最后一步有意义，先存下来
+        std::vector<float> xg((size_t)cfg_.n_embd);
+        metal::fwd_copy_x(xg.data(), cfg_.n_embd);
+        reset_kv();
+
+        gpu_fused_ = false;
+        gpu_active_ = false;
+        const bool prev_f32 = f32_ref_;
+        f32_ref_ = true;          // 参考必须是无损的，否则量不出 GPU 的问题
+        for (int i = 0; i < nstep && okc; i++) {
+            okc = forward(seq[(size_t)i], i, lc.data(), &e2);
+            if (okc) cpu_steps.insert(cpu_steps.end(), lc.begin(), lc.end());
+        }
+        f32_ref_ = prev_f32;
+        gpu_active_ = true;
+        gpu_fused_ = true;
+        reset_kv();
+        if (okg && okc) {
+            for (int i = 0; i < nstep; i++) {
+                double m = 0.0, r = 0.0;
+                for (int j = 0; j < cfg_.n_vocab; j++) {
+                    const size_t o = (size_t)i * (size_t)cfg_.n_vocab + (size_t)j;
+                    m = std::max(m, (double)std::fabs(gpu_steps[o] - cpu_steps[o]));
+                    r = std::max(r, (double)std::fabs(cpu_steps[o]));
+                }
+                if (std::getenv("DUBHE_FUSED_CHECK_VERBOSE")) {
+                    std::fprintf(stderr, "[dubhe]   pos %d: max|Δ|=%.3e  rel=%.2e\n",
+                                 i, m, m / (r + 1e-6));
+                }
+            }
+        }
+        if (okg && okc) {
+            // 批处理路径：prefill 实际走的就是这条（nrow 最多 8），
+            // 它用的是一整套 mm_* 内核，和逐 token 的 mv_* 完全是另一条代码，
+            // 所以必须单独对一次。
+            double rel_batch = 0.0;
+            if (nstep > 1) {
+                std::vector<float> lb((size_t)cfg_.n_vocab);
+                reset_kv();
+                if (forward_batch(seq.data(), nstep, 0, lb.data(), &e2)) {
+                    double m = 0.0, r = 0.0;
+                    const size_t base = (size_t)(nstep - 1) * (size_t)cfg_.n_vocab;
+                    for (int j = 0; j < cfg_.n_vocab; j++) {
+                        m = std::max(m, (double)std::fabs(lb[(size_t)j] - cpu_steps[base + (size_t)j]));
+                        r = std::max(r, (double)std::fabs(cpu_steps[base + (size_t)j]));
+                    }
+                    rel_batch = m / (r + 1e-6);
+                }
+                reset_kv();
+                // 前缀扫描：nrow=1,2,3... 逐级放大，找出第一个出错的行
+                if (std::getenv("DUBHE_BATCH_SWEEP")) {
+                    for (int pfx = 1; pfx <= nstep; pfx++) {
+                        std::vector<float> lp((size_t)cfg_.n_vocab);
+                        reset_kv();
+                        if (!forward_batch(seq.data(), pfx, 0, lp.data(), &e2)) break;
+                        double m = 0.0, r = 0.0;
+                        const size_t bs = (size_t)(pfx - 1) * (size_t)cfg_.n_vocab;
+                        for (int j = 0; j < cfg_.n_vocab; j++) {
+                            m = std::max(m, (double)std::fabs(lp[(size_t)j] - cpu_steps[bs + (size_t)j]));
+                            r = std::max(r, (double)std::fabs(cpu_steps[bs + (size_t)j]));
+                        }
+                        std::fprintf(stderr, "[dubhe]   nrow=%d rel=%.2e\n", pfx, m / (r + 1e-6));
+                    }
+                    reset_kv();
+                }
+                if (std::getenv("DUBHE_FUSED_CHECK_VERBOSE")) {
+                    std::fprintf(stderr, "[dubhe] 批处理对拍(nrow=%d): rel=%.2e\n",
+                                 nstep, rel_batch);
+                }
+            }
+
+            // 再比一次残差流：它排除了 out_norm / out_w 的干扰
+            double dx = 0.0, xr = 0.0;
+            int first = -1;
+            for (int i = 0; i < cfg_.n_embd; i++) {
+                const double d = std::fabs((double)xg[(size_t)i] - (double)x_[(size_t)i]);
+                if (d > 1e-3 * (std::fabs((double)x_[(size_t)i]) + 1e-3) && first < 0) first = i;
+                dx = std::max(dx, d);
+                xr = std::max(xr, (double)std::fabs(x_[(size_t)i]));
+            }
+            if (std::getenv("DUBHE_FUSED_CHECK_VERBOSE")) {
+                std::fprintf(stderr,
+                             "[dubhe] 残差流: max|Δ|=%.3e  max|x|=%.3e  首个偏离位置=%d\n",
+                             dx, xr, first);
+            }
+
+            // 判据用"所有位置里最差的那一步"，只要一步崩了就不能上融合路径
+            double rel = 0.0, mx = 0.0, mref = 0.0;
+            int arg_g = 0, arg_c = 0, bad_step = -1;
+            for (int i = 0; i < nstep; i++) {
+                double m = 0.0, r = 0.0;
+                int ag = 0, ac = 0;
+                for (int j = 0; j < cfg_.n_vocab; j++) {
+                    const size_t o = (size_t)i * (size_t)cfg_.n_vocab + (size_t)j;
+                    m = std::max(m, (double)std::fabs(gpu_steps[o] - cpu_steps[o]));
+                    r = std::max(r, (double)std::fabs(cpu_steps[o]));
+                    if (gpu_steps[o] > gpu_steps[(size_t)i * (size_t)cfg_.n_vocab + (size_t)ag]) ag = j;
+                    if (cpu_steps[o] > cpu_steps[(size_t)i * (size_t)cfg_.n_vocab + (size_t)ac]) ac = j;
+                }
+                const double rl = m / (r + 1e-6);
+                if (rl > rel) { rel = rl; mx = m; mref = r; arg_g = ag; arg_c = ac; bad_step = i; }
+            }
+            if (rel_batch > rel) { rel = rel_batch; bad_step = -2; }   // -2 标记批处理路径
+            if (std::getenv("DUBHE_FUSED_CHECK_VERBOSE")) {
+                std::fprintf(stderr,
+                             "[dubhe] 融合对拍: 最差 rel=%.2e @pos %d  max|Δ|=%.3e  "
+                             "argmax gpu=%d cpu=%d\n", rel, bad_step, mx, arg_g, arg_c);
+            }
+            if (rel > 5e-3) {
+                gpu_fused_ = false;
+                char b[192];
+                std::snprintf(b, sizeof(b), " · 融合校验未过(rel=%.1e@%d)", rel, bad_step);
+                gpu_note_ += b;
+            }
+        }
+    }
     return true;
 }
 
@@ -491,6 +673,7 @@ void Model::unload() {
 void Model::reset_kv() {
     kv_len_ = 0;
     clear_conv_state();
+    if (gpu_fused_) metal::fwd_reset_conv();
 }
 
 void Model::clear_conv_state() { std::fill(conv_state_.begin(), conv_state_.end(), 0.f); }
@@ -545,10 +728,9 @@ void Model::rmsnorm(float* out, const float* x, const TensorInfo& w, int n) cons
 }
 
 void Model::matvec(float* out, const float* x, const TensorInfo& w, int n_out, int n_in) const {
-    // DUBHE_F32_REF=1 时强制走纯 f32 点积。CPU 的默认路径会把激活量化成
+    // f32_ref_ 打开时强制走纯 f32 点积。CPU 的默认路径会把激活量化成
     // Q8（快 2~4 倍，但有 ~1e-3 的相对误差），所以校验 GPU 数值时必须关掉它，
     // 否则量的是 CPU 自己的近似误差，不是 GPU 的。
-    static const bool f32_ref = std::getenv("DUBHE_F32_REF") != nullptr;
     if (gpu_active_ && (int64_t)n_out * n_in >= kGpuMinMac && metal::supports(w.type, n_in)) {
         const uint64_t woff =
             (uint64_t)((const char*)file_.tensor_data(w) - (const char*)file_.mapping());
@@ -557,7 +739,7 @@ void Model::matvec(float* out, const float* x, const TensorInfo& w, int n_out, i
         gpu_active_ = false;
         std::fprintf(stderr, "[dubhe] GPU 矩阵乘失败，已回退 CPU：%s\n", metal::last_error());
     }
-    if (!f32_ref && act_q8_supported(w.type)) {
+    if (!f32_ref_ && act_q8_supported(w.type)) {
         // 激活只量化一次，所有行共用
         aq_.resize(act_q8_bytes(w.type, n_in));
         quantize_act(w.type, x, aq_.data(), n_in);

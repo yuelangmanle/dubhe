@@ -41,10 +41,27 @@ enum Slot {
     S_COUNT
 };
 
+// LFM3 额外需要的权重槽位。llama 系全部留空（off = ~0）。
+enum SlotEx {
+    X_QNORM = 0, X_KNORM, X_AGATE, X_POST_ATTN, X_POST_FFN,
+    X_CONV_IN, X_CONV_K, X_CONV_OUT,
+    X_COUNT
+};
+
+// 子层种类，与 internal.h 的 LayerKind 对应
+enum LayerKindGpu { G_ATTN_FULL = 0, G_ATTN_SWA = 1, G_CONV = 2 };
+
 struct LayerSpec {
     uint64_t off[S_COUNT] = {0};      // 各张量在 mmap 内的字节偏移
     uint32_t type[S_COUNT] = {0};
     uint64_t bias[3] = {~0ull, ~0ull, ~0ull};  // q/k/v bias 字节偏移，~0 = 无
+
+    // ---- LFM3
+    int32_t  kind = G_ATTN_FULL;
+    uint64_t ex_off[X_COUNT] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+    uint32_t ex_type[X_COUNT] = {0};
+    int32_t  conv_slot = -1;          // conv 状态缓冲里的槽位
+    float    rope_theta_l = 10000.f;  // 本层实际用的 RoPE base（滑窗层不同）
 };
 
 struct Spec {
@@ -55,6 +72,11 @@ struct Spec {
     int kv_cap = 0;
     uint64_t off_out_norm = 0, off_out_w = 0;
     uint32_t type_out_w = 0;
+    // ---- LFM3
+    int32_t n_swa = 0;          // 滑窗宽度，0 表示没有滑窗层
+    int32_t rope_angles = 0;    // partial RoPE 角度数，0 = 全部
+    int32_t conv_l_cache = 0;   // ShortConv 核宽
+    int32_t n_conv = 0;         // conv 层个数（决定状态缓冲大小）
     std::vector<LayerSpec> layers;
 };
 
@@ -68,6 +90,10 @@ bool fwd_token(const float* x0, int pos, float* logits, std::string* err);
 bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* err);
 // 批大小上限（与着色器 BMAX 一致）
 int fwd_batch_max();
+// 清零 LFM3 的 ShortConv 历史缓冲（新序列开始时调用）
+void fwd_reset_conv();
+// 调试：把 GPU 侧的残差流（g_bx 第 0 行）拷出来，用于和 CPU 路径逐位置对拍
+bool fwd_copy_x(float* dst, int n);
 
 }  // namespace metal
 }  // namespace dubhe
