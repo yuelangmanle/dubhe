@@ -37,11 +37,18 @@ TOOL_OBJS   := $(BUILD)/tools/selftest.o $(BUILD)/tools/ggufdump.o
 
 MODEL ?= $(HOME)/.dubhe/models/qwen2.5-0.5b-instruct/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
-.PHONY: all clean tools run inspect bench serve check gpu optest
+.PHONY: all clean tools run inspect bench serve check gpu optest shader-check mm2 engine
 
 all: $(BIN) $(SRV) tools
 
-tools: $(BUILD)/selftest $(BUILD)/ggufdump $(BUILD)/tokprobe
+# 别名。注意：仓库里有个同名目录 engine/，所以 make 会把 "engine" 当成一个
+# 已存在、无先决条件的文件目标而直接报 "Nothing to be done"——它**不会**重编
+# 任何东西。这个坑让一次参数 A/B 悄悄比较了两个完全相同的二进制。别名显式
+# 依赖 $(BIN) 之后，"make engine" 才真的会重编。
+engine: $(BIN)
+
+tools: $(BUILD)/selftest $(BUILD)/ggufdump $(BUILD)/tokprobe \
+       $(BUILD)/mma_probe $(BUILD)/mm2_check
 
 # 分词 + 贪心生成探针：同一模型不同量化档输出不一致时，用它区分
 # "分词差异" 和 "前向差异"（对比打印出的 token id 序列即可）。
@@ -106,8 +113,33 @@ check: all
 	@DUBHE_NO_GPU=1 ./$(BUILD)/selftest $(MODEL) "你好，请用一句话介绍你自己。" 2>&1 | tail -3
 
 # 逐个算子对拍（仅 Apple）
+$(BUILD)/mma_probe: tools/mma_probe.mm
+	@mkdir -p $(dir $@)
+	$(CXX) $(OBJCXXFLAGS) $< -o $@ $(LDFLAGS)
+	@echo "✓ $@"
+
+$(BUILD)/mm2_check: tools/mm2_check.mm engine/src/metal_kernels.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(OBJCXXFLAGS) $< -o $@ $(LDFLAGS)
+	@echo "✓ $@"
+
+# 着色器是 C++ 字符串里的源码，编译器看不到它 —— 只有运行时才报错，
+# 表现为"静默回退到 CPU"（实测踩过一次：prefill 数字全失真）。
+# 这个目标把字符串抠出来用离线 Metal 工具链编一遍，几秒钟就能抓到。
+shader-check:
+	@python3 -c "import re,sys; s=open('engine/src/metal_kernels.h').read(); \
+	  m=re.search(r'R\"MSL\\((.*?)\\)MSL\"', s, re.S); \
+	  sys.exit('找不到 MSL 字符串') if not m else open('/tmp/dubhe_k.metal','w').write(m.group(1))"
+	@xcrun -sdk macosx metal -c /tmp/dubhe_k.metal -o /tmp/dubhe_k.air
+	@echo "✓ 着色器编译通过"
+
 optest: $(BUILD)/optest
 	./$(BUILD)/optest
+
+# 分块 matmul 与旧内核逐元素对拍 + 裸吞吐基准
+mm2: $(BUILD)/mm2_check
+	./$(BUILD)/mm2_check
+	./$(BUILD)/mm2_check --bench
 
 # GPU / CPU 对比
 gpu: $(BIN)

@@ -182,10 +182,20 @@ int main() {
         }
 
         // ---------------------------------------------------------- rope
+        //
+        // 注意 buffer(9) 的 `angles`：Round 6 给 k_rope 加了 partial RoPE
+        // （zero-tail，只有前 angles 个频率真的转），但这里当时没跟着加，
+        // 于是这个用例一直在拿**野值**当 angles 用 —— 表现是 rope.q /
+        // rope.kcache 常年报失败，而引擎本身是对的。加参数时一定要回头
+        // 看所有直接调内核的工具。
+        //
+        // 两个用例各测一次：angles = hd/2 = 32（全量 RoPE）和 16
+        // （partial，尾部 16 个频率必须原样透传）。
+        for (int angles : {32, 16}) {
         for (int rows : {1, 3}) {
             const int n_head = 14, n_kvh = 2, hd = 64, pos0 = 5;
             const int q_dim = n_head * hd, k_dim = n_kvh * hd;
-            std::printf("[k_rope] hd=%d rows=%d pos0=%d\n", hd, rows, pos0);
+            std::printf("[k_rope] hd=%d rows=%d angles=%d pos0=%d\n", hd, rows, angles, pos0);
             std::vector<float> q((size_t)q_dim * rows), k((size_t)k_dim * rows);
             std::vector<float> refq, refk((size_t)k_dim * rows);
             fill(q, 31); fill(k, 32);
@@ -196,6 +206,7 @@ int main() {
                 for (int h = 0; h < nrow_head; h++) {
                     float* base = v + (size_t)h * hd;
                     for (int i = 0; i < hd / 2; i++) {
+                        if (i >= angles) continue;   // zero-tail：不转，原样透传
                         const float freq = 1.f / std::pow(theta, 2.f * i / hd);
                         const float a = (pos0 + row) * freq;
                         const float c = std::cos(a), s = std::sin(a);
@@ -219,6 +230,7 @@ int main() {
             std::memcpy([bkc contents], kc.data(), kc.size() * 4);
             uint32_t a = n_head, b = n_kvh, c = hd, p0 = pos0;
             float th = theta;
+            uint32_t ang = (uint32_t)angles;
             id<MTLCommandBuffer> cb = [g_q commandBuffer];
             id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
             [en setComputePipelineState:pipe("k_rope")];
@@ -231,6 +243,7 @@ int main() {
             [en setBytes:&c length:4 atIndex:6];
             [en setBytes:&p0 length:4 atIndex:7];
             [en setBytes:&th length:4 atIndex:8];
+            [en setBytes:&ang length:4 atIndex:9];
             [en dispatchThreads:MTLSizeMake((NSUInteger)((n_head + n_kvh) * (hd / 2)), (NSUInteger)rows, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [en endEncoding];
@@ -245,6 +258,7 @@ int main() {
                             kcp + (size_t)layer * cap * k_dim + (size_t)(pos0 + r) * k_dim,
                             k_dim * 4);
             report("rope.kcache", refk.data(), gotk.data(), (int)gotk.size());
+        }
         }
 
         // ---------------------------------------------------------- attn（split-K）

@@ -81,12 +81,17 @@ MLX 的 4bit 权重布局（group=64 的 affine，scale/bias 和量化值分开�
 
 ### prefill（601 token prompt）
 
-| 后端 | 权重 | prefill |
+> ⚠️ **本节数字已作废（2026-10-29 Round 7 修订）**：下面这张表是**跨会话**
+> 读数（两个数字来自不同时间、不同机器负载），相除没有意义。同会话配对
+> 重测后见 §3.5。旧结论"7.5 倍"保留在此仅为记录它错在哪里。
+
+| 后端 | 权重 | prefill（作废） |
 |---|---|---:|
 | 天枢 Metal | Q4_K_M | 66 tok/s |
 | MLX | 4bit | **495 tok/s** |
 
-**7.5 倍**。这是当前最大的单项差距，原因在下一节。
+**为什么不可比**：本机 load 在几分钟内能从 2 漂到 15，prefill 的绝对值随之
+浮动 1.5–2 倍。任何"一边跑完再跑另一边"得到的倍数都是噪声。
 
 ---
 
@@ -110,17 +115,54 @@ MLX 的 4bit 权重布局（group=64 的 affine，scale/bias 和量化值分开�
 
 结果：**13.8 → 47.2 tok/s（3.4x）**，Q4_K 的有效带宽 39 → 52 GB/s。
 
-### 还差什么（Round 7 的 prefill 分块）
+### 3.5 prefill 的真实差距与它的来源（Round 7 实测）
 
-prefill 的 7.5 倍差距不在指令数，在**激活的重复读取**：
-现在一个 simdgroup 算一行输出，同一块激活会被 `n_out` 个 simdgroup
-各读一遍。以 `ffn_up`（2048→7680）为例，激活只有 64 KB，但被读
-7680 次 = 491 MB，而权重才 8.8 MB —— **激活流量是权重的 55 倍**。
+上一轮我判断"差距在激活的重复读取，分块之后能到 250+ tok/s"。**这个判断
+错在量级上**，原因是我按"单个矩阵"算流量，而 prefill 的实际行为是按
+"整段 601 token" 展开的：
 
-标准解法是 GEMM 的二维分块：一个 threadgroup 负责 `ROWS × BMAX` 的
-输出块，把激活先搬进 threadgroup memory（32 KB 够装 256 元素 × 8 行），
-组内 4 个 simdgroup 共享。激活流量直接除以 4，预估 prefill 从 66 →
-250+ tok/s。之后再叠加 ANE 卸载。
+| 流量（整段 prefill） | 体积 |
+|---|---:|
+| 权重（1.1 GB × 601/8） | **83.6 GB** |
+| 激活（绝大部分命中 L2/L1） | 5.1 TB（不出 DRAM） |
+
+因为 `BMAX = 8`，每算 8 个 token 就要把整个权重矩阵重读一遍，601 个 token
+读 **76 遍**。MLX 把 601 个 token 一次当 N 维铺开，权重只读一遍 —— 两边
+算术强度差 76 倍。**prefill 的差距主要来自这里。**
+
+同会话、6 轮交错、逐轮配对取中位数：
+
+| 版本 | prefill | decode（内部对照） | prefill 相对 |
+|---|---:|---:|---:|
+| HEAD `47b0e27` | 72.9 tok/s | 29.2 tok/s | 1.00x |
+| + 二维分块 `mm2_*` | 94.6 tok/s | 29.9 tok/s | 1.30x |
+| + 权重预取 | **102.2 tok/s** | 32.4 tok/s | **1.42x** |
+
+decode 对照 1.03x / 1.01x —— 它走 `mv_*` 另一套内核、本轮没碰，所以这组
+比值是可信的。
+
+同会话 vs 苹果 MLX（4 轮配对）：
+
+| 目标 | prefill | decode | prefill 相对 | decode 相对 |
+|---|---:|---:|---:|---:|
+| 天枢 Q4_K_M | 102.0 tok/s | 32.5 tok/s | 1.00x | 1.00x |
+| MLX 4bit | 716.2 tok/s | 87.7 tok/s | **6.11x** | **2.67x** |
+| MLX 8bit | 614.5 tok/s | 42.5 tok/s | 4.56x | 1.57x |
+
+裸内核单层 GEMM（LFM3-1.7B 真实形状）：HEAD 422 → 现 672–688 GFLOP/s。
+
+**分块为什么只拿到 1.30x 而不是 4x**：收益上限由寄存器决定，不由内存流量
+决定。`acc(MM_SG×BMAX) + wv(MM_SG×8) ≤ 64` 这条约束卡死了复用度 ——
+`MM_SG=4, BMAX=8` 正好 64，再往上就溢出（`MM_SG=6` 从 672 掉到 236）。
+
+**预取为什么有效**：一片 K 只有 256 个 fma（约 256 拍），而一次没命中的
+DRAM 往返要 600 拍以上。把解量化拆成 `LD_*`（纯加载）/ `CV_*`（纯换算），
+算当前片之前先发下一片的加载，往返就被藏在计算后面。预取粒度刻意压到最小
+（只取 Q4_K 的 qs 8 字节），每行只多占 2 个寄存器。
+
+**下一步的形态**：受寄存器约束，靠调 `BMAX` 降低权重重读已经走不通（实测
+BMAX=16/32 每 token 反而慢 1.7x）。真正可行的是把 K 循环摊到多个
+threadgroup 做两级归约，让一次权重读取服务更多 token。
 
 ---
 
@@ -180,6 +222,31 @@ DUBHE_VERBOSE=1 ./build/dubhe inspect -m model.gguf
 
 # 融合内核与纯 f32 参考逐位置对拍
 DUBHE_FUSED_CHECK_VERBOSE=1 ./build/dubhe run -m model.gguf -p "..." -n 8 --temp 0
+
+# 分块 GEMM 对拍（5 种格式 vs CPU 参考）+ 裸内核吞吐
+make mm2
+
+# 离线编译 MSL 字符串（防止着色器语法错误被运行时的静默回退吃掉）
+make shader-check
+
+# 交错 A/B：**唯一可信的对比口径**（逐轮配对中位数 + decode 内部对照）
+python tools/ab.py -p 6 -n 24 \
+    --dubhe "HEAD=build/dubhe-old:$HOME/.dubhe/models/lfm3-1.7b/LFM3-1.7B-Q4_K_M.gguf" \
+    --dubhe "new=build/dubhe:$HOME/.dubhe/models/lfm3-1.7b/LFM3-1.7B-Q4_K_M.gguf"
+
+# 带 MLX 一起比（需要装了 mlx-lm 的 python，见下）
+python tools/ab.py -p 4 -n 24 --dubhe "dubhe=build/dubhe:$M" \
+    --mlx "mlx4=~/.dubhe/models/lfm3-mlx-4bit"
+
+# 分块参数扫描（改头文件→重编→跑→还原，全自动）
+python tools/sweep_mm.py
+```
+
+MLX 侧环境（`mlx-lm` 只有 0.32.x 有 `lfm2`，`lfm3` 靠 `tools/mlx_lfm3.py` 补）：
+
+```bash
+~/.local/bin/python3.12 -m venv ~/.dubhe/venv-mlx
+~/.dubhe/venv-mlx/bin/pip install mlx-lm
 ```
 
 ---
@@ -188,8 +255,16 @@ DUBHE_FUSED_CHECK_VERBOSE=1 ./build/dubhe run -m model.gguf -p "..." -n 8 --temp
 
 1. **ANE 是 prefill 的答案，不是 decode 的答案**。batch=1 上它和 GPU
    打平甚至更慢；batch≥32 时快 2–3 倍，`conv_in` 上快 9.7 倍。
-2. **天枢的 decode 现在是 47.2 tok/s（1.7B Q4_K_M），MLX 是 87.1**。
-   差距来自每字节指令数，这一轮已经把最大的那个坑填了（3.4x）。
-3. **prefill 是当前最大的短板：66 vs 495 tok/s**。根因是激活被重复读
-   55 倍，解法是 GEMM 二维分块 + threadgroup memory 暂存激活。
+2. **天枢的 decode 同会话配对是 MLX 4bit 的 0.37x**（32.5 / 87.7）。差距
+   来自每字节指令数，Round 6 已经把最大的那个坑填了（3.4x）。
+3. **prefill 同会话配对是 MLX 4bit 的 0.16x**（102 / 716，6.11x）。根因
+   **不是**激活重复读（那是次要项），而是 `BMAX=8` 让整个权重矩阵每 8 个
+   token 就重读一遍 —— 601 token 读 76 遍。二维分块 + 权重预取拿到了
+   1.42x，但要再上一个量级必须改这个结构。
 4. **Q8_0 与 F16 输出逐 token 一致**，两条反量化路径互为验证。
+5. **`simdgroup_matrix` 在 M4 上不是硬件矩阵单元**：8×8×8 MMA 只有
+   2.45 TFLOP/s，**低于** float4 FMA 的 2.84（`tools/mma_probe.mm`）。
+   "为 MMA 重写"这条路线可以彻底排除。
+6. **寄存器红线在 64 附近**。越过之后 occupancy 掉一半，任何"复用更多"
+   的改动都会净亏 —— 这决定了分块参数的可选范围，也解释了为什么
+   `BMAX=16/32` 这种直觉上该赢的方案实测更慢。

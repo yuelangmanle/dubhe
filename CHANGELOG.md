@@ -6,6 +6,69 @@
 
 ---
 
+## [0.5.0] · 2026-10-29 · prefill 二维分块 GEMM + 权重预取
+
+### 基准（LFM3-1.7B Q4_K_M，601 token prompt，6 轮交错配对取比值中位数）
+
+| 版本 | prefill | decode（对照） | prefill 相对 |
+|---|---:|---:|---:|
+| HEAD `47b0e27` | 72.9 tok/s | 29.2 tok/s | 1.00x |
+| + 二维分块 | 94.6 tok/s | 29.9 tok/s | 1.30x |
+| + 权重预取 | **102.2 tok/s** | 32.4 tok/s | **1.42x** |
+
+裸内核单层 GEMM（LFM3-1.7B 真实形状）：422 → 672–688 GFLOP/s。
+
+> 绝对 tok/s 与 0.4.0 的读数**不可比**：那批是另一段窗口、机器负载不同。
+> 本机 load 在几分钟内能从 2 漂到 15，只有同一批交错运行的比值可用。
+> 0.4.0 里"prefill 66 vs MLX 495（7.5x）"是跨会话读数，已作废；
+> 同会话配对后是 **6.11x**（102 / 716）。
+
+### 新增
+- **`mm2_*` 分块 GEMM 内核族**（f32 / f16 / q8_0 / q4_k / q6_k）：一个
+  threadgroup = 8 个 simdgroup × 4 行 = 32 行输出，K 方向按 256 元素分片，
+  激活读放大 ÷32。lane 固定负责 8 个连续元素，scale 解包退化成每块一次。
+- **权重软件预取**：解量化拆成 `LD_*`（纯加载）/ `CV_*`（纯换算），在算当前
+  K 片之前先发下一片的加载，把 600 拍的 DRAM 往返藏进 256 拍的计算里。
+- `tools/ab.py`：交错 A/B/C 基准，**逐轮配对算比值再取中位数**，并用
+  decode 做内部对照（decode 走 `mv_*`，改动只碰 prefill 时它的比值必须
+  ≈1.00x，偏离多少就是残余漂移）。
+- `tools/sweep_mm.py`：分块参数扫描。MSL 是字符串，`-D` 传不进去，每个
+  变体必须改头文件重编译 —— 脚本负责改、编、跑、`finally` 还原。
+- `tools/mma_probe.mm`：float4 FMA / half4 FMA / 8×8×8 MMA 三者对比。
+- `tools/mm2_check.mm`：`mm2_*` 与旧 `mm_*`、与 CPU 参考实现三方对拍，
+  外加 `--bench` 裸内核吞吐。
+- Makefile 新增 `shader-check`（离线 `xcrun metal` 编译 MSL 字符串）与
+  `mm2` 目标。
+
+### 变更
+- 激活**不经过 threadgroup memory**，直接读 device 内存。违反直觉但实测
+  更快（560 → 653 GFLOP/s）：每个 lane 只读自己那 8 个元素，tgmem 唯一
+  作用是"把搬运摊给 256 线程"，而每片一次 barrier 要等 400 拍、计算只有
+  280 拍。去掉后静态 tgmem 归零、占用率上升。
+- `engine/src/metal_kernels.h` 末尾新增 `namespace dubhe_msl` 常量真源：
+  MSL 里的 `#define` 在字符串里，C++ 侧看不见，派发参数与工具都从这里取。
+
+### 修复
+- **Makefile 的 `engine` 假目标**：仓库里有同名目录，`make engine` 被当成
+  "已存在、无先决条件"的文件目标，直接报 `Nothing to be done` 而**不重编
+  任何东西**。一次参数 A/B 因此比了两个完全相同的二进制。已加
+  `engine: $(BIN)` 别名。
+- **跨会话指标作废**：进度书里 prefill `0.13`（66 / 495）、decode `0.54`
+  （47.2 / 87.1）都是跨会话相除，已替换为同会话配对值（0.16 / 0.37），
+  并在指标表里保留一行"已作废"说明，避免再被引用。
+
+### 已实测否掉的方案（写下来避免重走）
+| 方案 | 实测 |
+|---|---|
+| `MM_SG=6/8` | 236 / 218 GFLOP/s（基线 672）。越过 64 寄存器线，溢出 |
+| `BMAX=16/32` | 405 / 351，每 token 反而慢 1.7x。acc 被 `MM_SG×BMAX` 锁死 |
+| threadgroup memory 暂存 | 560（无 tgmem 653）。barrier 等 L2 往返不划算 |
+| 上述 + 双缓冲 | 518。tgmem 翻倍把每 core 的 threadgroup 数从 4 压到 2 |
+| `simdgroup_matrix` 8×8×8 MMA | 2.45 TFLOP/s **低于** float4 FMA 的 2.84（苹果是标量模拟） |
+| fp16 FMA | 3.11 vs 2.84 TFLOP/s，只有 1.19x |
+
+---
+
 ## [0.4.0] · 2026-10-29 · LFM3 tri-hybrid + 量化 matvec 重写
 
 ### 基准（LFM3-1.7B，M4 24GB，同一会话背靠背，load≈4）

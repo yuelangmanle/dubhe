@@ -649,6 +649,278 @@ kernel void mm_q6_k(device const uchar* w     [[buffer(0)]],
     RED8();
 }
 
+// ================================================================ 二维分块 matmul
+//
+// 上面 mm_* 系列一个 simdgroup 只算**一行**输出，于是同一块激活被 n_out 个
+// simdgroup 各读一遍。ffn_up 的激活只有 64 KB，却被读 7680 次，折合每个
+// batch 491 MB 的激活流量（全 prefill 约 5.1 TB）。这些流量大部分命中 L2，
+// 但 L2 带宽也是有限的：按 600 GB/s 算正好 8 秒 —— 与实测 prefill 里
+// GEMM 占的 8.1 秒吻合。所以方向是"减少同一份激活的重复读取"。
+//
+// 新结构（mm2_*）：
+//   * 一个 threadgroup = MM_SG_PER_TG 个 simdgroup × MM_SG 行 = MMR(32) 行输出。
+//     组内 8 个 simdgroup 读的是同一片激活 → 激活流量除以 32。
+//   * K 方向按 TILE_K(256) 分片，一个片正好是一个 Q4_K/Q6_K 块。
+//   * lane 固定负责 8 个**连续**元素（e0 = lane*8）。因为 8 整除 16/32/256，
+//     一个 lane 的 8 个元素必然落在同一个 scale 组里 → scale 解包、ql/qh
+//     下标、移位量全部退化成"每块算一次"的标量（旧写法每块要算 8 次）。
+//
+// 激活**不经过 threadgroup memory**，直接读 device 内存。这一点违反直觉，
+// 但实测如此：每个 lane 只读自己那 8 个元素的激活，从不碰别人的数据，所以
+// threadgroup memory 唯一的作用只是"把搬运工作摊给 256 个线程"。去掉它、
+// 靠 L1/L2 兜住同组内 8 个 simdgroup 的重复读，裸内核 560 → 653 GFLOP/s，
+// 静态 threadgroup 内存归零、占用率反而上升。
+//
+// 本轮试过但**更慢**的方案（都实测过，别再走一遍）：
+//   * threadgroup memory 显式 staging + 每片一次 barrier：560 GFLOP/s
+//   * 上面的 staging 再加双缓冲（tgmem 16 KB）：518 GFLOP/s —— tgmem 翻倍
+//     把每 core 的 threadgroup 数从 4 压到 2，占用率损失大于延迟收益
+//   * BMAX 16（权重复用翻倍）：203 GFLOP/s —— 累加器翻倍直接溢出寄存器
+//   * MM_SG 8（MMR=64，更少 threadgroup）：181 GFLOP/s —— 同上
+//   * simdgroup_matrix：M4 上 8x8x8 MMA 只有 2.45 TFLOP/s，**低于** float4
+//     FMA 的 2.84 —— 苹果是标量模拟，不是硬件矩阵单元（见 tools/mma_probe.mm）
+//   * fp16 FMA：3.11 vs 2.62 TFLOP/s，只有 1.19x，不值得换精度
+//
+// 约束：n_in 必须是 TILE_K 的整数倍（分块解码依赖完整的 256 元素块），
+// 否则派发侧回退到旧的 mm_* 内核。
+#define MM_SG_PER_TG 8                  // 每 threadgroup 的 simdgroup 数（256 线程）
+#define MM_SG        4                  // 每 simdgroup 算几行
+#define MMR          (MM_SG_PER_TG * MM_SG)   // 每 threadgroup 的输出行数 = 32
+#define TILE_K       256
+
+// 激活按 float4 读，所以 BMAX 必须是 4 的倍数；
+// lane 负责 8 个连续元素，所以一片 K 至少要 32×8 = 256 个元素。
+static_assert(BMAX % 4 == 0, "BMAX 必须是 4 的倍数");
+static_assert(TILE_K >= 256, "TILE_K 必须 >= 32 lane × 8 元素");
+
+// ================================================================ 权重预取
+//
+// 为什么要把"读"和"算"拆成两半
+// ----------------------------
+// 一片 K（TILE_K=256 元素）只有 8×MM_SG×BMAX = 256 个 fma 的活儿，
+// 折合每 lane 约 256 拍。而一次没命中的 DRAM 往返要 600 拍以上。
+// 原来的写法是"读权重 → 立刻用"，于是每个 b 循环开头都要干等一次往返，
+// 实测 issue 效率只有 33%（693 GFLOP/s / 2.1 TFLOP/s 的可达值）。
+//
+// 把下一片的原始字提前读进寄存器，当前片算的时候加载就在飞 —— 延迟被
+// 完全隐藏，代价是每行多占 2–8 个寄存器。
+//
+// 寄存器的红线在 64 附近：acc(MM_SG×BMAX=32) + wv(MM_SG×8=32) 已经 64，
+// 再往上就越过 64 这条线，occupancy 掉一半。实测 MM_SG=6（96 个）直接
+// 从 672 掉到 236 GFLOP/s。所以预取只能压得很省：只预取"真正大块的那段
+// 负载"，scale/d 这些小字段留在 CV 里现读（同一 simdgroup 的 32 个 lane
+// 读的是同一 16 字节，一条事务就够，基本都命中 L1）。
+
+struct RawQ4K { uint2 q; };            // qs 8 字节
+struct RawQ6K { ushort ql[4]; ushort qh[4]; };  // ql 8 + qh 8
+struct RawQ8  { ushort q[4]; };        // 8 字节
+struct RawF16 { uint4 q; };            // 16 字节
+struct RawF32 { uint4 q; };            // 只预取前 16 字节，后 16 字节在 CV 里补
+
+static inline RawQ4K ld_q4k(device const uchar* q, uint lane) {
+    RawQ4K r;
+    r.q = *(device const uint2*)(q + 16u + ((lane >> 3) << 5) + ((lane & 3u) << 3));
+    return r;
+}
+
+static inline RawQ6K ld_q6k(device const uchar* q, uint lane) {
+    const uint qq = lane >> 2;
+    const uint r0 = (lane & 3u) << 3;
+    device const ushort* qlp =
+        (device const ushort*)(q + 32u * (qq & 1u) + 64u * (qq >> 2) + r0);
+    device const ushort* qhp =
+        (device const ushort*)(q + 128u + 32u * (qq >> 2) + r0);
+    RawQ6K r;
+#pragma unroll
+    for (uint i = 0; i < 4u; i++) { r.ql[i] = qlp[i]; r.qh[i] = qhp[i]; }
+    return r;
+}
+
+static inline RawQ8 ld_q8_0(device const uchar* q, uint lane) {
+    // 块跨度 34 ≡ 2 (mod 4)，起始地址只有 2 字节对齐 → 只能按 ushort 读，
+    // 用 char4/uint2 会踩未对齐（这个坑在 mm2_q8_0 第一版上踩过）。
+    device const ushort* up = (device const ushort*)
+        (q + (lane >> 2) * 34u + 2u + ((lane & 3u) << 3));
+    RawQ8 r;
+#pragma unroll
+    for (uint i = 0; i < 4u; i++) r.q[i] = up[i];
+    return r;
+}
+
+static inline RawF16 ld_f16(device const uchar* q, uint lane) {
+    RawF16 r;
+    r.q = *(device const uint4*)(q + ((lane << 3) << 1));
+    return r;
+}
+
+static inline RawF32 ld_f32(device const uchar* q, uint lane) {
+    RawF32 r;
+    r.q = *(device const uint4*)(q + ((lane << 3) << 2));
+    return r;
+}
+
+// ---------------------------------------------------------------- 换算
+// 约定：wv[0..7] 是本 lane 那 8 个元素的解量化结果（f32）。
+
+static inline void cv_q4k(device const uchar* q, RawQ4K raw, uint lane,
+                          thread float* wv) {
+    const float d_  = rd_f16(q);
+    const float dm_ = rd_f16(q + 2u);
+    uchar s1_, m1_;
+    k4_scale_min(int(lane >> 2), q + 4u, s1_, m1_);
+    const float sc_ = d_ * float(s1_);
+    const float mn_ = dm_ * float(m1_);
+    const uint sh_ = ((lane >> 2) & 1u) << 2;
+#pragma unroll
+    for (uint i_ = 0; i_ < 8u; i_++) {
+        const uint word_ = (i_ < 4u) ? raw.q.x : raw.q.y;
+        const uint v_ = (word_ >> (((i_ & 3u) << 3) + sh_)) & 0x0Fu;
+        wv[i_] = fma(sc_, float(v_), -mn_);
+    }
+}
+
+static inline void cv_q6k(device const uchar* q, RawQ6K raw, uint lane,
+                          thread float* wv) {
+    const uint qq_ = lane >> 2;
+    const float d_ = rd_f16(q + 208u) * float(((device const char*)(q + 192u))[lane >> 1]);
+    const uint sh_ = ((qq_ & 2u) != 0u) << 2;
+    const uint vh_ = 2u * (qq_ & 3u);
+#pragma unroll
+    for (uint i_ = 0; i_ < 8u; i_++) {
+        const uint lb_ = (uint(raw.ql[i_ >> 1]) >> (((i_ & 1u) << 3) + sh_)) & 0x0Fu;
+        const uint hb_ = (uint(raw.qh[i_ >> 1]) >> ((i_ & 1u) << 3)) & 0xFFu;
+        const int v_ = int(lb_ | (((hb_ >> vh_) & 3u) << 4)) - 32;
+        wv[i_] = d_ * float(v_);
+    }
+}
+
+static inline void cv_q8_0(device const uchar* q, RawQ8 raw, uint lane,
+                           thread float* wv) {
+    const float d_ = rd_f16(q + (lane >> 2) * 34u);
+#pragma unroll
+    for (uint i_ = 0; i_ < 4u; i_++) {
+        const uint w_ = uint(raw.q[i_]);
+        wv[i_ * 2u]     = d_ * float(int((char)(w_ & 0xFFu)));
+        wv[i_ * 2u + 1] = d_ * float(int((char)(w_ >> 8)));
+    }
+}
+
+static inline void cv_f16(device const uchar* q, RawF16 raw, uint lane,
+                          thread float* wv) {
+    (void)q; (void)lane;
+    const float2 a_ = float2(as_type<half2>(raw.q.x));
+    const float2 b_ = float2(as_type<half2>(raw.q.y));
+    const float2 c_ = float2(as_type<half2>(raw.q.z));
+    const float2 e_ = float2(as_type<half2>(raw.q.w));
+    wv[0] = a_.x; wv[1] = a_.y; wv[2] = b_.x; wv[3] = b_.y;
+    wv[4] = c_.x; wv[5] = c_.y; wv[6] = e_.x; wv[7] = e_.y;
+}
+
+static inline void cv_f32(device const uchar* q, RawF32 raw, uint lane,
+                          thread float* wv) {
+    (void)lane;
+    // 后半段 16 字节在预取阶段没读，这里补上。F32 权重是 f16 的两倍、
+    // Q4_K 的八倍，本来就不是 prefill 的主力格式，不值得为它多占寄存器。
+    const float4 a_ = as_type<float4>(raw.q);
+    const float4 b_ = *(device const float4*)(q + ((lane << 3) << 2) + 16u);
+    wv[0] = a_.x; wv[1] = a_.y; wv[2] = a_.z; wv[3] = a_.w;
+    wv[4] = b_.x; wv[5] = b_.y; wv[6] = b_.z; wv[7] = b_.w;
+}
+
+// ---------------------------------------------------------------- 内核主体
+//   RB = 单行字节跨度（p[r] 用）
+//   TB = 每片 K 的字节跨度（块循环里 b*TB 用）。注意 TB 与 RB 不是一回事：
+//        256 元素一片对 F32 是 1024 字节，对 Q4_K 是 144 字节；把它们
+//        混成一个量会让 b*RB 直接跳出整行（这个 bug 让第一版结果全错）。
+#define MM2_KERNEL(NAME, RT, LD, CV, RB, TB)                                  \
+kernel void NAME(device const uchar* w      [[buffer(0)]],                     \
+                 device const float* XT     [[buffer(1)]],                     \
+                 device float* Y            [[buffer(2)]],                     \
+                 constant uint& n_in        [[buffer(3)]],                     \
+                 constant ulong& woff       [[buffer(4)]],                     \
+                 constant uint& n_out       [[buffer(5)]],                     \
+                 constant uint& nrow        [[buffer(6)]],                     \
+                 uint tgid [[threadgroup_position_in_grid]],                    \
+                 uint tid  [[thread_position_in_threadgroup]],                  \
+                 uint lane [[thread_index_in_simdgroup]],                       \
+                 uint sg   [[simdgroup_index_in_threadgroup]])                  \
+{                                                                              \
+    (void)0;                                                                   \
+    const uint row0 = tgid * MMR;                                              \
+    const uint nb   = n_in / TILE_K;                                           \
+    const uint e0   = lane << 3;                                               \
+                                                                               \
+    uint row[MM_SG];                                                           \
+    device const uchar* p[MM_SG];                                              \
+    float acc[MM_SG][BMAX];                                                    \
+    RT rw[MM_SG];                                                              \
+    _Pragma("unroll")                                                          \
+    for (uint r = 0; r < MM_SG; r++) {                                         \
+        row[r] = row0 + sg * MM_SG + r;                                        \
+        p[r] = w + woff + (ulong)min(row[r], n_out - 1u) * (ulong)(RB);        \
+        _Pragma("unroll")                                                      \
+        for (uint j = 0; j < BMAX; j++) acc[r][j] = 0.0f;                      \
+        rw[r] = LD(p[r], lane);                                                \
+    }                                                                          \
+                                                                               \
+    for (uint b = 0; b < nb; b++) {                                            \
+                                                                               \
+        /* 先发下一片的加载，再算当前片 —— 这一行的位置就是全部收益所在。 */    \
+        /* 用 min() 夹住下标而不是三元判断：三元可能让加载变成条件执行。实测    \
+           两者在端到端上打平（机器噪声内），但夹下标少一条分支、代码更直白，   \
+           所以留这个。夹住之后末片会被多读一次，读的是合法内存，值不用。 */    \
+        RT rn[MM_SG];                                                          \
+        const ulong bnext = (ulong)min(b + 1u, nb - 1u);                       \
+        _Pragma("unroll")                                                      \
+        for (uint r = 0; r < MM_SG; r++)                                       \
+            rn[r] = LD(p[r] + bnext * (ulong)(TB), lane);                      \
+                                                                               \
+        float wv[MM_SG][8];                                                    \
+        _Pragma("unroll")                                                      \
+        for (uint r = 0; r < MM_SG; r++)                                       \
+            CV(p[r] + (ulong)b * (ulong)(TB), rw[r], lane, wv[r]);              \
+                                                                               \
+        /* 8 个元素：先把这一格的 BMAX 个激活读进寄存器，再摊给 MM_SG 行。       \
+           读一次激活做 MM_SG×BMAX 次 fma —— 这就是分块的全部收益。 */          \
+        _Pragma("unroll")                                                      \
+        for (uint i = 0; i < 8u; i++) {                                        \
+            const device float4* xq_ =                                         \
+                (const device float4*)(XT + (ulong)b * (TILE_K * BMAX) + (e0 + i) * BMAX); \
+            float4 xa_[BMAX / 4];                                              \
+            _Pragma("unroll")                                                  \
+            for (uint t = 0; t < BMAX / 4u; t++) xa_[t] = xq_[t];               \
+            _Pragma("unroll")                                                  \
+            for (uint r = 0; r < MM_SG; r++) {                                 \
+                _Pragma("unroll")                                              \
+                for (uint t = 0; t < BMAX / 4u; t++) {                         \
+                    acc[r][t*4+0] += wv[r][i] * xa_[t].x;                      \
+                    acc[r][t*4+1] += wv[r][i] * xa_[t].y;                      \
+                    acc[r][t*4+2] += wv[r][i] * xa_[t].z;                      \
+                    acc[r][t*4+3] += wv[r][i] * xa_[t].w;                      \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        _Pragma("unroll")                                                      \
+        for (uint r = 0; r < MM_SG; r++) rw[r] = rn[r];                        \
+    }                                                                          \
+                                                                               \
+    _Pragma("unroll")                                                          \
+    for (uint r = 0; r < MM_SG; r++) {                                         \
+        _Pragma("unroll")                                                      \
+        for (uint j = 0; j < BMAX; j++) {                                      \
+            const float s_ = simd_sum(acc[r][j]);                              \
+            if (lane == 0u && row[r] < n_out)                                  \
+                Y[(ulong)j * n_out + row[r]] = s_;                             \
+        }                                                                      \
+    }                                                                          \
+}
+
+MM2_KERNEL(mm2_f32,  RawF32, ld_f32,  cv_f32,  (n_in * 4u),         (TILE_K * 4u))
+MM2_KERNEL(mm2_f16,  RawF16, ld_f16,  cv_f16,  (n_in * 2u),         (TILE_K * 2u))
+MM2_KERNEL(mm2_q8_0, RawQ8,  ld_q8_0, cv_q8_0, ((n_in >> 5) * 34u), ((TILE_K >> 5) * 34u))
+MM2_KERNEL(mm2_q4_k, RawQ4K, ld_q4k,  cv_q4k,  ((n_in >> 8) * 144u), 144u)
+MM2_KERNEL(mm2_q6_k, RawQ6K, ld_q6k,  cv_q6k,  ((n_in >> 8) * 210u), 210u)
+
 // ================================================================ 融合算子
 //
 // 为什么要这些：一次 command buffer 的 commit+wait 在本机实测要 200 µs。
@@ -1119,3 +1391,18 @@ kernel void k_conv_shift(device const float* h    [[buffer(0)]],
     st[(ulong)(K - 2u) * n + gid] = hh[gid];
 }
 )MSL";
+
+// ---------------------------------------------------------------- C++ 侧常量
+//
+// 上面 MSL 是字符串，里面的 #define 对 C++ 不可见。这里给出**唯一真源**：
+// metal.mm 的派发参数和 tools 里的对拍工具都从这里取，避免两边漂移。
+namespace dubhe_msl {
+
+constexpr int kBmax      = 8;    // 与 MSL 的 BMAX 一致
+constexpr int kSgPerTg   = 4;    // 与 MSL 的 SG_PER_TG 一致（matvec 用）
+constexpr int kMvRows    = 2;    // 与 MSL 的 MV_R 一致
+constexpr int kMmSgPerTg = 8;    // 与 MSL 的 MM_SG_PER_TG 一致
+constexpr int kMmRows    = 32;   // 与 MSL 的 MMR 一致
+constexpr int kMmTileK   = 256;  // 与 MSL 的 TILE_K 一致
+
+}  // namespace dubhe_msl

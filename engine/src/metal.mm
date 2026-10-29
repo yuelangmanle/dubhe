@@ -21,6 +21,7 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace dubhe {
@@ -35,12 +36,22 @@ constexpr int kSgPerTg = 4;
 // 带宽上不去（Q4_K 实测只有 39 GB/s，而 Q8_0 能到 67 GB/s）。
 constexpr int kMvRows = 2;
 
+// ---- 二维分块 matmul（prefill）的派发参数，必须与着色器一致
+constexpr int kMmSgPerTg = 8;    // 256 线程/threadgroup
+constexpr int kMmRows    = 32;   // MMR：每 threadgroup 的输出行数
+constexpr int kMmTileK   = 256;  // TILE_K：K 方向分片
+
 enum KernelKind {
     K_F32 = 0, K_F16, K_Q4_0, K_Q5_0, K_Q8_0, K_Q4_K, K_Q6_K, K_COUNT
 };
 
 const char* const kNames[K_COUNT] = {
     "mv_f32", "mv_f16", "mv_q4_0", "mv_q5_0", "mv_q8_0", "mv_q4_k", "mv_q6_k"
+};
+
+// 分块 matmul 的函数名。Q4_0/Q5_0 没有分块版本（空串），派发时回退到 mm_*。
+const char* const kM2Names[K_COUNT] = {
+    "mm2_f32", "mm2_f16", "", "", "mm2_q8_0", "mm2_q4_k", "mm2_q6_k"
 };
 
 id<MTLDevice>       g_dev = nil;
@@ -257,7 +268,10 @@ const char* last_error() { return g_err.c_str(); }
 
 namespace {
 
-constexpr int kBmax = 8;        // 与着色器里的 BMAX 一致
+// 注意：不要再写一个字面量 8。MSL 是字符串，BMAX 对 C++ 不可见，所以
+// 唯一真源放在 metal_kernels.h 的 namespace dubhe_msl 里。这里直接从那里
+// 取，改 BMAX 时两边不会漂移（漂移的症状是结果错乱而不是编译错误）。
+constexpr int kBmax = dubhe_msl::kBmax;
 constexpr int kAttnSplits = 8;  // 注意力 key 区间最多切几段（split-K）
 
 enum FwdKernel {
@@ -278,6 +292,8 @@ const char* const kMmNames[K_COUNT] = {
     "mm_f32", "mm_f16", "mm_q4_0", "mm_q5_0", "mm_q8_0", "mm_q4_k", "mm_q6_k"
 };
 id<MTLComputePipelineState> g_mpipe[K_COUNT] = {nil};
+// 二维分块版本（prefill 主路径）。与 g_mpipe 并行存在，格式不支持时为 nil。
+id<MTLComputePipelineState> g_m2pipe[K_COUNT] = {nil};
 
 Spec         g_spec;
 bool         g_fwd_ready = false;
@@ -363,6 +379,18 @@ bool fwd_init(const Spec& s, std::string* err) {
         if (!g_mpipe[i]) {
             g_err = pe ? [[pe localizedDescription] UTF8String] : "pipeline 创建失败";
             if (err) *err = std::string("pipeline ") + kMmNames[i] + " 失败: " + g_err;
+            return false;
+        }
+    }
+    for (int i = 0; i < K_COUNT; i++) {
+        if (g_m2pipe[i] || !kM2Names[i][0]) continue;
+        id<MTLFunction> fn = [g_lib newFunctionWithName:[NSString stringWithUTF8String:kM2Names[i]]];
+        if (!fn) { if (err) *err = std::string("着色器缺少函数 ") + kM2Names[i]; return false; }
+        NSError* pe = nil;
+        g_m2pipe[i] = [g_dev newComputePipelineStateWithFunction:fn error:&pe];
+        if (!g_m2pipe[i]) {
+            g_err = pe ? [[pe localizedDescription] UTF8String] : "pipeline 创建失败";
+            if (err) *err = std::string("pipeline ") + kM2Names[i] + " 失败: " + g_err;
             return false;
         }
     }
@@ -494,17 +522,26 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         if (k < 0) return;
         uint32_t nin = (uint32_t)n_in, nout = (uint32_t)n_out, nr = (uint32_t)rows;
         if (rows > 1) {
-            // 先把激活转成 [n_in][BMAX]，让每个权重值的 8 次 fma 只需两条
-            // float4 加载。转置本身只有 n_in×8 个 float，代价可忽略。
-            uint32_t nn = (uint32_t)n_in, nr = (uint32_t)rows;
+            // 先把激活转成 [n_in][BMAX]，让每个权重值的 BMAX 次 fma 只需
+            // BMAX/4 条 float4 加载。转置本身只有 n_in×8 个 float，代价可忽略。
+            uint32_t nn = (uint32_t)n_in, nr2 = (uint32_t)rows;
             [en setComputePipelineState:g_fpipe[F_TRANS]];
             [en setBuffer:xin offset:0 atIndex:0];
             [en setBuffer:g_bxt offset:0 atIndex:1];
             [en setBytes:&nn length:4 atIndex:2];
-            [en setBytes:&nr length:4 atIndex:3];
+            [en setBytes:&nr2 length:4 atIndex:3];
             [en dispatchThreads:MTLSizeMake((NSUInteger)n_in, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [en setComputePipelineState:g_mpipe[k]];
+        }
+
+        // prefill 走二维分块内核：一个 threadgroup 算 kMmRows 行，
+        // 激活切片搬进 threadgroup memory 由组内 8 个 simdgroup 共享。
+        // 需要 n_in 是 TILE_K 的整数倍（分块解码依赖完整的 256 元素块）。
+        // DUBHE_NO_MM2=1 强制回退到旧内核，用于 A/B 定位。
+        static const bool no_mm2 = getenv("DUBHE_NO_MM2") != nullptr;
+        const bool tiled = rows > 1 && !no_mm2 && g_m2pipe[k] && (n_in % kMmTileK) == 0;
+        if (rows > 1) {
+            [en setComputePipelineState:tiled ? g_m2pipe[k] : g_mpipe[k]];
         } else {
             [en setComputePipelineState:g_pipe[k]];
         }
@@ -515,7 +552,14 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         [en setBytes:&woff length:sizeof(woff) atIndex:4];
         [en setBytes:&nout length:sizeof(nout) atIndex:5];
         if (rows > 1) [en setBytes:&nr length:sizeof(nr) atIndex:6];
-        // mv 内核一个 simdgroup 算 kMvRows 行；mm 内核一个 simdgroup 算一行。
+
+        if (tiled) {
+            const NSUInteger tgc = (NSUInteger)((n_out + kMmRows - 1) / kMmRows);
+            [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(kMmSgPerTg * 32, 1, 1)];
+            return;
+        }
+        // mv 内核一个 simdgroup 算 kMvRows 行；旧 mm 内核一个 simdgroup 算一行。
         const int per_tg = (rows > 1) ? kSgPerTg : kSgPerTg * kMvRows;
         const NSUInteger tgc = (NSUInteger)((n_out + per_tg - 1) / per_tg);
         [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
