@@ -10,6 +10,20 @@
     return n;
   };
 
+  // 图标统一走 index.html 里的 <symbol> 集，不在这里拼 SVG 路径
+  const icon = (name, cls) =>
+    `<svg class="${cls || 'i'}" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+  const iconNode = (name, cls) => {
+    const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    s.setAttribute('class', cls || 'i');
+    s.setAttribute('viewBox', '0 0 24 24');
+    s.setAttribute('aria-hidden', 'true');
+    const u = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+    u.setAttribute('href', '#i-' + name);
+    s.appendChild(u);
+    return s;
+  };
+
   const STORE_KEY = 'dubhe.conv.v1';
   const SET_KEY = 'dubhe.settings.v1';
 
@@ -20,6 +34,7 @@
     server: null,
     tools: true,
     attach: null,   // 待发送的图片/音频/视频（一次只允许一个）
+    abort: null,    // 生成中的 AbortController，用于"停止"
   };
 
   const settings = Object.assign(
@@ -129,7 +144,7 @@
       return;
     }
     for (const c of state.convs) {
-      const d = el('div', 'conv' + (state.current && c.id === state.current.id ? ' active' : ''));
+      const d = el('div', 'conv lit' + (state.current && c.id === state.current.id ? ' active' : ''));
       d.appendChild(el('span', 'dot'));
       d.appendChild(el('span', 'conv-title', c.title));
       d.onclick = () => {
@@ -137,7 +152,7 @@
         renderConvList();
         renderMessages();
         $('#convTitle').textContent = c.title;
-        if (window.innerWidth <= 760) $('#sidebar').classList.remove('open');
+        if (window.innerWidth <= 760) closeSidebar();
       };
       list.appendChild(d);
     }
@@ -155,8 +170,12 @@
           im.alt = m.att.name;
           b.appendChild(im);
         } else {
-          const ic = m.att.kind === 'audio' ? '♪' : (m.att.kind === 'video' ? '▶' : '📎');
-          b.appendChild(el('div', 'mfile', ic + ' ' + m.att.name));
+          const kind = m.att.kind === 'audio' ? 'audio'
+            : (m.att.kind === 'video' ? 'video' : (m.att.kind === 'image' ? 'image' : 'file'));
+          const f = el('div', 'mfile');
+          f.appendChild(iconNode(kind, 'i mfile-i'));
+          f.appendChild(el('span', '', m.att.name));
+          b.appendChild(f);
         }
       }
       if (m.content) b.appendChild(document.createTextNode(m.content));
@@ -171,7 +190,9 @@
       for (const t of m.tools) {
         const card = el('div', 'tool-card' + (t.ok === false ? ' failed' : ''));
         const head = el('div', 'tool-head');
-        head.appendChild(el('span', 'ic', t.ok === false ? '✕' : '⚡'));
+        const ic = el('span', 'ic');
+        ic.appendChild(iconNode(t.ok === false ? 'x' : 'bolt', 'i'));
+        head.appendChild(ic);
         head.appendChild(el('span', '', '调用工具'));
         head.appendChild(el('span', 'tool-name', t.name));
         card.appendChild(head);
@@ -301,10 +322,14 @@
       im.alt = a.name;
       chip.appendChild(im);
     } else {
-      chip.appendChild(el('div', 'ph', a.kind === 'audio' ? '♪' : '▶'));
+      const ph = el('div', 'ph');
+      ph.appendChild(iconNode(a.kind === 'audio' ? 'audio' : 'video', 'i'));
+      chip.appendChild(ph);
     }
     chip.appendChild(el('div', 'an', a.name));
-    const x = el('button', 'ax', '✕');
+    const x = el('button', 'ax');
+    x.setAttribute('aria-label', '移除附件');
+    x.appendChild(iconNode('x', 'i'));
     x.title = '移除';
     x.onclick = () => { state.attach = null; renderAttach(); };
     chip.appendChild(x);
@@ -376,9 +401,11 @@
     if (settings.system) msgs.unshift({ role: 'system', content: settings.system });
 
     try {
+      state.abort = new AbortController();
       const resp = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: state.abort.signal,
         body: JSON.stringify({
           messages: msgs,
           stream: true,
@@ -438,9 +465,15 @@
         }
       }
     } catch (e) {
-      ai.content = (ai.content || '') + `\n\n> ⚠️ 请求失败：${e.message}`;
+      if (e.name === 'AbortError') {
+        // 用户主动停止：保留已生成的部分，不报错
+        if (!ai.content) ai.content = '（已停止）';
+      } else {
+        ai.content = (ai.content || '') + `\n\n> ⚠️ 请求失败：${e.message}`;
+      }
     } finally {
       state.streaming = false;
+      state.abort = null;
       setSendEnabled(true);
       const finalNode = messageNode(ai);
       node.replaceWith(finalNode);
@@ -451,9 +484,14 @@
     }
   }
 
+  // 生成中按钮不能变灰：它要变成"停止"。禁用掉的话，用户只能刷新页面，
+  // 这是流式对话里最反直觉的一个坑。
   function setSendEnabled(on) {
     const b = $('#send');
-    b.disabled = !on;
+    b.disabled = false;
+    b.classList.toggle('stop', !on);
+    b.title = on ? '发送' : '停止生成';
+    b.innerHTML = on ? ICON_SEND : ICON_STOP;
   }
 
   // ---------------------------------------------------------------- 面板
@@ -507,6 +545,42 @@
     row(parent, label, desc, sw);
   }
 
+  // 分段控件：选中块是滑过去的，不是跳过去的
+  function seg(parent, options, get, set, desc) {
+    const wrap = el('div', 'seg');
+    const thumb = el('div', 'seg-thumb');
+    wrap.appendChild(thumb);
+
+    const btns = [];
+    const paint = () => {
+      const cur = get();
+      let idx = 0;
+      btns.forEach((b, i) => {
+        const on = b.dataset.v === cur;
+        b.classList.toggle('on', on);
+        if (on) idx = i;
+      });
+      const b = btns[idx];
+      if (!b || !b.offsetWidth) return;
+      thumb.style.width = b.offsetWidth + 'px';
+      thumb.style.transform = `translateX(${b.offsetLeft}px)`;
+    };
+
+    options.forEach((o) => {
+      const b = el('button', '', o.label);
+      b.dataset.v = o.value;
+      b.onclick = () => { set(o.value); paint(); };
+      btns.push(b);
+      wrap.appendChild(b);
+    });
+
+    parent.appendChild(wrap);
+    if (desc) parent.appendChild(el('div', 'desc', desc));
+    requestAnimationFrame(paint);
+    window.addEventListener('resize', paint);
+    return wrap;
+  }
+
   function openSettings() {
     openSheet('设置', (body) => {
       body.appendChild(el('div', 'group-title', '模型'));
@@ -525,6 +599,14 @@
       } else {
         body.appendChild(el('div', 'desc', '尚未加载模型。用命令行启动：dubhed -m <model.gguf>'));
       }
+
+      body.appendChild(el('div', 'group-title', '外观'));
+      seg(body, [
+        { value: 'full', label: '完整' },
+        { value: 'lite', label: '精简' },
+        { value: 'off', label: '省电' },
+      ], glassLevel, (v) => setGlass(v, true),
+        '完整最通透；精简省 GPU、观感接近；省电纯材质。三档排版与层次一致。');
 
       body.appendChild(el('div', 'group-title', '生成参数'));
       slider(body, '温度', '越高越随机，0 为确定性输出', 'temperature', 0, 1.5, 0.05, (v) => v.toFixed(2));
@@ -595,14 +677,139 @@
     t.style.height = Math.min(t.scrollHeight, 180) + 'px';
   }
 
+  // ---------------------------------------------------------------- 侧栏抽屉
+  // 移动端的抽屉必须满足三件事，缺一件用户就会觉得"卡"：
+  //   1. 点空白处能关（遮罩）
+  //   2. 能左滑关（手势）
+  //   3. 选中会话后自己关（否则用户要再点一次 ☰）
+  function syncScrim() {
+    const open = $('#sidebar').classList.contains('open');
+    const scrim = $('#scrim');
+    if (scrim) scrim.classList.toggle('show', open);
+  }
+
+  function closeSidebar() {
+    $('#sidebar').classList.remove('open');
+    syncScrim();
+  }
+
+  function bindSidebar() {
+    const sb = $('#sidebar');
+    let sx = 0, sy = 0, drag = false;
+
+    sb.addEventListener('touchstart', (e) => {
+      if (window.innerWidth > 760) return;
+      sx = e.touches[0].clientX; sy = e.touches[0].clientY;
+      drag = true; sb.style.transition = 'none';
+    }, { passive: true });
+
+    sb.addEventListener('touchmove', (e) => {
+      if (!drag) return;
+      const dx = e.touches[0].clientX - sx;
+      const dy = e.touches[0].clientY - sy;
+      // 只认明确的左滑，竖向滑动交给列表自己滚
+      if (dx > 0 || Math.abs(dy) > Math.abs(dx)) return;
+      sb.style.transform = `translateX(${Math.max(dx, -320)}px)`;
+    }, { passive: true });
+
+    sb.addEventListener('touchend', (e) => {
+      if (!drag) return;
+      drag = false;
+      sb.style.transition = '';
+      const dx = e.changedTouches[0].clientX - sx;
+      sb.style.transform = '';
+      if (dx < -70) closeSidebar();
+    });
+  }
+
+  // ---------------------------------------------------------------- 光跟随
+  // 指针在玻璃上移动时，把坐标写进 --mx / --my，CSS 的 radial-gradient 跟着走。
+  // 只在有精确指针的设备上挂（触摸设备没有 hover，跟着手指跑反而更耗电）。
+  const FINE_POINTER = window.matchMedia('(pointer: fine)');
+
+  function bindLight() {
+    document.querySelectorAll('.chip, .new-btn, .icon-btn, .send-btn, .conv, .side-item')
+      .forEach((n) => n.classList.add('lit'));
+    document.querySelectorAll('.composer, .sheet').forEach((n) => n.classList.add('edge'));
+    if (!FINE_POINTER.matches) return;
+
+    let raf = null, host = null, mx = 0, my = 0;
+
+    document.addEventListener('pointermove', (ev) => {
+      const h = ev.target.closest && ev.target.closest('.lit, .edge');
+      if (!h) return;
+      const r = h.getBoundingClientRect();
+      mx = ev.clientX - r.left; my = ev.clientY - r.top;
+      host = h;
+      h.classList.add('on');
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = null;
+        if (!host) return;
+        host.style.setProperty('--mx', mx + 'px');
+        host.style.setProperty('--my', my + 'px');
+      });
+    }, { passive: true });
+
+    document.addEventListener('pointerout', (ev) => {
+      const h = ev.target.closest && ev.target.closest('.lit, .edge');
+      if (h && !h.contains(ev.relatedTarget)) h.classList.remove('on');
+    }, { passive: true });
+  }
+
+  // ---------------------------------------------------------------- 视觉档位
+  // 三档材质。自适应只负责挑默认值；用户手动选过就永久记住，不再自动覆盖。
+  // 关键点：低档不是"关掉特效"，是换一套更省电的材质 —— 见 app.css 的档位段。
+  const GLASS_KEY = 'dubhe.glass';
+
+  function autoGlass() {
+    if (window.matchMedia('(prefers-reduced-transparency: reduce)').matches) return 'lite';
+    const ua = navigator.userAgent;
+    const cores = navigator.hardwareConcurrency || 4;
+    const mem = navigator.deviceMemory || 4;
+    // 安卓 WebView 的大面积 backdrop-filter 是软件渲染，中低端机扛不住
+    if (/Android/i.test(ua)) return (cores <= 4 || mem <= 3) ? 'lite' : 'full';
+    if (cores <= 2) return 'off';
+    return 'full';
+  }
+
+  function glassLevel() {
+    return localStorage.getItem(GLASS_KEY) || autoGlass();
+  }
+
+  function setGlass(level, persist) {
+    document.body.dataset.glass = level;
+    if (persist) { try { localStorage.setItem(GLASS_KEY, level); } catch (e) {} }
+  }
+
+  const ICON_SEND = icon('arrow-up');
+  const ICON_STOP = icon('stop');
+
   function bind() {
+    setGlass(glassLevel(), false);
+    bindLight();
+    bindSidebar();
+
     $('#input').addEventListener('input', autoGrow);
     $('#input').addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
     });
-    $('#send').onclick = () => send();
-    $('#newChat').onclick = () => newConv();
-    $('#toggleSidebar').onclick = () => $('#sidebar').classList.toggle('open');
+    // 软键盘弹起会压缩视口，把最新一条消息顶出去。等键盘落定再回到底部。
+    $('#input').addEventListener('focus', () => setTimeout(() => scrollBottom(true), 340));
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', () => scrollBottom(true));
+    }
+
+    $('#send').onclick = () => {
+      if (state.streaming) { if (state.abort) state.abort.abort(); return; }
+      send();
+    };
+    $('#newChat').onclick = () => { newConv(); closeSidebar(); };
+    $('#toggleSidebar').onclick = () => {
+      $('#sidebar').classList.toggle('open');
+      syncScrim();
+    };
+    $('#scrim').onclick = closeSidebar;
     $('#openSettings').onclick = openSettings;
     $('#openSettings2').onclick = openSettings;
     $('#modelChip').onclick = openSettings;
@@ -646,7 +853,7 @@
     });
 
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') closeSheet();
+      if (e.key === 'Escape') { closeSheet(); closeSidebar(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); newConv(); }
     });
   }
