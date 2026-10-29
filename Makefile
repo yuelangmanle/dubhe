@@ -41,7 +41,13 @@ MODEL ?= $(HOME)/.dubhe/models/qwen2.5-0.5b-instruct/qwen2.5-0.5b-instruct-q4_k_
 
 all: $(BIN) $(SRV) tools
 
-tools: $(BUILD)/selftest $(BUILD)/ggufdump
+tools: $(BUILD)/selftest $(BUILD)/ggufdump $(BUILD)/tokprobe
+
+# 分词 + 贪心生成探针：同一模型不同量化档输出不一致时，用它区分
+# "分词差异" 和 "前向差异"（对比打印出的 token id 序列即可）。
+$(BUILD)/tokprobe: $(ENGINE_OBJS) $(BUILD)/tools/tokprobe.o
+	$(CXX) $^ -o $@ $(LDFLAGS)
+	@echo "✓ $@"
 
 $(BIN): $(ENGINE_OBJS) $(CLI_OBJ)
 	@mkdir -p $(dir $@)

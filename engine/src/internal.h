@@ -245,6 +245,12 @@ enum LayerKind : uint8_t {
 struct Layer {
     LayerKind kind = LK_ATTN_FULL;
 
+    // 本层实际旋转的角度数。**逐层不同**：LFM3 的 HF 配置里只有
+    // full_attention 带 partial_rotary_factor=0.5，sliding_attention 缺省
+    // 就是 1.0，也就是滑窗层做的是**全量** RoPE。按全局一个值套所有层
+    // 会让 5 个滑窗层的 q/k 转错一半维度——输出仍然通顺，但分布偏了。
+    int32_t rope_angles_l = 0;
+
     // ---- 注意力子层
     TensorInfo attn_norm, attn_q, attn_k, attn_v, attn_output;
     TensorInfo attn_q_b, attn_k_b, attn_v_b;   // 可选 bias
@@ -319,7 +325,7 @@ private:
     void rmsnorm_heads(float* v, const TensorInfo& w, int hd, int n_head) const;
     void matvec(float* out, const float* x, const TensorInfo& w, int n_out, int n_in) const;
     void rope(float* q, float* k, int n_head, int n_head_kv, int head_dim, int pos,
-              float theta) const;
+              float theta, int angles) const;
     // LFM3 ShortConv 子层：结果写进 attn_out_
     void shortconv(const Layer& L, int slot, const float* xin);
     void clear_conv_state();

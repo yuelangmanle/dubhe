@@ -312,6 +312,7 @@ bool Model::enable_gpu(std::string* err) {
         d.rope_theta_l = (L.kind == LK_ATTN_SWA && cfg_.rope_theta_swa > 0.f)
                              ? cfg_.rope_theta_swa : cfg_.rope_theta;
         d.conv_slot = (L.kind == LK_CONV) ? conv_slot_[(size_t)l] : -1;
+        d.rope_angles_l = L.rope_angles_l;
 
         d.off[metal::S_ATTN_NORM] = off(L.attn_norm);  d.type[metal::S_ATTN_NORM] = L.attn_norm.type;
         d.off[metal::S_FFN_NORM] = off(L.ffn_norm);    d.type[metal::S_FFN_NORM] = L.ffn_norm.type;
@@ -572,6 +573,13 @@ bool Model::load_weights(std::string* err) {
             }
         }
 
+        // 每层实际旋转的角度数。HF 的 config.json 里 rope_parameters 是
+        // **按层类型**分开配的：full_attention 带 partial_rotary_factor=0.5，
+        // sliding_attention 没有这个键（缺省 1.0 → 全量旋转）。GGUF 没有
+        // 逐层的这个字段，所以按层类型推。
+        L.rope_angles_l = (L.kind == LK_ATTN_SWA) ? (cfg_.head_dim / 2)
+                                                  : cfg_.rope_angles;
+
         L.ffn_norm    = need(b + "ffn_norm.weight");
         L.ffn_gate    = need(b + "ffn_gate.weight");
         L.ffn_up      = need(b + "ffn_up.weight");
@@ -629,6 +637,30 @@ bool Model::load_weights(std::string* err) {
         if (layers_[(size_t)i].kind == LK_CONV) {
             conv_slot_[(size_t)i] = cfg_.n_conv++;
         }
+    }
+
+    // DUBHE_VERBOSE=1 打印逐层结构表。tri-hybrid 的层类型/角度/base 只要
+    // 错一层，症状都是"输出通顺但内容跑偏"，从外面完全看不出，只能看这张表。
+    if (std::getenv("DUBHE_VERBOSE")) {
+        int n_full = 0, n_swa = 0;
+        std::fprintf(stderr, "[dubhe] 层结构（共 %d 层）:\n", cfg_.n_layer);
+        for (int i = 0; i < cfg_.n_layer; i++) {
+            const Layer& L = layers_[(size_t)i];
+            const char* k = L.kind == LK_CONV ? "conv  "
+                          : L.kind == LK_ATTN_SWA ? "swa   " : "full  ";
+            if (L.kind == LK_CONV) {
+                std::fprintf(stderr, "[dubhe]   %2d %s\n", i, k);
+            } else {
+                const float th = (L.kind == LK_ATTN_SWA && cfg_.rope_theta_swa > 0.f)
+                                     ? cfg_.rope_theta_swa : cfg_.rope_theta;
+                std::fprintf(stderr, "[dubhe]   %2d %s rope_theta=%.0f angles=%d/%d%s\n",
+                             i, k, th, L.rope_angles_l, cfg_.head_dim / 2,
+                             L.has_attn_gate ? " gate" : "");
+                (L.kind == LK_ATTN_SWA ? n_swa : n_full)++;
+            }
+        }
+        std::fprintf(stderr, "[dubhe] 小计: conv=%d full=%d swa=%d  sandwich_norm=%d\n",
+                     cfg_.n_conv, n_full, n_swa, (int)cfg_.sandwich_norm);
     }
 
     // 量化描述
@@ -824,11 +856,13 @@ void Model::shortconv(const Layer& L, int slot, const float* xin) {
 }
 
 void Model::rope(float* q, float* k, int n_head, int n_head_kv, int head_dim, int pos,
-                 float theta) const {
+                 float theta, int angles) const {
     const int half = head_dim / 2;
     // partial RoPE：只转前 angles 个角度，后面的 cos=1/sin=0 等价于恒等，
-    // 直接跳过更省。LFM3 只转 32/64。
-    const int angles = (cfg_.rope_angles > 0 && cfg_.rope_angles < half) ? cfg_.rope_angles : half;
+    // 直接跳过更省。LFM3 的 full_attention 只转 32/64，sliding_attention 转满。
+    // 频率分母恒为 head_dim（不是 2*angles）——这是 zero-tail 布局的定义：
+    // 被旋转的前缀仍然用完整 head_dim 的频率级数。
+    if (angles <= 0 || angles > half) angles = half;
     for (int h = 0; h < n_head + n_head_kv; h++) {
         float* v = (h < n_head) ? (q + (size_t)h * head_dim)
                                 : (k + (size_t)(h - n_head) * head_dim);
@@ -951,7 +985,7 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
 
             const float theta = (L.kind == LK_ATTN_SWA && cfg_.rope_theta_swa > 0.f)
                                     ? cfg_.rope_theta_swa : cfg_.rope_theta;
-            rope(q_.data(), k_.data(), n_head, n_kv, hd, pos, theta);
+            rope(q_.data(), k_.data(), n_head, n_kv, hd, pos, theta, L.rope_angles_l);
 
             float* kc = k_cache_.data() + (size_t)l * kv_cap_ * kv_dim;
             float* vc = v_cache_.data() + (size_t)l * kv_cap_ * kv_dim;

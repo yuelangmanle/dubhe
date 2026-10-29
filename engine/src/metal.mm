@@ -28,8 +28,12 @@ namespace metal {
 
 namespace {
 
-// 与着色器里的 SG_PER_TG 必须一致：一个 threadgroup 装 4 个 simdgroup（4 行）。
+// 与着色器里的 SG_PER_TG 必须一致：一个 threadgroup 装 4 个 simdgroup。
 constexpr int kSgPerTg = 4;
+// 与着色器里的 MV_R 必须一致：解码时一个 simdgroup 同时算几行。
+// 解码是延迟受限的，一个 simdgroup 只算一行时 outstanding load 太少，
+// 带宽上不去（Q4_K 实测只有 39 GB/s，而 Q8_0 能到 67 GB/s）。
+constexpr int kMvRows = 2;
 
 enum KernelKind {
     K_F32 = 0, K_F16, K_Q4_0, K_Q5_0, K_Q8_0, K_Q4_K, K_Q6_K, K_COUNT
@@ -218,10 +222,11 @@ bool mfvec(uint32_t type, const float* x, float* y, int n_out, int n_in, uint64_
     [enc setBytes:&woff length:sizeof(woff) atIndex:4];
     [enc setBytes:&nout length:sizeof(nout) atIndex:5];
 
-    // 一个 threadgroup = 4 个 simdgroup = 4 行。必须按 threadgroup 派发
-    // 并自己判越界：dispatchThreads 的非均匀裁剪只在 thread 粒度生效，
-    // 而这里内核用的是 threadgroup_position_in_grid。
-    const NSUInteger tgc = (NSUInteger)((n_out + kSgPerTg - 1) / kSgPerTg);
+    // 一个 threadgroup = 4 个 simdgroup，每个 simdgroup 算 kMvRows 行。
+    // 必须按 threadgroup 派发并自己判越界：dispatchThreads 的非均匀裁剪
+    // 只在 thread 粒度生效，而这里内核用的是 threadgroup_position_in_grid。
+    const NSUInteger per_tg = (NSUInteger)(kSgPerTg * kMvRows);
+    const NSUInteger tgc = (NSUInteger)((n_out + per_tg - 1) / per_tg);
     [enc dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     [enc endEncoding];
@@ -510,7 +515,9 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         [en setBytes:&woff length:sizeof(woff) atIndex:4];
         [en setBytes:&nout length:sizeof(nout) atIndex:5];
         if (rows > 1) [en setBytes:&nr length:sizeof(nr) atIndex:6];
-        const NSUInteger tgc = (NSUInteger)((n_out + kSgPerTg - 1) / kSgPerTg);
+        // mv 内核一个 simdgroup 算 kMvRows 行；mm 内核一个 simdgroup 算一行。
+        const int per_tg = (rows > 1) ? kSgPerTg : kSgPerTg * kMvRows;
+        const NSUInteger tgc = (NSUInteger)((n_out + per_tg - 1) / per_tg);
         [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     };
@@ -669,8 +676,8 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
                 uint32_t a = (uint32_t)n_head, b = (uint32_t)n_kvh, c = (uint32_t)hd;
                 uint32_t p0 = (uint32_t)pos0;
                 float th = L.rope_theta_l;
-                uint32_t ang = (g_spec.rope_angles > 0 && g_spec.rope_angles < hd / 2)
-                                   ? (uint32_t)g_spec.rope_angles : (uint32_t)(hd / 2);
+                uint32_t ang = (L.rope_angles_l > 0 && L.rope_angles_l < hd / 2)
+                                   ? (uint32_t)L.rope_angles_l : (uint32_t)(hd / 2);
                 [en setComputePipelineState:g_fpipe[F_ROPE]];
                 [en setBuffer:g_bq offset:0 atIndex:0];
                 [en setBuffer:g_bk offset:0 atIndex:1];

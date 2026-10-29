@@ -62,6 +62,7 @@ struct LayerSpec {
     uint32_t ex_type[X_COUNT] = {0};
     int32_t  conv_slot = -1;          // conv 状态缓冲里的槽位
     float    rope_theta_l = 10000.f;  // 本层实际用的 RoPE base（滑窗层不同）
+    int32_t  rope_angles_l = 0;       // 本层实际旋转的角度数（滑窗层是全量）
 };
 
 struct Spec {

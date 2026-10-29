@@ -32,6 +32,22 @@ using namespace metal;
 // 每个 lane 8 个累加器，加上解码用的临时量，仍在 255 个寄存器内。
 #define BMAX 8
 
+// 解码时一个 simdgroup 同时处理几行。
+//
+// 为什么不是 1：解码是**延迟受限**而不是带宽受限。一行一个 simdgroup 时，
+// 每行的块循环是一条"取一个权重字节 → 一条 fma"的依赖链，单条链的
+// 未完成 load 数被调度器限制住，带宽上不去。实测 Q4_K（1.05 GB）和
+// Q8_0（1.76 GB）decode 都是 26 ms/token —— 前者只有 39 GB/s，后者 67 GB/s，
+// 说明 Q4_K 根本没到带宽墙，是 MLP（memory level parallelism）不够。
+//
+// 改成一次算 MV_R 行：x 只读一遍（复用），MV_R 条独立的 load 链同时在飞，
+// 同样的块循环喂饱 MV_R 倍的 outstanding load。MV_R=4 时寄存器仍然够用。
+#define MV_R 2
+// MSL 的程序级变量必须落在 constant 地址空间，`constexpr uint` 会直接编译失败
+// （program scope variable must reside in constant address space）。
+// 这里用宏：循环里写成 `r < MVR`，展开后是 `r < 4`，不会有 uint/int 比较告警。
+#define MVR MV_R
+
 // ---------------------------------------------------------------- 工具
 static inline float f16_to_f32(ushort h) { return float(as_type<half>(h)); }
 
@@ -68,13 +84,22 @@ kernel void mv_f32(device const uchar* w      [[buffer(0)]],
                    uint lane [[thread_index_in_simdgroup]],
                    uint sg   [[simdgroup_index_in_threadgroup]])
 {
-    const uint row = tgid * SG_PER_TG + sg;
-    if (row >= n_out) return;
-    device const float* p = (device const float*)(w + woff) + (ulong)row * n_in;
-    float acc = 0.0f;
-    for (uint i = lane; i < n_in; i += 32u) acc += p[i] * x[i];
-    acc = simd_sum(acc);
-    if (lane == 0u) y[row] = acc;
+    const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
+    if (row0 >= n_out) return;
+    const uint nok = min(uint(MVR), n_out - row0);
+    device const float* p[MV_R];
+    for (uint r = 0; r < MVR; r++)
+        p[r] = (device const float*)(w + woff) + (ulong)(row0 + (r < nok ? r : 0u)) * n_in;
+    float acc[MV_R];
+    for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
+    for (uint i = lane; i < n_in; i += 32u) {
+        const float xv = x[i];
+        for (uint r = 0; r < MVR; r++) acc[r] += p[r][i] * xv;
+    }
+    for (uint r = 0; r < MVR; r++) {
+        const float s = simd_sum(acc[r]);
+        if (lane == 0u && r < nok) y[row0 + r] = s;
+    }
 }
 
 kernel void mv_f16(device const uchar* w      [[buffer(0)]],
@@ -87,13 +112,22 @@ kernel void mv_f16(device const uchar* w      [[buffer(0)]],
                    uint lane [[thread_index_in_simdgroup]],
                    uint sg   [[simdgroup_index_in_threadgroup]])
 {
-    const uint row = tgid * SG_PER_TG + sg;
-    if (row >= n_out) return;
-    device const ushort* p = (device const ushort*)(w + woff) + (ulong)row * n_in;
-    float acc = 0.0f;
-    for (uint i = lane; i < n_in; i += 32u) acc += f16_to_f32(p[i]) * x[i];
-    acc = simd_sum(acc);
-    if (lane == 0u) y[row] = acc;
+    const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
+    if (row0 >= n_out) return;
+    const uint nok = min(uint(MVR), n_out - row0);
+    device const ushort* p[MV_R];
+    for (uint r = 0; r < MVR; r++)
+        p[r] = (device const ushort*)(w + woff) + (ulong)(row0 + (r < nok ? r : 0u)) * n_in;
+    float acc[MV_R];
+    for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
+    for (uint i = lane; i < n_in; i += 32u) {
+        const float xv = x[i];
+        for (uint r = 0; r < MVR; r++) acc[r] += f16_to_f32(p[r][i]) * xv;
+    }
+    for (uint r = 0; r < MVR; r++) {
+        const float s = simd_sum(acc[r]);
+        if (lane == 0u && r < nok) y[row0 + r] = s;
+    }
 }
 
 // ---------------------------------------------------------------- Q4_0（18 字节 / 32 元）
@@ -107,22 +141,32 @@ kernel void mv_q4_0(device const uchar* w     [[buffer(0)]],
                     uint lane [[thread_index_in_simdgroup]],
                     uint sg   [[simdgroup_index_in_threadgroup]])
 {
-    const uint row = tgid * SG_PER_TG + sg;
-    if (row >= n_out) return;
+    const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
+    if (row0 >= n_out) return;
+    const uint nok = min(uint(MVR), n_out - row0);
     const uint nb = n_in >> 5;
-    device const uchar* p = w + woff + (ulong)row * (ulong)nb * 18u;
+    const ulong rbytes = (ulong)nb * 18u;
+    device const uchar* p[MV_R];
+    for (uint r = 0; r < MVR; r++)
+        p[r] = w + woff + (ulong)(row0 + (r < nok ? r : 0u)) * rbytes;
     // lane 0..15 取低半字节（元素 0..15），lane 16..31 取高半字节（元素 16..31）
     const uint idx = lane & 15u;
     const bool hi  = lane >= 16u;
-    float acc = 0.0f;
+    float acc[MV_R];
+    for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
     for (uint b = 0; b < nb; b++) {
-        device const uchar* q = p + b * 18u;
-        const uint byte = uint(q[2u + idx]);
-        const int v = hi ? int(byte >> 4) : int(byte & 0x0Fu);
-        acc += rd_f16(q) * float(v - 8) * x[(b << 5) + lane];
+        const float xv = x[(b << 5) + lane];
+        for (uint r = 0; r < MVR; r++) {
+            device const uchar* q = p[r] + b * 18u;
+            const uint byte = uint(q[2u + idx]);
+            const int v = hi ? int(byte >> 4) : int(byte & 0x0Fu);
+            acc[r] += rd_f16(q) * float(v - 8) * xv;
+        }
     }
-    acc = simd_sum(acc);
-    if (lane == 0u) y[row] = acc;
+    for (uint r = 0; r < MVR; r++) {
+        const float s = simd_sum(acc[r]);
+        if (lane == 0u && r < nok) y[row0 + r] = s;
+    }
 }
 
 // ---------------------------------------------------------------- Q5_0（22 字节 / 32 元）
@@ -136,23 +180,33 @@ kernel void mv_q5_0(device const uchar* w     [[buffer(0)]],
                     uint lane [[thread_index_in_simdgroup]],
                     uint sg   [[simdgroup_index_in_threadgroup]])
 {
-    const uint row = tgid * SG_PER_TG + sg;
-    if (row >= n_out) return;
+    const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
+    if (row0 >= n_out) return;
+    const uint nok = min(uint(MVR), n_out - row0);
     const uint nb = n_in >> 5;
-    device const uchar* p = w + woff + (ulong)row * (ulong)nb * 22u;
+    const ulong rbytes = (ulong)nb * 22u;
+    device const uchar* p[MV_R];
+    for (uint r = 0; r < MVR; r++)
+        p[r] = w + woff + (ulong)(row0 + (r < nok ? r : 0u)) * rbytes;
     const uint idx = lane & 15u;
-    float acc = 0.0f;
+    float acc[MV_R];
+    for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
     for (uint b = 0; b < nb; b++) {
-        device const uchar* q = p + b * 22u;
-        const uint qh = uint(q[2]) | (uint(q[3]) << 8) | (uint(q[4]) << 16) | (uint(q[5]) << 24);
-        const int bit5 = int((qh >> lane) & 1u) << 4;
-        const uint byte = uint(q[6u + idx]);
-        const int v = (lane < 16u) ? (int(byte & 0x0Fu) | bit5)
-                                   : (int(byte >> 4)    | bit5);
-        acc += rd_f16(q) * float(v - 16) * x[(b << 5) + lane];
+        const float xv = x[(b << 5) + lane];
+        for (uint r = 0; r < MVR; r++) {
+            device const uchar* q = p[r] + b * 22u;
+            const uint qh = uint(q[2]) | (uint(q[3]) << 8) | (uint(q[4]) << 16) | (uint(q[5]) << 24);
+            const int bit5 = int((qh >> lane) & 1u) << 4;
+            const uint byte = uint(q[6u + idx]);
+            const int v = (lane < 16u) ? (int(byte & 0x0Fu) | bit5)
+                                       : (int(byte >> 4)    | bit5);
+            acc[r] += rd_f16(q) * float(v - 16) * xv;
+        }
     }
-    acc = simd_sum(acc);
-    if (lane == 0u) y[row] = acc;
+    for (uint r = 0; r < MVR; r++) {
+        const float s = simd_sum(acc[r]);
+        if (lane == 0u && r < nok) y[row0 + r] = s;
+    }
 }
 
 // ---------------------------------------------------------------- Q8_0（34 字节 / 32 元）
@@ -166,18 +220,28 @@ kernel void mv_q8_0(device const uchar* w     [[buffer(0)]],
                     uint lane [[thread_index_in_simdgroup]],
                     uint sg   [[simdgroup_index_in_threadgroup]])
 {
-    const uint row = tgid * SG_PER_TG + sg;
-    if (row >= n_out) return;
+    const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
+    if (row0 >= n_out) return;
+    const uint nok = min(uint(MVR), n_out - row0);
     const uint nb = n_in >> 5;
-    device const uchar* p = w + woff + (ulong)row * (ulong)nb * 34u;
-    float acc = 0.0f;
+    const ulong rbytes = (ulong)nb * 34u;
+    device const uchar* p[MV_R];
+    for (uint r = 0; r < MVR; r++)
+        p[r] = w + woff + (ulong)(row0 + (r < nok ? r : 0u)) * rbytes;
+    float acc[MV_R];
+    for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
     for (uint b = 0; b < nb; b++) {
-        device const uchar* q = p + b * 34u;
-        const int v = int(((device const char*)(q + 2u))[lane]);
-        acc += rd_f16(q) * float(v) * x[(b << 5) + lane];
+        const float xv = x[(b << 5) + lane];
+        for (uint r = 0; r < MVR; r++) {
+            device const uchar* q = p[r] + b * 34u;
+            const int v = int(((device const char*)(q + 2u))[lane]);
+            acc[r] += rd_f16(q) * float(v) * xv;
+        }
     }
-    acc = simd_sum(acc);
-    if (lane == 0u) y[row] = acc;
+    for (uint r = 0; r < MVR; r++) {
+        const float s = simd_sum(acc[r]);
+        if (lane == 0u && r < nok) y[row0 + r] = s;
+    }
 }
 
 // ---------------------------------------------------------------- Q4_K（144 字节 / 256 元）
@@ -201,31 +265,69 @@ kernel void mv_q4_k(device const uchar* w     [[buffer(0)]],
                     uint lane [[thread_index_in_simdgroup]],
                     uint sg   [[simdgroup_index_in_threadgroup]])
 {
-    const uint row = tgid * SG_PER_TG + sg;
-    if (row >= n_out) return;
+    const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
+    if (row0 >= n_out) return;
+    const uint nok = min(uint(MVR), n_out - row0);
     const uint nb = n_in >> 8;
-    device const uchar* p = w + woff + (ulong)row * (ulong)nb * 144u;
-    float acc = 0.0f;
+    const ulong rbytes = (ulong)nb * 144u;
+    device const uchar* p[MV_R];
+    for (uint r = 0; r < MVR; r++)
+        p[r] = w + woff + (ulong)(row0 + (r < nok ? r : 0u)) * rbytes;
+    float acc[MV_R];
+    for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
+
+    // 分工方式决定一切。
+    //
+    // 旧写法：一个 lane 在**每个** sub-block 里取一个元素 → 一个块要 8 次
+    // k4_scale_min（每次约 10 条指令，带分支和 3 次字节读）。一个 lane 每块
+    // 只算 8 个元素，却付了 80 条指令的账 → **10 条指令/元素**。
+    // Q8_0 那边是 1 条指令/元素，于是 Q4_K 的 decode 只有 14.5 GB/s，
+    // 而 Q8_0 能到 58 GB/s —— 差的不是带宽，是 ALU。
+    //
+    // 新写法：一个 lane **固定负责一个 sub-block 的 8 个元素**。
+    //   s = lane/4  → 第几个 sub-block（0..7）
+    //   h = lane%4  → sub-block 内第几个 8 元素组
+    // 于是每块只需 1 次 k4_scale_min，8 个元素 → **约 3 条指令/元素**。
+    //
+    // 字节布局（GGUF Q4_K 的 qs 是 64 元素交错，不是"每个 sub-block 16 字节"）：
+    //   64 元素块 k 占字节 [16+32k, 16+32k+32)，
+    //   元素 64k+i        → 第 i 字节的**低**半字节
+    //   元素 64k+32+i     → 第 i 字节的**高**半字节
+    // 所以 sub-block 为偶数取低半字节、奇数取高半字节，两者读的是同一段 8 字节。
+    const uint sb   = lane >> 2;              // 0..7
+    const uint h    = lane & 3u;              // 0..3
+    const uint chunk = sb >> 1;               // 64 元素块号 0..3
+    const bool take_hi = (sb & 1u) != 0u;
+    const uint boff = 16u + (chunk << 5) + (h << 3);   // 本 lane 的 8 字节起点
+    const uint xoff = (sb << 5) + (h << 3);            // 本 lane 的 8 元素起点
+
     for (uint b = 0; b < nb; b++) {
-        device const uchar* q  = p + b * 144u;
-        const float d  = rd_f16(q);
-        const float dm = rd_f16(q + 2u);
-        device const uchar* sc = q + 4u;
-        device const uchar* qs = q + 16u;
-        device const float* xb = x + (b << 8);
-        // 8 个小段 × 32 元素：lane 在每个小段里各取一个元素。
-        // 关键简化：把 min 项折进逐元素 fma —— sum(d*sc*v - dm*m) * x
-        //   = sum (d*sc*v - dm*m) * x，省掉单独的 x 求和。
-        for (uint s = 0; s < 8u; s++) {
+        device const float* xb = x + (b << 8) + xoff;
+        for (uint r = 0; r < MVR; r++) {
+            device const uchar* q = p[r] + b * 144u;
             uchar s1, m1;
-            k4_scale_min(int(s), sc, s1, m1);
-            const uint byte = uint(qs[(s >> 1) * 32u + lane]);
-            const int v = (s & 1u) ? int(byte >> 4) : int(byte & 0x0Fu);
-            acc += (d * float(s1) * float(v) - dm * float(m1)) * xb[(s << 5) + lane];
+            k4_scale_min(int(sb), q + 4u, s1, m1);
+            const float sc = rd_f16(q)      * float(s1);
+            const float mn = rd_f16(q + 2u) * float(m1);
+            // 8 个字节一次读进来（uint2 = 8 字节，地址 8 字节对齐：
+            // 块跨度 144 与 boff = 16+32k+8h 都是 8 的倍数，GGUF 张量基址
+            // 按 32 对齐，所以成立）。逐个 uchar 读是 8 条 load 指令，
+            // 一条 uint2 就够 —— 解码时 load 指令数才是真正的天花板。
+            const uint2 raw = *(device const uint2*)(q + boff);
+            // min 项折进逐元素 fma：sum(d*sc*v - dm*m)*x 省掉单独的 x 求和
+            #pragma unroll
+            for (uint i = 0; i < 8u; i++) {
+                const uint word = (i < 4u) ? raw.x : raw.y;
+                const uint byte = (word >> ((i & 3u) << 3)) & 0xFFu;
+                const int v = take_hi ? int(byte >> 4) : int(byte & 0x0Fu);
+                acc[r] += (sc * float(v) - mn) * xb[i];
+            }
         }
     }
-    acc = simd_sum(acc);
-    if (lane == 0u) y[row] = acc;
+    for (uint r = 0; r < MVR; r++) {
+        const float s = simd_sum(acc[r]);
+        if (lane == 0u && r < nok) y[row0 + r] = s;
+    }
 }
 
 // ---------------------------------------------------------------- Q6_K（210 字节 / 256 元）
@@ -239,33 +341,68 @@ kernel void mv_q6_k(device const uchar* w     [[buffer(0)]],
                     uint lane [[thread_index_in_simdgroup]],
                     uint sg   [[simdgroup_index_in_threadgroup]])
 {
-    const uint row = tgid * SG_PER_TG + sg;
-    if (row >= n_out) return;
+    const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
+    if (row0 >= n_out) return;
+    const uint nok = min(uint(MVR), n_out - row0);
     const uint nb = n_in >> 8;
-    device const uchar* p = w + woff + (ulong)row * (ulong)nb * 210u;
-    float acc = 0.0f;
+    const ulong rbytes = (ulong)nb * 210u;
+    device const uchar* p[MV_R];
+    for (uint r = 0; r < MVR; r++)
+        p[r] = w + woff + (ulong)(row0 + (r < nok ? r : 0u)) * rbytes;
+    float acc[MV_R];
+    for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
+
+    // 与 mv_q4_k 同一个思路：让一个 lane **固定负责一个 16 元素 scale 组里的
+    // 8 个元素**，而不是"每个 32 元素段各取一个"。scale 粒度是 16 元素，
+    // 32 个 lane / 16 组 = 每组 2 个 lane，正好各 8 个元素 → 每块只需 1 次
+    // scale 读，旧写法要 8 次。
+    //
+    // Q6_K 的字节布局（ql 128B 低 4 位 + qh 64B 高 2 位 + 16 个 int8 scale + d）：
+    //   元素 e 的 ql 下标 = (e & 63) + ((e >> 7) << 6)
+    //   ql 取高半字节当且仅当 (e & 64) != 0
+    //   元素 e 的 qh 下标 = ((e >> 7) << 5) + (e & 31)，取第 2*((e>>5)&3) 位起的 2 位
+    // 因为 8 整除 16、16 整除 32，一个 lane 的 8 个元素必然落在同一个 q = e>>5 里，
+    // 所以上面这些"下标/移位"全部是**每块算一次**的标量。
+    const uint g16 = lane >> 1;               // 16 元素组号 0..15
+    const uint q   = g16 >> 1;                // 32 元素段号 0..7
+    const uint r0  = ((g16 & 1u) << 4) + ((lane & 1u) << 3);   // 段内起点
+    const uint ql_off = 32u * (q & 1u) + 64u * (q >> 2) + r0;
+    const uint qh_off = 32u * (q >> 2) + r0;
+    const bool take_hi = (q & 2u) != 0u;
+    const uint vh = 2u * (q & 3u);
+    const uint xoff = (q << 5) + r0;
+
     for (uint b = 0; b < nb; b++) {
-        device const uchar* q  = p + b * 210u;
-        device const uchar* ql = q;
-        device const uchar* qh = q + 128u;
-        device const char*  sc = (device const char*)(q + 192u);
-        const float d = rd_f16(q + 208u);
-        device const float* xb = x + (b << 8);
-        const uint si = lane >> 4;    // scale 粒度是 16 元素
-        // 256 元素按 32 一段分 8 段，lane 在每段取一个 → 元素 lane + 32k
-        for (uint k = 0; k < 8u; k++) {
-            const uint h = k >> 2;                  // 前半 / 后半 128
-            const uint g = k & 3u;                  // 段内第几组
-            const uint li = h * 64u + lane + (g & 1u) * 32u;
-            const uint lo = (g < 2u) ? (uint(ql[li]) & 0x0Fu) : (uint(ql[li]) >> 4);
-            const uint hi2 = (uint(qh[h * 32u + lane]) >> (2u * g)) & 3u;
-            const int v = int(lo | (hi2 << 4)) - 32;
-            const float s = float(sc[h * 8u + si + g * 2u]);
-            acc += d * s * float(v) * xb[(k << 5) + lane];
+        device const float* xb = x + (b << 8) + xoff;
+        for (uint r = 0; r < MVR; r++) {
+            device const uchar* q_ = p[r] + b * 210u;
+            device const uchar* ql = q_ + ql_off;
+            device const uchar* qh = q_ + 128u + qh_off;
+            const float sc = rd_f16(q_ + 208u) * float(((device const char*)(q_ + 192u))[g16]);
+            // Q6_K 的块跨度是 210 字节（≡ 2 mod 4），奇数块拿不到 4 字节对齐，
+            // 所以只能按 ushort 向量化：8 个字节 4 条 load，而不是 8 条 uchar。
+            // 解码时 load 指令数就是天花板，这一条把 ql/qh 的 load 数砍了一半。
+            ushort qlw[4], qhw[4];
+            #pragma unroll
+            for (uint i = 0; i < 4u; i++) {
+                qlw[i] = ((device const ushort*)ql)[i];
+                qhw[i] = ((device const ushort*)qh)[i];
+            }
+            #pragma unroll
+            for (uint i = 0; i < 8u; i++) {
+                const uint lb = (uint(qlw[i >> 1]) >> ((i & 1u) << 3)) & 0xFFu;
+                const uint hb = (uint(qhw[i >> 1]) >> ((i & 1u) << 3)) & 0xFFu;
+                const uint lo = take_hi ? (lb >> 4) : (lb & 0x0Fu);
+                const uint hi2 = (hb >> vh) & 3u;
+                const int v = int(lo | (hi2 << 4)) - 32;
+                acc[r] += sc * float(v) * xb[i];
+            }
         }
     }
-    acc = simd_sum(acc);
-    if (lane == 0u) y[row] = acc;
+    for (uint r = 0; r < MVR; r++) {
+        const float s = simd_sum(acc[r]);
+        if (lane == 0u && r < nok) y[row0 + r] = s;
+    }
 }
 
 // ================================================================ matmul（prefill，B=nrow≤8）
