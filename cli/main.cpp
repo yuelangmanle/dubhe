@@ -15,6 +15,7 @@ struct Args {
     std::string mmproj;      // 视觉/音频塔
     std::string image;       // 输入图片
     std::string video;       // 输入视频
+    std::string audio;       // 输入音频
     double video_fps = 2.0;  // 抽帧率
     int   video_frames = 16; // 最多抽几帧
     int   video_side = 448;  // 长边压到多少像素（0 = 不缩）
@@ -39,6 +40,7 @@ void usage() {
         "  dubhe run     -m <model.gguf> -p \"提示词\" [-n 256] [--temp 0.7] [--raw] [--stats]\n"
         "  dubhe run     -m <vl.gguf> --mmproj <mmproj.gguf> --image <pic.jpg> -p \"描述这张图\"\n"
         "  dubhe run     -m <vl.gguf> --mmproj <mmproj.gguf> --video <clip.mp4> -p \"描述这段视频\"\n"
+        "  dubhe run     -m <audio.gguf> --mmproj <audio-mmproj.gguf> --audio <clip.wav> -p \"转写这段话\"\n"
         "  dubhe chat    -m <model.gguf> [--temp 0.7] [-c 4096]\n"
         "  dubhe bench   -m <model.gguf> [-n 128] [--concurrency 1]\n\n"
         "选项:\n"
@@ -50,6 +52,7 @@ void usage() {
         "      --video-fps <F>    抽帧率 (默认 2)\n"
         "      --video-frames <N> 最多抽几帧 (默认 16)\n"
         "      --video-side <N>   长边压到 N 像素 (默认 448，0 = 不缩)\n"
+        "      --audio <path>     输入音频；prompt 里的 <|audio|> 会被替换成音频特征\n"
         "  -n, --predict <N>      最多生成 token 数 (默认 256)\n"
         "  -c, --ctx <N>          上下文长度 (默认取模型训练值)\n"
         "  -t, --threads <N>      线程数 (默认自动)\n"
@@ -90,6 +93,7 @@ bool parse(int argc, char** argv, Args* a) {
         else if (k == "--video-fps") { if (!next(&v)) return false; a->video_fps = atof(v); }
         else if (k == "--video-frames") { if (!next(&v)) return false; a->video_frames = atoi(v); }
         else if (k == "--video-side") { if (!next(&v)) return false; a->video_side = atoi(v); }
+        else if (k == "--audio") { if (!next(&v)) return false; a->audio = v; }
         else if (k == "--concurrency") { if (!next(&v)) return false; a->concurrency = atoi(v); }
         else if (k == "--stats") a->stats = true;
         else if (k == "--raw") a->raw = true;
@@ -120,6 +124,19 @@ std::string build_chatml(const std::vector<std::pair<std::string, std::string>>&
     }
     p += "<|im_start|>assistant\n";
     return p;
+}
+
+// LFM 系的 chat 模板第一行是 `{{- bos_token -}}`，但 GGUF 里的
+// tokenizer.ggml.add_bos_token 是 false，分词器不会自动补。
+//
+// 少了这一个 token 的后果非常隐蔽：模型不会进入"对话"状态，而是把整段
+// 提示词当成待续写的正文。语音模型上表现为 —— 转写是对的，但转完继续
+// 复读指令、然后开始胡说。图像模型上则只是"回答得糙一点"，所以之前一直
+// 没发现。凡是模板里带 bos_token 的，都必须补。
+void prepend_bos(dubhe_engine* e, std::vector<int32_t>* toks) {
+    int32_t id = -1;
+    if (dubhe_tokenize(e, "<|startoftext|>", 0, &id, 1) == 1)
+        toks->insert(toks->begin(), id);
 }
 
 void cb_token(void* ud, int32_t, const char* piece) {
@@ -208,20 +225,25 @@ int cmd_run(const Args& a) {
     int32_t n = dubhe_tokenize(e, text.c_str(), 1, nullptr, 0);
     std::vector<int32_t> toks((size_t)n);
     dubhe_tokenize(e, text.c_str(), 1, toks.data(), n);
+    if (!a.raw) prepend_bos(e, &toks);
 
-    // 多模态：先跑视觉塔，再把占位 token 展开成 n 个，
+    // 多模态：先跑塔，再把占位 token 展开成 n 个，
     // 最后把特征按位置挂上去。顺序不能反 —— 展开后的下标才是注入起点。
     float* emb = nullptr;
     int32_t n_mm = 0, mm_dim = 0, mm_at = -1;
-    const bool want_video = !a.video.empty();
-    if (!a.image.empty() || want_video) {
-        if (!a.image.empty() && want_video) {
-            std::fprintf(stderr, "--image 与 --video 暂时只能二选一\n");
-            dubhe_destroy(e);
-            return 1;
-        }
+    int n_kind = (!a.image.empty() ? 1 : 0) + (!a.video.empty() ? 1 : 0) +
+                 (!a.audio.empty() ? 1 : 0);
+    if (n_kind > 1) {
+        std::fprintf(stderr, "--image / --video / --audio 一次只能给一个\n");
+        dubhe_destroy(e);
+        return 1;
+    }
+    if (n_kind == 1) {
+        const bool is_video = !a.video.empty();
+        const bool is_audio = !a.audio.empty();
+        const char* what = is_audio ? "音频" : (is_video ? "视频" : "图像");
         if (a.mmproj.empty()) {
-            std::fprintf(stderr, "用了 --image / --video 就必须给 --mmproj\n");
+            std::fprintf(stderr, "用了 --image / --video / --audio 就必须给 --mmproj\n");
             dubhe_destroy(e);
             return 1;
         }
@@ -231,7 +253,10 @@ int cmd_run(const Args& a) {
             return 1;
         }
         int mrc;
-        if (want_video) {
+        if (is_audio) {
+            std::fprintf(stderr, "语音塔编码中…\n");
+            mrc = dubhe_encode_audio(e, a.audio.c_str(), &emb, &n_mm, &mm_dim);
+        } else if (is_video) {
             std::fprintf(stderr, "抽帧 + 视觉塔编码中…\n");
             mrc = dubhe_encode_video(e, a.video.c_str(), a.video_fps, a.video_frames,
                                      a.video_side, &emb, &n_mm, &mm_dim);
@@ -240,13 +265,12 @@ int cmd_run(const Args& a) {
             mrc = dubhe_encode_image(e, a.image.c_str(), &emb, &n_mm, &mm_dim);
         }
         if (mrc != DUBHE_OK) {
-            std::fprintf(stderr, "%s编码失败: %s\n", want_video ? "视频" : "图像",
-                         dubhe_last_error());
+            std::fprintf(stderr, "%s编码失败: %s\n", what, dubhe_last_error());
             dubhe_destroy(e);
             return 1;
         }
         std::string err;
-        const char* ph = want_video ? "<|video|>" : "<|image|>";
+        const char* ph = is_audio ? "<|audio|>" : (is_video ? "<|video|>" : "<|image|>");
         if (!expand_mm_token(e, &toks, n_mm, ph, &mm_at, &err)) {
             std::fprintf(stderr, "%s\n", err.c_str());
             dubhe_free_embeds(emb);
@@ -260,7 +284,7 @@ int cmd_run(const Args& a) {
             return 1;
         }
         std::fprintf(stderr, "%s %d token × %d 维，占位在 prompt[%d]\n",
-                     want_video ? "视频" : "图像", n_mm, mm_dim, mm_at);
+                     what, n_mm, mm_dim, mm_at);
         n = (int32_t)toks.size();
     }
 
@@ -319,6 +343,7 @@ int cmd_chat(const Args& a) {
         int32_t n = dubhe_tokenize(e, prompt.c_str(), 1, nullptr, 0);
         std::vector<int32_t> toks((size_t)n);
         dubhe_tokenize(e, prompt.c_str(), 1, toks.data(), n);
+        prepend_bos(e, &toks);
 
         dubhe_sampling sp{};
         sp.max_tokens = a.n_predict;

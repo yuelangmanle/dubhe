@@ -6,6 +6,48 @@
 
 ---
 
+## [0.7.0] · 2026-10-29 · 视频与语音
+
+### 新增
+
+- **视频输入**（`--video`）：`AVAssetImageGenerator` 按 fps 均匀抽帧
+  （`appliesPreferredTrackTransform` 处理竖拍旋转，奇数帧补帧），
+  `pack_pixels2(rgb0, rgb1, …)` 把相邻两帧叠进一个 temporal patch。
+  `--video-fps` / `--video-frames` / `--video-side` 控制抽帧与缩放。
+- **语音输入**（`--audio`）：任意格式（wav/aiff/mp3/m4a/flac）经
+  AVFoundation 解成 16 kHz 单声道 → log-mel → 17 层语音塔 → 2048 维嵌入。
+  占位符 `<|audio|>`，按 `ceil(帧数/8)` 展开。
+- **log-mel 前端**（`engine/src/mel.*`）：周期 Hann、`center=False`、400 点
+  DFT（表驱动，窗已折进 cos/sin 表）、power 谱、128 个 Slaney mel 滤波器
+  （Slaney 刻度 + 面积归一化）、`log10` 下限 −12、仿射 `(x+4)/4`。
+- **语音塔**（`engine/src/audiomm.*`）：三层 stride-2 的 3×3 卷积降采样
+  （128 mel → 16，T → T/8）→ 17 层 LFM2（conv/conv/attn ×5 + attn ×2，
+  门控因果深度卷积宽 3、GQA 8/4 头、head_dim 96、滑窗 32 因果注意力）
+  → embedding_norm → 投影器（LayerNorm → 768→2048 → GELU → 2048→2048）。
+- **音频解码**（`engine/src/audiofile.*`）：AVAudioFile + AVAudioConverter。
+- **共用核函数**（`engine/src/mm_math.h`）：量化 matmul、NEON 点积、
+  RMSNorm/LayerNorm、SiLU/GELU、逐行并行，视觉塔与语音塔共用。
+- **工具**：`audio_oracle.py`（HF 的 `Lfm3AudioEncoder` 真跑一遍当参考）、
+  `audio_diff.py`（逐层对拍）、`audprobe`（逐层 dump）。
+
+### 修复
+
+- **跨模态漏 BOS**：LFM 系的 chat 模板第一行是 `{{- bos_token -}}`
+  （`<|startoftext|>`），但 GGUF 里 `tokenizer.ggml.add_bos_token = false`。
+  少了它模型不进入对话状态，而是把提示词当成待续写正文 —— 语音上表现为
+  "转写对了、然后复读指令、然后胡说"，视觉上只是"答得糙"，所以一直没被发现。
+  `run`（非 `--raw`）与 `chat` 现在都会补。
+- **`AVAudioFile` 的 EOF 不是错误**：读到末尾返回 NO + `eofErr(-39)`，
+  当成错误处理会让任何正常音频在最后一帧报错。
+
+### 基准
+
+- 语音：mel 前端 23 ms / 3.45 s 音频（实时率 ~150×），整塔 ~0.2 s（~17×）。
+- 视频：8 帧 512×512（784 token）编码 28 s；prefill 88.8 tok/s。
+- 精度：语音塔与 HF 逐层对拍 22 个检查点，相对误差 ≤6.2e-6，cos = 1.000000。
+
+---
+
 ## [0.6.0] · 2026-10-29 · 多模态第一步：LFM3-VL 视觉塔
 
 ### 新增

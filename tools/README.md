@@ -57,6 +57,40 @@ DUBHE_MM_TRACE=1 ./build/vlprobe ...           # 打印 matmul / 反量化分阶
 同一批误解。第一版 `vl_ref.py` 和 C++ 犯了同样两个错，对拍全绿 —— 假绿灯。
 只有把 HF 自己的 forward 拉进来才能证伪。
 
+### 语音（语音塔）对拍
+
+| 文件 | 用途 |
+| --- | --- |
+| `audio_oracle.py` | **权威参考**：把 mmproj 的权重装进 HF 的 `Lfm3AudioEncoder` + `Lfm3AudioProjector` 真跑一遍，逐层存 .npy |
+| `audio_diff.py` | 逐层比 max\|Δ\| / 相对误差 / 余弦（`down` 那步 HF 是 (通道, 时间)，工具里会自动转置） |
+| `audprobe.cpp` | 语音塔探针：mel → 降采样 → 17 层 → embedding_norm → 投影器，逐层写 f32 |
+
+```bash
+# 1. 造测试音频（macOS 自带 TTS，免下载）
+say -o /tmp/a.aiff "The quick brown fox jumps over the lazy dog."
+ffmpeg -y -i /tmp/a.aiff -ar 16000 -ac 1 -c:a pcm_s16le /tmp/a.wav
+
+# 2. 两路各跑一遍
+python tools/audio_oracle.py --wav /tmp/a.wav --out /tmp/ao
+./build/audprobe ~/.dubhe/models/lfm3-audio-2b/mmproj-LFM3-Audio-2B-Q8_0.gguf /tmp/a.wav /tmp/ac
+
+# 3. 比
+python tools/audio_diff.py --cpp /tmp/ac --oracle /tmp/ao   # 全部一致才算过
+./build/audprobe ... /tmp/a.wav /tmp/ac --mel-only          # 只查 mel 前端
+```
+
+**映射上的两个坑**（写在这里省得下次再查）：
+
+1. 语音塔内部是 **LFM2**，不是 LFM3 —— `AutoModel.from_config` 走的是
+   transformers 内置的 `Lfm2Model`，所以 HF 的参数名是 `q_layernorm` /
+   `out_proj`，跟 `modeling_lfm3.py` 里写的 `q_norm` / `o_proj` 不一样。
+2. GGUF 的 `a.post_ln` 对应 HF 的 `embedding_norm`，名字带 post，但它在
+   **所有层之后**才作用。`clip.audio.feed_forward_length = 1792` 也和
+   `config.json` 的 2560 不一致（后者是 2/3 规则前的值），以 GGUF 为准。
+
+**端到端还有一道独立闸门**：用 `say` 合成一句人声，看引擎能不能逐字转写。
+逐层对拍只能证明"C++ 和 HF 算的一样"，如果权重映射本身错了，两边会一起错。
+
 ### 测量纪律（踩过的坑，别再踩）
 
 1. **只信同条件交错 A/B。** 一边跑完再跑另一边得到的倍数一律作废 —— 本机

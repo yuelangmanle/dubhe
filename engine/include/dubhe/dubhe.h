@@ -120,6 +120,12 @@ int  dubhe_encode_image(dubhe_engine* e, const char* image_path, float** embeds,
 int  dubhe_encode_video(dubhe_engine* e, const char* video_path, double fps,
                         int32_t max_frames, int32_t max_side,
                         float** embeds, int32_t* n_tokens, int32_t* dim);
+
+/* 把一段音频编码成特征：任意格式（wav/aiff/mp3/m4a/flac）先解成 16 kHz 单声道，
+ * 再算 log-mel，过语音塔。一个 token 覆盖 80 ms 音频。需要先加载语音 mmproj
+ * （dubhe_load_mmproj 会按 clip.has_audio_encoder 自动区分视觉/语音）。 */
+int  dubhe_encode_audio(dubhe_engine* e, const char* audio_path, float** embeds,
+                        int32_t* n_tokens, int32_t* dim);
 void dubhe_free_embeds(float* embeds);
 
 /* 把图像/音频塔的输出注入下一次 dubhe_generate：序列里 [at_pos, at_pos+n_tokens)

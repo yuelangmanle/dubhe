@@ -56,6 +56,36 @@ prefill 是当前最大的短板，根因是激活被重复读 55 倍 —— 下
 > 完整的精度 × 后端矩阵见
 > [LFM3 精度与后端实测](docs/references/LFM3-精度与后端实测.md)。
 
+## 多模态：图、视频、语音
+
+Liquid 的多模态是一条谱系，**语言主干完全相同，能力全在独立的 mmproj 里**。
+所以引擎只有一套"读 mmproj → 编码 → 按位置注入嵌入"的机制，换塔就换能力。
+
+```bash
+# 图像（LFM3-VL-2B）
+./build/dubhe run -m LFM3-VL-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-VL-2B-Q8_0.gguf \
+    --image pic.png -p "<|image|>描述这张图"
+
+# 视频（同一份 mmproj；--video-fps / --video-frames / --video-side 控制抽帧）
+./build/dubhe run -m LFM3-VL-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-VL-2B-Q8_0.gguf \
+    --video clip.mp4 -p "<|video|>这段视频里发生了什么"
+
+# 语音（LFM3-Audio-2B；wav / mp3 / m4a / flac 都行，内部自动重采样到 16 kHz）
+./build/dubhe run -m LFM3-Audio-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-Audio-2B-Q8_0.gguf \
+    --audio clip.wav -p "<|audio|>把这段语音转写成文字"
+```
+
+| 模态 | 塔 | 规模 | 耗时 |
+| --- | --- | --- | ---: |
+| 图像 | LFM3-VL 视觉塔（14 层） | 161 M | 3.5 s / 384² · 13.5 s / 640² |
+| 视频 | 同上（每 2 帧一个 temporal patch） | — | 28 s / 8 帧 512² |
+| 语音 | LFM3-Audio（降采样 + 17 层 LFM2） | 109 M | **0.2 s / 3.45 s 音频** |
+
+精度：两座塔都与 HuggingFace 官方 forward **逐层对拍**过 —— 视觉 16 个检查点
+（相对误差 1.7e-5）、语音 22 个检查点（≤6.2e-6），余弦相似度 1.000000。
+端到端：图像能说对颜色形状，视频能判对运动方向（静止视频不会被描述成在动），
+语音转写逐字正确。
+
 ## 界面
 
 | 对话 | API 网关 | 设置（移动端） |

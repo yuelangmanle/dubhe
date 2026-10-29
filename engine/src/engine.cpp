@@ -2,7 +2,10 @@
 #include "internal.h"
 
 #include "../include/dubhe/dubhe.h"
+#include "audiofile.h"
+#include "audiomm.h"
 #include "image.h"
+#include "mel.h"
 #include "mmproj.h"
 
 #include <sys/sysctl.h>
@@ -30,7 +33,9 @@ struct dubhe_engine {
     int32_t mm_n = 0;
     int32_t mm_at = -1;
     // 多模态投影器（mmproj GGUF）。独立于语言模型加载，一张图只跑一次。
+    // 视觉塔和语音塔是两个不同的 mmproj 文件，所以各留一个指针。
     std::unique_ptr<MmProj> mmproj;
+    std::unique_ptr<AudioMm> audio_mm;
 };
 
 namespace {
@@ -209,7 +214,25 @@ int32_t dubhe_token_to_piece(const dubhe_engine* e, int32_t token, char* buf, in
 
 int dubhe_load_mmproj(dubhe_engine* e, const char* path) {
     if (!e || !path) return DUBHE_ERR_INVALID_ARG;
+
+    // 一个 mmproj 文件要么是视觉塔、要么是语音塔（Omni 模型也是分开两个文件）。
+    // 用 clip.has_audio_encoder 区分，比"先试一种再试另一种"给出的报错清楚得多。
+    bool is_audio = false;
+    {
+        GgufFile probe;
+        std::string perr;
+        if (!probe.open(path, &perr)) { set_err("mmproj 打不开: " + perr); return DUBHE_ERR_IO; }
+        is_audio = probe.get_u32("clip.has_audio_encoder", 0) != 0;
+    }
+
     std::string err;
+    if (is_audio) {
+        auto p = std::make_unique<AudioMm>();
+        if (!p->load(path, &err)) { set_err("语音 mmproj 加载失败: " + err); return DUBHE_ERR_FORMAT; }
+        std::lock_guard<std::mutex> lock(e->mu);
+        e->audio_mm = std::move(p);
+        return DUBHE_OK;
+    }
     auto p = std::make_unique<MmProj>();
     if (!p->load(path, &err)) { set_err("mmproj 加载失败: " + err); return DUBHE_ERR_FORMAT; }
     std::lock_guard<std::mutex> lock(e->mu);
@@ -264,6 +287,49 @@ int dubhe_encode_image(dubhe_engine* e, const char* image_path, float** embeds,
 }
 
 void dubhe_free_embeds(float* embeds) { std::free(embeds); }
+
+int dubhe_encode_audio(dubhe_engine* e, const char* audio_path, float** embeds,
+                       int32_t* n_tokens, int32_t* dim) {
+    if (!e || !audio_path || !embeds || !n_tokens || !dim) return DUBHE_ERR_INVALID_ARG;
+    if (!e->audio_mm) { set_err("未加载语音 mmproj，无法处理音频"); return DUBHE_ERR_STATE; }
+
+    std::string err;
+    std::vector<float> pcm;
+    if (!load_audio_16k_mono(audio_path, &pcm, &err)) {
+        set_err("解码音频失败: " + err);
+        return DUBHE_ERR_IO;
+    }
+
+    // 前端参数是训练时定死的，不从文件里读，也不给调用方改的机会
+    MelConfig mc;
+    std::vector<float> mel;
+    int64_t n_frames = 0;
+    if (!log_mel(pcm.data(), (int64_t)pcm.size(), mc, &mel, &n_frames, &err)) {
+        set_err("算 log-mel 失败: " + err);
+        return DUBHE_ERR_STATE;
+    }
+
+    const auto& c = e->audio_mm->config();
+    const int n_embd = e->model.loaded() ? e->model.cfg().n_embd : c.out_dim;
+    if (c.out_dim != n_embd) {
+        set_err("语音塔输出 " + std::to_string(c.out_dim) + " 维，模型需要 " +
+                std::to_string(n_embd) + " 维");
+        return DUBHE_ERR_FORMAT;
+    }
+    const int64_t nt = mel_num_tokens(n_frames, mc);
+    float* buf = (float*)std::malloc(sizeof(float) * (size_t)nt * (size_t)c.out_dim);
+    if (!buf) { set_err("内存不足"); return DUBHE_ERR_OOM; }
+    int got = 0;
+    if (!e->audio_mm->encode(mel.data(), n_frames, buf, &got, &err)) {
+        std::free(buf);
+        set_err("语音塔前向失败: " + err);
+        return DUBHE_ERR_STATE;
+    }
+    *embeds = buf;
+    *n_tokens = (int32_t)got;
+    *dim = c.out_dim;
+    return DUBHE_OK;
+}
 
 int dubhe_encode_video(dubhe_engine* e, const char* video_path, double fps, int32_t max_frames,
                        int32_t max_side, float** embeds, int32_t* n_tokens, int32_t* dim) {

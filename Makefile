@@ -18,18 +18,18 @@ UNAME_S  := $(shell uname -s)
 
 ENGINE_SRCS := engine/src/gguf.cpp engine/src/quant.cpp engine/src/quant_q8.cpp \
                engine/src/tokenizer.cpp engine/src/model.cpp engine/src/engine.cpp \
-               engine/src/mmproj.cpp
+               engine/src/mmproj.cpp engine/src/mel.cpp engine/src/audiomm.cpp
 
 # Metal 后端只在 Apple 平台编译。着色器在运行时编译（newLibraryWithSource:），
 # 所以不需要离线 Metal Toolchain。
 ifeq ($(UNAME_S),Darwin)
-  ENGINE_SRCS += engine/src/metal.mm engine/src/image.mm
+  ENGINE_SRCS += engine/src/metal.mm engine/src/image.mm engine/src/audiofile.mm
   OBJCXXFLAGS := $(CXXFLAGS) -fobjc-arc
   LDFLAGS     := -framework Metal -framework Foundation -framework ImageIO \
                  -framework CoreGraphics -framework CoreFoundation \
                  -framework AVFoundation -framework CoreMedia
 else
-  ENGINE_SRCS += engine/src/metal_stub.cpp engine/src/image_stub.cpp
+  ENGINE_SRCS += engine/src/metal_stub.cpp engine/src/image_stub.cpp engine/src/audiofile_stub.cpp
   LDFLAGS     :=
 endif
 
@@ -51,7 +51,7 @@ all: $(BIN) $(SRV) tools
 engine: $(BIN)
 
 tools: $(BUILD)/selftest $(BUILD)/ggufdump $(BUILD)/tokprobe \
-       $(BUILD)/mma_probe $(BUILD)/mm2_check $(BUILD)/vlprobe
+       $(BUILD)/mma_probe $(BUILD)/mm2_check $(BUILD)/vlprobe $(BUILD)/audprobe
 
 # 分词 + 贪心生成探针：同一模型不同量化档输出不一致时，用它区分
 # "分词差异" 和 "前向差异"（对比打印出的 token id 序列即可）。
@@ -122,6 +122,10 @@ $(BUILD)/mma_probe: tools/mma_probe.mm
 	@echo "✓ $@"
 
 $(BUILD)/vlprobe: $(ENGINE_OBJS) $(BUILD)/tools/vlprobe.o
+	$(CXX) $^ -o $@ $(LDFLAGS)
+	@echo "✓ $@"
+
+$(BUILD)/audprobe: $(ENGINE_OBJS) $(BUILD)/tools/audprobe.o
 	$(CXX) $^ -o $@ $(LDFLAGS)
 	@echo "✓ $@"
 
