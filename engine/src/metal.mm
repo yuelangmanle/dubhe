@@ -524,6 +524,10 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
 
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
+    // 诊断用：把"CPU 编码"和"提交后等 GPU"分开计时。两者之和远大于
+    // GPU 忙时时，说明瓶颈在 CPU 侧，改内核没用。
+    static const bool want_split = getenv("DUBHE_GPU_SPLIT") != nullptr;
+    const auto t_enc0 = std::chrono::steady_clock::now();
 
     // 逐元素算子：2D 网格（行内下标 × 行号）。
     // 注意：每个算子必须自己绑全部 buffer —— 早先版本把它们收进一个只
@@ -951,8 +955,19 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
     gemm(g_spec.type_out_w, g_bfinal, g_blogits, g_spec.off_out_w, g_spec.n_vocab, n_embd, 1);
 
     [en endEncoding];
+    const auto t_enc1 = std::chrono::steady_clock::now();
     [cb commit];
     [cb waitUntilCompleted];
+    if (want_split) {
+        const auto t_end = std::chrono::steady_clock::now();
+        static double enc = 0, wait = 0;
+        static long   cnt = 0;
+        enc  += std::chrono::duration<double, std::milli>(t_enc1 - t_enc0).count();
+        wait += std::chrono::duration<double, std::milli>(t_end - t_enc1).count();
+        if (++cnt % 32 == 0)
+            std::fprintf(stderr, "[split] 编码 %.1f ms / 提交后等 %.1f ms（%ld 次调用）\n",
+                         enc, wait, cnt);
+    }
 
     // 诊断：DUBHE_GPU_TIME=1 时打印"GPU 真正忙"的累计时间。若它明显小于
     // 墙上时间，说明瓶颈在 CPU 侧编码 / 提交，而不是 GPU 算力。

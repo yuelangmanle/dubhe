@@ -117,7 +117,25 @@ kernel void mv_f32(device const uchar* w      [[buffer(0)]],
         p[r] = (device const float*)(w + woff) + (ulong)(row0 + (r < nok ? r : 0u)) * n_in;
     float acc[MV_R];
     for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
-    for (uint i = lane; i < n_in; i += 32u) {
+
+    // 一条 load 换 4 次乘加。
+    //
+    // 原来写 `p[r][i]`，一个 lane 一次只读 4 字节 —— 每 4 字节付一条 load 指令。
+    // Q8_0 是一条 load 换 34 字节，两者差 8.5 倍指令数。实测 F16 解码只有
+    // 18.2 GB/s（Q8_0 是 66.0），差的正是这个。
+    // 改成 float4：32 lane × 4 = 128 个元素一轮。
+    const uint nb = n_in >> 7;
+    const uint lane4 = lane << 2;
+    for (uint b = 0; b < nb; b++) {
+        const uint i0 = (b << 7) + lane4;
+        const float4 xv = *(device const float4*)(x + i0);
+        #pragma unroll
+        for (uint r = 0; r < MVR; r++) {
+            const float4 wv = *(device const float4*)(p[r] + i0);
+            acc[r] += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
+        }
+    }
+    for (uint i = (nb << 7) + lane; i < n_in; i += 32u) {
         const float xv = x[i];
         for (uint r = 0; r < MVR; r++) acc[r] += p[r][i] * xv;
     }
@@ -140,14 +158,35 @@ kernel void mv_f16(device const uchar* w      [[buffer(0)]],
     const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
     if (row0 >= n_out) return;
     const uint nok = min(uint(MVR), n_out - row0);
-    device const ushort* p[MV_R];
+    device const half* p[MV_R];
     for (uint r = 0; r < MVR; r++)
-        p[r] = (device const ushort*)(w + woff) + (ulong)(row0 + (r < nok ? r : 0u)) * n_in;
+        p[r] = (device const half*)(w + woff) + (ulong)(row0 + (r < nok ? r : 0u)) * n_in;
     float acc[MV_R];
     for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
-    for (uint i = lane; i < n_in; i += 32u) {
+
+    // 一条 load 换 8 次乘加（half4 = 8 字节，两次 half4 = 16 字节 / 8 个元素）。
+    // 原来是 `p[r][i]` 逐元素读 —— 2 字节付一条 load 指令，比 Q8_0 多 17 倍。
+    // 实测 F16 解码 18.2 GB/s 就是这么来的（Q8_0 是 66.0）。
+    // 32 lane × 8 = 256 个元素一轮。
+    const uint nb = n_in >> 8;
+    const uint lane8 = lane << 3;
+    for (uint b = 0; b < nb; b++) {
+        const uint i0 = (b << 8) + lane8;
+        const float4 xa = *(device const float4*)(x + i0);
+        const float4 xb = *(device const float4*)(x + i0 + 4u);
+        #pragma unroll
+        for (uint r = 0; r < MVR; r++) {
+            const half4 wa = *(device const half4*)(p[r] + i0);
+            const half4 wb = *(device const half4*)(p[r] + i0 + 4u);
+            acc[r] += float(wa.x) * xa.x + float(wa.y) * xa.y +
+                      float(wa.z) * xa.z + float(wa.w) * xa.w +
+                      float(wb.x) * xb.x + float(wb.y) * xb.y +
+                      float(wb.z) * xb.z + float(wb.w) * xb.w;
+        }
+    }
+    for (uint i = (nb << 8) + lane; i < n_in; i += 32u) {
         const float xv = x[i];
-        for (uint r = 0; r < MVR; r++) acc[r] += f16_to_f32(p[r][i]) * xv;
+        for (uint r = 0; r < MVR; r++) acc[r] += float(p[r][i]) * xv;
     }
     for (uint r = 0; r < MVR; r++) {
         const float s = simd_sum(acc[r]);
