@@ -54,10 +54,10 @@ const char* const kM2Names[K_COUNT] = {
     "mm2_f32", "mm2_f16", "", "", "mm2_q8_0", "mm2_q4_k", "mm2_q6_k"
 };
 
-// MMA 版分块 matmul（第 3 代）。覆盖 Q4_K / Q6_K，其余回退 mm2_*。
+// MMA 版分块 matmul（第 3 代）。覆盖 F16 / Q4_K / Q6_K，其余回退 mm2_*。
 // 空串表示"没有这一档"，派发时跳过。
 const char* const kM3Names[K_COUNT] = {
-    "", "", "", "", "", "mm3_q4_k", "mm3_q6_k"
+    "", "mm3_f16", "", "", "", "mm3_q4_k", "mm3_q6_k"
 };
 
 // 与 MSL 的 MMA_BN / MMA_BM / MMA_NK 一致（全部取自 metal_kernels.h 的唯一真源）
