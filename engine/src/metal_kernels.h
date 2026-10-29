@@ -1495,7 +1495,7 @@ kernel void k_silu_mul(device float* o        [[buffer(0)]],
 // pos = pos0 + gid.y，koff 已包含层的偏移与 pos0 的偏移。
 kernel void k_rope(device float* q          [[buffer(0)]],
                    device const float* k    [[buffer(1)]],
-                   device float* kc         [[buffer(2)]],
+                   device half* kc          [[buffer(2)]],
                    constant ulong& koff     [[buffer(3)]],
                    constant uint& n_head    [[buffer(4)]],
                    constant uint& n_kvh     [[buffer(5)]],
@@ -1524,10 +1524,28 @@ kernel void k_rope(device float* q          [[buffer(0)]],
     } else {
         const uint kh = h - n_head;
         device const float* src = k + (ulong)row * kdim + kh * hd;
-        device float* dst = fat(kc, koff) + (ulong)row * kdim + kh * hd;
+        // KV cache 存 fp16：长上下文时 KV 流量会超过权重，见 k_attn 的注释
+        device half* dst = (device half*)((device uchar*)kc + koff)
+                         + (ulong)row * kdim + kh * hd;
         const float x0 = src[i], x1 = src[i + hh];
-        dst[i]      = x0 * c - x1 * s;
-        dst[i + hh] = x0 * s + x1 * c;
+        dst[i]      = half(x0 * c - x1 * s);
+        dst[i + hh] = half(x0 * s + x1 * c);
+    }
+}
+
+// d[doff + row*n + i] = (half)s[soff + row*n + i]
+// 只用于把 V 写进 fp16 的 KV cache。K 走 k_rope，因为要就地旋转。
+kernel void k_copy_h(device half* d          [[buffer(0)]],
+                     constant ulong& doff    [[buffer(1)]],
+                     device const float* s   [[buffer(2)]],
+                     constant ulong& soff    [[buffer(3)]],
+                     constant uint& n        [[buffer(4)]],
+                     uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < n) {
+        const ulong o = (ulong)gid.y * n + gid.x;
+        device half* dd = (device half*)((device uchar*)d + doff);
+        dd[o] = half(fatc(s, soff)[o]);
     }
 }
 
@@ -1563,8 +1581,8 @@ kernel void k_copy(device float* d          [[buffer(0)]],
 // 短上下文（nsp == 1）走这个融合版：直接写输出，不经过 partial 缓冲，
 // 也少一次 combine dispatch。split 版在 nsp == 1 时是纯粹的额外开销。
 kernel void k_attn(device const float* q  [[buffer(0)]],
-                   device const float* kc [[buffer(1)]],
-                   device const float* vc [[buffer(2)]],
+                   device const half* kc  [[buffer(1)]],
+                   device const half* vc  [[buffer(2)]],
                    device float* out      [[buffer(3)]],
                    constant ulong& coff   [[buffer(4)]],
                    constant uint& n_head  [[buffer(5)]],
@@ -1584,8 +1602,14 @@ kernel void k_attn(device const float* q  [[buffer(0)]],
     const uint mul = n_head / n_kvh;
     const uint kvh = head / mul;
     device const float* qh = q + ((ulong)row * n_head + head) * hd;
-    device const float* kb = fatc(kc, coff) + kvh * hd;
-    device const float* vb = fatc(vc, coff) + kvh * hd;
+    // KV cache 是 fp16。
+    //
+    // 为什么必须这么干：KV 是 f32 时，24506 token 上下文下 KV 要 2.41 GB，
+    // 比 1.10 GB 的权重还大一倍，decode 直接从 52.9 掉到 16.9 tok/s，
+    // 而且是纯带宽受限（3.5 GB/token ÷ 59 ms ≈ 59 GB/s，没到算力瓶颈）。
+    // 换 fp16 后同一场景的 KV 减半到 1.2 GB。
+    device const half* kb = (device const half*)((device uchar*)kc + coff) + kvh * hd;
+    device const half* vb = (device const half*)((device uchar*)vc + coff) + kvh * hd;
     const uint nlen = nlen0 + row;
     // 滑窗：只回看最近 win 个位置（win == 0 表示全量）
     const uint t0 = (win > 0u && nlen > win) ? (nlen - win) : 0u;
@@ -1595,9 +1619,9 @@ kernel void k_attn(device const float* q  [[buffer(0)]],
     for (int j = 0; j < 4; j++) acc[j] = 0.0f;
 
     for (uint t = t0; t < nlen; t++) {
-        device const float* kk = kb + (ulong)t * kv_dim;
+        device const half* kk = kb + (ulong)t * kv_dim;
         float partial = 0.0f;
-        for (uint d = lane; d < hd; d += 32u) partial += qh[d] * kk[d];
+        for (uint d = lane; d < hd; d += 32u) partial += qh[d] * float(kk[d]);
         const float s = simd_sum(partial) * scale;
 
         float w;
@@ -1613,9 +1637,9 @@ kernel void k_attn(device const float* q  [[buffer(0)]],
         }
         l += w;
 
-        device const float* vv = vb + (ulong)t * kv_dim;
+        device const half* vv = vb + (ulong)t * kv_dim;
         int j = 0;
-        for (uint d = lane; d < hd; d += 32u, j++) acc[j] += w * vv[d];
+        for (uint d = lane; d < hd; d += 32u, j++) acc[j] += w * float(vv[d]);
     }
 
     const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
@@ -1626,8 +1650,8 @@ kernel void k_attn(device const float* q  [[buffer(0)]],
 
 // 局部（未归并）结果布局：[row][split][head][hd + 2]，最后两个是 m 与 l
 kernel void k_attn_split(device const float* q  [[buffer(0)]],
-                         device const float* kc [[buffer(1)]],
-                         device const float* vc [[buffer(2)]],
+                         device const half* kc  [[buffer(1)]],
+                         device const half* vc  [[buffer(2)]],
                          device float* part     [[buffer(3)]],
                          constant ulong& coff   [[buffer(4)]],
                          constant uint& n_head  [[buffer(5)]],
@@ -1668,13 +1692,13 @@ kernel void k_attn_split(device const float* q  [[buffer(0)]],
         const uint mul = n_head / n_kvh;
         const uint kvh = head / mul;
         device const float* qh = q + ((ulong)row * n_head + head) * hd;
-        device const float* kb = fatc(kc, coff) + kvh * hd;
-        device const float* vb = fatc(vc, coff) + kvh * hd;
+        device const half* kb = (device const half*)((device uchar*)kc + coff) + kvh * hd;
+        device const half* vb = (device const half*)((device uchar*)vc + coff) + kvh * hd;
 
         for (uint t = k0; t < k1; t++) {
-            device const float* kk = kb + (ulong)t * kv_dim;
+            device const half* kk = kb + (ulong)t * kv_dim;
             float partial = 0.0f;
-            for (uint d = lane; d < hd; d += 32u) partial += qh[d] * kk[d];
+            for (uint d = lane; d < hd; d += 32u) partial += qh[d] * float(kk[d]);
             const float s = simd_sum(partial) * scale;
 
             float w;
@@ -1693,9 +1717,9 @@ kernel void k_attn_split(device const float* q  [[buffer(0)]],
             }
             l += w;
 
-            device const float* vv = vb + (ulong)t * kv_dim;
+            device const half* vv = vb + (ulong)t * kv_dim;
             int j = 0;
-            for (uint d = lane; d < hd; d += 32u, j++) acc[j] += w * vv[d];
+            for (uint d = lane; d < hd; d += 32u, j++) acc[j] += w * float(vv[d]);
         }
     }
 

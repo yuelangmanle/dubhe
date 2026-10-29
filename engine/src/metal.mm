@@ -295,12 +295,12 @@ constexpr int kBatchMax = dubhe_msl::kMmaBm;
 constexpr int kAttnSplits = 8;  // 注意力 key 区间最多切几段（split-K）
 
 enum FwdKernel {
-    F_RMSNORM = 0, F_ADD, F_BIAS, F_SILU, F_ROPE, F_COPY,
+    F_RMSNORM = 0, F_ADD, F_BIAS, F_SILU, F_ROPE, F_COPY, F_COPY_H,
     F_ATTN, F_ATTN_SPLIT, F_ATTN_COMB, F_TRANS,
     F_HEADNORM, F_GATE_MUL, F_MUL, F_CONV, F_CONV_SHIFT, F_COUNT
 };
 const char* const kFwdNames[F_COUNT] = {
-    "k_rmsnorm", "k_add", "k_bias", "k_silu_mul", "k_rope", "k_copy",
+    "k_rmsnorm", "k_add", "k_bias", "k_silu_mul", "k_rope", "k_copy", "k_copy_h",
     "k_attn", "k_attn_split", "k_attn_comb", "k_trans",
     "k_headnorm", "k_gate_mul", "k_mul", "k_conv", "k_conv_shift"
 };
@@ -435,7 +435,9 @@ bool fwd_init(const Spec& s, std::string* err) {
     const size_t B = (size_t)kBatchMax;
     const size_t n_embd = (size_t)s.n_embd, n_ff = (size_t)s.n_ff, n_vocab = (size_t)s.n_vocab;
     const size_t kv_dim = (size_t)s.n_head_kv * (size_t)s.hd;
-    const size_t kvb = (size_t)s.n_layer * (size_t)s.kv_cap * kv_dim * sizeof(float);
+    // KV cache 用 fp16。长上下文时 KV 会超过权重的流量（见 k_attn 的注释），
+    // 这里减半直接换来一倍的上下文吞吐。
+    const size_t kvb = (size_t)s.n_layer * (size_t)s.kv_cap * kv_dim * 2u;
 
     g_bx      = make_buf(B * n_embd * 4);
     g_bxb     = make_buf(B * n_embd * 4);
@@ -486,21 +488,21 @@ bool fwd_grow_kv(int new_cap, std::string* err) {
     const size_t kv_dim = (size_t)g_spec.n_head_kv * (size_t)g_spec.hd;
     const size_t old_row = (size_t)g_spec.kv_cap * kv_dim;
     const size_t new_row = (size_t)new_cap * kv_dim;
-    const size_t bytes = (size_t)g_spec.n_layer * new_row * sizeof(float);
+    const size_t bytes = (size_t)g_spec.n_layer * new_row * 2u;   // fp16
 
     id<MTLBuffer> nk = make_buf(bytes), nv = make_buf(bytes);
     if (!nk || !nv) { if (err) *err = "KV cache 扩容分配失败"; return false; }
     std::memset([nk contents], 0, bytes);
     std::memset([nv contents], 0, bytes);
 
-    // 统一内存：直接 CPU memcpy，按层重排
-    float* dk = (float*)[nk contents];
-    float* dv = (float*)[nv contents];
-    const float* sk = (const float*)[g_bkc contents];
-    const float* sv = (const float*)[g_bvc contents];
+    // 统一内存：直接 CPU memcpy，按层重排（单位是 half，所以指针用 uint16_t）
+    uint16_t* dk = (uint16_t*)[nk contents];
+    uint16_t* dv = (uint16_t*)[nv contents];
+    const uint16_t* sk = (const uint16_t*)[g_bkc contents];
+    const uint16_t* sv = (const uint16_t*)[g_bvc contents];
     for (int l = 0; l < g_spec.n_layer; l++) {
-        std::memcpy(dk + (size_t)l * new_row, sk + (size_t)l * old_row, old_row * sizeof(float));
-        std::memcpy(dv + (size_t)l * new_row, sv + (size_t)l * old_row, old_row * sizeof(float));
+        std::memcpy(dk + (size_t)l * new_row, sk + (size_t)l * old_row, old_row * 2u);
+        std::memcpy(dv + (size_t)l * new_row, sv + (size_t)l * old_row, old_row * 2u);
     }
     g_bkc = nk;
     g_bvc = nv;
@@ -768,8 +770,8 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
 
     for (int l = 0; l < g_spec.n_layer; l++) {
         const LayerSpec& L = g_spec.layers[(size_t)l];
-        const uint64_t coff = (uint64_t)l * kv_row * sizeof(float);
-        const uint64_t kpos = coff + (uint64_t)pos0 * (uint64_t)kv_dim * sizeof(float);
+        const uint64_t coff = (uint64_t)l * kv_row * 2u;                 // fp16
+        const uint64_t kpos = coff + (uint64_t)pos0 * (uint64_t)kv_dim * 2u;
 
         rmsnorm(g_bx, L.off[metal::S_ATTN_NORM], g_bxb, nrow);
 
@@ -829,11 +831,11 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
 
-            // v → cache
+            // v → cache（fp16，所以用 k_copy_h 而不是 k_copy）
             {
                 uint32_t n = (uint32_t)kv_dim;
                 uint64_t zero = 0;
-                [en setComputePipelineState:g_fpipe[F_COPY]];
+                [en setComputePipelineState:g_fpipe[F_COPY_H]];
                 [en setBuffer:g_bvc offset:0 atIndex:0];
                 [en setBytes:&kpos length:8 atIndex:1];
                 [en setBuffer:g_bv offset:0 atIndex:2];
