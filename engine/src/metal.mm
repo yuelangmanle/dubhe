@@ -54,6 +54,16 @@ const char* const kM2Names[K_COUNT] = {
     "mm2_f32", "mm2_f16", "", "", "mm2_q8_0", "mm2_q4_k", "mm2_q6_k"
 };
 
+// MMA 版分块 matmul（第 3 代）。目前只覆盖 Q4_K，其余回退 mm2_*。
+// 空串表示"没有这一档"，派发时跳过。
+const char* const kM3Names[K_COUNT] = {
+    "", "", "", "", "", "mm3_q4_k", ""
+};
+
+// 与 MSL 的 MMA_BN / MMA_NK 一致
+constexpr int kMmaBn = 64;
+constexpr int kMmaNk = 32;
+
 id<MTLDevice>       g_dev = nil;
 id<MTLCommandQueue> g_queue = nil;
 id<MTLLibrary>      g_lib = nil;
@@ -123,6 +133,9 @@ bool init(std::string* err) {
                                   error:&e];
     if (!g_lib) {
         g_err = e ? [[e localizedDescription] UTF8String] : "MSL 编译失败";
+        // 这个错误以前只塞进 g_err 就返回了，调用方静默退回 CPU ——
+        // 症状是"莫名其妙慢十倍"，查了很久。必须打出来。
+        std::fprintf(stderr, "\n[metal] MSL 编译失败: %s\n\n", g_err.c_str());
         if (err) *err = "MSL 编译失败: " + g_err;
         return false;
     }
@@ -294,6 +307,8 @@ const char* const kMmNames[K_COUNT] = {
 id<MTLComputePipelineState> g_mpipe[K_COUNT] = {nil};
 // 二维分块版本（prefill 主路径）。与 g_mpipe 并行存在，格式不支持时为 nil。
 id<MTLComputePipelineState> g_m2pipe[K_COUNT] = {nil};
+// MMA 版本（prefill 第 3 代）。nil 表示该格式没有 MMA 内核，回退 m2。
+id<MTLComputePipelineState> g_m3pipe[K_COUNT] = {nil};
 
 Spec         g_spec;
 bool         g_fwd_ready = false;
@@ -392,6 +407,19 @@ bool fwd_init(const Spec& s, std::string* err) {
             g_err = pe ? [[pe localizedDescription] UTF8String] : "pipeline 创建失败";
             if (err) *err = std::string("pipeline ") + kM2Names[i] + " 失败: " + g_err;
             return false;
+        }
+    }
+    // MMA 版：失败不该让整个前向起不来（老 GPU 可能不支持 simdgroup_matrix），
+    // 记一条日志然后回退 mm2_* 即可。
+    for (int i = 0; i < K_COUNT; i++) {
+        if (g_m3pipe[i] || !kM3Names[i][0]) continue;
+        id<MTLFunction> fn = [g_lib newFunctionWithName:[NSString stringWithUTF8String:kM3Names[i]]];
+        if (!fn) { std::fprintf(stderr, "  MMA 内核缺失 %s，回退 mm2\n", kM3Names[i]); continue; }
+        NSError* pe = nil;
+        g_m3pipe[i] = [g_dev newComputePipelineStateWithFunction:fn error:&pe];
+        if (!g_m3pipe[i]) {
+            std::fprintf(stderr, "  MMA pipeline %s 失败（%s），回退 mm2\n", kM3Names[i],
+                         pe ? [[pe localizedDescription] UTF8String] : "未知");
         }
     }
 
@@ -540,6 +568,27 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         // DUBHE_NO_MM2=1 强制回退到旧内核，用于 A/B 定位。
         static const bool no_mm2 = getenv("DUBHE_NO_MM2") != nullptr;
         const bool tiled = rows > 1 && !no_mm2 && g_m2pipe[k] && (n_in % kMmTileK) == 0;
+
+        // 第 3 代：MMA 版。条件比 mm2 更严 —— 行跨度按 256 元素整块算，
+        // 所以 n_in 必须是 256 的整数倍。DUBHE_NO_MMA=1 用于 A/B。
+        static const bool no_mma = getenv("DUBHE_NO_MMA") != nullptr;
+        const bool mma = rows > 1 && !no_mma && g_m3pipe[k] && (n_in % 256) == 0;
+
+        if (mma) {
+            [en setComputePipelineState:g_m3pipe[k]];
+            [en setBuffer:g_w offset:0 atIndex:0];
+            [en setBuffer:g_bxt offset:0 atIndex:1];
+            [en setBuffer:yout offset:0 atIndex:2];
+            [en setBytes:&nin length:sizeof(nin) atIndex:3];
+            [en setBytes:&woff length:sizeof(woff) atIndex:4];
+            [en setBytes:&nout length:sizeof(nout) atIndex:5];
+            [en setBytes:&nr length:sizeof(nr) atIndex:6];
+            const NSUInteger tgc = (NSUInteger)((n_out + kMmaBn - 1) / kMmaBn);
+            [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            return;
+        }
+
         if (rows > 1) {
             [en setComputePipelineState:tiled ? g_m2pipe[k] : g_mpipe[k]];
         } else {

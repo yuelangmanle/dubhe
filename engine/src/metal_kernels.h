@@ -22,6 +22,7 @@
 
 static const char* kDubheMSL = R"MSL(
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 // 一个 threadgroup 装 4 个 simdgroup → 4 行。128 线程是苹果 GPU 上
@@ -920,6 +921,138 @@ MM2_KERNEL(mm2_f16,  RawF16, ld_f16,  cv_f16,  (n_in * 2u),         (TILE_K * 2u
 MM2_KERNEL(mm2_q8_0, RawQ8,  ld_q8_0, cv_q8_0, ((n_in >> 5) * 34u), ((TILE_K >> 5) * 34u))
 MM2_KERNEL(mm2_q4_k, RawQ4K, ld_q4k,  cv_q4k,  ((n_in >> 8) * 144u), 144u)
 MM2_KERNEL(mm2_q6_k, RawQ6K, ld_q6k,  cv_q6k,  ((n_in >> 8) * 210u), 210u)
+
+// ================================================================ MMA 分块 matmul（prefill，第 3 代）
+//
+// 为什么推倒重写 mm2_*
+// -------------------
+// mm2 把反量化结果留在**寄存器**里：wv[MM_SG][8] 占 32 个，累加器
+// acc[MM_SG][BMAX] 又占 32 个，一共 64+ —— 正好压在寄存器红线上，occupancy
+// 被砍一半。真实模型实测只有 680 GFLOP/s，是本机裸 FMA 峰值 3.1 TFLOP/s 的 22%。
+//
+// 当时的结论是"再复用更多就净亏"，于是所有"提高复用率"的方向（MM_SG↑、
+// BMAX↑、threadgroup 暂存）都被否掉了。**顺序反了**：应该先换掉累加器的
+// 表示方式，再谈复用。换成 MMA 之后：
+//
+//   * 累加器是 simdgroup_float8x8，一个 8x8 块只占 2 个寄存器/lane
+//   * 反量化结果写 threadgroup memory（half），不占寄存器
+//   * 一条 MMA 指令 = 8x8x8 = 512 次乘加 = 16 条 fma/lane
+//
+// 同一台机器上 llama.cpp（走 simdgroup_float8x8）跑 882 tok/s、MLX 840，
+// 我们 184。差距不在硬件也不在指令集，就在这个结构上。
+//
+// 分块
+// ----
+//   每个 threadgroup：BN=64 个输出行 × BMAX=8 个 token，K 方向每次 32 元素。
+//   4 个 simdgroup 各管 16 个输出行（2 个 8x8 累加块）。
+//   128 线程，每行 2 个线程，每个线程反量化 16 个元素 ——
+//   正好是 Q4_K 一个 32 元子块的一半，子块的 scale/min 只算一次。
+//
+// threadgroup 内存：权重 64×32 half = 4 KB，激活 8×32 half = 512 B，
+// 输出暂存 8×64 float = 2 KB，合计 6.6 KB —— 每 core 能驻留 7 个，延迟藏得住。
+
+#define MMA_BN 64
+#define MMA_NK 32
+
+kernel void mm3_q4_k(device const uchar* w      [[buffer(0)]],
+                     device const float* XT     [[buffer(1)]],   // [n_in][BMAX] 已转置
+                     device float* Y            [[buffer(2)]],   // [BMAX][n_out]
+                     constant uint& n_in        [[buffer(3)]],
+                     constant ulong& woff       [[buffer(4)]],
+                     constant uint& n_out       [[buffer(5)]],
+                     constant uint& nrow        [[buffer(6)]],
+                     uint tgid [[threadgroup_position_in_grid]],
+                     uint tid  [[thread_position_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]],
+                     uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half  ws[MMA_BN * MMA_NK];   // 权重：反量化后的 [n][k]
+    threadgroup half  xs[BMAX * MMA_NK];     // 激活：[m][k]
+    threadgroup float cs[BMAX * MMA_BN];     // 输出暂存：[m][n]
+
+    const uint row0 = tgid * MMA_BN;
+    const uint nb   = n_in / MMA_NK;
+    const ulong rbytes = (ulong)(n_in >> 8) * 144u;   // Q4_K：每行 144 字节/256 元素
+
+    // 本线程负责第 lr 行的第 16*half16 .. +16 个元素
+    const uint lr     = tid >> 1;          // 0..63
+    const uint half16 = tid & 1u;          // 0 / 1
+    const uint grow   = row0 + lr;
+    device const uchar* prow = w + woff + (ulong)min(grow, n_out - 1u) * rbytes;
+
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8>(0.f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    for (uint b = 0; b < nb; b++) {
+        const uint k0 = b * MMA_NK;
+
+        // ---- 反量化 16 个元素进 ws[lr][16*half16 ..]
+        {
+            const uint e0    = k0 + (half16 << 4);   // 全局元素下标
+            const uint inblk = e0 & 255u;            // 块内下标
+            const uint chunk = inblk >> 6;           // 0..3
+            const uint inch  = inblk & 63u;          // 0/16/32/48
+            const bool hi    = inch >= 32u;          // 取高半字节还是低半字节
+            const uint sb    = inblk >> 5;           // 子块 0..7
+            device const uchar* q = prow + (ulong)(e0 >> 8) * 144u;
+
+            uchar s1, m1;
+            k4_scale_min(int(sb), q + 4u, s1, m1);
+            const float sc = rd_f16(q)      * float(s1);
+            const float mn = rd_f16(q + 2u) * float(m1);
+
+            // 16 个连续字节：chunk 内偏移 inch&31 起，全部同一种半字节
+            device const uchar* src = q + 16u + (chunk << 5) + (inch & 31u);
+            uint o = lr * MMA_NK + (half16 << 4);
+            for (uint i = 0; i < 16u; i++) {
+                const uint byte = src[i];
+                const uint v = hi ? (byte >> 4) : (byte & 0x0Fu);
+                ws[o + i] = (half)fma(sc, float(v), -mn);
+            }
+        }
+
+        // ---- 激活搬进 xs：8 行 × 32 元素 = 256 个，128 线程每人 2 个
+        for (uint t = 0; t < 2u; t++) {
+            const uint idx = tid * 2u + t;
+            const uint m = idx >> 5;
+            const uint k = idx & 31u;
+            // 超出 nrow 的行必须写 0，否则残留值会进 MMA（虽然结果被丢弃，
+            // 但 NaN/Inf 会拖慢整个 warp，而且不写 0 就依赖上一轮的内容）
+            xs[m * MMA_NK + k] = (m < nrow) ? (half)XT[(ulong)(k0 + k) * BMAX + m] : (half)0;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- 4 个 K 子步 × 2 个 N 块
+        for (uint kk = 0; kk < 4u; kk++) {
+            simdgroup_half8x8 ma;
+            simdgroup_load(ma, xs, MMA_NK, ulong2(kk << 3, 0u), false);
+
+            simdgroup_half8x8 mb0;
+            simdgroup_load(mb0, ws, MMA_NK, ulong2(kk << 3, sg << 4), true);
+            simdgroup_multiply_accumulate(acc0, ma, mb0, acc0);
+
+            simdgroup_half8x8 mb1;
+            simdgroup_load(mb1, ws, MMA_NK, ulong2(kk << 3, (sg << 4) + 8u), true);
+            simdgroup_multiply_accumulate(acc1, ma, mb1, acc1);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- 写回：先落到 threadgroup，再按边界拷到 Y（n_out 不一定是 8 的倍数）
+    simdgroup_store(acc0, cs, MMA_BN, ulong2(sg << 4, 0u), false);
+    simdgroup_store(acc1, cs, MMA_BN, ulong2((sg << 4) + 8u, 0u), false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = 0; t < 4u; t++) {
+        const uint idx = tid * 4u + t;
+        const uint m = idx >> 6;          // 0..7
+        const uint n = idx & 63u;         // 0..63
+        if (m < nrow && row0 + n < n_out)
+            Y[(ulong)m * n_out + row0 + n] = cs[m * MMA_BN + n];
+    }
+}
 
 // ================================================================ 融合算子
 //
