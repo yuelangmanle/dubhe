@@ -319,6 +319,11 @@ void MmProj::smart_resize(int h, int w, int* oh, int* ow) const {
 //  2) patch 内元素顺序是 [c][ph][pw]（通道最外、pw 最内）。这是 GGUF 里
 //     v.patch_embd.weight 的 ne=(16,16,3) 决定的：ne0 最快 → 下标 = pw + 16·ph + 256·c。
 bool MmProj::pack_pixels(const uint8_t* rgb, int w, int h, float* out) const {
+    return pack_pixels2(rgb, rgb, w, h, out);
+}
+
+bool MmProj::pack_pixels2(const uint8_t* rgb0, const uint8_t* rgb1, int w, int h,
+                          float* out) const {
     const auto& c = cfg_;
     if (c.patch <= 0 || w % c.patch || h % c.patch) return false;
     const int P = c.patch, M = c.merge;
@@ -339,12 +344,15 @@ bool MmProj::pack_pixels(const uint8_t* rgb, int w, int h, float* out) const {
                     const int py = (by * M + dy) * P;   // 该 patch 的左上角像素
                     const int px = (bx * M + dx) * P;
                     float* dst = out + p * c.patch_dim();
-                    // 静止图像：两个时间片填同一份内容（与参考实现的复制行为一致）
                     for (int t = 0; t < c.temporal; t++) {
+                        // 静止图像两个时间片是同一帧；视频里 t=0/1 取相邻两帧
+                        const uint8_t* src_rgb = (t == 0 || !rgb1) ? rgb0 : rgb1;
+                        if (c.temporal > 1 && t > 1) src_rgb = rgb1 ? rgb1 : rgb0;
                         float* s = dst + (int64_t)t * slice;
                         for (int ch = 0; ch < 3; ch++) {
                             for (int yy = 0; yy < P; yy++) {
-                                const uint8_t* rowp = rgb + ((size_t)(py + yy) * w + px) * 3 + ch;
+                                const uint8_t* rowp =
+                                    src_rgb + ((size_t)(py + yy) * w + px) * 3 + ch;
                                 float* o = s + (int64_t)ch * P * P + (int64_t)yy * P;
                                 for (int xx = 0; xx < P; xx++)
                                     o[xx] = (float)rowp[(size_t)xx * 3] * scale[ch] - bias[ch];

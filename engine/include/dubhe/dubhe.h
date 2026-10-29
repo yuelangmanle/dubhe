@@ -113,6 +113,13 @@ int  dubhe_load_mmproj(dubhe_engine* e, const char* path);
  * 一张 640×640 的图目前要十几秒，调用方应放到后台线程。 */
 int  dubhe_encode_image(dubhe_engine* e, const char* image_path, float** embeds,
                         int32_t* n_tokens, int32_t* dim);
+
+/* 把一段视频编码成特征：按 fps 抽帧（最多 max_frames 帧），每 2 帧合成一个
+ * temporal patch 过一遍视觉塔，输出按时间顺序拼接。max_side <= 0 表示不缩放，
+ * 否则把长边压到 max_side（省时间的主要手段）。fps <= 0 取 2。 */
+int  dubhe_encode_video(dubhe_engine* e, const char* video_path, double fps,
+                        int32_t max_frames, int32_t max_side,
+                        float** embeds, int32_t* n_tokens, int32_t* dim);
 void dubhe_free_embeds(float* embeds);
 
 /* 把图像/音频塔的输出注入下一次 dubhe_generate：序列里 [at_pos, at_pos+n_tokens)

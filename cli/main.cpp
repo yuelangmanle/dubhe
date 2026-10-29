@@ -14,6 +14,10 @@ struct Args {
     std::string prompt;
     std::string mmproj;      // 视觉/音频塔
     std::string image;       // 输入图片
+    std::string video;       // 输入视频
+    double video_fps = 2.0;  // 抽帧率
+    int   video_frames = 16; // 最多抽几帧
+    int   video_side = 448;  // 长边压到多少像素（0 = 不缩）
     int   n_predict = 256;
     float temp = 0.7f;
     int   top_k = 40;
@@ -34,13 +38,18 @@ void usage() {
         "  dubhe inspect -m <model.gguf>\n"
         "  dubhe run     -m <model.gguf> -p \"提示词\" [-n 256] [--temp 0.7] [--raw] [--stats]\n"
         "  dubhe run     -m <vl.gguf> --mmproj <mmproj.gguf> --image <pic.jpg> -p \"描述这张图\"\n"
+        "  dubhe run     -m <vl.gguf> --mmproj <mmproj.gguf> --video <clip.mp4> -p \"描述这段视频\"\n"
         "  dubhe chat    -m <model.gguf> [--temp 0.7] [-c 4096]\n"
         "  dubhe bench   -m <model.gguf> [-n 128] [--concurrency 1]\n\n"
         "选项:\n"
         "  -m, --model <path>     GGUF 模型路径\n"
         "  -p, --prompt <text>    提示词\n"
-        "      --mmproj <path>    多模态投影器（视觉塔），配合 --image 使用\n"
+        "      --mmproj <path>    多模态投影器（视觉塔），配合 --image / --video 使用\n"
         "      --image <path>     输入图片；prompt 里的 <|image|> 会被替换成图像特征\n"
+        "      --video <path>     输入视频；prompt 里的 <|video|> 会被替换成视频特征\n"
+        "      --video-fps <F>    抽帧率 (默认 2)\n"
+        "      --video-frames <N> 最多抽几帧 (默认 16)\n"
+        "      --video-side <N>   长边压到 N 像素 (默认 448，0 = 不缩)\n"
         "  -n, --predict <N>      最多生成 token 数 (默认 256)\n"
         "  -c, --ctx <N>          上下文长度 (默认取模型训练值)\n"
         "  -t, --threads <N>      线程数 (默认自动)\n"
@@ -77,6 +86,10 @@ bool parse(int argc, char** argv, Args* a) {
         else if (k == "--repeat") { if (!next(&v)) return false; a->rep = (float)atof(v); }
         else if (k == "--mmproj") { if (!next(&v)) return false; a->mmproj = v; }
         else if (k == "--image") { if (!next(&v)) return false; a->image = v; }
+        else if (k == "--video") { if (!next(&v)) return false; a->video = v; }
+        else if (k == "--video-fps") { if (!next(&v)) return false; a->video_fps = atof(v); }
+        else if (k == "--video-frames") { if (!next(&v)) return false; a->video_frames = atoi(v); }
+        else if (k == "--video-side") { if (!next(&v)) return false; a->video_side = atoi(v); }
         else if (k == "--concurrency") { if (!next(&v)) return false; a->concurrency = atoi(v); }
         else if (k == "--stats") a->stats = true;
         else if (k == "--raw") a->raw = true;
@@ -115,20 +128,20 @@ void cb_token(void* ud, int32_t, const char* piece) {
     std::fflush(stdout);
 }
 
-// 把 prompt 里单个 <|image|> 展开成 n 个（HF 的 replace_image_token 就是
-// image_token * num_image_tokens）。展开后返回第一个的位置，即注入起点。
+// 把 prompt 里单个占位符（<|image|> / <|video|>）展开成 n 个（HF 的
+// replace_image_token 就是 token * num_tokens）。展开后返回第一个的位置，即注入起点。
 // 位置必须是**展开之后**的下标，因为注入是按绝对位置覆盖的。
-bool expand_image_token(dubhe_engine* e, std::vector<int32_t>* toks, int n,
-                        int32_t* at, std::string* err) {
+bool expand_mm_token(dubhe_engine* e, std::vector<int32_t>* toks, int n,
+                     const char* ph_text, int32_t* at, std::string* err) {
     int32_t ph = -1;
-    if (dubhe_tokenize(e, "<|image|>", 0, &ph, 1) != 1) {
-        *err = "词表里找不到 <|image|>（这个模型可能不支持图像）";
+    if (dubhe_tokenize(e, ph_text, 0, &ph, 1) != 1) {
+        *err = std::string("词表里找不到 ") + ph_text + "（这个模型可能不支持该模态）";
         return false;
     }
     size_t pos = toks->size();
     for (size_t i = 0; i < toks->size(); i++)
         if ((*toks)[i] == ph) { pos = i; break; }
-    if (pos == toks->size()) { *err = "prompt 里没有 <|image|> 占位符"; return false; }
+    if (pos == toks->size()) { *err = std::string("prompt 里没有 ") + ph_text + " 占位符"; return false; }
     toks->erase(toks->begin() + (long)pos);
     toks->insert(toks->begin() + (long)pos, (size_t)n, ph);
     *at = (int32_t)pos;
@@ -196,13 +209,19 @@ int cmd_run(const Args& a) {
     std::vector<int32_t> toks((size_t)n);
     dubhe_tokenize(e, text.c_str(), 1, toks.data(), n);
 
-    // 图像：先跑视觉塔，再把占位 token 展开成 n_image_tokens 个，
+    // 多模态：先跑视觉塔，再把占位 token 展开成 n 个，
     // 最后把特征按位置挂上去。顺序不能反 —— 展开后的下标才是注入起点。
     float* emb = nullptr;
-    int32_t n_img = 0, img_dim = 0, img_at = -1;
-    if (!a.image.empty()) {
+    int32_t n_mm = 0, mm_dim = 0, mm_at = -1;
+    const bool want_video = !a.video.empty();
+    if (!a.image.empty() || want_video) {
+        if (!a.image.empty() && want_video) {
+            std::fprintf(stderr, "--image 与 --video 暂时只能二选一\n");
+            dubhe_destroy(e);
+            return 1;
+        }
         if (a.mmproj.empty()) {
-            std::fprintf(stderr, "用了 --image 就必须给 --mmproj\n");
+            std::fprintf(stderr, "用了 --image / --video 就必须给 --mmproj\n");
             dubhe_destroy(e);
             return 1;
         }
@@ -211,26 +230,37 @@ int cmd_run(const Args& a) {
             dubhe_destroy(e);
             return 1;
         }
-        std::fprintf(stderr, "视觉塔编码中…\n");
-        if (dubhe_encode_image(e, a.image.c_str(), &emb, &n_img, &img_dim) != DUBHE_OK) {
-            std::fprintf(stderr, "图像编码失败: %s\n", dubhe_last_error());
+        int mrc;
+        if (want_video) {
+            std::fprintf(stderr, "抽帧 + 视觉塔编码中…\n");
+            mrc = dubhe_encode_video(e, a.video.c_str(), a.video_fps, a.video_frames,
+                                     a.video_side, &emb, &n_mm, &mm_dim);
+        } else {
+            std::fprintf(stderr, "视觉塔编码中…\n");
+            mrc = dubhe_encode_image(e, a.image.c_str(), &emb, &n_mm, &mm_dim);
+        }
+        if (mrc != DUBHE_OK) {
+            std::fprintf(stderr, "%s编码失败: %s\n", want_video ? "视频" : "图像",
+                         dubhe_last_error());
             dubhe_destroy(e);
             return 1;
         }
         std::string err;
-        if (!expand_image_token(e, &toks, n_img, &img_at, &err)) {
+        const char* ph = want_video ? "<|video|>" : "<|image|>";
+        if (!expand_mm_token(e, &toks, n_mm, ph, &mm_at, &err)) {
             std::fprintf(stderr, "%s\n", err.c_str());
             dubhe_free_embeds(emb);
             dubhe_destroy(e);
             return 1;
         }
-        if (dubhe_set_mm_embeds(e, emb, n_img, img_at, img_dim) != DUBHE_OK) {
+        if (dubhe_set_mm_embeds(e, emb, n_mm, mm_at, mm_dim) != DUBHE_OK) {
             std::fprintf(stderr, "注入失败: %s\n", dubhe_last_error());
             dubhe_free_embeds(emb);
             dubhe_destroy(e);
             return 1;
         }
-        std::fprintf(stderr, "图像 %d token × %d 维，占位在 prompt[%d]\n", n_img, img_dim, img_at);
+        std::fprintf(stderr, "%s %d token × %d 维，占位在 prompt[%d]\n",
+                     want_video ? "视频" : "图像", n_mm, mm_dim, mm_at);
         n = (int32_t)toks.size();
     }
 

@@ -96,6 +96,11 @@ public:
     // 用 smart_resize 算好目标尺寸）。
     bool pack_pixels(const uint8_t* rgb_hwc, int w, int h, float* out) const;
 
+    // 视频版：一个 patch 的 temporal_patch_size 个时间片来自**相邻的不同帧**。
+    // 静止图像就是 rgb0 == rgb1。
+    bool pack_pixels2(const uint8_t* rgb0, const uint8_t* rgb1, int w, int h,
+                      float* out) const;
+
     // 参考实现 smart_resize：保持长宽比，两边对齐到 patch×merge 的倍数，
     // 总像素落在 [min_px, max_px]。和 HF 的 Lfm3VlImageProcessor 一致。
     void smart_resize(int h, int w, int* oh, int* ow) const;

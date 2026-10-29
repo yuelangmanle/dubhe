@@ -26,7 +26,8 @@ ifeq ($(UNAME_S),Darwin)
   ENGINE_SRCS += engine/src/metal.mm engine/src/image.mm
   OBJCXXFLAGS := $(CXXFLAGS) -fobjc-arc
   LDFLAGS     := -framework Metal -framework Foundation -framework ImageIO \
-                 -framework CoreGraphics -framework CoreFoundation
+                 -framework CoreGraphics -framework CoreFoundation \
+                 -framework AVFoundation -framework CoreMedia
 else
   ENGINE_SRCS += engine/src/metal_stub.cpp engine/src/image_stub.cpp
   LDFLAGS     :=

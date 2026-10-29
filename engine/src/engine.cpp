@@ -265,6 +265,67 @@ int dubhe_encode_image(dubhe_engine* e, const char* image_path, float** embeds,
 
 void dubhe_free_embeds(float* embeds) { std::free(embeds); }
 
+int dubhe_encode_video(dubhe_engine* e, const char* video_path, double fps, int32_t max_frames,
+                       int32_t max_side, float** embeds, int32_t* n_tokens, int32_t* dim) {
+    if (!e || !video_path || !embeds || !n_tokens || !dim) return DUBHE_ERR_INVALID_ARG;
+    if (!e->mmproj) { set_err("未加载 mmproj，无法处理视频"); return DUBHE_ERR_STATE; }
+    if (max_frames < 2) max_frames = 2;
+
+    int w = 0, h = 0;
+    std::vector<std::vector<uint8_t>> frames;
+    std::string err;
+    if (!load_video_frames_rgb(video_path, fps, max_frames, max_side, &w, &h, &frames, &err)) {
+        set_err("抽帧失败: " + err);
+        return DUBHE_ERR_IO;
+    }
+
+    const auto& c = e->mmproj->config();
+    int oh = 0, ow = 0;
+    e->mmproj->smart_resize(h, w, &oh, &ow);
+    const int gh = oh / c.patch, gw = ow / c.patch;
+    const int64_t np = (int64_t)gh * gw;
+    const int64_t nt_step = np / (c.merge * c.merge);
+    const int steps = (int)(frames.size() / 2);      // 每 2 帧合成一个 temporal patch
+
+    const int n_embd = e->model.loaded() ? e->model.cfg().n_embd : c.out_dim;
+    if (c.out_dim != n_embd) {
+        set_err("视觉塔输出 " + std::to_string(c.out_dim) + " 维，模型需要 " +
+                std::to_string(n_embd) + " 维");
+        return DUBHE_ERR_FORMAT;
+    }
+
+    std::vector<uint8_t> f0((size_t)ow * oh * 3), f1((size_t)ow * oh * 3);
+    std::vector<float> pixels((size_t)(np * c.patch_dim()));
+    std::vector<float> one((size_t)(nt_step * c.out_dim));
+    std::vector<float> all;
+    all.reserve((size_t)(nt_step * steps * c.out_dim));
+
+    for (int k = 0; k < steps; k++) {
+        resize_bicubic(frames[(size_t)(2 * k)].data(), w, h, f0.data(), ow, oh);
+        resize_bicubic(frames[(size_t)(2 * k + 1)].data(), w, h, f1.data(), ow, oh);
+        if (!e->mmproj->pack_pixels2(f0.data(), f1.data(), ow, oh, pixels.data())) {
+            set_err("pack_pixels2 失败");
+            return DUBHE_ERR_FORMAT;
+        }
+        // 视觉塔的注意力和卷积都是**每个 temporal 步内**做的（HF 的 frame_shapes
+        // 就是按帧切 batch），所以逐步跑再拼接，和整段一起跑在数学上等价。
+        if (!e->mmproj->encode(pixels.data(), gh, gw, one.data(), &err)) {
+            set_err("视觉塔前向失败: " + err);
+            return DUBHE_ERR_STATE;
+        }
+        all.insert(all.end(), one.begin(), one.end());
+    }
+
+    const int64_t total = nt_step * steps;
+    float* buf = (float*)std::malloc(sizeof(float) * (size_t)total * (size_t)c.out_dim);
+    if (!buf) { set_err("内存不足"); return DUBHE_ERR_OOM; }
+    std::memcpy(buf, all.data(), sizeof(float) * (size_t)total * (size_t)c.out_dim);
+    *embeds = buf;
+    *n_tokens = (int32_t)total;
+    *dim = c.out_dim;
+    return DUBHE_OK;
+}
+
 int dubhe_set_mm_embeds(dubhe_engine* e, const float* embeds, int32_t n_tokens,
                         int32_t at_pos, int32_t dim) {
     if (!e || !embeds || n_tokens <= 0) { set_err("多模态特征为空"); return DUBHE_ERR_INVALID_ARG; }

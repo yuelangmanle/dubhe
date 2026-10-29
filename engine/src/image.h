@@ -20,6 +20,18 @@ namespace dubhe {
 bool load_image_rgb(const char* path, int* w, int* h, std::vector<uint8_t>* rgb,
                     std::string* err);
 
+// 视频抽帧。按 fps 均匀取帧，最多 max_frames 帧；所有帧统一缩放到**第一帧**的
+// 尺寸（视觉塔要求同一批 patch 形状一致，而手机视频的尺寸偶尔会中途变化）。
+// frames 里是连续排列的 RGB8，每帧 w*h*3 字节。
+// max_side 限制长边像素（视频原始 1080p 一帧就是 8160 个 patch，必须先缩）。
+//
+// 抽帧而不是"每帧都算"：LFM3-VL 的 temporal_patch_size = 2，两帧合成一个
+// patch，而 24/30 fps 的相邻帧差异极小 —— 按 fps 抽稀到 1–2 fps 通常不损失
+// 语义，却把 token 数直接砍掉一个数量级。
+bool load_video_frames_rgb(const char* path, double fps, int max_frames, int max_side,
+                           int* w, int* h, std::vector<std::vector<uint8_t>>* frames,
+                           std::string* err);
+
 // 双三次缩放。用的是 Catmull-Rom（a = -0.5），与 PIL 的 BICUBIC 一致 ——
 // 预处理必须和参考实现对齐，否则同一张图在两边会切出不同的像素，
 // 视觉塔的输出差异会被误判成"引擎算错了"。

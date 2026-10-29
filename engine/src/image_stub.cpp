@@ -16,6 +16,14 @@ bool load_image_rgb(const char* path, int* w, int* h, std::vector<uint8_t>* rgb,
     return false;
 }
 
+bool load_video_frames_rgb(const char* path, double fps, int max_frames, int max_side,
+                           int* w, int* h, std::vector<std::vector<uint8_t>>* frames,
+                           std::string* err) {
+    (void)path; (void)fps; (void)max_frames; (void)max_side; (void)w; (void)h; (void)frames;
+    if (err) *err = "本平台的视频抽帧尚未接入（macOS 走 AVFoundation，其他平台待补）";
+    return false;
+}
+
 void resize_bicubic(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) {
     if (sw == dw && sh == dh) { std::memcpy(dst, src, (size_t)sw * sh * 3); return; }
     // 最近邻兜底，保证不崩
