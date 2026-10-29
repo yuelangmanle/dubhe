@@ -2,7 +2,7 @@
 
 > Apple Silicon MacBook 与 Android 手机上的本地大模型推理引擎。GGUF 原生直读，单路与多路都不掉速。
 
-状态：M0 已交付（引擎 + CLI + HTTP + Web UI 全链路可跑）· **M1 Metal GPU 后端已上线** · 闭源 · 私有仓库
+状态：M0 已交付（引擎 + CLI + HTTP + Web UI 全链路可跑）· **M1 Metal GPU 后端 + 批处理 prefill 已上线** · 闭源 · 私有仓库
 
 ---
 
@@ -10,7 +10,8 @@
 
 ```bash
 make                        # 零外部依赖，只需要 Xcode 命令行工具
-make check                  # 一条命令自检：加载 → 分词 → 前向 → 生成
+make check                  # 一条命令自检：加载 → 分词 → 前向 → 生成（GPU + CPU 双路径）
+make optest                 # 7 个 Metal 融合算子逐个和 C 参考实现对拍
 
 # 命令行对话
 ./build/dubhe chat -m ~/.dubhe/models/qwen2.5-0.5b-instruct/qwen2.5-0.5b-instruct-q4_k_m.gguf
@@ -22,15 +23,22 @@ make check                  # 一条命令自检：加载 → 分词 → 前向 
 ./build/dubhed -m <model.gguf> --share
 ```
 
-实测（Qwen2.5-0.5B-Instruct-Q4_K_M，M4 24GB）：
+实测（Qwen2.5-0.5B-Instruct-Q4_K_M，M4 24GB，短上下文）：
 
 | 后端 | decode | prefill |
 | --- | --- | --- |
 | CPU · NEON | 20.6 tok/s | 21.3 tok/s |
-| **Metal GPU** | **60.9 tok/s** | **70.0 tok/s** |
+| **Metal GPU** | **79–84 tok/s** | **382 tok/s** |
 
-GPU 路径的 logits 与纯 f32 基准最大差 **1e-4**，比 CPU 的 Q8 激活量化路径
-（3e-2）还准。`make gpu` 一条命令复现这个对比。
+长上下文（631 token 提示）GPU 侧：prefill **276–318 tok/s**，decode
+**47–52 tok/s**。同一台机器上 CPU 路径是 25 / 23 tok/s。
+
+> 这台测试机的绝对带宽只有真实 M4 的约 1/6（裸带宽实测 17 GB/s，真机应在
+> 100 GB/s 量级），所以绝对数字仅供参考，**倍数**是背靠背交替测量得出的。
+
+数值一致性：GPU 与纯 f32 基准逐位置 logits 最大差 **3e-5**、cosine
+1.000000；631 token 上下文下贪心输出与 CPU **逐字一致**。
+`make gpu` 复现性能对比，`make optest` 逐个算子对拍。
 
 ## 界面
 
@@ -63,6 +71,8 @@ GPU 路径的 logits 与纯 f32 基准最大差 **1e-4**，比 CPU 的 Q8 激活
 | API 网关 | `--share` 局域网共享 + `sk-dubhe-…` 密钥 | ✅ M0 |
 | `dubhe-bench` | 与 llama.cpp / MLX 对打的基准客户端 | M1 |
 | Metal 后端 | 运行时编译 MSL，整层前向单 command buffer，权重零拷贝 | ✅ M1 |
+| 批处理 prefill | 权重读一遍喂 8 个 token，激活转置成 `[n_in][8]` 用 `float4` 取 | ✅ M1 |
+| split-K 注意力 | 长上下文按 key 区间切 8 段并行，combine 归并 | ✅ M1 |
 | Android | NDK + NEON + NPU | M4 |
 | 双端原生 App | SwiftUI / Compose | M5 |
 
@@ -84,8 +94,8 @@ GPU 路径的 logits 与纯 f32 基准最大差 **1e-4**，比 CPU 的 Q8 激活
 ## 技术栈
 
 C++20 / Objective-C++（内核）· ARM NEON + `vdotq_s32`（整数点积）·
-libdispatch（行并行）· Metal Shading Language（运行时编译，零拷贝统一内存）·
-零外部依赖构建（只用系统 clang）
+libdispatch（行并行）· Metal Shading Language（运行时编译，零拷贝统一内存，
+simdgroup 级并行）· 零外部依赖构建（只用系统 clang）
 
 ## 目录
 

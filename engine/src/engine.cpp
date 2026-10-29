@@ -225,10 +225,17 @@ int dubhe_generate(dubhe_engine* e,
 
     const double t0 = now_ms();
     std::string err;
-    for (int32_t i = 0; i < n_prompt; i++) {
-        if (!e->model.forward(prompt[i], i, logits.data(), &err)) {
-            set_err(err);
-            return DUBHE_ERR_STATE;
+    // prefill：按引擎实际批大小切块。GPU 上一次提交吃 8 个 token，
+    // 权重只读一遍就摊到 8 个 token 上——这是首字延迟的关键。
+    {
+        const int nb = std::max(1, e->model.batch_size());
+        for (int32_t i = 0; i < n_prompt; ) {
+            const int take = std::min<int>(nb, n_prompt - i);
+            if (!e->model.forward_batch(prompt + i, take, i, logits.data(), &err)) {
+                set_err(err);
+                return DUBHE_ERR_STATE;
+            }
+            i += take;
         }
     }
     const double t1 = now_ms();

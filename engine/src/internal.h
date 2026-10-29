@@ -262,6 +262,11 @@ public:
 
     // 一次前向：给定最后一个 token 与已有 KV，输出 logits（n_vocab）
     bool forward(int32_t token, int32_t pos, float* logits, std::string* err);
+    // 批量前向（prefill）：tokens[0..n) 连续喂入，pos0 是首 token 的位置。
+    // 只有最后一个 token 的 logits 有效。n==1 时等价于 forward()。
+    bool forward_batch(const int32_t* tokens, int n, int32_t pos0, float* logits, std::string* err);
+    // 引擎实际使用的批大小（GPU 不可用时为 1）
+    int  batch_size() const;
     void reset_kv();
 
     // 供 UI / 统计使用
@@ -297,6 +302,7 @@ private:
 
     std::vector<float> x_, xb_, xb2_, q_, k_, v_, attn_out_, gate_, up_, ffn_out_;
     std::vector<float> logits_;
+    std::vector<float> xbatch_;        // 批量 embedding 暂存 [batch][n_embd]
     mutable std::vector<uint8_t> aq_;  // 量化激活缓冲（matvec 复用）
 
     uint64_t n_params_ = 0;

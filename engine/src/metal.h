@@ -17,6 +17,10 @@ const char* last_error();
 
 // 把整块 mmap 权重零拷贝绑成 MTLBuffer。base 必须页对齐。
 bool bind_weights(const void* base, size_t size, std::string* err);
+// 只释放权重绑定与前向缓冲，**不**拆设备/命令队列。
+// 模型卸载必须走这个：device 和 library 是进程级共享的，
+// 一个模型 unload 把全局状态拆了，同进程里其它模型立刻失效。
+void unbind_weights();
 
 // 该权重类型 + n_in 是否能走 GPU
 bool supports(uint32_t type, int n_in);
@@ -59,6 +63,11 @@ bool fwd_init(const Spec& s, std::string* err);
 bool fwd_grow_kv(int new_cap, std::string* err);
 // 一次解码步。x0 是已反量化的 embedding（n_embd 个 float）。
 bool fwd_token(const float* x0, int pos, float* logits, std::string* err);
+// prefill 批处理：x0 是 [nrow][n_embd] 已反量化的 embedding，pos0 是首行位置。
+// 只有最后一行需要 logits，其余行的 out_w 被省掉。
+bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* err);
+// 批大小上限（与着色器 BMAX 一致）
+int fwd_batch_max();
 
 }  // namespace metal
 }  // namespace dubhe

@@ -6,6 +6,50 @@
 
 ---
 
+## [0.3.0] · 2026-10-29 · 底层三处结构性优化
+
+### 基准（Qwen2.5-0.5B-Instruct Q4_K_M，M4 24GB，背靠背交替测量）
+
+| 场景 | 上一版 | 本版 | 倍数 |
+|---|---|---|---|
+| 短上下文 prefill | 87–92 tok/s | **382 tok/s** | **4.3x** |
+| 短上下文 decode | 78–79 tok/s | **79–84 tok/s** | 持平 |
+| 631 tok prefill | 47 tok/s | **276–318 tok/s** | **6.0x** |
+| 631 tok decode | 33–35 tok/s | **47–52 tok/s** | **1.5x** |
+
+### 新增
+- **批处理 prefill**（`mm_*` 内核 + `fwd_batch`）：权重读一遍喂 8 个 token，
+  算术强度 ×8。prefill 内 `out_w` 只对最后一行计算（它是全模型最大的单个
+  矩阵乘，占权重流量 36%）。
+- **激活转置布局** `[n_in][BMAX]`：一个权重值的 8 次 fma 从 8 条标量加载
+  变成 2 条 `float4`。转置时对 `j >= nrow` 填 0，内核里彻底去掉分支。
+- **split-K 注意力**（`k_attn_split` + `k_attn_comb`）：长上下文把 key 区间
+  切成 nsp 段并行算局部 (m, l, acc) 再归并。nsp 随上下文长度增长，上限 8。
+- `make optest`：7 个 Metal 融合算子逐个与 C 参考实现对拍
+  （`tools/gpu_optest.mm`），覆盖 rows=1/3、nsp=1/4、多种 head_dim。
+- `metal::unbind_weights()`：卸载模型只释放权重绑定，不再拆全局 device /
+  library（否则同进程里其它模型一起失效）。
+- `dubhe_model_info.backend` 字段；`make check` 覆盖 GPU/CPU 双路径。
+
+### 变更
+- **matvec 并行粒度**：一线程一行 → 一个 simdgroup 一行（32 lane 分摊行内
+  元素 + `simd_sum` 归约）。ffn_down 的线程数从 896 → 28672。
+- Q4_K 的 min 项折进逐元素 fma，省掉一遍 x 求和。
+- 注意力在 `nsp == 1`（短上下文）时走融合版内核——split 版在这个区间是
+  纯亏的，实测会拖低 decode 25%。
+
+### 修复
+- **公共 lambda 漏绑 buffer**：`add`/`silu` 收进只 `setPipeline` 的公共
+  lambda 后，`k_add` 读到上一次 `gemm` 的绑定，`d` 指向权重 mmap。症状是
+  "输出等于输入 embedding"。
+- **原地 rmsnorm 的 aliasing**：最后一层 norm 改为写入独立的 `g_bfinal`。
+
+### 文档
+- 进度书 v2.3：§9.6 记录三处优化、两个 bug、以及"绝对数字不可信，只信
+  交替对比"的测量方法。
+
+---
+
 ## [0.2.0] · 2026-10-29 · Metal GPU 后端
 
 ### 基准（Qwen2.5-0.5B-Instruct Q4_K_M，M4 24GB，本机）

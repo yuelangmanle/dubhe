@@ -37,7 +37,7 @@ TOOL_OBJS   := $(BUILD)/tools/selftest.o $(BUILD)/tools/ggufdump.o
 
 MODEL ?= $(HOME)/.dubhe/models/qwen2.5-0.5b-instruct/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
-.PHONY: all clean tools run inspect bench serve check gpu
+.PHONY: all clean tools run inspect bench serve check gpu optest
 
 all: $(BIN) $(SRV) tools
 
@@ -59,6 +59,13 @@ $(BUILD)/selftest: $(ENGINE_OBJS) $(BUILD)/tools/selftest.o
 
 $(BUILD)/ggufdump: $(BUILD)/engine/src/gguf.o $(BUILD)/engine/src/quant.o $(BUILD)/tools/ggufdump.o
 	$(CXX) $^ -o $@ $(LDFLAGS)
+	@echo "✓ $@"
+
+# 融合算子逐个对拍：整个前向是 400 多个 dispatch 编进一个 command buffer，
+# 错一个的症状只有"输出乱码"，从外面看不出是哪个。这个工具几秒定位。
+$(BUILD)/optest: tools/gpu_optest.mm engine/src/metal_kernels.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(OBJCXXFLAGS) $< -o $@ $(LDFLAGS)
 	@echo "✓ $@"
 
 $(BUILD)/%.o: %.cpp
@@ -91,6 +98,10 @@ check: all
 	./$(BUILD)/selftest $(MODEL) "你好，请用一句话介绍你自己。"
 	@echo "── CPU 路径 ──"
 	@DUBHE_NO_GPU=1 ./$(BUILD)/selftest $(MODEL) "你好，请用一句话介绍你自己。" 2>&1 | tail -3
+
+# 逐个算子对拍（仅 Apple）
+optest: $(BUILD)/optest
+	./$(BUILD)/optest
 
 # GPU / CPU 对比
 gpu: $(BIN)

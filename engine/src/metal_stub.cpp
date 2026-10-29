@@ -18,6 +18,7 @@ bool bind_weights(const void*, size_t, std::string* err) {
     if (err) *err = "Metal 不可用";
     return false;
 }
+void unbind_weights() {}
 bool supports(uint32_t, int) { return false; }
 bool mfvec(uint32_t, const float*, float*, int, int, uint64_t) { return false; }
 
@@ -27,6 +28,11 @@ bool fwd_token(const float*, int, float*, std::string* err) {
     if (err) *err = "Metal 不可用";
     return false;
 }
+bool fwd_batch(const float*, int, int, float*, std::string* err) {
+    if (err) *err = "Metal 不可用";
+    return false;
+}
+int fwd_batch_max() { return 1; }
 
 }  // namespace metal
 }  // namespace dubhe

@@ -354,7 +354,7 @@ void Model::unload() {
     loaded_ = false;
     gpu_active_ = false;
     // 必须在 file_.close() 之前释放：MTLBuffer 引用的就是那块 mmap
-    metal::shutdown();
+    metal::unbind_weights();
     layers_.clear();
     k_cache_.clear();
     v_cache_.clear();
@@ -464,6 +464,46 @@ void Model::rope(float* q, float* k, int n_head, int n_head_kv, int head_dim, in
             v[i + half] = x0 * s + x1 * c;
         }
     }
+}
+
+int Model::batch_size() const {
+    if (!gpu_active_) return 1;
+    return metal::fwd_batch_max();
+}
+
+// prefill 批处理。GPU 可用时一次提交算完 n 个 token；否则退化成 n 次
+// 单 token 前向（结果一致，只是慢——CPU 侧还没有批量内核）。
+bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* logits,
+                          std::string* err) {
+    if (!loaded_) { if (err) *err = "模型未加载"; return false; }
+    if (n <= 0 || !tokens) { if (err) *err = "空批"; return false; }
+    if (n == 1) return forward(tokens[0], pos0, logits, err);
+
+    if (!gpu_active_) {
+        for (int i = 0; i < n; i++) {
+            if (!forward(tokens[i], pos0 + i, logits, err)) return false;
+        }
+        return true;
+    }
+
+    if (pos0 + n > n_ctx_) { if (err) *err = "上下文已满"; return false; }
+    if (pos0 + n > kv_cap_ && !grow_kv(pos0 + n)) { if (err) *err = "KV cache 扩容失败"; return false; }
+
+    const int n_embd = cfg_.n_embd;
+    xbatch_.resize((size_t)n * (size_t)n_embd);
+    for (int i = 0; i < n; i++) {
+        const void* row = (const char*)file_.tensor_data(tok_embd_) +
+                          (size_t)tokens[i] * type_row_bytes(tok_embd_.type, n_embd);
+        dequant_row(tok_embd_.type, row, xbatch_.data() + (size_t)i * n_embd, n_embd);
+    }
+
+    if (!metal::fwd_batch(xbatch_.data(), n, pos0, logits, err)) {
+        gpu_active_ = false;
+        if (err && err->empty()) *err = "GPU 批处理前向失败";
+        return false;
+    }
+    kv_len_ = pos0 + n;
+    return true;
 }
 
 bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err) {
