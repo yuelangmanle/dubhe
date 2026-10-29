@@ -34,6 +34,9 @@
     server: null,
     tools: true,
     attach: null,   // 待发送的图片/音频/视频（一次只允许一个）
+    logs: [],       // 右栏系统日志：只记真实事件，不编
+    gen: null,      // 本轮生成统计 { tokens, tps, total, ttft }
+    q: '',          // 左栏搜索关键词
     abort: null,    // 生成中的 AbortController，用于"停止"
   };
 
@@ -138,29 +141,37 @@
     const list = $('#convList');
     list.innerHTML = '';
     if (!state.convs.length) {
-      const tip = el('div', 'hw', '还没有对话');
-      tip.style.padding = '14px 12px';
-      list.appendChild(tip);
+      list.appendChild(el('div', 'conv-empty', '还没有对话。点上面的 ＋ 开始。'));
       return;
     }
-    for (const c of state.convs) {
-      const d = el('div', 'conv lit' + (state.current && c.id === state.current.id ? ' active' : ''));
-      d.appendChild(el('span', 'dot'));
+    const q = (state.q || '').trim().toLowerCase();
+    const items = q ? state.convs.filter((c) => (c.title || '').toLowerCase().includes(q)) : state.convs;
+    if (!items.length) {
+      list.appendChild(el('div', 'conv-empty', '没有匹配的对话'));
+      return;
+    }
+    for (const c of items) {
+      const active = state.current && c.id === state.current.id;
+      const d = el('div', 'conv' + (active ? ' active' : ''));
+      const ci = el('span', 'ci');
+      ci.appendChild(iconNode('chat', 'i'));
+      d.appendChild(ci);
       d.appendChild(el('span', 'conv-title', c.title));
       d.onclick = () => {
         state.current = c;
         renderConvList();
         renderMessages();
+        renderTools();
         $('#convTitle').textContent = c.title;
-        if (window.innerWidth <= 760) closeSidebar();
+        if (window.innerWidth <= 860) closeSidebar();
       };
       list.appendChild(d);
     }
   }
 
   function messageNode(m) {
-    const wrap = el('div', 'msg ' + m.role);
     if (m.role === 'user') {
+      const wrap = el('div', 'msg user');
       const b = el('div', 'bubble');
       if (m.att) {
         if (m.att.kind === 'image' && m.att.thumb) {
@@ -182,16 +193,43 @@
       wrap.appendChild(b);
       return wrap;
     }
+
+    // 助手消息：头像 + 内容列。头像不是装饰 —— 它让"谁在说话"不用读文字就分得清。
+    const wrap = el('div', 'msg assistant');
+    const av = el('div', 'avatar');
+    av.appendChild(iconNode('logo', 'i'));
+    wrap.appendChild(av);
+    const col = el('div', 'col');
+    wrap.appendChild(col);
+
+    const st = el('div', 'msg-status');
+    if (m.meta && (m.meta.tokens || m.meta.tps)) {
+      st.appendChild(el('span', 'dot-ok'));
+      st.appendChild(el('span', '', '已完成'));
+      if (m.meta.tokens) {
+        st.appendChild(el('span', 'sp', '·'));
+        st.appendChild(el('span', '', m.meta.tokens + ' tokens'));
+      }
+      if (m.meta.tps) {
+        st.appendChild(el('span', 'sp', '·'));
+        st.appendChild(el('span', '', m.meta.tps.toFixed(1) + ' tok/s'));
+      }
+      col.appendChild(st);
+    } else if (m.streaming) {
+      st.appendChild(el('span', '', '生成中…'));
+      col.appendChild(st);
+    }
+
     const body = el('div', 'body');
     body.innerHTML = renderMarkdown(stripToolCalls(m.content || ''));
-    wrap.appendChild(body);
+    col.appendChild(body);
 
     if (m.tools && m.tools.length) {
       for (const t of m.tools) {
         const card = el('div', 'tool-card' + (t.ok === false ? ' failed' : ''));
         const head = el('div', 'tool-head');
         const ic = el('span', 'ic');
-        ic.appendChild(iconNode(t.ok === false ? 'x' : 'bolt', 'i'));
+        ic.appendChild(iconNode(t.ok === false ? 'x' : 'terminal', 'i'));
         head.appendChild(ic);
         head.appendChild(el('span', '', '调用工具'));
         head.appendChild(el('span', 'tool-name', t.name));
@@ -200,7 +238,7 @@
           const tb = el('div', 'tool-body', t.output.slice(0, 1200));
           card.appendChild(tb);
         }
-        wrap.appendChild(card);
+        col.appendChild(card);
       }
     }
 
@@ -208,7 +246,7 @@
       const meta = el('div', 'meta');
       if (m.meta.tps) meta.appendChild(el('span', '', m.meta.tps.toFixed(1) + ' tok/s'));
       if (m.meta.tokens) meta.appendChild(el('span', '', m.meta.tokens + ' tokens'));
-      wrap.appendChild(meta);
+      col.appendChild(meta);
     }
     return wrap;
   }
@@ -233,40 +271,266 @@
   }
 
   // ---------------------------------------------------------------- 服务端
+  function fmtCtx(n) {
+    if (!n) return '—';
+    return n >= 1024 ? Math.round(n / 1024) + 'K' : String(n);
+  }
+  function parseSysRam(hw) {
+    const m = /([\d.]+)\s*GB/.exec(hw || '');
+    return m ? parseFloat(m[1]) : 0;
+  }
+  const GB = 1073741824;
+
   async function refreshState() {
     try {
       const r = await fetch('/api/state');
       const s = await r.json();
+      const first = !state.server;
       state.server = s;
-      const chip = $('#modelChip');
-      if (s.loaded && s.info) {
-        const p = (s.info.params / 1e9).toFixed(2);
-        chip.textContent = `${s.info.arch} · ${s.info.quant} · ${p}B`;
-        chip.classList.add('live');
-        chip.title = s.model;
-      } else {
-        chip.textContent = '未加载模型 · 点击设置';
-        chip.classList.remove('live');
-      }
+      renderHead(s);
+      renderModelInfo(s);
+      renderMeters(s);
+      renderRes(s);
       $('#hwInfo').textContent = s.hardware || '';
-      // 只有加载了视觉塔/语音塔才露出附件入口
+      // 只有加载了视觉塔/语音塔才露出对应入口
       const att = $('#btnAttach');
       if (att) att.hidden = !(s.mm_vision || s.mm_audio);
+      const bi = $('#btnImage');
+      if (bi) {
+        bi.disabled = !s.mm_vision;
+        bi.classList.toggle('dim', !s.mm_vision);
+      }
+      const mi = $('#btnMic');
+      if (mi) {
+        mi.disabled = !s.mm_audio;
+        mi.classList.toggle('dim', !s.mm_audio);
+      }
+      if (first) {
+        log(s.loaded ? 'Model loaded successfully.' : 'No model loaded.', s.loaded ? '' : 'err');
+        if (s.info && s.info.gpu) log('Using Metal (GPU) ...');
+      }
       return s;
     } catch (e) {
-      $('#modelChip').textContent = '服务未连接';
+      $('#mpName').textContent = '服务未连接';
+      $('#mpTags').innerHTML = '';
+      $('#liveBadge').classList.remove('on');
+      $('#liveBadge').querySelector('span').textContent = '未连接';
       return null;
+    }
+  }
+
+  // ---------------------------------------------------------------- 右栏
+  // 量化标签取 model_id 里的主量化标记（Q4_K_M），而不是 info.quant 串。
+  // info.quant 是逐层拼起来的，比如 "F32+Q4_K+Q6_K" —— 尾项 Q6_K 是输出层，
+  // 拿它当标签等于说这个模型是 Q6_K，和实际主体差两档。
+  // 顶栏胶囊和右栏模型信息共用这一个函数，两处不能各写一套。
+  function quantLabel(s) {
+    const qm = /(IQ\d[_A-Z0-9]*|Q\d[_A-Z0-9]*|BF16|F16|F32)/.exec((s && s.model_id) || '');
+    if (qm) return qm[1];
+    // model_id 里没有量化标记时退回 quant 串：跳过 F32/F16 这类"未量化"的边角层，
+    // 取第一个真正的量化块。全都未量化才显示 F32。
+    const parts = (((s && s.info && s.info.quant) || '')).split('+').filter(Boolean);
+    return parts.find((x) => !/^(F32|F16|BF16)$/.test(x)) || parts[0] || '';
+  }
+
+  function renderHead(s) {
+    const name = $('#mpName');
+    const tags = $('#mpTags');
+    const live = $('#liveBadge');
+    if (!name) return;
+    tags.innerHTML = '';
+    if (s && s.loaded && s.info) {
+      name.textContent = s.model_id || '已加载';
+      const i = s.info;
+      const bits = [
+        (i.params / 1e9).toFixed(2) + 'B',
+        quantLabel(s),
+        fmtCtx(i.n_ctx),
+      ].filter(Boolean);
+      for (const t of bits) tags.appendChild(el('span', '', t));
+      live.classList.add('on');
+      live.querySelector('span').textContent = '本地运行 · 已加载';
+    } else {
+      name.textContent = s ? '未加载模型' : '服务未连接';
+      live.classList.remove('on');
+      live.querySelector('span').textContent = s ? '空闲' : '未连接';
+    }
+  }
+
+  function renderModelInfo(s) {
+    const kv = $('#modelKv');
+    const nm = $('#mcName');
+    const tg = $('#mcTag');
+    if (!kv) return;
+    kv.innerHTML = '';
+    if (!s || !s.info) {
+      nm.textContent = '未加载';
+      tg.textContent = '空闲';
+      tg.className = 'tag off';
+      return;
+    }
+    const i = s.info;
+    nm.textContent = s.model_id || i.arch;
+    tg.textContent = '本地';
+    tg.className = 'tag';
+    const rows = [
+      ['参数量', (i.params / 1e9).toFixed(2) + 'B'],
+      ['量化', quantLabel(s)],
+      ['架构', i.arch],
+      ['层数', String(i.n_layer)],
+      ['上下文', fmtCtx(i.n_ctx)],
+      ['词表', i.n_vocab >= 1000 ? Math.round(i.n_vocab / 1000) + 'K' : String(i.n_vocab)],
+    ];
+    for (const [k, v] of rows) {
+      const row = el('div', 'kv');
+      row.appendChild(el('span', 'k', k));
+      row.appendChild(el('span', 'v', v));
+      kv.appendChild(row);
+    }
+  }
+
+  // 内存条只显示实测值（进程 RSS / 系统内存），不做估算。
+  // 估算值一旦和活动监视器对不上，这块面板就没人信了。
+  function renderMeters(s) {
+    const box = $('#meters');
+    if (!box) return;
+    const rows = [];
+    const sysGB = parseSysRam(s && s.hardware);
+    const rssGB = s && s.rss_bytes ? s.rss_bytes / GB : 0;
+    if (sysGB && rssGB) {
+      rows.push({
+        label: '内存',
+        pct: Math.min(100, (rssGB / sysGB) * 100),
+        val: rssGB.toFixed(1) + ' / ' + sysGB.toFixed(0) + ' GB',
+      });
+    }
+    const maxTok = settings.max_tokens || 1024;
+    const genTok = state.gen && state.gen.tokens ? state.gen.tokens : 0;
+    rows.push({
+      label: '生成',
+      pct: Math.min(100, (genTok / maxTok) * 100),
+      val: genTok + ' / ' + maxTok,
+    });
+
+    box.innerHTML = '';
+    for (const r of rows) {
+      const m = el('div', 'meter');
+      m.appendChild(el('span', 'm-label', r.label));
+      const bar = el('span', 'm-bar');
+      const fill = el('i');
+      if (r.pct >= 88) fill.className = 'warn';
+      fill.style.width = r.pct.toFixed(1) + '%';
+      bar.appendChild(fill);
+      m.appendChild(bar);
+      m.appendChild(el('span', 'm-val', r.val));
+      box.appendChild(m);
+    }
+    if (s && s.info) {
+      const bits = [];
+      bits.push(s.info.gpu ? 'Metal' : 'CPU');
+      bits.push('上下文 ' + fmtCtx(s.info.n_ctx));
+      if (s.info.chatml) bits.push('ChatML');
+      box.appendChild(el('div', 'meter-note', bits.join(' · ')));
+    }
+  }
+
+  // 左栏底部的资源条：和右栏内存条同源，只是换了呈现方式。
+  function renderRes(s) {
+    const txt = $('#resTxt');
+    const bar = $('#resBar');
+    if (!txt || !bar) return;
+    const sysGB = parseSysRam(s && s.hardware);
+    const rssGB = s && s.rss_bytes ? s.rss_bytes / GB : 0;
+    if (!sysGB || !rssGB) {
+      txt.textContent = '—';
+      bar.style.width = '0';
+      return;
+    }
+    txt.textContent = rssGB.toFixed(1) + ' / ' + sysGB.toFixed(0) + ' GB';
+    bar.style.width = Math.min(100, (rssGB / sysGB) * 100).toFixed(1) + '%';
+  }
+
+  // 环形仪表：满量程 60 tok/s。固定量程比自适应好 ——
+  // 自适应会让"快"和"慢"看起来一样，环形就失去参照意义了。
+  const TPS_MAX = 60;
+  const GAUGE_ARC = 235.6;
+  function setGauge(tps, tokens, total, ttft) {
+    const fill = $('#gaugeFill');
+    if (!fill) return;
+    const pct = Math.max(0, Math.min(1, (tps || 0) / TPS_MAX));
+    fill.setAttribute('stroke-dasharray', (pct * GAUGE_ARC).toFixed(1) + ' 314.2');
+    $('#gTps').textContent = tps ? tps.toFixed(1) : '—';
+    $('#gTok').textContent = tokens ? tokens.toLocaleString() : '0';
+    $('#gTime').textContent = total ? total.toFixed(1) + ' s' : '—';
+    $('#gTtft').textContent = ttft ? ttft.toFixed(2) + ' s' : '—';
+  }
+
+  function log(msg, kind) {
+    const d = new Date();
+    const t = [d.getHours(), d.getMinutes(), d.getSeconds()]
+      .map((n) => String(n).padStart(2, '0')).join(':');
+    state.logs.push({ t, msg, kind: kind || '' });
+    if (state.logs.length > 80) state.logs.shift();
+    renderLogs();
+  }
+  function renderLogs() {
+    const box = $('#logBox');
+    if (!box) return;
+    box.innerHTML = '';
+    for (const l of state.logs) {
+      const line = el('div');
+      line.appendChild(el('span', 't', '[' + l.t + '] '));
+      line.appendChild(el('span', l.kind === 'err' ? 'e' : '', l.msg));
+      box.appendChild(line);
+    }
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function renderTools() {
+    const box = $('#toolList');
+    if (!box) return;
+    const c = state.current;
+    let tools = [];
+    if (c) for (const m of c.messages) if (m.tools) tools = tools.concat(m.tools);
+    const cnt = $('#toolCount');
+    if (cnt) cnt.textContent = String(tools.length);
+    box.innerHTML = '';
+    if (!tools.length) {
+      box.appendChild(el('div', 'tool-empty', '本轮对话还没有调用工具'));
+      return;
+    }
+    for (const t of tools.slice(-8)) {
+      const row = el('div', 'tool-row' + (t.ok === false ? ' fail' : ''));
+      const ti = el('span', 'ti');
+      ti.appendChild(iconNode(t.ok === false ? 'x' : 'terminal', 'i'));
+      row.appendChild(ti);
+      row.appendChild(el('span', 'tn', t.name));
+      const td = el('span', 'td');
+      if (t.ok === false) {
+        td.appendChild(el('span', '', '失败'));
+      } else {
+        td.appendChild(iconNode('check', 'i'));
+        if (t.ms) td.appendChild(el('span', '', (t.ms / 1000).toFixed(1) + 's'));
+      }
+      row.appendChild(td);
+      box.appendChild(row);
     }
   }
 
   // ---------------------------------------------------------------- 附件
   // 服务端一次只接受一个媒体（视觉塔和语音塔是两个独立的 mmproj，同时注入
   // 需要两套前缀），所以这里也做成单选。
-  function pickAttachment() {
+  function pickAttachment(only) {
     const s = state.server || {};
     const acc = [];
-    if (s.mm_vision) acc.push('image/*', 'video/*');
-    if (s.mm_audio) acc.push('audio/*');
+    if (only === 'image') {
+      acc.push('image/*');
+    } else if (only === 'file') {
+      acc.push('*/*');
+    } else {
+      if (s.mm_vision) acc.push('image/*', 'video/*');
+      if (s.mm_audio) acc.push('audio/*');
+    }
     const inp = $('#fileInput');
     inp.accept = acc.length ? acc.join(',') : '*/*';
     inp.value = '';
@@ -367,8 +631,12 @@
     $('#input').value = '';
     autoGrow();
 
-    const ai = { role: 'assistant', content: '', tools: [], meta: null };
+    const ai = { role: 'assistant', content: '', tools: [], meta: null, streaming: true };
     conv.messages.push(ai);
+    state.gen = { tokens: 0, tps: 0, total: 0, ttft: 0 };
+    setGauge(0, 0, 0, 0);
+    renderMeters(state.server);
+    log('Running inference ...');
 
     const box = $('#messages');
     const empty = $('#emptyState');
@@ -400,6 +668,9 @@
       });
     if (settings.system) msgs.unshift({ role: 'system', content: settings.system });
 
+    const t0 = performance.now();
+    let tFirst = 0;
+
     try {
       state.abort = new AbortController();
       const resp = await fetch('/v1/chat/completions', {
@@ -421,6 +692,7 @@
       const dec = new TextDecoder();
       let buf = '';
       let raf = null;
+      let genTick = 0;
 
       const paint = () => {
         body.innerHTML = renderMarkdown(stripToolCalls(ai.content)) || '<p></p>';
@@ -444,10 +716,17 @@
 
           if (j.dubhe) {
             if (j.dubhe.type === 'tool_call') {
-              ai.tools.push({ name: j.dubhe.name, args: j.dubhe.arguments, ok: true });
+              ai.tools.push({ name: j.dubhe.name, args: j.dubhe.arguments, ok: true, t0: performance.now() });
+              log('Tool call: ' + j.dubhe.name);
+              renderTools();
             } else if (j.dubhe.type === 'tool_result') {
               const last = ai.tools[ai.tools.length - 1];
-              if (last) { last.output = j.dubhe.output; last.ok = j.dubhe.ok; }
+              if (last) {
+                last.output = j.dubhe.output;
+                last.ok = j.dubhe.ok;
+                last.ms = performance.now() - (last.t0 || performance.now());
+              }
+              renderTools();
               // 重绘以显示工具卡片
               const fresh = messageNode(ai);
               node.replaceWith(fresh);
@@ -458,9 +737,25 @@
             continue;
           }
           const delta = j.choices && j.choices[0] && j.choices[0].delta;
-          if (delta && delta.content) { ai.content += delta.content; paint(); }
+          if (delta && delta.content) {
+            if (!tFirst) {
+              tFirst = performance.now();
+              state.gen.ttft = (tFirst - t0) / 1000;
+              log('First token in ' + state.gen.ttft.toFixed(2) + ' s');
+            }
+            ai.content += delta.content;
+            paint();
+            // 生成中每 12 帧刷一次仪表，别让 DOM 写操作拖慢解码
+            if (++genTick % 12 === 0) {
+              const el2 = (performance.now() - t0) / 1000;
+              state.gen.total = el2;
+              setGauge(state.gen.tokens / Math.max(el2, 0.001), state.gen.tokens, el2, state.gen.ttft);
+            }
+          }
           if (j.usage) {
             ai.meta = { tps: j.usage.decode_tps, tokens: j.usage.completion_tokens };
+            state.gen.tokens = j.usage.completion_tokens || 0;
+            state.gen.tps = j.usage.decode_tps || 0;
           }
         }
       }
@@ -474,12 +769,30 @@
     } finally {
       state.streaming = false;
       state.abort = null;
+      ai.streaming = false;
       setSendEnabled(true);
+      const total = (performance.now() - t0) / 1000;
+      const tokens = (ai.meta && ai.meta.tokens) || state.gen.tokens || 0;
+      state.gen = {
+        tokens,
+        tps: (ai.meta && ai.meta.tps) || (tokens / Math.max(total, 0.001)),
+        total,
+        ttft: state.gen.ttft || 0,
+      };
+      setGauge(state.gen.tps, tokens, total, state.gen.ttft);
+      if (tokens) {
+        log('Response generated (' + tokens + ' tokens, '
+            + state.gen.tps.toFixed(1) + ' tok/s).');
+      } else {
+        log('Stopped.', 'err');
+      }
       const finalNode = messageNode(ai);
       node.replaceWith(finalNode);
       body.classList.remove('typing');
       saveConvs();
       scrollBottom(true);
+      renderTools();
+      renderMeters(state.server);
       refreshState();
     }
   }
@@ -683,13 +996,23 @@
   //   2. 能左滑关（手势）
   //   3. 选中会话后自己关（否则用户要再点一次 ☰）
   function syncScrim() {
-    const open = $('#sidebar').classList.contains('open');
+    const nav = $('#sidebar').classList.contains('open');
+    const insp = $('#inspector').classList.contains('show');
     const scrim = $('#scrim');
-    if (scrim) scrim.classList.toggle('show', open);
+    if (scrim) scrim.classList.toggle('show', nav || insp);
   }
 
   function closeSidebar() {
     $('#sidebar').classList.remove('open');
+    $('#inspector').classList.remove('show');
+    syncScrim();
+  }
+
+  function toggleInspector(force) {
+    const ins = $('#inspector');
+    const want = force != null ? force : !ins.classList.contains('show');
+    ins.classList.toggle('show', want);
+    if (want && window.innerWidth <= 860) $('#sidebar').classList.remove('open');
     syncScrim();
   }
 
@@ -698,7 +1021,7 @@
     let sx = 0, sy = 0, drag = false;
 
     sb.addEventListener('touchstart', (e) => {
-      if (window.innerWidth > 760) return;
+      if (window.innerWidth > 860) return;
       sx = e.touches[0].clientX; sy = e.touches[0].clientY;
       drag = true; sb.style.transition = 'none';
     }, { passive: true });
@@ -728,7 +1051,7 @@
   const FINE_POINTER = window.matchMedia('(pointer: fine)');
 
   function bindLight() {
-    document.querySelectorAll('.chip, .new-btn, .icon-btn, .send-btn, .conv, .side-item')
+    document.querySelectorAll('.chip, .icon-btn, .send-btn, .conv, .nav-item, .model-pick, .suggest button')
       .forEach((n) => n.classList.add('lit'));
     document.querySelectorAll('.composer, .sheet').forEach((n) => n.classList.add('edge'));
     if (!FINE_POINTER.matches) return;
@@ -782,7 +1105,7 @@
     if (persist) { try { localStorage.setItem(GLASS_KEY, level); } catch (e) {} }
   }
 
-  const ICON_SEND = icon('arrow-up');
+  const ICON_SEND = icon('send');
   const ICON_STOP = icon('stop');
 
   function bind() {
@@ -805,11 +1128,45 @@
       send();
     };
     $('#newChat').onclick = () => { newConv(); closeSidebar(); };
+    const nc2 = $('#newChat2');
+    if (nc2) nc2.onclick = () => { newConv(); closeSidebar(); };
     $('#toggleSidebar').onclick = () => {
-      $('#sidebar').classList.toggle('open');
+      $('#sidebar').classList.add('open');
+      $('#inspector').classList.remove('show');
       syncScrim();
     };
+    const navClose = $('#navClose');
+    if (navClose) navClose.onclick = closeSidebar;
+    const insBtn = $('#toggleInspector');
+    if (insBtn) insBtn.onclick = () => toggleInspector();
+    const insClose = $('#inspClose');
+    if (insClose) insClose.onclick = () => toggleInspector(false);
     $('#scrim').onclick = closeSidebar;
+
+    // 输入栏按钮
+    const bf = $('#btnFile');
+    if (bf) bf.onclick = () => pickAttachment('file');
+    const bim = $('#btnImage');
+    if (bim) bim.onclick = () => { if (!bim.disabled) pickAttachment('image'); };
+    const bm = $('#btnMode');
+    if (bm) bm.onclick = openSettings;
+    const mib = $('#modelInfoBtn');
+    if (mib) mib.onclick = openSettings;
+    const cl = $('#copyLog');
+    if (cl) cl.onclick = () => {
+      const txt = state.logs.map((l) => '[' + l.t + '] ' + l.msg).join('\n');
+      navigator.clipboard.writeText(txt);
+      log('Logs copied to clipboard.');
+    };
+
+    // 左栏搜索
+    const si = $('#searchInput');
+    if (si) {
+      si.addEventListener('input', () => {
+        state.q = si.value;
+        renderConvList();
+      });
+    }
     $('#openSettings').onclick = openSettings;
     $('#openSettings2').onclick = openSettings;
     $('#modelChip').onclick = openSettings;
@@ -842,6 +1199,21 @@
       c.onclick = () => send(c.dataset.p);
     });
 
+    // 左栏导航：目前只有"对话"是完整实现的。其余项不做假的空页面 ——
+    // 点了给一句实话，比给一个空白界面强。
+    document.querySelectorAll('.nav-item[data-view]').forEach((b) => {
+      b.onclick = () => {
+        document.querySelectorAll('.nav-item[data-view]').forEach((x) => x.classList.remove('on'));
+        b.classList.add('on');
+        if (b.dataset.view !== 'chat') {
+          openSheet(b.textContent.trim(), (body) => {
+            body.appendChild(el('p', 'desc',
+              '这一块还在开发中。当前版本已经可用的是对话、模型切换、工具调用和 API 网关。'));
+          });
+        }
+      };
+    });
+
     document.addEventListener('click', (e) => {
       const btn = e.target.closest('[data-copy]');
       if (btn) {
@@ -854,7 +1226,12 @@
 
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') { closeSheet(); closeSidebar(); }
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); newConv(); }
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        const si = $('#searchInput');
+        if (si && window.innerWidth > 860) si.focus();
+        else { $('#sidebar').classList.add('open'); syncScrim(); if (si) si.focus(); }
+      }
     });
   }
 
@@ -872,7 +1249,21 @@
       renderConvList();
     }
     setSendEnabled(true);
+    renderLogs();
+    renderTools();
+    setGauge(0, 0, 0, 0);
     setInterval(refreshState, 8000);
+    // 宽屏不需要抽屉遮罩；窗口从窄变宽时清掉残留状态
+    window.addEventListener('resize', () => {
+      if (window.innerWidth > 1024) {
+        $('#inspector').classList.remove('show');
+        syncScrim();
+      }
+      if (window.innerWidth > 860) {
+        $('#sidebar').classList.remove('open');
+        syncScrim();
+      }
+    });
   }
 
   boot();

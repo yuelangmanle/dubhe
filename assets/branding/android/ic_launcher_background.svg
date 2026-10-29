@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
+  <title>天枢 · adaptive icon background</title>
+  <!--
+    Android 自适应图标 · 背景层。
+    纯渐变、无内容 —— 内容全在前景层，这样系统做视差动效时环和星芒会跟着手指动，
+    背景只负责提供深色底。渐变中心偏左上（40%/32%），和前景的光照方向一致。
+  -->
+  <defs>
+    <radialGradient id="bgLayer" cx="40%" cy="32%" r="82%">
+      <stop offset="0%" stop-color="#1E4147"/>
+      <stop offset="42%" stop-color="#102A2F"/>
+      <stop offset="100%" stop-color="#070E10"/>
+    </radialGradient>
+  </defs>
+  <rect width="108" height="108" fill="url(#bgLayer)"/>
+</svg>

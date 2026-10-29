@@ -1,5 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#007AFF"/>
-  <circle cx="32" cy="32" r="7" fill="#fff"/>
-  <ellipse cx="32" cy="32" rx="24" ry="10" fill="none" stroke="#fff" stroke-width="3" opacity=".75" transform="rotate(-28 32 32)"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Dubhe">
+  <title>Dubhe</title>
+  <!-- favicon：16–32px 下只剩轮廓，所以砍到两个元素 —— 一个环、一个点。
+       加第三个元素（星芒、第二道环）在这个尺寸只会变成脏点。 -->
+  <rect width="64" height="64" rx="15" fill="#0E2226"/>
+  <ellipse cx="32" cy="32" rx="22" ry="8.5" fill="none" stroke="#6FD3C4"
+           stroke-width="3.2" transform="rotate(-24 32 32)"/>
+  <circle cx="32" cy="32" r="7.5" fill="#F4FBF8"/>
 </svg>

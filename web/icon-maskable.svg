@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="天枢 Dubhe">
+  <title>天枢 Dubhe · maskable</title>
+  <!--
+    Android maskable 版本。和 icon.svg 的区别只有一个：底色铺满整块画布，不切圆角。
+
+    为什么必须单独出一版：
+      maskable 图标由系统自己套遮罩（圆形、方形、水滴形都可能），所以
+      ① 四角不能是透明的 —— 透明角被系统裁掉后会露出黑色
+      ② 所有内容必须落在中心直径 80% 的安全圆内，否则被裁
+
+    本图内容实测：环最远伸到 348（半宽 512 的 68%），星芒 250，安全圆半径 410。
+    都在里面，所以直接把 icon.svg 的内容搬过来、去掉 squircle 裁切即可。
+  -->
+  <defs>
+    <radialGradient id="mBg" cx="40%" cy="32%" r="78%">
+      <stop offset="0%" stop-color="#1E4147"/>
+      <stop offset="42%" stop-color="#102A2F"/>
+      <stop offset="100%" stop-color="#070E10"/>
+    </radialGradient>
+    <linearGradient id="mTeal" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#C9F6EC"/>
+      <stop offset="34%" stop-color="#6FD9C9"/>
+      <stop offset="100%" stop-color="#1F6C6E"/>
+    </linearGradient>
+    <linearGradient id="mGold" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FBEFD2"/>
+      <stop offset="38%" stop-color="#E0C68E"/>
+      <stop offset="100%" stop-color="#8A6D3D"/>
+    </linearGradient>
+    <linearGradient id="mTeal2" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2C8280"/>
+      <stop offset="50%" stop-color="#84DCCE"/>
+      <stop offset="100%" stop-color="#DBF7F0"/>
+    </linearGradient>
+    <linearGradient id="mStar" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="46%" stop-color="#F2FBF8"/>
+      <stop offset="100%" stop-color="#BFE6DE"/>
+    </linearGradient>
+    <radialGradient id="mCore" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity=".72"/>
+      <stop offset="48%" stop-color="#DFF4EE" stop-opacity=".22"/>
+      <stop offset="100%" stop-color="#DFF4EE" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#mBg)"/>
+  <circle cx="512" cy="512" r="250" fill="url(#mCore)"/>
+  <path d="M512 286 C522 456 568 502 738 512 C568 522 522 568 512 738
+           C502 568 456 522 286 512 C456 502 502 456 512 286Z" fill="url(#mStar)"/>
+  <g fill="none" stroke-linecap="round">
+    <ellipse cx="512" cy="512" rx="342" ry="126" transform="rotate(-24 512 512)"
+             stroke="url(#mTeal)" stroke-width="14"/>
+    <ellipse cx="512" cy="512" rx="146" ry="342" transform="rotate(-24 512 512)"
+             stroke="url(#mGold)" stroke-width="12"/>
+    <ellipse cx="512" cy="512" rx="312" ry="118" transform="rotate(33 512 512)"
+             stroke="url(#mTeal2)" stroke-width="8" opacity=".62"/>
+  </g>
+</svg>

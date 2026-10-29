@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="天枢 Dubhe">
+  <title>天枢 Dubhe</title>
+  <!--
+    天枢 App 图标 · 矢量版
+
+    参考图（assets/branding/app-icon-3d.jpg）是 3D 渲染的玻璃徽章，质感很好，
+    但它有透视、有地面反射，缩到 48px 会糊成一团。图标必须在 1024 和 32
+    两个尺寸上都成立，所以这里重画成矢量。
+
+    两条硬规则：
+      1. 星芒必须明显小于环 —— 星芒一撑满，环就被切成碎片，整个图标读不出"轨道"。
+      2. 环画在星芒之上。这样环是"绕着"中心的，不是被中心盖住的两截断线。
+
+    配色取自参考图：底 #0B1416 / 青绿 #5FC9BC / 金 #D9BE86。
+    这些色只用在图标里，不进 UI —— 图标可以比界面更有存在感，
+    因为它要在桌面上被一眼找到。
+  -->
+  <defs>
+    <radialGradient id="bg" cx="40%" cy="32%" r="78%">
+      <stop offset="0%" stop-color="#1E4147"/>
+      <stop offset="42%" stop-color="#102A2F"/>
+      <stop offset="100%" stop-color="#070E10"/>
+    </radialGradient>
+
+    <linearGradient id="ringTeal" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#C9F6EC"/>
+      <stop offset="34%" stop-color="#6FD9C9"/>
+      <stop offset="100%" stop-color="#1F6C6E"/>
+    </linearGradient>
+
+    <linearGradient id="ringGold" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FBEFD2"/>
+      <stop offset="38%" stop-color="#E0C68E"/>
+      <stop offset="100%" stop-color="#8A6D3D"/>
+    </linearGradient>
+
+    <linearGradient id="ringTeal2" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2C8280"/>
+      <stop offset="50%" stop-color="#84DCCE"/>
+      <stop offset="100%" stop-color="#DBF7F0"/>
+    </linearGradient>
+
+    <radialGradient id="core" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity=".72"/>
+      <stop offset="48%" stop-color="#DFF4EE" stop-opacity=".22"/>
+      <stop offset="100%" stop-color="#DFF4EE" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="starFill" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="46%" stop-color="#F2FBF8"/>
+      <stop offset="100%" stop-color="#BFE6DE"/>
+    </linearGradient>
+
+    <linearGradient id="rim" x1="0%" y1="0%" x2="58%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity=".48"/>
+      <stop offset="30%" stop-color="#FFFFFF" stop-opacity=".09"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity=".02"/>
+    </linearGradient>
+
+    <clipPath id="squircle">
+      <rect x="0" y="0" width="1024" height="1024" rx="232"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#squircle)">
+    <rect width="1024" height="1024" fill="url(#bg)"/>
+
+    <!-- 中心柔光：给星芒一层"空气感"，否则白色直接压在黑底上会很硬 -->
+    <circle cx="512" cy="512" r="250" fill="url(#core)"/>
+
+    <!-- 四角星芒。半径 226 —— 约等于图标宽度的 44%，
+         这个比例下四个尖角还在环的内圈里，不会把环顶破。 -->
+    <path d="M512 286
+             C522 456 568 502 738 512
+             C568 522 522 568 512 738
+             C502 568 456 522 286 512
+             C456 502 502 456 512 286Z"
+          fill="url(#starFill)"/>
+
+    <!-- 三道轨道，画在星芒之上 —— 环"绕着"中心，而不是被中心切断 -->
+    <g fill="none" stroke-linecap="round">
+      <ellipse cx="512" cy="512" rx="342" ry="126" transform="rotate(-24 512 512)"
+               stroke="url(#ringTeal)" stroke-width="14"/>
+      <ellipse cx="512" cy="512" rx="146" ry="342" transform="rotate(-24 512 512)"
+               stroke="url(#ringGold)" stroke-width="12"/>
+      <ellipse cx="512" cy="512" rx="312" ry="118" transform="rotate(33 512 512)"
+               stroke="url(#ringTeal2)" stroke-width="8" opacity=".62"/>
+    </g>
+
+    <!-- 边缘高光：玻璃厚度 -->
+    <rect x="3" y="3" width="1018" height="1018" rx="230"
+          fill="none" stroke="url(#rim)" stroke-width="5"/>
+  </g>
+</svg>

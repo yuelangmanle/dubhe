@@ -16,7 +16,9 @@
 
 #include <ifaddrs.h>
 #include <netinet/in.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -124,7 +126,9 @@ std::string guess_mime(const std::string& p) {
     if (ends(".json")) return "application/json; charset=utf-8";
     if (ends(".svg")) return "image/svg+xml";
     if (ends(".png")) return "image/png";
+    if (ends(".jpg")) return "image/jpeg";
     if (ends(".ico")) return "image/x-icon";
+    if (ends(".webmanifest")) return "application/manifest+json; charset=utf-8";
     if (ends(".woff2")) return "font/woff2";
     return "application/octet-stream";
 }
@@ -822,10 +826,29 @@ int main(int argc, char** argv) {
     };
 
     srv.get("/", [&](const http::Request& req, http::Conn& c) { serve_file(req, c, g.web_root); });
-    srv.get("/index.html", [&](const http::Request& req, http::Conn& c) { serve_file(req, c, g.web_root); });
-    srv.get("/app.js", [&](const http::Request& req, http::Conn& c) { serve_file(req, c, g.web_root); });
-    srv.get("/app.css", [&](const http::Request& req, http::Conn& c) { serve_file(req, c, g.web_root); });
-    srv.get("/favicon.svg", [&](const http::Request& req, http::Conn& c) { serve_file(req, c, g.web_root); });
+
+    // 其余静态资源走兜底：图标、manifest、字体以后还会加，一条一条注册跟不上。
+    // 但只放行白名单后缀 —— 否则 /api/typo 会返回 404 页面而不是 404 JSON，
+    // 而且等于把整个 web_root 连同未来可能放进去的源文件都暴露出去。
+    srv.set_fallback([&](const http::Request& req, http::Conn& c) {
+        if (req.method != "GET") {
+            c.send(404, "application/json", "{\"error\":\"not found\"}");
+            return;
+        }
+        static const char* kAllowed[] = {".html", ".css", ".js", ".json", ".svg",
+                                         ".png", ".ico", ".webmanifest", ".woff2", ".jpg"};
+        std::string p = req.path;
+        bool ok = false;
+        for (const char* e : kAllowed) {
+            size_t n = std::strlen(e);
+            if (p.size() > n && p.compare(p.size() - n, n, e) == 0) { ok = true; break; }
+        }
+        if (!ok) {
+            c.send(404, "application/json", "{\"error\":\"not found\"}");
+            return;
+        }
+        serve_file(req, c, g.web_root);
+    });
 
     srv.get("/healthz", [](const http::Request&, http::Conn& c) {
         c.send(200, "application/json", "{\"ok\":true}");
@@ -852,6 +875,31 @@ int main(int argc, char** argv) {
         o.set("mm_vision", json::Value::make_bool((caps & 1) != 0));
         o.set("mm_audio", json::Value::make_bool((caps & 2) != 0));
         o.set("mmproj", json::Value::make_str(g.mmproj_path));
+        // 真实占用：进程常驻内存 + 模型文件体积。
+        // 前端右栏的"内存"条靠这两个值，不做估算 —— 估算出来的数字
+        // 一旦和 Activity Monitor 对不上，用户就不信这块面板了。
+        {
+            struct stat st {};
+            double model_bytes = 0;
+            if (!g.model_path.empty() && stat(g.model_path.c_str(), &st) == 0) {
+                model_bytes += (double)st.st_size;
+            }
+            if (!g.mmproj_path.empty() && stat(g.mmproj_path.c_str(), &st) == 0) {
+                model_bytes += (double)st.st_size;
+            }
+            o.set("model_bytes", json::Value::make_num(model_bytes));
+
+            struct rusage ru {};
+            double rss = 0;
+            if (getrusage(RUSAGE_SELF, &ru) == 0) {
+#ifdef __APPLE__
+                rss = (double)ru.ru_maxrss;            // macOS: 字节
+#else
+                rss = (double)ru.ru_maxrss * 1024.0;   // Linux: KB
+#endif
+            }
+            o.set("rss_bytes", json::Value::make_num(rss));
+        }
         if (!g.model_path.empty()) {
             dubhe_model_info mi{};
             if (dubhe_model_info_get(g.engine, &mi) == DUBHE_OK) {

@@ -144,6 +144,9 @@ public:
     void get(const std::string& p, Handler h) { routes_["GET " + p] = std::move(h); }
     void post(const std::string& p, Handler h) { routes_["POST " + p] = std::move(h); }
 
+    // 未命中任何路由时调用。用于静态资源通配，避免为每个文件注册一条路由。
+    void set_fallback(Handler h) { fallback_ = std::move(h); }
+
     bool listen(const std::string& host, int port) {
         fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd_ < 0) return false;
@@ -260,7 +263,18 @@ private:
         Conn conn(cfd);
         auto it = routes_.find(req.method + " " + req.path);
         if (it == routes_.end()) {
-            conn.send(404, "application/json", "{\"error\":\"not found\"}");
+            // 兜底：静态资源用一条通配路由接住，不必为每个 .png / .svg 单独注册。
+            // 没有兜底时仍然返回 404 JSON，行为与以前一致。
+            if (fallback_) {
+                try {
+                    fallback_(req, conn);
+                } catch (const std::exception& e) {
+                    conn.send(500, "application/json",
+                              std::string("{\"error\":\"") + e.what() + "\"}");
+                }
+            } else {
+                conn.send(404, "application/json", "{\"error\":\"not found\"}");
+            }
         } else {
             try {
                 it->second(req, conn);
@@ -276,6 +290,7 @@ private:
     int fd_ = -1;
     std::atomic<bool> running_{false};
     std::map<std::string, Handler> routes_;
+    Handler fallback_;
 };
 
 }  // namespace http

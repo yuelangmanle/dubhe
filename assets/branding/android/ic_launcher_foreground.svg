@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
+  <title>天枢 · adaptive icon foreground</title>
+  <!--
+    Android 自适应图标 · 前景层（透明底，只有环和星芒）
+
+    自适应图标的画布是 108×108dp，但系统随时会把它裁成圆形/方形/水滴，
+    只有中心直径 66dp 的圆是"保证可见"的。所以：
+      · 背景层铺满 108×108，颜色打底
+      · 前景层的内容全部缩进中心 66dp 圆内
+      · 前景层不能有底色，否则会把背景层盖死，动效（视差）就没了
+
+    这里把 1024 版的内容整体缩到 0.72 再居中：环最远 348 × 0.72 ≈ 251（单位 1024），
+    换算到 108dp 画布约 26.4dp 半径，落在 33dp 安全半径里。
+  -->
+  <g transform="translate(54 54) scale(0.0759) translate(-512 -512)">
+    <defs>
+      <linearGradient id="fgTeal" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="#C9F6EC"/>
+        <stop offset="34%" stop-color="#6FD9C9"/>
+        <stop offset="100%" stop-color="#1F6C6E"/>
+      </linearGradient>
+      <linearGradient id="fgGold" x1="100%" y1="0%" x2="0%" y2="100%">
+        <stop offset="0%" stop-color="#FBEFD2"/>
+        <stop offset="38%" stop-color="#E0C68E"/>
+        <stop offset="100%" stop-color="#8A6D3D"/>
+      </linearGradient>
+      <linearGradient id="fgTeal2" x1="0%" y1="100%" x2="100%" y2="0%">
+        <stop offset="0%" stop-color="#2C8280"/>
+        <stop offset="50%" stop-color="#84DCCE"/>
+        <stop offset="100%" stop-color="#DBF7F0"/>
+      </linearGradient>
+      <linearGradient id="fgStar" x1="50%" y1="0%" x2="50%" y2="100%">
+        <stop offset="0%" stop-color="#FFFFFF"/>
+        <stop offset="46%" stop-color="#F2FBF8"/>
+        <stop offset="100%" stop-color="#BFE6DE"/>
+      </linearGradient>
+      <radialGradient id="fgCore" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#FFFFFF" stop-opacity=".55"/>
+        <stop offset="50%" stop-color="#DFF4EE" stop-opacity=".16"/>
+        <stop offset="100%" stop-color="#DFF4EE" stop-opacity="0"/>
+      </radialGradient>
+    </defs>
+
+    <circle cx="512" cy="512" r="250" fill="url(#fgCore)"/>
+    <path d="M512 286 C522 456 568 502 738 512 C568 522 522 568 512 738
+             C502 568 456 522 286 512 C456 502 502 456 512 286Z" fill="url(#fgStar)"/>
+    <g fill="none" stroke-linecap="round">
+      <ellipse cx="512" cy="512" rx="342" ry="126" transform="rotate(-24 512 512)"
+               stroke="url(#fgTeal)" stroke-width="14"/>
+      <ellipse cx="512" cy="512" rx="146" ry="342" transform="rotate(-24 512 512)"
+               stroke="url(#fgGold)" stroke-width="12"/>
+      <ellipse cx="512" cy="512" rx="312" ry="118" transform="rotate(33 512 512)"
+               stroke="url(#fgTeal2)" stroke-width="8" opacity=".62"/>
+    </g>
+  </g>
+</svg>

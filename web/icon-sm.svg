@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="天枢 Dubhe">
+  <title>天枢 Dubhe</title>
+  <!--
+    天枢 App 图标 · 小尺寸专用版（≤ 96px 使用）
+
+    为什么不直接缩 icon.svg：
+      64px 时三道环的描边各只有 0.9px / 0.75px / 0.5px，抗锯齿之后不是"细线"
+      而是三圈灰色噪点；星芒的四个尖角也被压成一个白方块。整个图标读不出"轨道"。
+
+    所以这一版是重新配比的，不是缩放：
+      1. 只留两道环 —— 第三道在这个尺寸纯属噪声，删掉它反而更清楚。
+      2. 描边加粗到 30 / 26（1024 空间），64px 下各约 1.9px / 1.6px，能立住。
+      3. 星芒放大到半径 250，让四个尖角在缩到 32px 后还剩一点形状。
+      4. 去掉边缘高光 —— 5px 的描边在 64px 下是 0.3px，只会让边缘发脏。
+
+    几何关系和 icon.svg 保持一致：星芒在环的内圈里，环画在星芒之上。
+  -->
+  <defs>
+    <radialGradient id="smBg" cx="40%" cy="32%" r="78%">
+      <stop offset="0%" stop-color="#20464C"/>
+      <stop offset="45%" stop-color="#102A2F"/>
+      <stop offset="100%" stop-color="#060C0E"/>
+    </radialGradient>
+
+    <linearGradient id="smTeal" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#D6FAF1"/>
+      <stop offset="36%" stop-color="#6FD9C9"/>
+      <stop offset="100%" stop-color="#1E6A6C"/>
+    </linearGradient>
+
+    <linearGradient id="smGold" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FCEDCB"/>
+      <stop offset="40%" stop-color="#E0C68E"/>
+      <stop offset="100%" stop-color="#8A6D3D"/>
+    </linearGradient>
+
+    <linearGradient id="smStar" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="52%" stop-color="#F4FCF9"/>
+      <stop offset="100%" stop-color="#C6E9E1"/>
+    </linearGradient>
+
+    <radialGradient id="smCore" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity=".66"/>
+      <stop offset="52%" stop-color="#DFF4EE" stop-opacity=".16"/>
+      <stop offset="100%" stop-color="#DFF4EE" stop-opacity="0"/>
+    </radialGradient>
+
+    <clipPath id="smSquircle">
+      <rect x="0" y="0" width="1024" height="1024" rx="232"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#smSquircle)">
+    <rect width="1024" height="1024" fill="url(#smBg)"/>
+    <circle cx="512" cy="512" r="272" fill="url(#smCore)"/>
+
+    <!-- 星芒：半径 250，比 icon.svg 的 226 大一圈，给小尺寸留形状 -->
+    <path d="M512 262
+             C522 452 572 502 762 512
+             C572 522 522 572 512 762
+             C502 572 452 522 262 512
+             C452 502 502 452 512 262Z"
+          fill="url(#smStar)"/>
+
+    <!-- 两道环，描边加粗一倍以上 -->
+    <g fill="none" stroke-linecap="round">
+      <ellipse cx="512" cy="512" rx="348" ry="128" transform="rotate(-24 512 512)"
+               stroke="url(#smTeal)" stroke-width="30"/>
+      <ellipse cx="512" cy="512" rx="148" ry="348" transform="rotate(-24 512 512)"
+               stroke="url(#smGold)" stroke-width="26"/>
+    </g>
+  </g>
+</svg>
