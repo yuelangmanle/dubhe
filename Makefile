@@ -10,11 +10,11 @@ DEFS     := -DNDEBUG
 INCS     := -Iengine/include -Iengine/src
 CXXFLAGS := $(CXXSTD) $(OPT) $(WARN) $(DEFS) $(INCS) -MMD -MP
 
-BUILD    := build
-BIN      := $(BUILD)/dubhe
-SRV      := $(BUILD)/dubhed
-
 UNAME_S  := $(shell uname -s)
+
+# PLATFORM 决定选哪套平台源文件和链接参数。默认跟随本机，交叉编译时显式指定：
+#   make PLATFORM=android ANDROID_ABI=arm64-v8a
+PLATFORM ?= $(UNAME_S)
 
 ENGINE_SRCS := engine/src/gguf.cpp engine/src/quant.cpp engine/src/quant_q8.cpp \
                engine/src/tokenizer.cpp engine/src/model.cpp engine/src/engine.cpp \
@@ -22,16 +22,55 @@ ENGINE_SRCS := engine/src/gguf.cpp engine/src/quant.cpp engine/src/quant_q8.cpp 
 
 # Metal 后端只在 Apple 平台编译。着色器在运行时编译（newLibraryWithSource:），
 # 所以不需要离线 Metal Toolchain。
-ifeq ($(UNAME_S),Darwin)
+ifeq ($(PLATFORM),Darwin)
   ENGINE_SRCS += engine/src/metal.mm engine/src/image.mm engine/src/audiofile.mm
   OBJCXXFLAGS := $(CXXFLAGS) -fobjc-arc
   LDFLAGS     := -framework Metal -framework Foundation -framework ImageIO \
                  -framework CoreGraphics -framework CoreFoundation \
                  -framework AVFoundation -framework CoreMedia
+else ifeq ($(PLATFORM),android)
+  # ---- NDK 交叉编译
+  # 目标：先把纯文本 CPU 路径跑起来。Metal 换成 stub，图像/音频解码也还是
+  # stub（Android 侧要接 ImageDecoder / MediaCodec，那是客户端那一轮的事）。
+  ANDROID_ABI ?= arm64-v8a
+  ANDROID_API ?= 26
+  ANDROID_NDK ?= $(firstword $(wildcard $(HOME)/Library/Android/sdk/ndk/*) \
+                             $(wildcard $(HOME)/Android/Sdk/ndk/*))
+  ifeq ($(ANDROID_NDK),)
+    $(error 找不到 NDK。装一个：sdkmanager "ndk;27.2.12479018"，或指定 ANDROID_NDK=<path>)
+  endif
+  NDK_BIN := $(ANDROID_NDK)/toolchains/llvm/prebuilt/$(shell uname -s | tr 'A-Z' 'a-z')-x86_64/bin
+
+  ifeq ($(ANDROID_ABI),arm64-v8a)
+    ANDROID_TARGET := aarch64-linux-android$(ANDROID_API)
+    ANDROID_ARCH_FLAGS :=
+  else ifeq ($(ANDROID_ABI),armeabi-v7a)
+    ANDROID_TARGET := armv7a-linux-androideabi$(ANDROID_API)
+    ANDROID_ARCH_FLAGS := -mfpu=neon -mfloat-abi=softfp
+  else ifeq ($(ANDROID_ABI),x86_64)
+    ANDROID_TARGET := x86_64-linux-android$(ANDROID_API)
+    ANDROID_ARCH_FLAGS :=
+  else
+    $(error 不支持的 ANDROID_ABI: $(ANDROID_ABI))
+  endif
+
+  CXX := $(NDK_BIN)/clang++
+  CC  := $(NDK_BIN)/clang
+  CXXFLAGS += --target=$(ANDROID_TARGET) $(ANDROID_ARCH_FLAGS) -fPIC -fno-omit-frame-pointer
+  # 静态链 libc++：Android 系统里没有 libc++.so，动态链会装不上
+  LDFLAGS  := --target=$(ANDROID_TARGET) -static-libstdc++ -Wl,--gc-sections -lm
+  ENGINE_SRCS += engine/src/metal_stub.cpp engine/src/image_stub.cpp engine/src/audiofile_stub.cpp
+  BUILD := build-android-$(ANDROID_ABI)
 else
   ENGINE_SRCS += engine/src/metal_stub.cpp engine/src/image_stub.cpp engine/src/audiofile_stub.cpp
   LDFLAGS     :=
 endif
+
+# BUILD 必须在平台分支之后再展开：交叉编译时 BUILD 会被改成 build-android-<abi>，
+# 如果 BIN 在上面就展开，Android 产物会直接盖掉本机的 build/dubhe（踩过）。
+BUILD ?= build
+BIN   := $(BUILD)/dubhe
+SRV   := $(BUILD)/dubhed
 
 ENGINE_OBJS := $(patsubst %.cpp,$(BUILD)/%.o,$(patsubst %.mm,$(BUILD)/%.o,$(ENGINE_SRCS)))
 CLI_OBJ     := $(BUILD)/cli/main.o

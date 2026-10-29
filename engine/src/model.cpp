@@ -7,8 +7,7 @@
 //     所以 load() 里会用真实权重跑一次 GPU/CPU 交叉校验，不达标就不上 GPU。
 #include "internal.h"
 #include "metal.h"
-
-#include <dispatch/dispatch.h>
+#include "parallel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -777,12 +776,12 @@ void Model::matvec(float* out, const float* x, const TensorInfo& w, int n_out, i
         quantize_act(w.type, x, aq_.data(), n_in);
         MatvecCtx ctx{aq_.data(), out, (const char*)file_.tensor_data(w),
                       type_row_bytes(w.type, n_in), w.type, n_in, true};
-        dispatch_apply_f((size_t)n_out, DISPATCH_APPLY_AUTO, &ctx, matvec_work);
+        parallel_for((size_t)n_out, matvec_work, &ctx);
         return;
     }
     MatvecCtx ctx{x, out, (const char*)file_.tensor_data(w),
                   type_row_bytes(w.type, n_in), w.type, n_in, false};
-    dispatch_apply_f((size_t)n_out, DISPATCH_APPLY_AUTO, &ctx, matvec_work);
+    parallel_for((size_t)n_out, matvec_work, &ctx);
 }
 
 // 每 head 独立 RMSNorm（LFM3 的 QK norm）。权重只有 head_dim 长，
@@ -1014,7 +1013,7 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
 
             AttnCtx actx{q_.data(), kc, vc, attn_out_.data(), n_head, n_kv, hd, pos + 1, kv_mul,
                          t_start, scale};
-            dispatch_apply_f((size_t)n_head, DISPATCH_APPLY_AUTO, &actx, attn_work);
+            parallel_for((size_t)n_head, attn_work, &actx);
 
             // LFM3：逐 head 的 sigmoid 输出门，在 o_proj 之前乘上去
             if (L.has_attn_gate) {

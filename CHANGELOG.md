@@ -6,6 +6,51 @@
 
 ---
 
+## [0.9.0] · 2026-10-29 · Android 交叉编译打通（M4 起步）
+
+### 新增
+
+- **Android arm64-v8a 交叉编译**：`make PLATFORM=android` 走 NDK toolchain，
+  产物在 `build-android-<abi>/`，与本机 `build/` 完全隔离。
+  `ANDROID_NDK` / `ANDROID_ABI` / `ANDROID_API` 均可覆盖。
+- **`engine/src/parallel.h`**：并行 for 的跨平台封装。Apple 走 GCD
+  （`dispatch_apply_f`），其它平台走常驻线程池 + 原子任务分发。
+  线程数可用 `DUBHE_THREADS` 覆盖。
+- **`engine/src/sysinfo.h`**：CPU 名 / 内存 / 核数的跨平台查询。
+  Apple 走 sysctl，其它平台读 `/proc/cpuinfo` 与 `/proc/meminfo`。
+
+### 变更
+
+- `model.cpp` 不再包含 `<dispatch/dispatch.h>`；三处 `dispatch_apply_f`
+  改为 `parallel_for`。
+- `engine.cpp` 不再包含 `<sys/sysctl.h>`。
+
+### 修复
+
+- **交叉编译产物覆盖本机二进制**：`BIN := $(BUILD)/dubhe` 在文件顶部展开，
+  而 `BUILD := build-android-<abi>` 在平台分支里才赋值，导致 Android 产物直接
+  盖掉 `build/dubhe`。改为平台分支之后再定义 `BIN`/`SRV`，`BUILD ?= build` 兜底。
+
+### 基准（Android 13 模拟器，arm64-v8a / 3 核 / 2 GB，**非真机**）
+
+| 项 | 值 |
+| --- | --- |
+| 0.5B Q4_K_M decode | 19.8–25.5 tok/s |
+| 0.5B Q4_K_M prefill | 14.6–22.6 tok/s |
+| 1 线程 vs 3 线程 | 25.5 vs 22.8 tok/s（模拟器虚拟核无真并行，多线程反而亏） |
+
+模拟器数据只能证明"能跑且输出正确"，性能必须真机重测。
+
+### 已知限制
+
+- Android 上图像/音频解码仍是 stub（要接 `ImageDecoder` / `MediaCodec`），
+  多模态暂不可用。
+- 没有 GPU 后端，纯 CPU。
+- 只验了 `arm64-v8a`，`armeabi-v7a` 分支未实测。
+- 未上真机。
+
+---
+
 ## [0.8.0] · 2026-10-29 · 三模态接产品面
 
 ### 新增

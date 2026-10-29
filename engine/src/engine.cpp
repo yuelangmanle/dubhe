@@ -8,7 +8,7 @@
 #include "mel.h"
 #include "mmproj.h"
 
-#include <sys/sysctl.h>
+#include "sysinfo.h"
 #include <sys/types.h>
 
 #include <algorithm>
@@ -43,26 +43,6 @@ namespace {
 thread_local std::string g_err;
 
 void set_err(const std::string& s) { g_err = s; }
-
-std::string hardware_summary() {
-    char brand[256] = {0};
-    size_t len = sizeof(brand);
-    if (sysctlbyname("machdep.cpu.brand_string", brand, &len, nullptr, 0) != 0)
-        std::snprintf(brand, sizeof(brand), "Apple Silicon");
-
-    uint64_t mem = 0;
-    len = sizeof(mem);
-    sysctlbyname("hw.memsize", &mem, &len, nullptr, 0);
-
-    int ncpu = 0;
-    len = sizeof(ncpu);
-    sysctlbyname("hw.ncpu", &ncpu, &len, nullptr, 0);
-
-    char buf[512];
-    std::snprintf(buf, sizeof(buf), "%s · %d 核 · %.0f GB 统一内存", brand, ncpu,
-                  (double)mem / (1024.0 * 1024.0 * 1024.0));
-    return std::string(buf);
-}
 
 // 采样：重复惩罚 → temperature → top-k → top-p → 多项式
 int32_t sample_token(float* logits, int n_vocab, const dubhe_sampling& sp,
@@ -143,14 +123,7 @@ dubhe_engine* dubhe_create(const dubhe_config* cfg) {
     if (!e) return nullptr;
     if (cfg) e->cfg = *cfg;
     if (e->cfg.n_threads <= 0) {
-        int ncpu = 0;
-        size_t len = sizeof(ncpu);
-        sysctlbyname("hw.perflevel0.logicalcpu", &ncpu, &len, nullptr, 0);
-        if (ncpu <= 0) {
-            len = sizeof(ncpu);
-            sysctlbyname("hw.ncpu", &ncpu, &len, nullptr, 0);
-        }
-        e->cfg.n_threads = ncpu > 0 ? ncpu : 4;
+        e->cfg.n_threads = dubhe::cpu_count();
     }
     return e;
 }
@@ -537,7 +510,7 @@ const char* dubhe_version(void) {
 }
 
 const char* dubhe_hardware_info(void) {
-    static std::string s = hardware_summary();
+    static std::string s = dubhe::hardware_summary();
     return s.c_str();
 }
 

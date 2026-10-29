@@ -125,6 +125,30 @@ HTTP 端到端：图像 6.8 s / 视频 13.1 s / 语音 4.3 s（decode 50–60 to
 | --- | --- | --- |
 | ![chat](docs/screenshots/chat.png) | ![gateway](docs/screenshots/gateway.png) | ![settings](docs/screenshots/settings-mobile.png) |
 
+## Android
+
+引擎在 Android 上走纯 CPU（NEON + 自建线程池），Metal 换成 stub，
+图像/音频解码暂时也是 stub。交叉编译：
+
+```bash
+# 一次性：装 NDK
+~/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager "ndk;27.2.12479018"
+
+make PLATFORM=android            # → build-android-arm64-v8a/dubhe（ELF aarch64）
+make PLATFORM=android ANDROID_ABI=armeabi-v7a
+```
+
+产物与本机 `build/` 完全隔离。线程数可用 `DUBHE_THREADS` 覆盖：
+
+```bash
+adb push build-android-arm64-v8a/dubhe /data/local/tmp/
+adb shell chmod 755 /data/local/tmp/dubhe
+adb shell DUBHE_THREADS=4 /data/local/tmp/dubhe run -m model.gguf -p "你好" --stats
+```
+
+模拟器（Android 13 / arm64-v8a / 3 核）实测 0.5B Q4_K_M decode 19.8–25.5 tok/s、
+输出连贯中文 —— **这只证明能跑且正确，性能必须真机重测**。
+
 ## 一句话
 
 让个人设备把大模型真正跑起来、跑得久、跑得省，并且不要求用户"先转换一下"。
