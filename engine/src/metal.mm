@@ -292,7 +292,12 @@ namespace {
 // 两者不一致，所以超过 8 行而该张量没有 MMA 内核时，gemm 里要按 8 行分批。
 constexpr int kBmax     = dubhe_msl::kBmax;
 constexpr int kBatchMax = dubhe_msl::kMmaBm;
-constexpr int kAttnSplits = 8;  // 注意力 key 区间最多切几段（split-K）
+// 注意力 key 区间最多切几段（split-K）。
+// 段数决定长上下文的并行度：解码时一个 simdgroup 算一个 head 的一段 key，
+// 并行度 = (n_head/4) × nsp 个 threadgroup。n_head=16 时 nsp=8 只有 32 个
+// threadgroup（128 warp），对 10 个核来说延迟掩盖不够；提到 32 是 128 个
+// threadgroup（512 warp）。代价只是 combine 阶段多读几个 partial。
+constexpr int kAttnSplits = 64;
 
 enum FwdKernel {
     F_RMSNORM = 0, F_ADD, F_BIAS, F_SILU, F_ROPE, F_COPY, F_COPY_H,
