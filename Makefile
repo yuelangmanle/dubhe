@@ -17,16 +17,18 @@ SRV      := $(BUILD)/dubhed
 UNAME_S  := $(shell uname -s)
 
 ENGINE_SRCS := engine/src/gguf.cpp engine/src/quant.cpp engine/src/quant_q8.cpp \
-               engine/src/tokenizer.cpp engine/src/model.cpp engine/src/engine.cpp
+               engine/src/tokenizer.cpp engine/src/model.cpp engine/src/engine.cpp \
+               engine/src/mmproj.cpp
 
 # Metal 后端只在 Apple 平台编译。着色器在运行时编译（newLibraryWithSource:），
 # 所以不需要离线 Metal Toolchain。
 ifeq ($(UNAME_S),Darwin)
-  ENGINE_SRCS += engine/src/metal.mm
+  ENGINE_SRCS += engine/src/metal.mm engine/src/image.mm
   OBJCXXFLAGS := $(CXXFLAGS) -fobjc-arc
-  LDFLAGS     := -framework Metal -framework Foundation
+  LDFLAGS     := -framework Metal -framework Foundation -framework ImageIO \
+                 -framework CoreGraphics -framework CoreFoundation
 else
-  ENGINE_SRCS += engine/src/metal_stub.cpp
+  ENGINE_SRCS += engine/src/metal_stub.cpp engine/src/image_stub.cpp
   LDFLAGS     :=
 endif
 
@@ -48,7 +50,7 @@ all: $(BIN) $(SRV) tools
 engine: $(BIN)
 
 tools: $(BUILD)/selftest $(BUILD)/ggufdump $(BUILD)/tokprobe \
-       $(BUILD)/mma_probe $(BUILD)/mm2_check
+       $(BUILD)/mma_probe $(BUILD)/mm2_check $(BUILD)/vlprobe
 
 # 分词 + 贪心生成探针：同一模型不同量化档输出不一致时，用它区分
 # "分词差异" 和 "前向差异"（对比打印出的 token id 序列即可）。
@@ -116,6 +118,10 @@ check: all
 $(BUILD)/mma_probe: tools/mma_probe.mm
 	@mkdir -p $(dir $@)
 	$(CXX) $(OBJCXXFLAGS) $< -o $@ $(LDFLAGS)
+	@echo "✓ $@"
+
+$(BUILD)/vlprobe: $(ENGINE_OBJS) $(BUILD)/tools/vlprobe.o
+	$(CXX) $^ -o $@ $(LDFLAGS)
 	@echo "✓ $@"
 
 $(BUILD)/mm2_check: tools/mm2_check.mm engine/src/metal_kernels.h
