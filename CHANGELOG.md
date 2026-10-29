@@ -6,6 +6,53 @@
 
 ---
 
+## [0.6.0] · 2026-10-29 · 多模态第一步：LFM3-VL 视觉塔
+
+### 新增
+
+- **mmproj 加载器**（`engine/src/mmproj.*`）：读 `clip.vision.*` 元数据，按实际
+  存在的张量判定每层是 conv 还是 attention（`attn_q` → A，`conv2d_in_proj` → C），
+  不靠外部配置猜。
+- **图像预处理**（`engine/src/image.*`）：macOS 走 ImageIO（PNG/JPEG/HEIC/WebP
+  + EXIF 方向），自写 Catmull-Rom 双三次缩放（与 PIL BICUBIC 对齐），
+  `smart_resize` 与 HF 等价，`pack_pixels` 按 merge-block 序摊平。
+- **视觉塔前向**：patchify → RMSNorm → 轴向 2D RoPE → 14 层 conv/attn 交替
+  → 投影器（LayerNorm → 4 patch 拼 4096 → GELU → 2048）。
+- **嵌入注入 ABI**：`dubhe_load_mmproj` / `dubhe_encode_image` /
+  `dubhe_set_mm_embeds`。注入按**绝对位置**覆盖 token 嵌入。
+- **CLI**：`dubhe run -m vl.gguf --mmproj mmproj.gguf --image pic.png -p '<|image|>…'`
+- **工具**：`vl_oracle.py`（跑 HF 自己的 forward 当权威参考）、`vl_ref.py`
+  （numpy 逐行转写）、`vl_diff.py`（逐层对拍）、`gguf_read.py`（共享读取器）、
+  `vlprobe --dump`（逐层 dump）、`DUBHE_MM_TRACE=1`（分阶段计时）。
+
+### 修复（四个静默 bug，都不报错、只让结果悄悄错）
+
+- 门控卷积漏了**输出门**：`out_proj(C * conv)`，中间那段是门。
+- RoPE 坐标用了 merge-block 号而不是 **patch 号**，等于把图当成缩小一倍的网格。
+- `Gguf.get()` 对 4D 张量用 `reshape(-1, ne[0])`，只对 2D 成立；`patch_embd`
+  是 `[16,16,3,1024]`，会得到 `(1536,16)` —— 形状刚好能乘，结果全错。
+- patchify 的 matmul 没传步长：每 patch 1536 维只取前 768，却按 768 跨步，
+  第 t 个 patch 跨进了相邻 patch。纯白区域看不出来，带细节的图才炸。
+
+### 基准
+
+| 项 | 结果 |
+|---|---|
+| 与 HF 官方 forward 对拍 | 16 个检查点全部一致，最大相对误差 **1.7e-5**，余弦 1.000000 |
+| 640×640（400 token）视觉塔 | 24.9 s → **13.5 s**（1.84x） |
+| 384×384（144 token）视觉塔 | ~8 s → **3.5 s** |
+| matmul 吞吐 | 标量 22.4 → NEON **48 GFLOP/s**（515 GFLOP/图） |
+| 端到端（含模型加载） | 红圆 → *a red circle*；蓝方块+绿长条 → *a blue square and a green rectangle* |
+
+### 说明
+
+- 视觉塔的 matmul 在 CPU 上已贴着 NEON 吞吐上限，再快只能上 Metal。
+- 剩下的 2.3 s 主要是 softmax 的 2.87 亿次 `expf`。
+- `make engine` 只构建 `build/dubhe`，探针要 `make tools` —— 这一轮因此跑了
+  几次旧二进制，白追一个假 bug。
+
+---
+
 ## [0.5.0] · 2026-10-29 · prefill 二维分块 GEMM + 权重预取
 
 ### 基准（LFM3-1.7B Q4_K_M，601 token prompt，6 轮交错配对取比值中位数）

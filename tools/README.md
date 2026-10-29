@@ -36,6 +36,27 @@
 | `ane_probe.py` | ANE（Core ML）算子级测速 |
 | `ui_shot.mjs` | Web UI 截图 |
 
+### 多模态（视觉塔）对拍
+
+| 文件 | 用途 |
+| --- | --- |
+| `vl_oracle.py` | **权威参考**：直接跑 HF 的 `modeling_lfm3_vl.py`，权重取自同一份 mmproj。首次运行会把 HF 那 5 个 .py 抓到 `~/.dubhe/oracle/` |
+| `vl_ref.py` | numpy 版参考，逐行对照源码转写，不依赖 torch |
+| `vl_diff.py` | 逐层比 max\|Δ\| / 相对误差 / 余弦 |
+| `gguf_read.py` | 共享 GGUF 读取器。**4D 张量用 `reshape(ne[-1], -1)`**，不是 `reshape(-1, ne[0])` |
+| `vlprobe.cpp` | 视觉塔探针：`--dump` 逐层写 f32，编号与 HF `hidden_states` 对齐 |
+
+```bash
+./build/vlprobe mmproj.gguf pic.png --dump /tmp/vl
+python tools/vl_oracle.py mmproj.gguf /tmp/vl.pixels.f32 /tmp/vl.meta.txt --dump /tmp/vl
+python tools/vl_diff.py /tmp/vl /tmp/vl        # 全部 ✓ 才算过
+DUBHE_MM_TRACE=1 ./build/vlprobe ...           # 打印 matmul / 反量化分阶段耗时
+```
+
+**为什么要有 oracle**：两个独立实现如果是同一个人照着同一份理解写的，就共享
+同一批误解。第一版 `vl_ref.py` 和 C++ 犯了同样两个错，对拍全绿 —— 假绿灯。
+只有把 HF 自己的 forward 拉进来才能证伪。
+
 ### 测量纪律（踩过的坑，别再踩）
 
 1. **只信同条件交错 A/B。** 一边跑完再跑另一边得到的倍数一律作废 —— 本机
