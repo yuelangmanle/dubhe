@@ -1123,6 +1123,173 @@ kernel void mm3_q4_k(device const uchar* w      [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------- Q6_K
+//
+// Q6_K 块：256 元素 / 210 字节 —— ql[128]、qh[64]、sc[16]（int8）、d(fp16)@208。
+//
+// 6 bit 的拼法是 ggml 定的顺序，别自己发明：
+//   256 块分成两个 128 的半区 h = inblk >> 7，每半区 4 组 × 32 元素，
+//   组号 l0 = (inblk & 127) >> 5。元素值 q = 低 4 位 | 高 2 位 << 4：
+//     * 低 4 位：l0 为偶数取 ql[l]，奇数取 ql[l + 32]；
+//                l0 < 2 取低半字节，l0 >= 2 取高半字节。
+//     * 高 2 位：qh[l] 右移 l0*2 位。
+//   一个 32 元组的 scale 下标 = h*8 + l0*2 + (j >> 4)，j 是组内下标。
+//
+// 为什么这个内核比 Q4_K 那个更值：Q4_K_M 里 ffn_down / attn_v 是 Q6_K，
+// 约占权重的 23%。没有这个内核时它们走"32 行拆 4 批"的老路 —— 权重被
+// 读 4 遍，等于把 23% 的流量放大成 92%。
+//
+// 当前状态：**没启用**（metal.mm 的 kM3Names 里是空串）。结果正确，但慢。
+// -------------------------------------------------------------------
+// 实测（1.7B Q4_K_M，5 token 提示词，交错 3 轮一致）：
+//   只开 Q4_K 的 MMA   prefill  55 ms
+//   再开 Q6_K 的 MMA   prefill 242 ms   ← 慢 4.4 倍，而输出逐字一致
+//
+// 二分过程（每一步都重新编译、交错测）：
+//   1. 反量化砍到只剩一条字节 load          → 242 ms（没变）
+//   2. 反量化砍到零访存                     →  52 ms（恢复）
+//   3. 地址从 q[qlo+lane] 改成 warp 内统一的 q[qlo] → 241 ms（没变）
+//
+// 结论：不是合并访问的问题，是**每条 load 本身的发射/延迟成本**。
+// Q6_K 每元素要 2 条字节 load；Q4_K 是每 16 元素 1 条 uint4 —— 差 32 倍。
+// 6 bit 的打包方式（低 4 位在 ql、高 2 位在 qh）天生不适合逐元素抽取。
+//
+// 救回来的唯一办法是**对齐修正后的 uint4 读**：块跨度 210 只保证 2 字节
+// 对齐，所以要先读 q-2 处的 uint4，再按 (q&3) 移位拼出 16 字节。收益
+// 上限约 prefill 1.5x（Q6_K 权重被读 4 遍 ≈ 多花 18 ms）。留作下一步。
+//
+// 线程分工（保持现状，等向量化之后再回来调）
+// ------------------------------------------
+// lane 就是 32 元组内的元素下标：一个 warp 一次处理一行，32 条 lane 读
+// ql[lane]、qh[lane] 共 32 个连续字节；4 个 warp 并行 4 行，16 轮走完
+// 64 行。d 和 scale 是 warp 内广播。
+kernel void mm3_q6_k(device const uchar* w      [[buffer(0)]],
+                     device const float* XT     [[buffer(1)]],
+                     device float* Y            [[buffer(2)]],
+                     constant uint& n_in        [[buffer(3)]],
+                     constant ulong& woff       [[buffer(4)]],
+                     constant uint& n_out       [[buffer(5)]],
+                     constant uint& nrow        [[buffer(6)]],
+                     constant uint& xstride     [[buffer(7)]],
+                     constant ulong& yoff       [[buffer(8)]],
+                     uint tgid [[threadgroup_position_in_grid]],
+                     uint tid  [[thread_position_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]],
+                     uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half  ws[MMA_BN * MMA_NK];
+    threadgroup half  xs[MMA_BM * MMA_NK];
+    threadgroup float cs[MMA_BM * MMA_BN];
+
+    const uint row0 = tgid * MMA_BN;
+    const uint nb   = n_in / MMA_NK;
+    const ulong rbytes = (ulong)(n_in >> 8) * 210u;
+
+    const uint wid = tid >> 5;             // 0..3，一个 warp 一轮处理一行
+    device const uchar* wbase = w + woff;
+
+    simdgroup_float8x8 acc[2][4];
+    #pragma unroll
+    for (uint i = 0; i < 2u; i++)
+        #pragma unroll
+        for (uint j = 0; j < 4u; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    for (uint b = 0; b < nb; b++) {
+        const uint k0 = b * MMA_NK;
+
+        // ---- 反量化 64 行 × 32 元素进 ws
+        {
+            const uint inblk = k0 & 255u;             // 块内偏移
+            const uint h128  = inblk >> 7;            // 半区 0/1
+            const uint l0    = (inblk & 127u) >> 5;   // 组号 0..3
+            const uint hif   = (l0 >= 2u) ? 4u : 0u;  // ql 取高半字节还是低半字节
+            const uint sh    = (l0 >> 1) << 1;        // qh 的移位 0/2/4/6
+            const uint qlo   = h128 * 64u + ((l0 & 1u) ? 32u : 0u);
+            const uint qho   = 128u + h128 * 32u;
+            const uint scof  = h128 * 8u + l0 * 2u + (lane >> 4);   // lane>>4 = 组内 j/16
+            const ulong step = (ulong)(4) * rbytes;   // 一个 warp 每轮跳 4 行
+
+            device const uchar* qrow =
+                wbase + (ulong)min(row0 + wid, n_out - 1u) * rbytes + (ulong)(k0 >> 8) * 210u;
+            // 末组不满 64 行时的兜底：夹到最后一行的指针，别读出张量尾
+            const uint rlast = (row0 + 63u < n_out) ? 63u : (n_out - 1u - row0);
+            device const uchar* qend =
+                wbase + (ulong)(n_out - 1u) * rbytes + (ulong)(k0 >> 8) * 210u;
+
+            // 展开 4 轮：每轮一条独立的 load 链，4 条同时在飞才盖得住
+            // device memory 的延迟。不展开时 16 轮严格串行，实测 prefill 慢 5 倍。
+            #pragma unroll 4
+            for (uint it = 0; it < 16u; it++) {
+                const uint r = wid + (it << 2);       // 0..63
+                device const uchar* q = (r <= rlast) ? (qrow + (ulong)it * step) : qend;
+
+                const float d  = rd_f16(q + 208u);
+                const float sc = d * float(int(((device const char*)(q + 192u))[scof]));
+
+                const uint qb = uint(q[qlo + lane]);
+                const uint qh = uint(q[qho + lane]);
+                const uint v  = ((qb >> hif) & 0x0Fu) | (((qh >> sh) & 3u) << 4);
+
+                ws[r * MMA_NK + lane] = (half)(sc * float(int(v) - 32));
+            }
+        }
+
+        // ---- 激活搬进 xs（与 Q4_K 版相同）
+        #pragma unroll
+        for (uint t = 0; t < 2u; t++) {
+            const uint i4 = tid * 2u + t;
+            const uint m0 = (i4 & 7u) << 2;
+            const uint k  = i4 >> 3;
+            const float4 v = *(device const float4*)(XT + (ulong)(k0 + k) * xstride + m0);
+            *(threadgroup half4*)(xs + k * MMA_BM + m0) =
+                half4((half)v.x, (half)v.y, (half)v.z, (half)v.w);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint kk = 0; kk < 4u; kk++) {
+            simdgroup_half8x8 ma[4];
+            #pragma unroll
+            for (uint j = 0; j < 4u; j++)
+                simdgroup_load(ma[j], xs, MMA_BM, ulong2(j << 3, kk << 3), true);
+
+            simdgroup_half8x8 mb[2];
+            #pragma unroll
+            for (uint i = 0; i < 2u; i++)
+                simdgroup_load(mb[i], ws, MMA_NK, ulong2(kk << 3, (sg << 4) + (i << 3)), true);
+
+            #pragma unroll
+            for (uint i = 0; i < 2u; i++) {
+                #pragma unroll
+                for (uint j = 0; j < 4u; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], ma[j], mb[i], acc[i][j]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma unroll
+    for (uint i = 0; i < 2u; i++) {
+        #pragma unroll
+        for (uint j = 0; j < 4u; j++)
+            simdgroup_store(acc[i][j], cs, MMA_BN,
+                            ulong2((sg << 4) + (i << 3), j << 3), false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    #pragma unroll
+    for (uint t = 0; t < 16u; t++) {
+        const uint idx = tid * 16u + t;
+        const uint m = idx >> 6;
+        const uint n = idx & 63u;
+        if (m < nrow && row0 + n < n_out)
+            Y[yoff + (ulong)m * n_out + row0 + n] = cs[m * MMA_BN + n];
+    }
+}
+
 // ================================================================ 融合算子
 //
 // 为什么要这些：一次 command buffer 的 commit+wait 在本机实测要 200 µs。
