@@ -1043,6 +1043,21 @@
       </div>
       <div class="hint" id="hint">Enter 发送 · Shift+Enter 换行</div>
     </div>
+
+    <!-- 侧栏切过来的功能视图。盖在对话区上而不是替换 DOM：
+         对话的滚动位置、草稿、流式状态全在原位，切回来一点不丢。 -->
+    <section id="views" class="views" hidden>
+      <header class="view-head">
+        <button class="icon-btn xs" id="viewBack" title="返回对话" aria-label="返回对话">
+          <svg class="i" viewBox="0 0 24 24"><use href="#i-chevron-right"/></svg>
+        </button>
+        <h2 id="viewTitle">模型</h2>
+        <span class="view-sub" id="viewSub"></span>
+        <span class="grow"></span>
+        <div class="view-actions" id="viewActions"></div>
+      </header>
+      <div class="view-body" id="viewBody"></div>
+    </section>
   </main>
 
   <!-- ------------------------------ 右：运行状态 ------------------------------ -->

@@ -134,7 +134,7 @@ std::string path_dir(const std::string& p) {
 
 // 相对路径按工作区解析；~ 展开成家目录
 std::string path_abs(const std::string& p) {
-    if (p.empty()) return g.workspace;
+    if (p.empty() || p == "." || p == "./") return g.workspace;
     if (p[0] == '~') {
         const char* h = getenv("HOME");
         return std::string(h ? h : "") + p.substr(1);

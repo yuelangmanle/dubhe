@@ -38,6 +38,8 @@
     gen: null,      // 本轮生成统计 { tokens, tps, total, ttft }
     q: '',          // 左栏搜索关键词
     abort: null,    // 生成中的 AbortController，用于"停止"
+    view: null,     // 当前打开的功能视图（null = 对话）
+    fsPath: '',     // 文件视图当前目录
   };
 
   const settings = Object.assign(
@@ -1108,6 +1110,583 @@
   const ICON_SEND = icon('send');
   const ICON_STOP = icon('stop');
 
+  // ==========================================================================
+  // 功能视图：模型 / 工具 / Agent / 文件 / 知识库
+  //
+  // 五个视图都是真实数据 + 真实操作，没有一个是占位页：
+  // 模型能真的切换（卸载 + 加载），文件能真的读，工具能真的执行，
+  // 知识库能真的索引和检索。后端没做的能力（比如自动多步规划）就不假装有。
+  // ==========================================================================
+
+  async function vapi(path, opts) {
+    const r = await fetch(path, opts);
+    const text = await r.text();
+    let j = null;
+    try { j = JSON.parse(text); } catch (e) { /* 非 JSON 响应 */ }
+    if (!r.ok) throw new Error((j && (j.error || j.message)) || 'HTTP ' + r.status);
+    return j || {};
+  }
+  const vpost = (p, body) =>
+    vapi(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+
+  function fmtBytes(b) {
+    if (!b) return '0 B';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0, v = b;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (v >= 10 || i === 0 ? v.toFixed(0) : v.toFixed(1)) + ' ' + u[i];
+  }
+
+  function fmtAgo(t) {
+    if (!t) return '';
+    const d = new Date(t * 1000);
+    const s = (Date.now() - d.getTime()) / 1000;
+    if (s < 90) return '刚刚';
+    if (s < 3600) return Math.floor(s / 60) + ' 分钟前';
+    if (s < 86400) return Math.floor(s / 3600) + ' 小时前';
+    if (s < 86400 * 30) return Math.floor(s / 86400) + ' 天前';
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+
+  function setViewHead(title, sub, actions) {
+    $('#viewTitle').textContent = title;
+    $('#viewSub').textContent = sub || '';
+    const box = $('#viewActions');
+    box.innerHTML = '';
+    (actions || []).forEach((a) => {
+      const b = el('button', 'vbtn' + (a.pri ? ' pri' : '') + (a.ghost ? ' ghost' : ''));
+      if (a.icon) b.appendChild(iconNode(a.icon));
+      b.appendChild(document.createTextNode(a.label));
+      if (a.on) b.onclick = a.on;
+      box.appendChild(b);
+    });
+  }
+
+  const VIEWS = {
+    models: { title: '模型', render: () => viewModels() },
+    tools: { title: '工具', render: () => viewTools() },
+    agent: { title: 'Agent', render: () => viewAgent() },
+    files: { title: '文件', render: () => viewFiles(state.fsPath) },
+    kb: { title: '知识库', render: () => viewKb() },
+  };
+
+  function openView(name) {
+    const v = VIEWS[name];
+    if (!v) return;
+    state.view = name;
+    $('#views').hidden = false;
+    $('#viewBody').innerHTML = '';
+    setViewHead(v.title, '', []);
+    // 地址栏带上是哪个视图：刷新不丢位置，也能直接分享 /#kb
+    try { history.replaceState(null, '', '#' + name); } catch (e) {}
+    document.querySelectorAll('.nav-item[data-view]').forEach((x) =>
+      x.classList.toggle('on', x.dataset.view === name));
+    v.render();
+  }
+
+  function closeView() {
+    state.view = null;
+    $('#views').hidden = true;
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+    document.querySelectorAll('.nav-item[data-view]').forEach((x) =>
+      x.classList.toggle('on', x.dataset.view === 'chat'));
+  }
+
+  function vEmpty(title, desc) {
+    const b = el('div', 'vempty');
+    b.appendChild(el('b', null, title));
+    if (desc) b.appendChild(document.createTextNode(desc));
+    return b;
+  }
+
+  // ---------------------------------------------------------------- 模型
+  async function viewModels() {
+    const body = $('#viewBody');
+    body.innerHTML = '';
+    body.appendChild(el('div', 'vempty', '正在扫描模型目录…'));
+    let d;
+    try {
+      d = await vapi('/api/models');
+    } catch (e) {
+      body.innerHTML = '';
+      body.appendChild(el('div', 'vnote bad', '读不到模型清单：' + e.message));
+      return;
+    }
+    setViewHead('模型', d.items.length + ' 个 · ' + d.dir, [
+      { label: '刷新', icon: 'restart', on: () => viewModels() },
+    ]);
+    body.innerHTML = '';
+    if (!d.items.length) {
+      body.appendChild(vEmpty('模型目录是空的', d.dir + ' 下没有 .gguf 文件。把模型放到这里就能在界面上切换。'));
+      return;
+    }
+    const card = el('div', 'vcard');
+    d.items.forEach((m) => {
+      const row = el('div', 'vrow' + (m.loaded ? ' on' : ''));
+      const ico = el('div', 'vico');
+      ico.appendChild(iconNode('cube'));
+      row.appendChild(ico);
+      // mmproj 是多模态塔（视觉/语音编码器），不是能单独加载的语言模型：
+      // 它得跟着主模型一起用 --mmproj 挂上去。列出来是为了让人看得见，
+      // 但绝不能给一个点了必然失败的"加载"按钮。
+      const isMm = /^mmproj/i.test(m.name);
+      const main = el('div', 'vmain');
+      const nm = el('div', 'vname', m.name);
+      if (m.loaded) nm.appendChild(el('span', 'vtag on', '当前'));
+      if (isMm) nm.appendChild(el('span', 'vtag', '多模态塔'));
+      main.appendChild(nm);
+      const bits = [];
+      if (m.quant) bits.push(m.quant);
+      if (m.params) bits.push((m.params / 1e9).toFixed(1) + 'B');
+      bits.push(fmtBytes(m.bytes));
+      bits.push(fmtAgo(m.mtime));
+      main.appendChild(el('div', 'vmeta', bits.join(' · ')));
+      row.appendChild(main);
+      if (!m.loaded && !isMm) {
+        const b = el('button', 'vbtn', '加载');
+        b.onclick = async () => {
+          b.disabled = true;
+          b.textContent = '加载中…';
+          try {
+            const r = await vpost('/api/load', { path: m.path });
+            b.textContent = '已加载 ' + Math.round(r.ms) + ' ms';
+            await refreshState();
+            viewModels();
+          } catch (e) {
+            b.disabled = false;
+            b.textContent = '加载';
+            const note = el('div', 'vnote bad', '加载失败：' + e.message);
+            card.parentNode.insertBefore(note, card);
+            setTimeout(() => note.remove(), 6000);
+          }
+        };
+        row.appendChild(b);
+      }
+      card.appendChild(row);
+    });
+    body.appendChild(card);
+    body.appendChild(el('div', 'vnote',
+      '切换模型会先卸载当前权重再加载新的，通常 1~2 秒。加载失败会自动装回原来的模型，不会把服务变成没有模型的状态。'));
+  }
+
+  // ---------------------------------------------------------------- 工具
+  async function viewTools() {
+    const body = $('#viewBody');
+    body.innerHTML = '';
+    body.appendChild(el('div', 'vempty', '正在读取工具清单…'));
+    let d;
+    try {
+      d = await vapi('/api/tools');
+    } catch (e) {
+      body.innerHTML = '';
+      body.appendChild(el('div', 'vnote bad', '读不到工具清单：' + e.message));
+      return;
+    }
+    setViewHead('工具', d.items.filter((t) => t.enabled).length + ' / ' + d.items.length + ' 已启用', [
+      { label: '刷新', icon: 'restart', on: () => viewTools() },
+    ]);
+    body.innerHTML = '';
+    body.appendChild(el('div', 'vnote', '工作区：' + d.workspace));
+
+    const card = el('div', 'vcard');
+    d.items.forEach((t) => {
+      const wrap = el('div');
+      const row = el('div', 'vrow tap');
+      const ico = el('div', 'vico');
+      ico.appendChild(iconNode(t.name === 'shell' ? 'terminal' : 'nodes'));
+      row.appendChild(ico);
+      const main = el('div', 'vmain');
+      const nm = el('div', 'vname', t.name);
+      nm.appendChild(el('span', 'vtag' + (t.enabled ? ' on' : ' warn'), t.enabled ? '已启用' : '未启用'));
+      main.appendChild(nm);
+      main.appendChild(el('div', 'vmeta', t.desc + ' · 参数 ' + t.args));
+      row.appendChild(main);
+      const caret = el('div', 'vmeta', '试运行');
+      row.appendChild(caret);
+      wrap.appendChild(row);
+
+      // 展开区：参数输入 + 执行 + 输出。默认收起，避免一屏全是输入框。
+      const panel = el('div');
+      panel.style.display = 'none';
+      panel.style.padding = '0 13px 12px';
+      const inp = el('input');
+      inp.type = 'text';
+      inp.placeholder = t.name === 'shell' ? 'command，例如 ls -la' : 'path，例如 README.md';
+      const ibox = el('div', 'vinput');
+      ibox.appendChild(iconNode('terminal'));
+      ibox.appendChild(inp);
+      const run = el('button', 'vbtn pri', '运行');
+      run.style.marginLeft = '8px';
+      const bar = el('div');
+      bar.style.display = 'flex';
+      bar.style.alignItems = 'center';
+      bar.appendChild(ibox);
+      ibox.style.flex = '1 1 auto';
+      bar.appendChild(run);
+      panel.appendChild(bar);
+      const out = el('pre', 'vcode');
+      out.style.display = 'none';
+      out.style.marginTop = '9px';
+      panel.appendChild(out);
+      wrap.appendChild(panel);
+
+      row.onclick = () => {
+        const open = panel.style.display !== 'none';
+        panel.style.display = open ? 'none' : 'block';
+        caret.textContent = open ? '试运行' : '收起';
+        if (!open) inp.focus();
+      };
+      run.onclick = async (ev) => {
+        ev.stopPropagation();
+        const val = inp.value.trim();
+        if (!val) { inp.focus(); return; }
+        run.disabled = true;
+        run.textContent = '运行中…';
+        out.style.display = 'block';
+        out.textContent = '…';
+        try {
+          const args = t.name === 'shell' ? { command: val } : { path: val };
+          const r = await vpost('/api/tools/run', { name: t.name, arguments: args });
+          out.textContent = r.output || '(无输出)';
+          if (!r.ok) out.style.borderColor = 'var(--red)';
+        } catch (e) {
+          out.textContent = '执行失败：' + e.message;
+        }
+        run.disabled = false;
+        run.textContent = '运行';
+      };
+      card.appendChild(wrap);
+    });
+    body.appendChild(card);
+  }
+
+  // ---------------------------------------------------------------- Agent
+  //
+  // 不做"假的多步规划面板"：1.7B 级模型拆出来的计划基本没法用，画一个漂亮
+  // 的计划树只会骗人。这里做的是真实的东西 —— 一个把任务直接丢给带工具
+  // 循环的对话的入口，加上从历史会话里真实聚合出来的工具调用轨迹。
+  async function viewAgent() {
+    const body = $('#viewBody');
+    body.innerHTML = '';
+    setViewHead('Agent', '任务交给带工具的对话执行', []);
+
+    const card = el('div', 'vcard');
+    card.style.padding = '13px';
+    card.appendChild(el('div', 'vname', '要做什么'));
+    card.appendChild(el('div', 'vmeta', '会切回对话并把工具调用打开，模型自己决定读哪个文件、跑哪条命令。'));
+
+    const inp = el('textarea');
+    inp.rows = 3;
+    inp.placeholder = '例如：读一下 engine/src/metal.mm，告诉我 prefill 的派发逻辑在哪几行';
+    inp.style.cssText =
+      'width:100%;margin:10px 0;padding:9px 11px;border-radius:11px;border:1px solid var(--glass-line);' +
+      'background:var(--glass-strong);font:inherit;font-size:13px;color:var(--text);outline:0;resize:vertical;box-sizing:border-box';
+    card.appendChild(inp);
+
+    const go = el('button', 'vbtn pri', '在对话中执行');
+    go.onclick = () => {
+      const t = inp.value.trim();
+      if (!t) { inp.focus(); return; }
+      state.tools = true;
+      settings.tools = true;
+      saveSettings();
+      closeView();
+      send(t);
+    };
+    card.appendChild(go);
+    body.appendChild(card);
+
+    // ---- 真实轨迹：把历史会话里所有工具调用按时间倒序摊平
+    const runs = [];
+    for (const c of state.convs) {
+      for (const m of c.messages || []) {
+        for (const t of m.tools || []) runs.push({ t, conv: c.title, at: c.at });
+      }
+    }
+    runs.sort((a, b) => (b.at || 0) - (a.at || 0));
+
+    const sec = el('div', 'vsec');
+    const head = el('div', 'vsec-head');
+    head.appendChild(el('h3', null, '最近的工具调用'));
+    head.appendChild(el('span', 'n', runs.length + ' 次'));
+    sec.appendChild(head);
+
+    if (!runs.length) {
+      sec.appendChild(vEmpty('还没有工具调用', '在对话里问一个需要读文件的问题，这里就会出现轨迹。'));
+    } else {
+      const list = el('div', 'vcard');
+      runs.slice(0, 20).forEach(({ t, conv }) => {
+        const row = el('div', 'vrow');
+        const ico = el('div', 'vico');
+        ico.appendChild(iconNode('nodes'));
+        row.appendChild(ico);
+        const main = el('div', 'vmain');
+        const nm = el('div', 'vname', t.name + (t.ok === false ? '（失败）' : ''));
+        main.appendChild(nm);
+        const arg = t.args ? JSON.stringify(t.args).slice(0, 70) : '';
+        main.appendChild(el('div', 'vmeta', arg));
+        row.appendChild(main);
+        row.appendChild(el('div', 'vmeta', conv || ''));
+        list.appendChild(row);
+      });
+      sec.appendChild(list);
+    }
+    body.appendChild(sec);
+  }
+
+  // ---------------------------------------------------------------- 文件
+  async function viewFiles(path) {
+    const body = $('#viewBody');
+    body.innerHTML = '';
+    body.appendChild(el('div', 'vempty', '正在读目录…'));
+    let d;
+    try {
+      d = await vapi('/api/files?path=' + encodeURIComponent(path || '.'));
+    } catch (e) {
+      body.innerHTML = '';
+      setViewHead('文件', path || '', [{ label: '返回对话', on: closeView }]);
+      body.appendChild(el('div', 'vnote bad', '读不到目录：' + e.message));
+      return;
+    }
+    state.fsPath = d.path;
+    setViewHead('文件', d.items.length + ' 项', [
+      { label: '上一级', icon: 'folder', on: () => viewFiles(d.parent) },
+    ]);
+    body.innerHTML = '';
+    body.appendChild(el('div', 'vpath', d.path));
+
+    if (!d.items.length) {
+      body.appendChild(vEmpty('这个目录是空的', ''));
+      return;
+    }
+    const card = el('div', 'vcard');
+    d.items.forEach((it) => {
+      const row = el('div', 'vrow tap');
+      const ico = el('div', 'vico');
+      ico.appendChild(iconNode(it.dir ? 'folder' : it.text ? 'msg-file' : 'cube'));
+      row.appendChild(ico);
+      const main = el('div', 'vmain');
+      main.appendChild(el('div', 'vname', it.name + (it.dir ? '/' : '')));
+      const bits = [];
+      if (!it.dir) bits.push(fmtBytes(it.bytes));
+      bits.push(fmtAgo(it.mtime));
+      if (!it.dir && !it.text) bits.push('非文本');
+      main.appendChild(el('div', 'vmeta', bits.join(' · ')));
+      row.appendChild(main);
+      row.onclick = () => {
+        if (it.dir) viewFiles(it.path);
+        else if (it.text) viewFileText(it.path);
+        else {
+          const n = el('div', 'vnote bad', '这是二进制文件，界面上不预览。');
+          card.parentNode.insertBefore(n, card);
+          setTimeout(() => n.remove(), 3500);
+        }
+      };
+      card.appendChild(row);
+    });
+    body.appendChild(card);
+  }
+
+  async function viewFileText(path) {
+    const body = $('#viewBody');
+    body.innerHTML = '';
+    body.appendChild(el('div', 'vempty', '正在读文件…'));
+    let d;
+    try {
+      d = await vapi('/api/files/read?path=' + encodeURIComponent(path));
+    } catch (e) {
+      body.innerHTML = '';
+      body.appendChild(el('div', 'vnote bad', '读不到文件：' + e.message));
+      return;
+    }
+    setViewHead(d.name, fmtBytes(d.bytes) + (d.truncated ? ' · 已截断' : ''), [
+      { label: '上一级', icon: 'folder', on: () => viewFiles(path.replace(/\/[^/]*$/, '') || '/') },
+      {
+        label: '问这个文件',
+        pri: true,
+        on: () => {
+          closeView();
+          send('请读一下 ' + path + '，然后概括它讲了什么');
+        },
+      },
+    ]);
+    body.innerHTML = '';
+    body.appendChild(el('div', 'vpath', d.path));
+    if (d.binary) {
+      body.appendChild(el('div', 'vnote bad', '这个文件里有二进制内容，不预览。'));
+      return;
+    }
+    const pre = el('pre', 'vcode', d.text || '(空文件)');
+    body.appendChild(pre);
+  }
+
+  // ---------------------------------------------------------------- 知识库
+  async function viewKb() {
+    const body = $('#viewBody');
+    body.innerHTML = '';
+    body.appendChild(el('div', 'vempty', '正在读取知识库…'));
+    let d;
+    try {
+      d = await vapi('/api/kb');
+    } catch (e) {
+      body.innerHTML = '';
+      body.appendChild(el('div', 'vnote bad', '读不到知识库：' + e.message));
+      return;
+    }
+    const rag = { on: d.rag };
+    setViewHead('知识库', d.n_docs + ' 篇 · ' + d.n_chunks + ' 块 · ' + fmtBytes(d.bytes), []);
+    body.innerHTML = '';
+
+    // ---- 自动注入开关
+    const sw = el('button', 'vbtn' + (d.rag ? ' pri' : ''), d.rag ? '自动注入：开' : '自动注入：关');
+    sw.onclick = async () => {
+      rag.on = !rag.on;
+      try {
+        const r = await vpost('/api/kb/rag', { on: rag.on });
+        sw.className = 'vbtn' + (r.rag ? ' pri' : '');
+        sw.textContent = r.rag ? '自动注入：开' : '自动注入：关';
+      } catch (e) { /* 保持原状 */ }
+    };
+
+    const bar = el('div');
+    bar.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap';
+    bar.appendChild(sw);
+
+    const inp = el('input');
+    inp.type = 'text';
+    inp.placeholder = '路径，如 docs';
+    const ibox = el('div', 'vinput');
+    ibox.style.flex = '1 1 220px';
+    ibox.appendChild(iconNode('folder'));
+    ibox.appendChild(inp);
+    const add = el('button', 'vbtn', '索引');
+    add.onclick = async () => {
+      const p = inp.value.trim();
+      if (!p) { inp.focus(); return; }
+      add.disabled = true;
+      add.textContent = '索引中…';
+      try {
+        const r = await vpost('/api/kb/add', { path: p });
+        inp.value = '';
+        viewKb();
+        return;
+      } catch (e) {
+        const n = el('div', 'vnote bad', '索引失败：' + e.message);
+        body.insertBefore(n, bar);
+        setTimeout(() => n.remove(), 6000);
+      }
+      add.disabled = false;
+      add.textContent = '索引';
+    };
+    bar.appendChild(ibox);
+    bar.appendChild(add);
+    body.appendChild(bar);
+
+    // ---- 检索
+    const q = el('input');
+    q.type = 'text';
+    q.placeholder = '搜一句试试，比如「Q6_K 移位写错」';
+    const qbox = el('div', 'vinput');
+    qbox.appendChild(iconNode('search'));
+    qbox.appendChild(q);
+    body.appendChild(qbox);
+    const results = el('div');
+    results.style.marginTop = '12px';
+    body.appendChild(results);
+
+    const doSearch = async () => {
+      const text = q.value.trim();
+      if (!text) return;
+      results.innerHTML = '';
+      results.appendChild(el('div', 'vempty', '检索中…'));
+      let r;
+      try {
+        r = await vpost('/api/kb/search', { q: text, k: 6 });
+      } catch (e) {
+        results.innerHTML = '';
+        results.appendChild(el('div', 'vnote bad', '检索失败：' + e.message));
+        return;
+      }
+      results.innerHTML = '';
+      if (!r.hits.length) {
+        results.appendChild(vEmpty('没有命中', '换个说法，或者先把相关目录索引进来。'));
+        return;
+      }
+      const card = el('div', 'vcard');
+      r.hits.forEach((h) => {
+        const box = el('div', 'khit');
+        const hd = el('div', 'khit-head');
+        hd.appendChild(el('b', null, h.name));
+        hd.appendChild(el('span', 'khit-score', h.score.toFixed(1)));
+        box.appendChild(hd);
+        const sn = el('div', 'khit-snip');
+        // 把命中的查询词高亮出来 —— 检索是 BM25，能说清"为什么这条排前面"
+        let html = escapeHtml(h.snippet);
+        text.split(/\s+/).filter((w) => w.length >= 2).forEach((w) => {
+          const safe = escapeHtml(w).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          html = html.replace(new RegExp(safe, 'gi'), (m) => '<mark>' + m + '</mark>');
+        });
+        sn.innerHTML = html;
+        box.appendChild(sn);
+        card.appendChild(box);
+      });
+      results.appendChild(card);
+    };
+    q.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); doSearch(); }
+    });
+    qbox.style.cursor = 'text';
+    qbox.onclick = () => q.focus();
+
+    // ---- 文档清单
+    const sec = el('div', 'vsec');
+    sec.style.marginTop = '16px';
+    const head = el('div', 'vsec-head');
+    head.appendChild(el('h3', null, '已索引'));
+    head.appendChild(el('span', 'n', d.n_docs + ' 篇'));
+    if (d.n_docs) {
+      const clr = el('button', 'vbtn ghost', '清空');
+      clr.style.marginLeft = 'auto';
+      clr.onclick = async () => {
+        if (!confirm('清空知识库索引？源文件不会被删除。')) return;
+        try { await vpost('/api/kb/clear', {}); viewKb(); } catch (e) {}
+      };
+      head.appendChild(clr);
+    }
+    sec.appendChild(head);
+
+    if (!d.docs.length) {
+      sec.appendChild(vEmpty('还没有索引任何东西', '把 docs、README.md 这类目录或文件加进来，之后对话会自动参考它们。'));
+    } else {
+      const list = el('div', 'vcard');
+      d.docs.forEach((doc) => {
+        const row = el('div', 'vrow');
+        const ico = el('div', 'vico');
+        ico.appendChild(iconNode('book'));
+        row.appendChild(ico);
+        const main = el('div', 'vmain');
+        const nm = el('div', 'vname', doc.name);
+        if (doc.missing) nm.appendChild(el('span', 'vtag warn', '已删除'));
+        main.appendChild(nm);
+        main.appendChild(el('div', 'vmeta', doc.chunks + ' 块 · ' + fmtBytes(doc.bytes) + ' · ' + fmtAgo(doc.mtime)));
+        row.appendChild(main);
+        const rm = el('button', 'vbtn ghost', '移除');
+        rm.onclick = async () => {
+          try { await vpost('/api/kb/remove', { path: doc.path }); viewKb(); } catch (e) {}
+        };
+        row.appendChild(rm);
+        list.appendChild(row);
+      });
+      sec.appendChild(list);
+    }
+    body.appendChild(sec);
+
+    body.appendChild(el('div', 'vnote',
+      '检索用 BM25（词频 + 逆文档频率），不是向量检索 —— 本地没有 embedding 模型，' +
+      '而为了 RAG 硬塞一个 300 MB 的模型进来不划算。中文按二元组切词，' +
+      '所以「本地推理」会被拆成 本地 / 地推 / 推理，召回偏高但排序仍然稳。'));
+  }
+
   function bind() {
     setGlass(glassLevel(), false);
     bindLight();
@@ -1199,20 +1778,18 @@
       c.onclick = () => send(c.dataset.p);
     });
 
-    // 左栏导航：目前只有"对话"是完整实现的。其余项不做假的空页面 ——
-    // 点了给一句实话，比给一个空白界面强。
+    // 左栏导航：对话 + 五个真实视图。视图盖在对话区上，切回来时
+    // 滚动位置和草稿都还在。
     document.querySelectorAll('.nav-item[data-view]').forEach((b) => {
       b.onclick = () => {
         document.querySelectorAll('.nav-item[data-view]').forEach((x) => x.classList.remove('on'));
         b.classList.add('on');
-        if (b.dataset.view !== 'chat') {
-          openSheet(b.textContent.trim(), (body) => {
-            body.appendChild(el('p', 'desc',
-              '这一块还在开发中。当前版本已经可用的是对话、模型切换、工具调用和 API 网关。'));
-          });
-        }
+        if (b.dataset.view === 'chat') closeView();
+        else openView(b.dataset.view);
       };
     });
+    const vback = $('#viewBack');
+    if (vback) vback.onclick = closeView;
 
     document.addEventListener('click', (e) => {
       const btn = e.target.closest('[data-copy]');
@@ -1225,7 +1802,7 @@
     });
 
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') { closeSheet(); closeSidebar(); }
+      if (e.key === 'Escape') { closeSheet(); closeSidebar(); if (state.view) closeView(); }
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
         e.preventDefault();
         const si = $('#searchInput');
@@ -1252,6 +1829,9 @@
     renderLogs();
     renderTools();
     setGauge(0, 0, 0, 0);
+    // 地址栏 hash 直接打开对应视图（刷新不丢位置）
+    const h = location.hash.replace('#', '');
+    if (h && VIEWS[h]) openView(h);
     setInterval(refreshState, 8000);
     // 宽屏不需要抽屉遮罩；窗口从窄变宽时清掉残留状态
     window.addEventListener('resize', () => {

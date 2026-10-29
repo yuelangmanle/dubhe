@@ -45,18 +45,49 @@ struct Request {
         return "";
     }
     std::string param(const std::string& k) const {
-        // 从 query 中取 ?a=1&b=2
+        // 从 query 中取 ?a=1&b=2，并做 percent-decode。
+        //
+        // 解码是必须的：前端用 encodeURIComponent 编码路径，/Users/a b/c.md
+        // 会变成 %2FUsers%2Fa%20b%2Fc.md。不解码的话服务端拿到的是一个
+        // 以 %2F 开头的"相对路径"，stat 必然失败 —— 而且报的是"文件不存在"，
+        // 看起来像权限问题，极难往编码上想。
+        //
+        // 只处理 %XX，不把 '+' 当空格：query 里 '+' 表示空格是表单编码的
+        // 约定，而这里的参数基本都是文件路径，'+' 是合法的文件名字符。
         size_t p = 0;
         while (p < query.size()) {
             size_t eq = query.find('=', p);
             size_t amp = query.find('&', p);
             if (amp == std::string::npos) amp = query.size();
             if (eq != std::string::npos && eq < amp) {
-                if (query.substr(p, eq - p) == k) return query.substr(eq + 1, amp - eq - 1);
+                if (query.substr(p, eq - p) == k) return url_decode(query.substr(eq + 1, amp - eq - 1));
             }
             p = amp + 1;
         }
         return "";
+    }
+
+    static std::string url_decode(const std::string& s) {
+        auto hex = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        std::string o;
+        o.reserve(s.size());
+        for (size_t i = 0; i < s.size(); i++) {
+            if (s[i] == '%' && i + 2 < s.size()) {
+                const int h = hex(s[i + 1]), l = hex(s[i + 2]);
+                if (h >= 0 && l >= 0) {
+                    o += (char)(h * 16 + l);
+                    i += 2;
+                    continue;
+                }
+            }
+            o += s[i];
+        }
+        return o;
     }
 };
 
