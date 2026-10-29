@@ -101,53 +101,39 @@ def run_dubhe(model: Path, prompt: str, n: int, no_gpu: bool) -> Row | None:
 # ------------------------------------------------------------------ MLX
 
 def mlx_available() -> tuple[bool, str]:
+    """MLX 侧走 tools/mlx_lfm3.py（mlx-lm 0.32 只有 lfm2，没有 lfm3）。"""
+    script = ROOT / "tools" / "mlx_lfm3.py"
+    if not script.exists():
+        return False, "缺少 tools/mlx_lfm3.py"
     try:
+        import mlx.core  # noqa: F401
         import mlx_lm  # noqa: F401
     except Exception as e:  # noqa: BLE001
-        return False, f"mlx_lm 不可用: {e}"
-    try:
-        from mlx_lm.models import lfm3  # noqa: F401
-        return True, ""
-    except Exception:  # noqa: BLE001
-        try:
-            from mlx_lm.utils import _get_classes
-            return True, "lfm3 模块名未知，交由 load 自动识别"
-        except Exception as e:  # noqa: BLE001
-            return False, f"mlx_lm 不支持 lfm3: {e}"
+        return False, f"MLX 不可用: {e}"
+    return True, ""
 
 
 def run_mlx(model_dir: Path, prompt: str, n: int) -> Row:
     """在一个子进程里跑 MLX，避免 import 失败拖垮整个矩阵。"""
     if not model_dir.exists():
         return Row("mlx", model_dir.name, note="目录不存在")
-    code = r"""
-import json, sys, time
-from mlx_lm import load, generate
-path, prompt, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
-model, tok = load(path)
-# 贪心：temp=0 在 mlx_lm 里走 argmax 路径
-t0 = time.perf_counter()
-text = generate(model, tok, prompt=prompt, max_tokens=n, temp=0.0, verbose=False)
-dt = time.perf_counter() - t0
-ntok = len(tok.encode(text))
-print(json.dumps({"text": text, "decode_tps": ntok / dt if dt else 0.0,
-                  "prefill_tps": 0.0, "note": ""}))
-"""
+    script = ROOT / "tools" / "mlx_lfm3.py"
     try:
-        p = subprocess.run([sys.executable, "-c", code, str(model_dir), prompt, str(n)],
-                           capture_output=True, text=True, timeout=1200)
+        p = subprocess.run([sys.executable, str(script), str(model_dir), prompt, str(n)],
+                           capture_output=True, text=True, timeout=1800,
+                           stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return Row("mlx", model_dir.name, note="超时")
-    if p.returncode != 0:
+    # 用 rfind 而不是"找以 { 开头的行"：transformers 的 trust_remote_code 提示
+    # 可能和 JSON 粘在同一行（stdin 不是 tty 时不带换行）。
+    i = p.stdout.rfind('{"tokens_in"')
+    if i < 0:
         tail = (p.stderr or "").strip().splitlines()
         return Row("mlx", model_dir.name, note=tail[-1] if tail else "失败")
-    try:
-        d = json.loads(p.stdout.strip().splitlines()[-1])
-    except Exception:  # noqa: BLE001
-        return Row("mlx", model_dir.name, note="输出解析失败")
+    d = json.loads(p.stdout[i:].splitlines()[0])
     size = sum(f.stat().st_size for f in model_dir.glob("*.safetensors")) / 1e6
     return Row("mlx", model_dir.name, size_mb=size, prefill_tps=d["prefill_tps"],
-               decode_tps=d["decode_tps"], text=d["text"].strip(), note=d.get("note", ""))
+               decode_tps=d["decode_tps"], text=d["text"].strip())
 
 
 # ------------------------------------------------------------------ 输出

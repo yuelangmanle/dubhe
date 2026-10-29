@@ -2,7 +2,7 @@
 
 > Apple Silicon MacBook 与 Android 手机上的本地大模型推理引擎。GGUF 原生直读，单路与多路都不掉速。
 
-状态：M0 已交付（引擎 + CLI + HTTP + Web UI 全链路可跑）· **M1 Metal GPU 后端 + 批处理 prefill 已上线** · 闭源 · 私有仓库
+状态：M0 已交付（引擎 + CLI + HTTP + Web UI 全链路可跑）· **M1 Metal GPU 后端 + LFM3 tri-hybrid + 量化 matvec 重写** · 闭源 · 私有仓库
 
 ---
 
@@ -23,22 +23,38 @@ make optest                 # 7 个 Metal 融合算子逐个和 C 参考实现�
 ./build/dubhed -m <model.gguf> --share
 ```
 
-实测（Qwen2.5-0.5B-Instruct-Q4_K_M，M4 24GB，短上下文）：
+实测（M4 24GB，同一会话内背靠背测量）：
+
+**LFM3-1.7B（tri-hybrid，1.73B 参数）**
+
+| 后端 | 权重 | 体积 | decode | 有效带宽 |
+| --- | --- | ---: | ---: | ---: |
+| 天枢 Metal | Q4_K_M | 1.10 GB | **47.2 tok/s** | 52 GB/s |
+| 天枢 Metal | Q8_0 | 1.85 GB | 33.5 tok/s | 62 GB/s |
+| 天枢 Metal | F16 | 3.47 GB | 20.8 tok/s | 72 GB/s |
+| 天枢 CPU · NEON | Q4_K_M | 1.10 GB | 10.7 tok/s | 12 GB/s |
+| 苹果 MLX | 4bit | 0.97 GB | 87.1 tok/s | 85 GB/s |
+| 苹果 MLX | 8bit | 1.90 GB | 47.9 tok/s | 91 GB/s |
+
+长上下文（601 token 提示）prefill：天枢 **66 tok/s**，MLX **495 tok/s**。
+prefill 是当前最大的短板，根因是激活被重复读 55 倍 —— 下一轮做 GEMM 二维分块。
+
+**Qwen2.5-0.5B-Instruct Q4_K_M**
 
 | 后端 | decode | prefill |
 | --- | --- | --- |
 | CPU · NEON | 20.6 tok/s | 21.3 tok/s |
 | **Metal GPU** | **79–84 tok/s** | **382 tok/s** |
 
-长上下文（631 token 提示）GPU 侧：prefill **276–318 tok/s**，decode
-**47–52 tok/s**。同一台机器上 CPU 路径是 25 / 23 tok/s。
+数值一致性：GPU 与纯 f32 参考逐位置 logits 最大差 **9.4e-6**、argmax 一致；
+631 token 上下文下贪心输出与 CPU **逐字一致**。
+`make gpu` 复现性能对比，`make optest` 逐个算子对拍，
+`DUBHE_FUSED_CHECK_VERBOSE=1` 打印逐位置对拍明细。
 
-> 这台测试机的绝对带宽只有真实 M4 的约 1/6（裸带宽实测 17 GB/s，真机应在
-> 100 GB/s 量级），所以绝对数字仅供参考，**倍数**是背靠背交替测量得出的。
-
-数值一致性：GPU 与纯 f32 基准逐位置 logits 最大差 **3e-5**、cosine
-1.000000；631 token 上下文下贪心输出与 CPU **逐字一致**。
-`make gpu` 复现性能对比，`make optest` 逐个算子对拍。
+> 这台机器在跑其它任务时 decode 会从 47 掉到 13 tok/s（2.8x 波动），
+> 所以绝对数字只反映当时的负载，**倍数**是背靠背测量得出的。
+> 完整的精度 × 后端矩阵见
+> [LFM3 精度与后端实测](docs/references/LFM3-精度与后端实测.md)。
 
 ## 界面
 
@@ -73,6 +89,8 @@ make optest                 # 7 个 Metal 融合算子逐个和 C 参考实现�
 | Metal 后端 | 运行时编译 MSL，整层前向单 command buffer，权重零拷贝 | ✅ M1 |
 | 批处理 prefill | 权重读一遍喂 8 个 token，激活转置成 `[n_in][8]` 用 `float4` 取 | ✅ M1 |
 | split-K 注意力 | 长上下文按 key 区间切 8 段并行，combine 归并 | ✅ M1 |
+| LFM3 tri-hybrid | ShortConv / QK RMSNorm / sigmoid 输出门 / zero-tail partial RoPE / 滑窗注意力，CPU + Metal 双路径 | ✅ M1 |
+| 苹果 MLX 参考实现 | `tools/mlx_lfm3.py` 补上 mlx-lm 缺失的 lfm3，用于交叉验证与基准 | ✅ M1 |
 | Android | NDK + NEON + NPU | M4 |
 | 双端原生 App | SwiftUI / Compose | M5 |
 

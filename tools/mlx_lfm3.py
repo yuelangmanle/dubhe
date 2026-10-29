@@ -322,7 +322,10 @@ def main() -> int:
         text += r.text
     gen_tps = r.generation_tps if n_out else 0.0
 
-    print(json.dumps({
+    # 前置换行：transformers 在 stdin 不是 tty 时会把 "Do you wish to run the
+    # custom code?" 提示打到 stdout 且**不带换行**，不隔开的话 JSON 会和它粘在
+    # 同一行，下游按行解析就找不到。
+    print("\n" + json.dumps({
         "tokens_in": len(ids),
         "tokens_out": n_out,
         "prefill_tps": t_first or 0.0,

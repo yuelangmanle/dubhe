@@ -6,6 +6,60 @@
 
 ---
 
+## [0.4.0] · 2026-10-29 · LFM3 tri-hybrid + 量化 matvec 重写
+
+### 基准（LFM3-1.7B，M4 24GB，同一会话背靠背，load≈4）
+
+| 后端 | 权重 | 体积 | decode | 有效带宽 |
+|---|---|---:|---:|---:|
+| 天枢 Metal | Q4_K_M | 1.10 GB | **47.2 tok/s** | 52 GB/s |
+| 天枢 Metal | Q8_0 | 1.85 GB | 33.5 tok/s | 62 GB/s |
+| 天枢 Metal | F16 | 3.47 GB | 20.8 tok/s | 72 GB/s |
+| 天枢 CPU | Q4_K_M | 1.10 GB | 10.7 tok/s | 12 GB/s |
+| 苹果 MLX | 4bit | 0.97 GB | 87.1 tok/s | 85 GB/s |
+| 苹果 MLX | 8bit | 1.90 GB | 47.9 tok/s | 91 GB/s |
+
+prefill（601 token）：天枢 66 tok/s，MLX 495 tok/s。完整矩阵见
+[`docs/references/LFM3-精度与后端实测.md`](docs/references/LFM3-精度与后端实测.md)。
+
+### 新增
+- **LFM3 tri-hybrid 架构支持**（CPU + Metal 双路径）：13 个 ShortConv 层、
+  6 个全局注意力层、5 个滑窗注意力层，外加每 head 的 QK RMSNorm、
+  sigmoid 输出门、zero-tail partial RoPE、sandwich norm。层类型直接读
+  GGUF 的 `head_count_kv` / `sliding_window_pattern` 两张逐层表。
+- **Metal 融合内核 4 个**：`k_headnorm` / `k_gate_mul` / `k_conv`+`k_conv_shift`
+  / `k_mul`，全部编进同一个 command buffer，每 token 仍只同步一次。
+- `tools/tokprobe.cpp`：分词 + 贪心生成探针，用于区分"输出不同"是分词
+  差异还是前向差异。
+- `tools/mlx_lfm3.py`：补上 mlx-lm 缺失的 lfm3 实现，于是 Liquid 官方的
+  `LFM3-*-MLX-4bit/8bit` 能在苹果 MLX 上跑 —— 既是独立参考实现，
+  也是"苹果的版本"的速度基准。
+- `tools/bench_matrix.py`：精度 × 后端全矩阵，输出 markdown 表格。
+- `DUBHE_VERBOSE=1`：打印逐层结构表（层类型 / rope base / 角度 / 门）。
+- `DUBHE_F32_REF=1`：强制 CPU 参考路径走纯 f32，把对拍噪声底从 1e-1 降到 1e-5。
+
+### 变更
+- **量化 matvec 重写**：Q4_K / Q6_K 从"一个 lane 在每个 32 元素段各取一个
+  元素"改成"一个 lane 固定负责一个 scale 组的 8 个元素"。scale 查询从
+  每块 8 次降到 1 次，指令数从 10 条/元素降到约 3 条；8 个量化字节用一条
+  `uint2` / 4 条 `ushort` 向量读。decode **13.8 → 47.2 tok/s（3.4x）**。
+- mv 内核改为"一个 simdgroup 同时算 `MV_R` 行"（`MV_R=2`）。
+- 层结构里新增 `rope_angles_l`。
+
+### 修复
+- **滑窗层的 RoPE 角度**：HF 的 `rope_parameters` 是按层类型分开配的，
+  `sliding_attention` 没有 `partial_rotary_factor`（缺省 1.0 → 64/64 全量），
+  早先按全局一个值套所有层，5 个滑窗层的 q/k 有一半维度该转没转。
+- `k_mul` 把字节偏移当元素下标（残差流 rel=0.23）、行跨度写死成 `n`
+  （nrow=1 精确、nrow=2 崩）、`k_conv` 写 y 不带行偏移（多行全写第 0 行）。
+- ShortConv 历史缓冲改为**先卷积、后移位**（反过来会让核整体偏移一位）。
+
+### 基准
+- ANE 实测：batch=1 无优势（脉动阵列空转），batch≥32 快 2–3 倍，
+  `conv_in` 在 batch=128 上比 GPU 快 **9.7 倍**。结论：ANE 属于 prefill。
+
+---
+
 ## [0.3.0] · 2026-10-29 · 底层三处结构性优化
 
 ### 基准（Qwen2.5-0.5B-Instruct Q4_K_M，M4 24GB，背靠背交替测量）
