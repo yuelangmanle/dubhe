@@ -123,6 +123,9 @@ public:
     uint32_t     get_u32(const std::string& key, uint32_t def = 0) const;
     float        get_f32(const std::string& key, float def = 0.f) const;
     bool         has(const std::string& key) const;
+    // 每层取值不同的架构（LFM3 的 head_count_kv / sliding_window_pattern）要读数组
+    const std::vector<int32_t>* get_arr_i32(const std::string& key) const;
+    const std::vector<uint8_t>* get_arr_u8(const std::string& key) const;
 
     const TensorInfo* find_tensor(const std::string& name) const;
     const void* tensor_data(const TensorInfo& t) const;
@@ -231,11 +234,34 @@ private:
 };
 
 // ---------------------------------------------------------------- 模型
+// 层的算子种类。LFM3 把三种子层交错排布（conv / 滑窗注意力 / 全局注意力），
+// llama 系全部是 LK_ATTN_FULL。
+enum LayerKind : uint8_t {
+    LK_ATTN_FULL = 0,   // 全局因果注意力
+    LK_ATTN_SWA  = 1,   // 滑窗注意力（只看最近 n_swa 个位置）
+    LK_CONV      = 2,   // LFM3 的 ShortConv：门控深度可分离因果卷积
+};
+
 struct Layer {
+    LayerKind kind = LK_ATTN_FULL;
+
+    // ---- 注意力子层
     TensorInfo attn_norm, attn_q, attn_k, attn_v, attn_output;
     TensorInfo attn_q_b, attn_k_b, attn_v_b;   // 可选 bias
-    TensorInfo ffn_norm, ffn_gate, ffn_up, ffn_down;
+    TensorInfo attn_q_norm, attn_k_norm;       // LFM3: 每 head 的 QK RMSNorm
+    TensorInfo attn_gate;                      // LFM3: 逐 head 的 sigmoid 输出门
     bool has_q_bias = false, has_k_bias = false, has_v_bias = false;
+    bool has_qk_norm = false, has_attn_gate = false;
+
+    // ---- ShortConv 子层（仅 LK_CONV）
+    TensorInfo conv_in, conv_kernel, conv_out;
+
+    // ---- FFN 子层
+    TensorInfo ffn_norm, ffn_gate, ffn_up, ffn_down;
+
+    // ---- LFM3 的 sandwich norm：子层输出再过一次 norm 才加残差
+    TensorInfo post_attn_norm, post_ffn_norm;
+    bool has_sandwich = false;
 };
 
 struct ModelConfig {
@@ -247,7 +273,14 @@ struct ModelConfig {
     float   rope_scale = 1.f;
     bool    tied_embd = false;
     int32_t head_dim = 0;
-    int32_t n_swa = 0;  // sliding window（暂未用）
+    int32_t n_swa = 0;              // 滑窗宽度，0 表示没有滑窗层
+
+    // ---- LFM3 专属
+    int32_t rope_angles = 0;        // partial RoPE：真正旋转的角度数，0 = 全部
+    float   rope_theta_swa = 0.f;   // 滑窗层用另一套 base（1e4 vs 1e6）
+    int32_t conv_l_cache = 0;       // ShortConv 的卷积核宽度
+    bool    sandwich_norm = false;
+    int     n_conv = 0;             // conv 层个数
 };
 
 class Model {
@@ -275,20 +308,30 @@ public:
     const char* quant_desc() const { return quant_desc_.c_str(); }
     bool gpu_active() const { return gpu_active_; }
     const char* gpu_note() const { return gpu_note_.c_str(); }
+    bool arch_is_lfm3() const { return cfg_.arch == "lfm3" || cfg_.arch == "lfm2"; }
 
 private:
     bool load_weights(std::string* err);
     bool enable_gpu(std::string* err);
     bool grow_kv(int need);
     void rmsnorm(float* out, const float* x, const TensorInfo& w, int n) const;
+    // 每 head 独立归一化（LFM3 的 QK norm），v 是 [n_head][hd] 的连续布局
+    void rmsnorm_heads(float* v, const TensorInfo& w, int hd, int n_head) const;
     void matvec(float* out, const float* x, const TensorInfo& w, int n_out, int n_in) const;
-    void rope(float* q, float* k, int n_head, int n_head_kv, int head_dim, int pos) const;
+    void rope(float* q, float* k, int n_head, int n_head_kv, int head_dim, int pos,
+              float theta) const;
+    // LFM3 ShortConv 子层：结果写进 attn_out_
+    void shortconv(const Layer& L, int slot, const float* xin);
+    void clear_conv_state();
 
     GgufFile file_;
     Tokenizer tok_;
     ModelConfig cfg_;
     bool loaded_ = false;
     mutable bool gpu_active_ = false;   // GPU 出错时 matvec 会就地降级，故 mutable
+    // 整层前向是否由 Metal 融合内核接管。LFM3 还没有对应的融合内核，
+    // 但逐算子的 matvec 仍然走 GPU，所以这两个标志必须分开。
+    bool gpu_fused_ = false;
     std::string gpu_note_;              // GPU 状态说明（供 UI / 日志展示）
     int  n_ctx_ = 0;    // 可用上下文上限
     int  kv_cap_ = 0;   // KV cache 已分配槽位
@@ -304,6 +347,13 @@ private:
     std::vector<float> logits_;
     std::vector<float> xbatch_;        // 批量 embedding 暂存 [batch][n_embd]
     mutable std::vector<uint8_t> aq_;  // 量化激活缓冲（matvec 复用）
+
+    // ---- LFM3 ShortConv 的时序状态
+    std::vector<float> conv_bc_;       // in_proj 输出 B/C/x 暂存，3*n_embd
+    std::vector<float> conv_h_;        // hidden = B*x，n_embd
+    std::vector<float> conv_state_;    // [n_conv][l_cache-1][n_embd]，环形历史
+    std::vector<int>   conv_slot_;     // 层号 → conv_state_ 槽位，-1 表示非 conv
+    std::vector<float> ffn_down_out_;  // ffn down 输出，n_embd
 
     uint64_t n_params_ = 0;
     std::string quant_desc_;

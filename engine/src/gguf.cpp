@@ -274,6 +274,15 @@ float GgufFile::get_f32(const std::string& key, float def) const {
     return v->f64 != 0.0 ? (float)v->f64 : (float)(v->i64 ? v->i64 : (int64_t)v->u64);
 }
 
+const std::vector<int32_t>* GgufFile::get_arr_i32(const std::string& key) const {
+    auto* v = get(key);
+    return (v && !v->arr_i32.empty()) ? &v->arr_i32 : nullptr;
+}
+const std::vector<uint8_t>* GgufFile::get_arr_u8(const std::string& key) const {
+    auto* v = get(key);
+    return (v && !v->arr_u8.empty()) ? &v->arr_u8 : nullptr;
+}
+
 const TensorInfo* GgufFile::find_tensor(const std::string& name) const {
     for (auto& t : tensors_)
         if (t.name == name) return &t;
