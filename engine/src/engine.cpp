@@ -240,6 +240,15 @@ int dubhe_load_mmproj(dubhe_engine* e, const char* path) {
     return DUBHE_OK;
 }
 
+int dubhe_mm_caps(dubhe_engine* e) {
+    if (!e) return 0;
+    std::lock_guard<std::mutex> lock(e->mu);
+    int c = 0;
+    if (e->mmproj) c |= 1;
+    if (e->audio_mm) c |= 2;
+    return c;
+}
+
 int dubhe_encode_image(dubhe_engine* e, const char* image_path, float** embeds,
                        int32_t* n_tokens, int32_t* dim) {
     if (!e || !image_path || !embeds || !n_tokens || !dim) return DUBHE_ERR_INVALID_ARG;

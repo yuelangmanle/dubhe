@@ -44,6 +44,8 @@ struct AppState {
     std::string workspace;
     std::string api_key;      // 为空表示不校验（仅建议本机使用）
     std::string lan_url;      // 局域网可访问的 base url
+    std::string mmproj_path;  // 视觉/语音塔；空表示不支持多模态
+    std::string tmp_dir;      // 多模态请求的落地目录
     bool allow_shell = false;
     std::mutex mu;
     std::atomic<bool> busy{false};
@@ -256,6 +258,199 @@ bool extract_tool_call(const std::string& text, std::string* name, json::Value* 
 }
 
 // ---------------------------------------------------------------- ChatML
+// ---------------------------------------------------------------- 多模态
+//
+// 走 OpenAI 的 content 数组格式（和手机端 SDK 一致）：
+//   {"type":"text","text":"..."}
+//   {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
+//   {"type":"video_url","video_url":{"url":"data:video/mp4;base64,..."}}
+//   {"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}
+//
+// video_url 不是 OpenAI 官方字段（官方还没定视频协议），沿用社区的写法。
+//
+// 为什么落临时文件而不是加一套"从内存编码"的 ABI：塔的编码本来就是几百毫秒
+// 起步，多一次几十 KB 的写盘可以忽略；而给 image/audio 各加一对 *_mem 接口
+// 意味着两条预处理链路都要重写一遍（ImageIO 走 NSData、AVFoundation 走
+// AVAudioFile），出错面远大于收益。
+//
+// 一次请求只接受一个媒体。引擎侧 dubhe_set_mm_embeds 只保存一段区间，
+// 两段特征要两套前缀，等 Omni 那一轮改成多段再放开。
+
+struct MediaPart {
+    std::string kind;   // "image" / "audio" / "video"
+    std::string path;   // 临时文件
+};
+
+std::string now_id();   // 定义在文件末尾
+
+bool b64_decode(const std::string& in, std::string* out) {
+    static int8_t tbl[256];
+    static bool init = false;
+    if (!init) {
+        std::memset(tbl, -1, sizeof tbl);
+        const char* a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; i++) tbl[(uint8_t)a[i]] = (int8_t)i;
+        init = true;
+    }
+    out->clear();
+    out->reserve(in.size() * 3 / 4 + 4);
+    int acc = 0, bits = 0;
+    for (unsigned char ch : in) {
+        if (ch == '=' || ch == '\n' || ch == '\r' || ch == ' ') continue;
+        const int8_t v = tbl[ch];
+        if (v < 0) return false;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out->push_back((char)((acc >> bits) & 0xFF));
+        }
+    }
+    return true;
+}
+
+// 支持 data URL 和本机绝对路径两种写法。
+// 不直接抓 http(s)：服务端去访问外部 URL 会变成 SSRF 入口，而且局域网场景下
+// 用户手里的图片本来就在本机。
+bool load_media(const std::string& url, std::string* bytes, std::string* ext,
+                std::string* err) {
+    if (url.rfind("data:", 0) == 0) {
+        const size_t comma = url.find(',');
+        if (comma == std::string::npos) { if (err) *err = "data URL 格式不对"; return false; }
+        const std::string head = url.substr(5, comma - 5);
+        if (head.find("base64") == std::string::npos) {
+            if (err) *err = "只支持 base64 编码的 data URL";
+            return false;
+        }
+        const size_t semi = head.find(';');
+        const std::string mime = head.substr(0, semi == std::string::npos ? head.size() : semi);
+        *ext = ".bin";
+        if (mime == "image/png") *ext = ".png";
+        else if (mime == "image/jpeg" || mime == "image/jpg") *ext = ".jpg";
+        else if (mime == "image/heic") *ext = ".heic";
+        else if (mime == "image/webp") *ext = ".webp";
+        else if (mime == "image/gif") *ext = ".gif";
+        else if (mime == "audio/wav" || mime == "audio/x-wav") *ext = ".wav";
+        else if (mime == "audio/mpeg" || mime == "audio/mp3") *ext = ".mp3";
+        else if (mime == "audio/mp4" || mime == "audio/m4a") *ext = ".m4a";
+        else if (mime == "audio/flac") *ext = ".flac";
+        else if (mime == "audio/aiff") *ext = ".aiff";
+        else if (mime == "video/mp4") *ext = ".mp4";
+        else if (mime == "video/quicktime") *ext = ".mov";
+        else if (mime == "video/webm") *ext = ".webm";
+        if (!b64_decode(url.substr(comma + 1), bytes)) {
+            if (err) *err = "base64 解码失败";
+            return false;
+        }
+        if (bytes->empty()) { if (err) *err = "data URL 里没有数据"; return false; }
+        return true;
+    }
+    std::ifstream f(url, std::ios::binary);
+    if (!f) { if (err) *err = "读不了这个路径: " + url; return false; }
+    bytes->assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    const size_t dot = url.find_last_of('.');
+    *ext = dot == std::string::npos ? ".bin" : url.substr(dot);
+    return !bytes->empty();
+}
+
+// 把 content 数组摊平成"文本 + 占位符"，媒体落到临时文件。
+// 只保留最后一条 user 消息里的媒体（多轮历史里的旧媒体没有对应特征，
+// 塞进去只会让模型看到一堆没有内容的占位符）。
+json::Value flatten_messages(const json::Value& messages, std::vector<MediaPart>* media,
+                             std::string* err) {
+    json::Value out = json::Value::make_arr();
+    size_t last_user = 0;
+    for (size_t i = 0; i < messages.arr.size(); i++)
+        if (messages.arr[i].s("role") == "user") last_user = i;
+
+    for (size_t i = 0; i < messages.arr.size(); i++) {
+        const auto& m = messages.arr[i];
+        json::Value nm = json::Value::make_obj();
+        nm.set("role", json::Value::make_str(m.s("role")));
+        const json::Value* content = m.get("content");
+        if (!content) { nm.set("content", json::Value::make_str("")); out.arr.push_back(nm); continue; }
+
+        if (content->type != json::Value::ARR) {
+            // 字符串形式：原样带走。注意不能写成 content->s("")，那是"取名为空
+            // 串的子键"，对 STR 类型的 Value 恒返回默认值，会把正文整个吃掉。
+            nm.set("content", json::Value::make_str(
+                                  content->type == json::Value::STR ? content->str : ""));
+            out.arr.push_back(nm);
+            continue;
+        }
+        // 数组形式：拼文本，媒体变占位符
+        std::string text;
+        for (const auto& part : content->arr) {
+            const std::string type = part.s("type");
+            if (type == "text") {
+                text += part.s("text");
+            } else if (type == "image_url" || type == "input_audio" || type == "video_url") {
+                const char* ph = (type == "image_url") ? "<|image|>"
+                                 : (type == "video_url" ? "<|video|>" : "<|audio|>");
+                const std::string kind = (type == "image_url") ? "image"
+                                         : (type == "video_url" ? "video" : "audio");
+                if (i != last_user) { text += ph; continue; }   // 历史消息里的媒体：只留占位
+                if (!media->empty()) {
+                    if (err) *err = "一次请求只支持一个媒体（图像 / 视频 / 音频）";
+                    return json::Value::make_obj();
+                }
+                std::string url, b64, fmt;
+                if (const json::Value* iu = part.get("image_url")) url = iu->s("url");
+                if (const json::Value* vu = part.get("video_url")) {
+                    url = vu->s("url");
+                    if (url.empty()) url = vu->s("path");
+                }
+                if (const json::Value* ia = part.get("input_audio")) {
+                    b64 = ia->s("data");
+                    fmt = ia->s("format");
+                    if (!b64.empty() && b64.rfind("data:", 0) != 0)
+                        url = "data:audio/" + (fmt.empty() ? std::string("wav") : fmt) +
+                              ";base64," + b64;
+                }
+                if (url.empty()) { if (err) *err = std::string("缺少 ") + type + " 数据"; return json::Value::make_obj(); }
+
+                std::string bytes, ext, lerr;
+                if (!load_media(url, &bytes, &ext, &lerr)) { if (err) *err = lerr; return json::Value::make_obj(); }
+                std::string dir = g.tmp_dir.empty() ? "/tmp" : g.tmp_dir;
+                std::string path = dir + "/dubhe_mm_" + now_id() + ext;
+                std::ofstream of(path, std::ios::binary);
+                if (!of) { if (err) *err = "写不了临时文件: " + path; return json::Value::make_obj(); }
+                of.write(bytes.data(), (std::streamsize)bytes.size());
+                of.close();
+                media->push_back({kind, path});
+                text += ph;
+            }
+        }
+        nm.set("content", json::Value::make_str(text));
+        out.arr.push_back(nm);
+    }
+    return out;
+}
+
+// 把 prompt 里单个占位符展开成 n 个，返回展开后的注入起点。
+// 和 CLI 里的 expand_mm_token 是同一套逻辑：展开后的下标才是注入位置。
+bool expand_placeholder(dubhe_engine* e, std::vector<int32_t>* toks, int n,
+                        const char* ph_text, int32_t* at) {
+    int32_t ph = -1;
+    if (dubhe_tokenize(e, ph_text, 0, &ph, 1) != 1) return false;
+    size_t pos = toks->size();
+    for (size_t i = 0; i < toks->size(); i++)
+        if ((*toks)[i] == ph) { pos = i; break; }
+    if (pos == toks->size()) return false;
+    toks->erase(toks->begin() + (long)pos);
+    toks->insert(toks->begin() + (long)pos, (size_t)n, ph);
+    *at = (int32_t)pos;
+    return true;
+}
+
+// LFM 系的 chat 模板第一行是 `{{- bos_token -}}`，但 GGUF 的 add_bos_token
+// 是 false。少了它模型不进入对话状态（详见 docs/02-进度书.md §9.10）。
+void prepend_bos(dubhe_engine* e, std::vector<int32_t>* toks) {
+    int32_t id = -1;
+    if (dubhe_tokenize(e, "<|startoftext|>", 0, &id, 1) == 1)
+        toks->insert(toks->begin(), id);
+}
+
 std::string build_prompt(const json::Value& messages, bool chatml, bool with_tools) {
     std::string p;
     if (!chatml) {
@@ -295,6 +490,117 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
 std::string json_escape(const std::string& s) {
     json::Value v = json::Value::make_str(s);
     return json::dump(v);
+}
+
+// 请求级的多模态缓存。工具调用会走第二轮生成，而视觉塔编一张图要十几秒，
+// 不能因为要多生成一轮就把同一张图重编一遍。
+struct MmCache {
+    bool valid = false;
+    std::string kind;
+    std::vector<float> embeds;
+    int32_t n_tokens = 0;
+    int32_t dim = 0;
+};
+
+// messages → token 序列：摊平 content 数组 → 分词 → 补 BOS → 编码媒体 →
+// 展开占位符 → 注入特征。返回 false 时 err 里是可以直接回给客户端的原因。
+//
+// force_raw：不加 chat 模板，直接续写。语音模型特别吃这一套 —— 见下面的判定。
+bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, bool with_tools,
+                  bool force_raw, std::vector<int32_t>* toks, MmCache* cache,
+                  std::string* err) {
+    std::vector<MediaPart> media;
+    json::Value flat = flatten_messages(messages, &media, err);
+    if (flat.type != json::Value::ARR) return false;
+
+    // 只给了一段音频、一个字都没打 —— 用户要的就是转写。
+    // 这时候走 chat 模板反而害事：LFM3-Audio 进了对话状态后会把音频当成
+    // "待推理的问题"，输出 "We need to answer the question: …" 这种分析过程，
+    // 转写被埋在里面。不加模板直接续写，第一句就是转写正文。
+    bool raw = force_raw;
+    if (!raw && media.size() == 1 && media[0].kind == "audio") {
+        std::string t;
+        for (auto& m : flat.arr)
+            if (m.s("role") == "user") t = m.s("content");
+        for (const char* ph : {"<|audio|>", "<|image|>", "<|video|>"}) {
+            size_t p;
+            while ((p = t.find(ph)) != std::string::npos) t.erase(p, std::strlen(ph));
+        }
+        const size_t a = t.find_first_not_of(" \t\r\n");
+        raw = (a == std::string::npos);
+    }
+
+    std::string prompt;
+    if (raw) {
+        for (auto& m : flat.arr)
+            if (m.s("role") == "user") prompt = m.s("content");
+    } else {
+        prompt = build_prompt(flat, chatml, with_tools);
+    }
+
+    const int32_t n = dubhe_tokenize(e, prompt.c_str(), 1, nullptr, 0);
+    if (n <= 0) { if (err) *err = "分词失败"; return false; }
+    toks->assign((size_t)n, 0);
+    if (dubhe_tokenize(e, prompt.c_str(), 1, toks->data(), n) != n) {
+        if (err) *err = "分词失败";
+        return false;
+    }
+    // raw 也必须补 BOS。不补的话模型不知道自己站在序列开头，转写内容是对的，
+    // 但一句接一句复读到 max_tokens 也不吐 EOS；补上之后它写完就停。
+    prepend_bos(e, toks);
+
+    // 上一轮请求可能留了特征，不主动清掉的话，这一轮纯文本也会被覆盖。
+    dubhe_clear_mm_embeds(e);
+    if (media.empty()) return true;
+
+    // ---- 编码：一次请求只做一遍，第二轮复用
+    if (!cache->valid) {
+        const MediaPart& mp = media[0];
+        float* emb = nullptr;
+        int32_t n_mm = 0, dim = 0;
+        int rc;
+        if (mp.kind == "image") {
+            rc = dubhe_encode_image(e, mp.path.c_str(), &emb, &n_mm, &dim);
+        } else if (mp.kind == "video") {
+            // 2 fps / 16 帧 / 长边 448：默认值在"看得清动作"和"编得完"之间取的折中
+            rc = dubhe_encode_video(e, mp.path.c_str(), 2.0, 16, 448, &emb, &n_mm, &dim);
+        } else {
+            rc = dubhe_encode_audio(e, mp.path.c_str(), &emb, &n_mm, &dim);
+        }
+        if (rc != DUBHE_OK) {
+            if (err) *err = std::string("媒体编码失败: ") + dubhe_last_error();
+            return false;
+        }
+        cache->kind = mp.kind;
+        cache->embeds.assign(emb, emb + (size_t)n_mm * (size_t)dim);
+        cache->n_tokens = n_mm;
+        cache->dim = dim;
+        cache->valid = true;
+        dubhe_free_embeds(emb);
+    }
+    // 特征已经拷进内存，临时文件可以删了（base64 的图动辄几 MB，不删会攒满 /tmp）
+    for (auto& mp : media) std::remove(mp.path.c_str());
+
+    const char* ph = (cache->kind == "image") ? "<|image|>"
+                     : (cache->kind == "video" ? "<|video|>" : "<|audio|>");
+    int32_t at = 0;
+    if (!expand_placeholder(e, toks, cache->n_tokens, ph, &at)) {
+        // 分清两种失败：词表里压根没这个 token（语言模型不支持该模态），
+        // 还是词表有但 prompt 里没写。前者是配置问题，后者是调用方问题。
+        int32_t probe = -1;
+        const bool known = dubhe_tokenize(e, ph, 0, &probe, 1) == 1;
+        if (err) {
+            *err = known ? (std::string("prompt 里没有 ") + ph + " 占位符")
+                         : (std::string("这个语言模型的词表里没有 ") + ph +
+                            "，它不支持该模态（塔能加载，但语言模型接不住）");
+        }
+        return false;
+    }
+    if (dubhe_set_mm_embeds(e, cache->embeds.data(), cache->n_tokens, at, cache->dim) != DUBHE_OK) {
+        if (err) *err = std::string("特征注入失败: ") + dubhe_last_error();
+        return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------- SSE 流式上下文
@@ -398,6 +704,7 @@ int main(int argc, char** argv) {
     int ctx = 0;
     int threads = 0;
     bool no_gpu = false;
+    std::vector<std::string> mmprojs;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -411,6 +718,8 @@ int main(int argc, char** argv) {
         else if (a == "--allow-shell") g.allow_shell = true;
         else if (a == "--no-gpu") no_gpu = true;
         else if (a == "--api-key") g.api_key = next();
+        else if (a == "--mmproj") mmprojs.push_back(next());
+        else if (a == "--tmp-dir") g.tmp_dir = next();
         else if (a == "--share") {
             // 对外分享：监听所有网卡，并自动生成访问密钥
             host = "0.0.0.0";
@@ -421,7 +730,9 @@ int main(int argc, char** argv) {
                 "dubhed %s\n\n"
                 "用法: dubhed -m <model.gguf> [--port 7777] [--host 127.0.0.1]\n"
                 "             [--web web] [-c 4096] [-t N] [--allow-shell] [--no-gpu]\n"
+                "             [--mmproj <mmproj.gguf>] [--tmp-dir /tmp]\n"
                 "             [--share] [--api-key <key>]\n\n"
+                "  --mmproj P     加载视觉塔或语音塔（可给多次，Omni 模型两个都要）\n"
                 "  --share        监听 0.0.0.0 并自动生成 API Key（手机/其他设备可接入）\n"
                 "  --api-key K    指定 API Key（/v1/* 需要 Authorization: Bearer K）\n",
                 dubhe_version());
@@ -470,6 +781,27 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "未指定模型，UI 中可加载。\n");
     }
 
+    if (g.tmp_dir.empty()) g.tmp_dir = "/tmp";
+
+    // 多模态塔加载失败不该让整个服务起不来：纯文本照常可用，只是 UI 上
+    // 不显示附件入口（/api/state 的 mm 字段会是 0）。
+    // --mmproj 可以给多次：Omni 模型是视觉塔 + 语音塔两个独立文件。
+    for (const auto& mp : mmprojs) {
+        std::fprintf(stderr, "加载多模态塔 %s …\n", mp.c_str());
+        auto t0 = std::chrono::steady_clock::now();
+        if (dubhe_load_mmproj(g.engine, mp.c_str()) != DUBHE_OK) {
+            std::fprintf(stderr, "多模态塔加载失败: %s（跳过这个塔）\n", dubhe_last_error());
+            continue;
+        }
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        const int caps = dubhe_mm_caps(g.engine);
+        std::fprintf(stderr, "  → 就绪 %.0f ms · 现有能力: %s\n", (double)ms,
+                     caps == 3 ? "图像/视频 + 语音" : (caps & 2 ? "语音" : "图像/视频"));
+        if (!g.mmproj_path.empty()) g.mmproj_path += ",";
+        g.mmproj_path += mp;
+    }
+
     http::Server srv;
 
     // ---- 静态资源
@@ -514,6 +846,12 @@ int main(int argc, char** argv) {
         o.set("requests", json::Value::make_num((double)g.total_requests));
         o.set("tokens", json::Value::make_num((double)g.total_tokens));
         o.set("decode_tps", json::Value::make_num(g.last_decode_tps));
+        // 多模态能力：0 无 / 1 图像+视频 / 2 语音 / 3 两者都有
+        const int caps = dubhe_mm_caps(g.engine);
+        o.set("mm", json::Value::make_num(caps));
+        o.set("mm_vision", json::Value::make_bool((caps & 1) != 0));
+        o.set("mm_audio", json::Value::make_bool((caps & 2) != 0));
+        o.set("mmproj", json::Value::make_str(g.mmproj_path));
         if (!g.model_path.empty()) {
             dubhe_model_info mi{};
             if (dubhe_model_info_get(g.engine, &mi) == DUBHE_OK) {
@@ -580,10 +918,19 @@ int main(int argc, char** argv) {
         sp.repeat_penalty = (float)body.n("repeat_penalty", 1.1);
         sp.repeat_last_n = 64;
 
-        std::string prompt = build_prompt(*msgs, chatml, with_tools);
-        int32_t n = dubhe_tokenize(g.engine, prompt.c_str(), 1, nullptr, 0);
-        std::vector<int32_t> toks((size_t)n);
-        dubhe_tokenize(g.engine, prompt.c_str(), 1, toks.data(), n);
+        // 只允许一个媒体：视觉塔和语音塔是两个独立的 mmproj，一次注入两段特征
+        // 需要两套前缀，留到 Omni 那一轮再做。
+        MmCache mcache;
+        std::vector<int32_t> toks;
+        std::string berr;
+        const bool force_raw = body.flag("dubhe_raw", false);
+        if (!build_tokens(g.engine, *msgs, chatml, with_tools, force_raw, &toks, &mcache, &berr)) {
+            c.send(400, "application/json",
+                   "{\"error\":{\"message\":" + json_escape(berr) +
+                       ",\"type\":\"invalid_request_error\"}}");
+            return;
+        }
+        const int32_t n = (int32_t)toks.size();
 
         const std::string id = now_id();
         long long created = (long long)time(nullptr);
@@ -623,17 +970,22 @@ int main(int argc, char** argv) {
                 tm.set("content", json::Value::make_str(tr.output));
                 msgs2.arr.push_back(tm);
 
-                std::string p2 = build_prompt(msgs2, chatml, with_tools);
-                int32_t n2 = dubhe_tokenize(g.engine, p2.c_str(), 1, nullptr, 0);
-                std::vector<int32_t> t2((size_t)n2);
-                dubhe_tokenize(g.engine, p2.c_str(), 1, t2.data(), n2);
+                // 第二轮复用第一轮编好的特征：图片不重编，只重新分词
+                std::vector<int32_t> t2;
+                std::string e2;
+                if (!build_tokens(g.engine, msgs2, chatml, with_tools, force_raw, &t2, &mcache, &e2)) {
+                    c.write_chunk("data: {\"dubhe\":{\"type\":\"error\",\"message\":" +
+                                  json_escape(e2) + "}}\n\n");
+                }
 
                 // 第二轮重新判定：这次应该是正常回答了
                 ctx.decided = false;
                 ctx.suppress = false;
                 ctx.pending.clear();
                 dubhe_stats st2{};
-                dubhe_generate(g.engine, t2.data(), n2, &sp, on_piece, nullptr, &ctx, &st2);
+                if (!t2.empty())
+                    dubhe_generate(g.engine, t2.data(), (int32_t)t2.size(), &sp, on_piece, nullptr,
+                                   &ctx, &st2);
                 flush_pending(&ctx);
                 st.n_generated += st2.n_generated;
                 st.decode_tps = st2.decode_tps;

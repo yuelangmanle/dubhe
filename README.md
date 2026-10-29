@@ -86,6 +86,39 @@ Liquid 的多模态是一条谱系，**语言主干完全相同，能力全在�
 端到端：图像能说对颜色形状，视频能判对运动方向（静止视频不会被描述成在动），
 语音转写逐字正确。
 
+### 走 HTTP：手机和网页也能用
+
+`--mmproj` 可以给多次（Omni 是视觉塔 + 语音塔两个文件），服务端按
+OpenAI 的 content 数组收媒体：
+
+```bash
+./build/dubhed -m LFM3-VL-2B-Q4_K_M.gguf \
+    --mmproj mmproj-LFM3-VL-2B-Q8_0.gguf \
+    --mmproj mmproj-LFM3-Audio-2B-Q8_0.gguf \
+    --share
+```
+
+```jsonc
+{"messages":[{"role":"user","content":[
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}},
+  {"type":"text","text":"这张图里是什么"}
+]}]}
+
+{"messages":[{"role":"user","content":[
+  {"type":"video_url","video_url":{"url":"data:video/mp4;base64,..."}}
+]}]}
+
+{"messages":[{"role":"user","content":[
+  {"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}
+]}]}
+```
+
+Web UI 输入框左侧的 `+` 就是干这个的，`accept` 按服务端实际能力动态拼。
+**只给音频、不打字**时会自动走转写模式（见 [进度书 §9.11](docs/02-进度书.md)）。
+
+HTTP 端到端：图像 6.8 s / 视频 13.1 s / 语音 4.3 s（decode 50–60 tok/s，
+和纯文本一致 —— 嵌入注入没有额外开销）。
+
 ## 界面
 
 | 对话 | API 网关 | 设置（移动端） |

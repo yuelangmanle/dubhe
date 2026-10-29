@@ -108,6 +108,10 @@ int32_t dubhe_token_to_piece(const dubhe_engine* e, int32_t token, char* buf, in
 /* 加载 mmproj（视觉/音频塔的 GGUF，独立于语言模型）。 */
 int  dubhe_load_mmproj(dubhe_engine* e, const char* path);
 
+/* 已加载的多模态能力位掩码：1 = 图像/视频（视觉塔），2 = 语音（音频塔）。
+ * 都没加载返回 0。服务端靠它决定 UI 上该露出哪些附件入口。 */
+int  dubhe_mm_caps(dubhe_engine* e);
+
 /* 把一张图编码成可直接注入的特征：返回 *embeds（n_tokens × dim，行主序
  * float32，调用方用 dubhe_free_embeds 释放）。这一步是纯 CPU 的视觉塔前向，
  * 一张 640×640 的图目前要十几秒，调用方应放到后台线程。 */

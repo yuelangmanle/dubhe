@@ -19,6 +19,7 @@
     streaming: false,
     server: null,
     tools: true,
+    attach: null,   // 待发送的图片/音频/视频（一次只允许一个）
   };
 
   const settings = Object.assign(
@@ -146,7 +147,19 @@
     const wrap = el('div', 'msg ' + m.role);
     if (m.role === 'user') {
       const b = el('div', 'bubble');
-      b.textContent = m.content;
+      if (m.att) {
+        if (m.att.kind === 'image' && m.att.thumb) {
+          const im = new Image();
+          im.className = 'thumb';
+          im.src = m.att.thumb;
+          im.alt = m.att.name;
+          b.appendChild(im);
+        } else {
+          const ic = m.att.kind === 'audio' ? '♪' : (m.att.kind === 'video' ? '▶' : '📎');
+          b.appendChild(el('div', 'mfile', ic + ' ' + m.att.name));
+        }
+      }
+      if (m.content) b.appendChild(document.createTextNode(m.content));
       wrap.appendChild(b);
       return wrap;
     }
@@ -215,6 +228,9 @@
         chip.classList.remove('live');
       }
       $('#hwInfo').textContent = s.hardware || '';
+      // 只有加载了视觉塔/语音塔才露出附件入口
+      const att = $('#btnAttach');
+      if (att) att.hidden = !(s.mm_vision || s.mm_audio);
       return s;
     } catch (e) {
       $('#modelChip').textContent = '服务未连接';
@@ -222,20 +238,107 @@
     }
   }
 
+  // ---------------------------------------------------------------- 附件
+  // 服务端一次只接受一个媒体（视觉塔和语音塔是两个独立的 mmproj，同时注入
+  // 需要两套前缀），所以这里也做成单选。
+  function pickAttachment() {
+    const s = state.server || {};
+    const acc = [];
+    if (s.mm_vision) acc.push('image/*', 'video/*');
+    if (s.mm_audio) acc.push('audio/*');
+    const inp = $('#fileInput');
+    inp.accept = acc.length ? acc.join(',') : '*/*';
+    inp.value = '';
+    inp.click();
+  }
+
+  function readAttachment(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onerror = () => reject(new Error('读取失败'));
+      fr.onload = () => {
+        const dataUrl = String(fr.result || '');
+        const mime = file.type || 'application/octet-stream';
+        const ext = (file.name.split('.').pop() || '').toLowerCase();
+        let kind = 'image';
+        if (mime.startsWith('audio/') || ['wav', 'mp3', 'm4a', 'flac', 'aiff', 'aif', 'ogg'].includes(ext)) kind = 'audio';
+        else if (mime.startsWith('video/') || ['mp4', 'mov', 'webm', 'm4v'].includes(ext)) kind = 'video';
+        resolve({ kind, name: file.name, mime, fmt: mime.split('/')[1] || 'bin', dataUrl });
+      };
+      fr.readAsDataURL(file);
+    });
+  }
+
+  // 缩略图：原图几 MB，直接塞进 localStorage 会撑爆配额（历史记录要留着）
+  function makeThumb(dataUrl) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onerror = () => resolve(null);
+      img.onload = () => {
+        const S = 192;
+        const s = Math.min(1, S / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(img.width * s));
+        c.height = Math.max(1, Math.round(img.height * s));
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        try { resolve(c.toDataURL('image/jpeg', 0.62)); } catch (e) { resolve(null); }
+      };
+      img.src = dataUrl;
+    });
+  }
+
+  function renderAttach() {
+    const bar = $('#attachBar');
+    if (!bar) return;
+    bar.innerHTML = '';
+    const a = state.attach;
+    if (!a) { bar.classList.add('hidden'); return; }
+    bar.classList.remove('hidden');
+    const chip = el('div', 'attach-chip');
+    if (a.kind === 'image' && a.thumb) {
+      const im = new Image();
+      im.src = a.thumb;
+      im.alt = a.name;
+      chip.appendChild(im);
+    } else {
+      chip.appendChild(el('div', 'ph', a.kind === 'audio' ? '♪' : '▶'));
+    }
+    chip.appendChild(el('div', 'an', a.name));
+    const x = el('button', 'ax', '✕');
+    x.title = '移除';
+    x.onclick = () => { state.attach = null; renderAttach(); };
+    chip.appendChild(x);
+    bar.appendChild(chip);
+  }
+
+  // 把附件塞进 OpenAI 的 content 数组
+  function attachmentParts(a) {
+    if (a.kind === 'image') return { type: 'image_url', image_url: { url: a.dataUrl } };
+    if (a.kind === 'video') return { type: 'video_url', video_url: { url: a.dataUrl } };
+    // data 直接给完整 data URL，服务端会原样用
+    return { type: 'input_audio', input_audio: { data: a.dataUrl, format: a.fmt } };
+  }
+
   // ---------------------------------------------------------------- 发送
   async function send(text) {
     if (state.streaming) return;
     const content = (text != null ? text : $('#input').value).trim();
-    if (!content) return;
+    const att = state.attach;
+    if (!content && !att) return;
 
     if (!state.current) newConv();
     const conv = state.current;
 
-    conv.messages.push({ role: 'user', content });
+    const userMsg = { role: 'user', content };
+    if (att) userMsg.att = { kind: att.kind, name: att.name, thumb: att.thumb, mime: att.mime };
+    conv.messages.push(userMsg);
     if (conv.title === '新对话') {
-      conv.title = content.slice(0, 24) + (content.length > 24 ? '…' : '');
+      const t = content || att.name;
+      conv.title = t.slice(0, 24) + (t.length > 24 ? '…' : '');
       $('#convTitle').textContent = conv.title;
     }
+    state.attach = null;
+    renderAttach();
     $('#input').value = '';
     autoGrow();
 
@@ -245,7 +348,7 @@
     const box = $('#messages');
     const empty = $('#emptyState');
     if (empty && empty.parentNode) empty.remove();
-    box.appendChild(messageNode({ role: 'user', content }));
+    box.appendChild(messageNode(userMsg));
     const node = messageNode(ai);
     box.appendChild(node);
     const body = node.querySelector('.body');
@@ -259,7 +362,17 @@
 
     const msgs = conv.messages
       .filter((m) => m.role === 'user' || (m.role === 'assistant' && m.content))
-      .map((m) => ({ role: m.role, content: m.content }));
+      .map((m) => {
+        if (m === userMsg && att) {
+          const parts = [attachmentParts(att)];
+          if (content) parts.push({ type: 'text', text: content });
+          return { role: 'user', content: parts };
+        }
+        // 历史消息里的附件只留一行说明：服务端只认最后一条 user 的媒体，
+        // 而且占位符没配特征会让模型看到空 token。
+        const c = m.content || '';
+        return { role: m.role, content: m.att ? (c ? c + '\n' : '') + `[${m.att.kind}: ${m.att.name}]` : c };
+      });
     if (settings.system) msgs.unshift({ role: 'system', content: settings.system });
 
     try {
@@ -502,6 +615,21 @@
       $('#btnTools').classList.toggle('on', state.tools);
     };
     $('#btnTools').classList.toggle('on', true);
+
+    $('#btnAttach').onclick = pickAttachment;
+    $('#fileInput').onchange = async (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      if (f.size > 64 * 1024 * 1024) { alert('文件太大，上限 64 MB'); return; }
+      try {
+        const a = await readAttachment(f);
+        if (a.kind === 'image') a.thumb = await makeThumb(a.dataUrl);
+        state.attach = a;
+        renderAttach();
+      } catch (err) {
+        alert('读取文件失败：' + err.message);
+      }
+    };
 
     document.querySelectorAll('.chip').forEach((c) => {
       c.onclick = () => send(c.dataset.p);

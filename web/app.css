@@ -216,6 +216,39 @@ pre:hover .copy-code { opacity: 1; }
 .send-btn:not(:disabled):active { transform: scale(.92); }
 .hint { text-align: center; font-size: 11px; color: var(--secondary); margin-top: 7px; }
 
+/* ---------------- 附件 ---------------- */
+.attach-bar {
+  max-width: 780px; margin: 0 auto 8px; display: flex; gap: 8px; flex-wrap: wrap;
+  animation: rise .2s;
+}
+.attach-chip {
+  position: relative; display: flex; align-items: center; gap: 8px;
+  background: var(--card); border: 1px solid var(--sep); border-radius: 14px;
+  padding: 6px 30px 6px 8px; max-width: 240px; box-shadow: var(--shadow-s);
+}
+.attach-chip img { width: 38px; height: 38px; border-radius: 9px; object-fit: cover; display: block; }
+.attach-chip .ph {
+  width: 38px; height: 38px; border-radius: 9px; display: grid; place-items: center;
+  background: var(--fill); color: var(--secondary); font-size: 17px;
+}
+.attach-chip .an { font-size: 12.5px; color: var(--text-2); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.attach-chip .ax {
+  position: absolute; top: 3px; right: 3px; width: 20px; height: 20px; border: none;
+  border-radius: 50%; background: var(--fill); color: var(--secondary); cursor: pointer;
+  font-size: 12px; line-height: 1; display: grid; place-items: center; padding: 0;
+}
+.attach-chip .ax:hover { background: color-mix(in srgb, var(--red, #FF3B30) 18%, transparent); color: var(--red, #FF3B30); }
+
+/* 消息里的媒体 */
+.msg.user .bubble img.thumb {
+  display: block; max-width: 190px; max-height: 190px; border-radius: 12px; margin-bottom: 6px;
+}
+.msg.user .bubble .mfile {
+  display: block; font-size: 13px; opacity: .9; margin-bottom: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px;
+}
+
 /* ---------------- 空态 ---------------- */
 .empty { max-width: 620px; margin: 8vh auto 0; text-align: center; animation: rise .4s; }
 .empty-logo { width: 54px; height: 54px; margin: 0 auto 14px; color: var(--blue); }

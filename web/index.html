@@ -64,7 +64,11 @@
     </div>
 
     <div class="composer-wrap">
+      <div class="attach-bar hidden" id="attachBar"></div>
       <div class="composer" id="composer">
+        <button class="composer-btn" id="btnAttach" title="添加图片 / 音频 / 视频" hidden>
+          <svg viewBox="0 0 24 24" width="20" height="20"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+        </button>
         <button class="composer-btn" id="btnTools" title="启用工具调用">
           <svg viewBox="0 0 24 24" width="20" height="20"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4l-5.6 5.6a1.4 1.4 0 0 0 2 2l5.6-5.6a4 4 0 0 0 5.4-5.4l-2.2 2.2-2-2 2.2-2.2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
         </button>
@@ -90,6 +94,7 @@
   <div class="sheet-body" id="sheetBody"></div>
 </div>
 
+<input type="file" id="fileInput" hidden>
 <script src="/app.js"></script>
 </body>
 </html>
