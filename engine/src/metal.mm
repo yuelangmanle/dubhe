@@ -54,19 +54,10 @@ const char* const kM2Names[K_COUNT] = {
     "mm2_f32", "mm2_f16", "", "", "mm2_q8_0", "mm2_q4_k", "mm2_q6_k"
 };
 
-// MMA 版分块 matmul（第 3 代）。目前只启用 Q4_K，其余回退 mm2_*。
+// MMA 版分块 matmul（第 3 代）。覆盖 Q4_K / Q6_K，其余回退 mm2_*。
 // 空串表示"没有这一档"，派发时跳过。
-//
-// Q6_K 的 mm3 内核写好了（metal_kernels.h 里的 mm3_q6_k）、结果也对，
-// 但**关掉了**：实测 prefill 从 55 ms 掉到 242 ms（5 token 提示词，
-// 交错 3 轮一致）。原因是 6 bit 打包 —— 每元素要 2 条字节 load，
-// 而 Q4_K 是每 16 元素 1 条 uint4，差 32 倍。已用零访存/统一地址两个
-// 变体二分确认：砍掉访存就恢复 52 ms，改统一地址仍然是 241 ms，
-// 所以不是合并访问问题，是每条 load 的发射成本本身。
-// 要救回来必须做对齐修正后的 uint4 读（块跨度 210 只保证 2 字节对齐），
-// 收益上限约 prefill 1.5x，先记在这里。
 const char* const kM3Names[K_COUNT] = {
-    "", "", "", "", "", "mm3_q4_k", ""
+    "", "", "", "", "", "mm3_q4_k", "mm3_q6_k"
 };
 
 // 与 MSL 的 MMA_BN / MMA_BM / MMA_NK 一致（全部取自 metal_kernels.h 的唯一真源）
