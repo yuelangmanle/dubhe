@@ -1001,14 +1001,29 @@ kernel void mm3_q4_k(device const uchar* w      [[buffer(0)]],
             const float sc = rd_f16(q)      * float(s1);
             const float mn = rd_f16(q + 2u) * float(m1);
 
-            // 16 个连续字节：chunk 内偏移 inch&31 起，全部同一种半字节
-            device const uchar* src = q + 16u + (chunk << 5) + (inch & 31u);
-            uint o = lr * MMA_NK + (half16 << 4);
-            for (uint i = 0; i < 16u; i++) {
-                const uint byte = src[i];
-                const uint v = hi ? (byte >> 4) : (byte & 0x0Fu);
-                ws[o + i] = (half)fma(sc, float(v), -mn);
+            // 16 个连续字节：chunk 内偏移 inch&31 起，全部同一种半字节。
+            // 一次 uint4 读进来（16 字节，8 字节对齐成立：块跨度 144、
+            // 偏移 16+32k+16h 都是 8 的倍数），再按 nibble 摊开。
+            // 逐个 uchar 读是 16 条 load 指令，这里只要 1 条。
+            const uint4 raw = *(device const uint4*)(q + 16u + (chunk << 5) + (inch & 31u));
+            const uint words[4] = { raw.x, raw.y, raw.z, raw.w };
+            const uint sh = hi ? 4u : 0u;
+            const uint4 o4 = uint4(lr * MMA_NK + (half16 << 4));
+
+            half4 h4[4];
+            #pragma unroll
+            for (uint t = 0; t < 4u; t++) {
+                #pragma unroll
+                for (uint j = 0; j < 4u; j++) {
+                    const uint byte = (words[t] >> (j << 3)) & 0xFFu;
+                    const uint v = (byte >> sh) & 0x0Fu;
+                    h4[t][j] = (half)fma(sc, float(v), -mn);
+                }
             }
+            // half4 直接存，避免 16 次标量 half 写
+            threadgroup half4* dst = (threadgroup half4*)(ws + (o4.x & ~3u));
+            #pragma unroll
+            for (uint t = 0; t < 4u; t++) dst[t] = h4[t];
         }
 
         // ---- 激活搬进 xs：8 行 × 32 元素 = 256 个，128 线程每人 2 个
