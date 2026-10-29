@@ -60,9 +60,10 @@ const char* const kM3Names[K_COUNT] = {
     "", "", "", "", "", "mm3_q4_k", ""
 };
 
-// 与 MSL 的 MMA_BN / MMA_NK 一致
-constexpr int kMmaBn = 64;
-constexpr int kMmaNk = 32;
+// 与 MSL 的 MMA_BN / MMA_BM / MMA_NK 一致（全部取自 metal_kernels.h 的唯一真源）
+constexpr int kMmaBn = dubhe_msl::kMmaBn;
+constexpr int kMmaBm = dubhe_msl::kMmaBm;
+constexpr int kMmaNk = dubhe_msl::kMmaNk;
 
 id<MTLDevice>       g_dev = nil;
 id<MTLCommandQueue> g_queue = nil;
@@ -284,7 +285,13 @@ namespace {
 // 注意：不要再写一个字面量 8。MSL 是字符串，BMAX 对 C++ 不可见，所以
 // 唯一真源放在 metal_kernels.h 的 namespace dubhe_msl 里。这里直接从那里
 // 取，改 BMAX 时两边不会漂移（漂移的症状是结果错乱而不是编译错误）。
-constexpr int kBmax = dubhe_msl::kBmax;
+//
+// 这里有两个批大小，别再混：
+//   kBmax    = 8  —— mm2_* / mm_* 内核一次吃几个 token（受寄存器限制）
+//   kBatchMax= 32 —— 一次前向最多提交几个 token（受 mm3_* 的 MMA_BM 限制）
+// 两者不一致，所以超过 8 行而该张量没有 MMA 内核时，gemm 里要按 8 行分批。
+constexpr int kBmax     = dubhe_msl::kBmax;
+constexpr int kBatchMax = dubhe_msl::kMmaBm;
 constexpr int kAttnSplits = 8;  // 注意力 key 区间最多切几段（split-K）
 
 enum FwdKernel {
@@ -313,7 +320,7 @@ id<MTLComputePipelineState> g_m3pipe[K_COUNT] = {nil};
 Spec         g_spec;
 bool         g_fwd_ready = false;
 
-// 前向用到的所有激活缓冲。按 kBmax 行分配，解码时只用第 0 行。
+// 前向用到的所有激活缓冲。按 kBatchMax 行分配，解码时只用第 0 行。
 id<MTLBuffer> g_bx = nil, g_bxb = nil, g_bq = nil, g_bk = nil, g_bv = nil;
 id<MTLBuffer> g_batt = nil, g_bgate = nil, g_bup = nil, g_bffn = nil, g_blogits = nil;
 id<MTLBuffer> g_bkc = nil, g_bvc = nil;
@@ -425,7 +432,7 @@ bool fwd_init(const Spec& s, std::string* err) {
 
     g_spec = s;
 
-    const size_t B = (size_t)kBmax;
+    const size_t B = (size_t)kBatchMax;
     const size_t n_embd = (size_t)s.n_embd, n_ff = (size_t)s.n_ff, n_vocab = (size_t)s.n_vocab;
     const size_t kv_dim = (size_t)s.n_head_kv * (size_t)s.hd;
     const size_t kvb = (size_t)s.n_layer * (size_t)s.kv_cap * kv_dim * sizeof(float);
@@ -504,7 +511,7 @@ bool fwd_grow_kv(int new_cap, std::string* err) {
 // x0: [nrow][n_embd] 已反量化的 embedding；pos0: 首行在序列中的位置。
 bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* err) {
     if (!g_fwd_ready) { if (err) *err = "GPU 前向未初始化"; return false; }
-    if (nrow <= 0 || nrow > kBmax) { if (err) *err = "批大小越界"; return false; }
+    if (nrow <= 0 || nrow > kBatchMax) { if (err) *err = "批大小越界"; return false; }
     if (pos0 + nrow > g_spec.kv_cap) { if (err) *err = "KV cache 越界"; return false; }
 
     const int n_embd = g_spec.n_embd, n_ff = g_spec.n_ff;
@@ -544,23 +551,16 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
     };
 
     // 矩阵乘：rows 行激活 → rows 行输出。rows == 1 走 matvec，否则走 matmul。
+    //
+    // 三代 prefill 内核的 token 摊薄倍数不一样：mm3_* 吃 kMmaBm=32 个 token，
+    // mm2_* 和 mm_* 吃 kBmax=8 个。所以**先定走哪一代、再按那一代的步长转置**。
+    // 顺序不能反 —— 转置写下的步长和内核读的步长必须同一套，否则结果是乱的
+    // 而不是报错，这种 bug 最难查。
     auto gemm = [&](uint32_t type, id<MTLBuffer> xin, id<MTLBuffer> yout, uint64_t woff,
                     int n_out, int n_in, int rows) {
         const int k = kind_of(type);
         if (k < 0) return;
         uint32_t nin = (uint32_t)n_in, nout = (uint32_t)n_out, nr = (uint32_t)rows;
-        if (rows > 1) {
-            // 先把激活转成 [n_in][BMAX]，让每个权重值的 BMAX 次 fma 只需
-            // BMAX/4 条 float4 加载。转置本身只有 n_in×8 个 float，代价可忽略。
-            uint32_t nn = (uint32_t)n_in, nr2 = (uint32_t)rows;
-            [en setComputePipelineState:g_fpipe[F_TRANS]];
-            [en setBuffer:xin offset:0 atIndex:0];
-            [en setBuffer:g_bxt offset:0 atIndex:1];
-            [en setBytes:&nn length:4 atIndex:2];
-            [en setBytes:&nr2 length:4 atIndex:3];
-            [en dispatchThreads:MTLSizeMake((NSUInteger)n_in, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        }
 
         // prefill 走二维分块内核：一个 threadgroup 算 kMmRows 行，
         // 激活切片搬进 threadgroup memory 由组内 8 个 simdgroup 共享。
@@ -574,7 +574,25 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         static const bool no_mma = getenv("DUBHE_NO_MMA") != nullptr;
         const bool mma = rows > 1 && !no_mma && g_m3pipe[k] && (n_in % 256) == 0;
 
+        // 把 xin 里第 j0 行起的 stride 行激活转置进 g_bxt（步长 stride）。
+        // 转置本身只有 n_in×stride 个 float，代价可忽略。
+        auto transpose = [&](int j0, int stride) {
+            uint32_t nn = (uint32_t)n_in, jj = (uint32_t)j0, st = (uint32_t)stride;
+            [en setComputePipelineState:g_fpipe[F_TRANS]];
+            [en setBuffer:xin offset:0 atIndex:0];
+            [en setBuffer:g_bxt offset:0 atIndex:1];
+            [en setBytes:&nn length:4 atIndex:2];
+            [en setBytes:&nr length:4 atIndex:3];
+            [en setBytes:&jj length:4 atIndex:4];
+            [en setBytes:&st length:4 atIndex:5];
+            [en dispatchThreads:MTLSizeMake((NSUInteger)n_in, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        };
+
         if (mma) {
+            const uint32_t xs = (uint32_t)kMmaBm;
+            const uint64_t yo = 0;
+            transpose(0, kMmaBm);
             [en setComputePipelineState:g_m3pipe[k]];
             [en setBuffer:g_w offset:0 atIndex:0];
             [en setBuffer:g_bxt offset:0 atIndex:1];
@@ -583,6 +601,8 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
             [en setBytes:&woff length:sizeof(woff) atIndex:4];
             [en setBytes:&nout length:sizeof(nout) atIndex:5];
             [en setBytes:&nr length:sizeof(nr) atIndex:6];
+            [en setBytes:&xs length:sizeof(xs) atIndex:7];
+            [en setBytes:&yo length:sizeof(yo) atIndex:8];
             const NSUInteger tgc = (NSUInteger)((n_out + kMmaBn - 1) / kMmaBn);
             [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -590,26 +610,44 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         }
 
         if (rows > 1) {
-            [en setComputePipelineState:tiled ? g_m2pipe[k] : g_mpipe[k]];
-        } else {
-            [en setComputePipelineState:g_pipe[k]];
+            // mm2_* / mm_* 只吃 kBmax 个 token。rows 超过就按 kBmax 分批派发，
+            // 每批的转置和输出行都用 yo 平移 —— 权重只读一遍，成本不变。
+            for (int c = 0; c < rows; c += kBmax) {
+                const int take = (rows - c < kBmax) ? (rows - c) : kBmax;
+                const uint32_t nrc = (uint32_t)take;
+                const uint64_t yo = (uint64_t)c * (uint64_t)n_out;
+                transpose(c, kBmax);
+                [en setComputePipelineState:tiled ? g_m2pipe[k] : g_mpipe[k]];
+                [en setBuffer:g_w offset:0 atIndex:0];
+                [en setBuffer:g_bxt offset:0 atIndex:1];
+                [en setBuffer:yout offset:0 atIndex:2];
+                [en setBytes:&nin length:sizeof(nin) atIndex:3];
+                [en setBytes:&woff length:sizeof(woff) atIndex:4];
+                [en setBytes:&nout length:sizeof(nout) atIndex:5];
+                [en setBytes:&nrc length:sizeof(nrc) atIndex:6];
+                [en setBytes:&yo length:sizeof(yo) atIndex:7];
+                if (tiled) {
+                    const NSUInteger tgc = (NSUInteger)((n_out + kMmRows - 1) / kMmRows);
+                    [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(kMmSgPerTg * 32, 1, 1)];
+                } else {
+                    const NSUInteger tgc = (NSUInteger)((n_out + kSgPerTg - 1) / kSgPerTg);
+                    [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
+            }
+            return;
         }
+
+        // 单 token：matvec。一个 simdgroup 算 kMvRows 行。
+        [en setComputePipelineState:g_pipe[k]];
         [en setBuffer:g_w offset:0 atIndex:0];
-        [en setBuffer:(rows > 1 ? g_bxt : xin) offset:0 atIndex:1];
+        [en setBuffer:xin offset:0 atIndex:1];
         [en setBuffer:yout offset:0 atIndex:2];
         [en setBytes:&nin length:sizeof(nin) atIndex:3];
         [en setBytes:&woff length:sizeof(woff) atIndex:4];
         [en setBytes:&nout length:sizeof(nout) atIndex:5];
-        if (rows > 1) [en setBytes:&nr length:sizeof(nr) atIndex:6];
-
-        if (tiled) {
-            const NSUInteger tgc = (NSUInteger)((n_out + kMmRows - 1) / kMmRows);
-            [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(kMmSgPerTg * 32, 1, 1)];
-            return;
-        }
-        // mv 内核一个 simdgroup 算 kMvRows 行；旧 mm 内核一个 simdgroup 算一行。
-        const int per_tg = (rows > 1) ? kSgPerTg : kSgPerTg * kMvRows;
+        const int per_tg = kSgPerTg * kMvRows;
         const NSUInteger tgc = (NSUInteger)((n_out + per_tg - 1) / per_tg);
         [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -947,7 +985,7 @@ bool fwd_token(const float* x0, int pos, float* logits, std::string* err) {
     return fwd_batch(x0, 1, pos, logits, err);
 }
 
-int fwd_batch_max() { return kBmax; }
+int fwd_batch_max() { return kBatchMax; }
 
 bool fwd_copy_x(float* dst, int n) {
     if (!g_fwd_ready || !g_bx) return false;

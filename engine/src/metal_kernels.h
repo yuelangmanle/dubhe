@@ -447,12 +447,14 @@ kernel void mm_f32(device const uchar* w      [[buffer(0)]],
                    constant ulong& woff       [[buffer(4)]],
                    constant uint& n_out       [[buffer(5)]],
                    constant uint& nrow        [[buffer(6)]],
+                   constant ulong& yoff       [[buffer(7)]],
                    uint tgid [[threadgroup_position_in_grid]],
                    uint lane [[thread_index_in_simdgroup]],
                    uint sg   [[simdgroup_index_in_threadgroup]])
 {
     const uint row = tgid * SG_PER_TG + sg;
     if (row >= n_out) return;
+    Y += yoff;   // 分批派发时指向本批第 0 个 token 的起始行
     device const float* p = (device const float*)(w + woff) + (ulong)row * n_in;
     float acc[BMAX];
     for (int j = 0; j < BMAX; j++) acc[j] = 0.0f;
@@ -470,12 +472,14 @@ kernel void mm_f16(device const uchar* w      [[buffer(0)]],
                    constant ulong& woff       [[buffer(4)]],
                    constant uint& n_out       [[buffer(5)]],
                    constant uint& nrow        [[buffer(6)]],
+                   constant ulong& yoff       [[buffer(7)]],
                    uint tgid [[threadgroup_position_in_grid]],
                    uint lane [[thread_index_in_simdgroup]],
                    uint sg   [[simdgroup_index_in_threadgroup]])
 {
     const uint row = tgid * SG_PER_TG + sg;
     if (row >= n_out) return;
+    Y += yoff;   // 分批派发时指向本批第 0 个 token 的起始行
     device const ushort* p = (device const ushort*)(w + woff) + (ulong)row * n_in;
     float acc[BMAX];
     for (int j = 0; j < BMAX; j++) acc[j] = 0.0f;
@@ -493,12 +497,14 @@ kernel void mm_q4_0(device const uchar* w     [[buffer(0)]],
                     constant ulong& woff      [[buffer(4)]],
                     constant uint& n_out      [[buffer(5)]],
                     constant uint& nrow       [[buffer(6)]],
+                    constant ulong& yoff      [[buffer(7)]],
                     uint tgid [[threadgroup_position_in_grid]],
                     uint lane [[thread_index_in_simdgroup]],
                     uint sg   [[simdgroup_index_in_threadgroup]])
 {
     const uint row = tgid * SG_PER_TG + sg;
     if (row >= n_out) return;
+    Y += yoff;   // 分批派发时指向本批第 0 个 token 的起始行
     const uint nb = n_in >> 5;
     device const uchar* p = w + woff + (ulong)row * (ulong)nb * 18u;
     const uint idx = lane & 15u;
@@ -523,12 +529,14 @@ kernel void mm_q5_0(device const uchar* w     [[buffer(0)]],
                     constant ulong& woff      [[buffer(4)]],
                     constant uint& n_out      [[buffer(5)]],
                     constant uint& nrow       [[buffer(6)]],
+                    constant ulong& yoff      [[buffer(7)]],
                     uint tgid [[threadgroup_position_in_grid]],
                     uint lane [[thread_index_in_simdgroup]],
                     uint sg   [[simdgroup_index_in_threadgroup]])
 {
     const uint row = tgid * SG_PER_TG + sg;
     if (row >= n_out) return;
+    Y += yoff;   // 分批派发时指向本批第 0 个 token 的起始行
     const uint nb = n_in >> 5;
     device const uchar* p = w + woff + (ulong)row * (ulong)nb * 22u;
     const uint idx = lane & 15u;
@@ -555,12 +563,14 @@ kernel void mm_q8_0(device const uchar* w     [[buffer(0)]],
                     constant ulong& woff      [[buffer(4)]],
                     constant uint& n_out      [[buffer(5)]],
                     constant uint& nrow       [[buffer(6)]],
+                    constant ulong& yoff      [[buffer(7)]],
                     uint tgid [[threadgroup_position_in_grid]],
                     uint lane [[thread_index_in_simdgroup]],
                     uint sg   [[simdgroup_index_in_threadgroup]])
 {
     const uint row = tgid * SG_PER_TG + sg;
     if (row >= n_out) return;
+    Y += yoff;   // 分批派发时指向本批第 0 个 token 的起始行
     const uint nb = n_in >> 5;
     device const uchar* p = w + woff + (ulong)row * (ulong)nb * 34u;
     float acc[BMAX];
@@ -582,12 +592,14 @@ kernel void mm_q4_k(device const uchar* w     [[buffer(0)]],
                     constant ulong& woff      [[buffer(4)]],
                     constant uint& n_out      [[buffer(5)]],
                     constant uint& nrow       [[buffer(6)]],
+                    constant ulong& yoff      [[buffer(7)]],
                     uint tgid [[threadgroup_position_in_grid]],
                     uint lane [[thread_index_in_simdgroup]],
                     uint sg   [[simdgroup_index_in_threadgroup]])
 {
     const uint row = tgid * SG_PER_TG + sg;
     if (row >= n_out) return;
+    Y += yoff;   // 分批派发时指向本批第 0 个 token 的起始行
     const uint nb = n_in >> 8;
     device const uchar* p = w + woff + (ulong)row * (ulong)nb * 144u;
     float acc[BMAX];
@@ -618,12 +630,14 @@ kernel void mm_q6_k(device const uchar* w     [[buffer(0)]],
                     constant ulong& woff      [[buffer(4)]],
                     constant uint& n_out      [[buffer(5)]],
                     constant uint& nrow       [[buffer(6)]],
+                    constant ulong& yoff      [[buffer(7)]],
                     uint tgid [[threadgroup_position_in_grid]],
                     uint lane [[thread_index_in_simdgroup]],
                     uint sg   [[simdgroup_index_in_threadgroup]])
 {
     const uint row = tgid * SG_PER_TG + sg;
     if (row >= n_out) return;
+    Y += yoff;   // 分批派发时指向本批第 0 个 token 的起始行
     const uint nb = n_in >> 8;
     device const uchar* p = w + woff + (ulong)row * (ulong)nb * 210u;
     const uint si = lane >> 4;
@@ -841,12 +855,14 @@ kernel void NAME(device const uchar* w      [[buffer(0)]],                     \
                  constant ulong& woff       [[buffer(4)]],                     \
                  constant uint& n_out       [[buffer(5)]],                     \
                  constant uint& nrow        [[buffer(6)]],                     \
+                 constant ulong& yoff       [[buffer(7)]],                     \
                  uint tgid [[threadgroup_position_in_grid]],                    \
                  uint tid  [[thread_position_in_threadgroup]],                  \
                  uint lane [[thread_index_in_simdgroup]],                       \
                  uint sg   [[simdgroup_index_in_threadgroup]])                  \
 {                                                                              \
     (void)0;                                                                   \
+    Y += yoff;                                                                 \
     const uint row0 = tgid * MMR;                                              \
     const uint nb   = n_in / TILE_K;                                           \
     const uint e0   = lane << 3;                                               \
@@ -943,32 +959,47 @@ MM2_KERNEL(mm2_q6_k, RawQ6K, ld_q6k,  cv_q6k,  ((n_in >> 8) * 210u), 210u)
 //
 // 分块
 // ----
-//   每个 threadgroup：BN=64 个输出行 × BMAX=8 个 token，K 方向每次 32 元素。
-//   4 个 simdgroup 各管 16 个输出行（2 个 8x8 累加块）。
+//   每个 threadgroup：BN=64 个输出行 × BM=32 个 token，K 方向每次 32 元素。
+//   4 个 simdgroup 各管 16 个输出行（2 个 8x8 累加块）× 4 个 token 块。
 //   128 线程，每行 2 个线程，每个线程反量化 16 个元素 ——
 //   正好是 Q4_K 一个 32 元子块的一半，子块的 scale/min 只算一次。
 //
-// threadgroup 内存：权重 64×32 half = 4 KB，激活 8×32 half = 512 B，
-// 输出暂存 8×64 float = 2 KB，合计 6.6 KB —— 每 core 能驻留 7 个，延迟藏得住。
+// 为什么 BM 从 8 提到 32
+// ---------------------
+// mm2 时代 BMAX=8 是被**寄存器**逼出来的：acc[MM_SG][8] 占 32 个，wv[MM_SG][8]
+// 再占 32 个，64 就是红线。换 MMA 之后累加器只要 2 个寄存器/lane/8x8 块，
+// 于是"摊薄倍数"第一次可以单独调。权重反量化的代价是每 256 元素块算一次
+// scale/min，摊到 8 个 token 上是 1/8，摊到 32 个上是 1/32 —— 而 prefill
+// 的真实瓶颈正是这个摊薄倍数（把反量化向量化后零增益，就是这个结论的反证）。
+//
+// threadgroup 内存：权重 64×32 half = 4 KB，激活 32×32 half = 2 KB，
+// 输出暂存 32×64 float = 8 KB，合计 14 KB —— 每 core 还能驻留 2 个。
+//
+// 激活存成 [k][m]（k 行主序、m 连续），让每个线程一次 float4 写四个 token；
+// 读的时候给 simdgroup_load 打开 transpose，语义等价于 [m][k]。
+// 反过来存 [m][k] 就要 4 次标量 half 写，白扔一条向量指令。
 
 #define MMA_BN 64
+#define MMA_BM 32
 #define MMA_NK 32
 
 kernel void mm3_q4_k(device const uchar* w      [[buffer(0)]],
-                     device const float* XT     [[buffer(1)]],   // [n_in][BMAX] 已转置
-                     device float* Y            [[buffer(2)]],   // [BMAX][n_out]
+                     device const float* XT     [[buffer(1)]],   // [n_in][xstride] 已转置
+                     device float* Y            [[buffer(2)]],   // [xstride][n_out]
                      constant uint& n_in        [[buffer(3)]],
                      constant ulong& woff       [[buffer(4)]],
                      constant uint& n_out       [[buffer(5)]],
                      constant uint& nrow        [[buffer(6)]],
+                     constant uint& xstride     [[buffer(7)]],
+                     constant ulong& yoff       [[buffer(8)]],
                      uint tgid [[threadgroup_position_in_grid]],
                      uint tid  [[thread_position_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]],
                      uint sg   [[simdgroup_index_in_threadgroup]])
 {
     threadgroup half  ws[MMA_BN * MMA_NK];   // 权重：反量化后的 [n][k]
-    threadgroup half  xs[BMAX * MMA_NK];     // 激活：[m][k]
-    threadgroup float cs[BMAX * MMA_BN];     // 输出暂存：[m][n]
+    threadgroup half  xs[MMA_BM * MMA_NK];   // 激活：[k][m]
+    threadgroup float cs[MMA_BM * MMA_BN];   // 输出暂存：[m][n]
 
     const uint row0 = tgid * MMA_BN;
     const uint nb   = n_in / MMA_NK;
@@ -980,8 +1011,13 @@ kernel void mm3_q4_k(device const uchar* w      [[buffer(0)]],
     const uint grow   = row0 + lr;
     device const uchar* prow = w + woff + (ulong)min(grow, n_out - 1u) * rbytes;
 
-    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8>(0.f);
-    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8>(0.f);
+    // 本 simdgroup 负责 16 个输出行 × 32 个 token = 2×4 个 8x8 累加块
+    simdgroup_float8x8 acc[2][4];
+    #pragma unroll
+    for (uint i = 0; i < 2u; i++)
+        #pragma unroll
+        for (uint j = 0; j < 4u; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
 
     for (uint b = 0; b < nb; b++) {
         const uint k0 = b * MMA_NK;
@@ -1026,46 +1062,64 @@ kernel void mm3_q4_k(device const uchar* w      [[buffer(0)]],
             for (uint t = 0; t < 4u; t++) dst[t] = h4[t];
         }
 
-        // ---- 激活搬进 xs：8 行 × 32 元素 = 256 个，128 线程每人 2 个
+        // ---- 激活搬进 xs：32 token × 32 元素 = 1024 个，128 线程每人 8 个。
+        // 一次 float4 读四个 token（m 在 XT 里连续），一次 half4 写进 xs。
+        // 越界 token 已由 k_trans 填 0，这里不必再判。
+        #pragma unroll
         for (uint t = 0; t < 2u; t++) {
-            const uint idx = tid * 2u + t;
-            const uint m = idx >> 5;
-            const uint k = idx & 31u;
-            // 超出 nrow 的行必须写 0，否则残留值会进 MMA（虽然结果被丢弃，
-            // 但 NaN/Inf 会拖慢整个 warp，而且不写 0 就依赖上一轮的内容）
-            xs[m * MMA_NK + k] = (m < nrow) ? (half)XT[(ulong)(k0 + k) * BMAX + m] : (half)0;
+            const uint i4 = tid * 2u + t;       // 0..255
+            const uint m0 = (i4 & 7u) << 2;     // 0,4,...,28
+            const uint k  = i4 >> 3;            // 0..31
+            const float4 v = *(device const float4*)(XT + (ulong)(k0 + k) * xstride + m0);
+            *(threadgroup half4*)(xs + k * MMA_BM + m0) =
+                half4((half)v.x, (half)v.y, (half)v.z, (half)v.w);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ---- 4 个 K 子步 × 2 个 N 块
+        // ---- 4 个 K 子步 × 2 个行块 × 4 个 token 块 = 32 条 MMA
+        // ma 从 xs 取：xs 是 [k][m]，所以 origin 的 x 是 token 偏移、y 是 K 偏移，
+        // 再开 transpose 把 [k][m] 读成 [m][k]。
+        #pragma unroll
         for (uint kk = 0; kk < 4u; kk++) {
-            simdgroup_half8x8 ma;
-            simdgroup_load(ma, xs, MMA_NK, ulong2(kk << 3, 0u), false);
+            simdgroup_half8x8 ma[4];
+            #pragma unroll
+            for (uint j = 0; j < 4u; j++)
+                simdgroup_load(ma[j], xs, MMA_BM, ulong2(j << 3, kk << 3), true);
 
-            simdgroup_half8x8 mb0;
-            simdgroup_load(mb0, ws, MMA_NK, ulong2(kk << 3, sg << 4), true);
-            simdgroup_multiply_accumulate(acc0, ma, mb0, acc0);
+            simdgroup_half8x8 mb[2];
+            #pragma unroll
+            for (uint i = 0; i < 2u; i++)
+                simdgroup_load(mb[i], ws, MMA_NK, ulong2(kk << 3, (sg << 4) + (i << 3)), true);
 
-            simdgroup_half8x8 mb1;
-            simdgroup_load(mb1, ws, MMA_NK, ulong2(kk << 3, (sg << 4) + 8u), true);
-            simdgroup_multiply_accumulate(acc1, ma, mb1, acc1);
+            #pragma unroll
+            for (uint i = 0; i < 2u; i++) {
+                #pragma unroll
+                for (uint j = 0; j < 4u; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], ma[j], mb[i], acc[i][j]);
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // ---- 写回：先落到 threadgroup，再按边界拷到 Y（n_out 不一定是 8 的倍数）
-    simdgroup_store(acc0, cs, MMA_BN, ulong2(sg << 4, 0u), false);
-    simdgroup_store(acc1, cs, MMA_BN, ulong2((sg << 4) + 8u, 0u), false);
+    #pragma unroll
+    for (uint i = 0; i < 2u; i++) {
+        #pragma unroll
+        for (uint j = 0; j < 4u; j++)
+            simdgroup_store(acc[i][j], cs, MMA_BN,
+                            ulong2((sg << 4) + (i << 3), j << 3), false);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint t = 0; t < 4u; t++) {
-        const uint idx = tid * 4u + t;
-        const uint m = idx >> 6;          // 0..7
+    #pragma unroll
+    for (uint t = 0; t < 16u; t++) {
+        const uint idx = tid * 16u + t;
+        const uint m = idx >> 6;          // 0..31
         const uint n = idx & 63u;         // 0..63
         if (m < nrow && row0 + n < n_out)
-            Y[(ulong)m * n_out + row0 + n] = cs[m * MMA_BN + n];
+            Y[yoff + (ulong)m * n_out + row0 + n] = cs[m * MMA_BN + n];
     }
 }
 
@@ -1079,17 +1133,23 @@ kernel void mm3_q4_k(device const uchar* w      [[buffer(0)]],
 // 逐元素算子统一用 uint2 网格：gid.x = 行内下标，gid.y = 批内第几行。
 // 解码时只派发 gid.y = 0 一层，批处理时派发 nrow 层——同一份代码覆盖两种模式。
 
-// 激活转置：[nrow][n] → [n][BMAX]，j >= nrow 的位置填 0。
-// 填 0 是为了让 matmul 内核可以无条件做满 8 次 fma，去掉所有分支。
+// 激活转置：[nrow][n] → [n][stride]，src 从第 j0 行开始取，越界位置填 0。
+// 填 0 是为了让 matmul 内核可以无条件做满 stride 次 fma，去掉所有分支。
+//
+// 为什么 stride 要变成运行期参数：两代内核的 token 摊薄倍数不一样。
+// mm2_* 一次吃 BMAX=8 个 token，mm3_* 吃 MMA_BM=32 个 —— 同一个 g_bxt
+// 缓冲要用两种布局，所以步长和行偏移都不能再写死。
 kernel void k_trans(device const float* src [[buffer(0)]],
                     device float* dst       [[buffer(1)]],
                     constant uint& n        [[buffer(2)]],
                     constant uint& nrow     [[buffer(3)]],
+                    constant uint& j0       [[buffer(4)]],
+                    constant uint& stride   [[buffer(5)]],
                     uint e [[thread_position_in_grid]])
 {
     if (e >= n) return;
-    for (uint j = 0; j < BMAX; j++)
-        dst[(ulong)e * BMAX + j] = (j < nrow) ? src[(ulong)j * n + e] : 0.0f;
+    for (uint j = 0; j < stride; j++)
+        dst[(ulong)e * stride + j] = (j0 + j < nrow) ? src[(ulong)(j0 + j) * n + e] : 0.0f;
 }
 
 // RMSNorm：out = x * rsqrt(mean(x^2)+eps) * w   （w 为 f32，位于权重 mmap 内）
@@ -1546,7 +1606,10 @@ kernel void k_conv_shift(device const float* h    [[buffer(0)]],
 // metal.mm 的派发参数和 tools 里的对拍工具都从这里取，避免两边漂移。
 namespace dubhe_msl {
 
-constexpr int kBmax      = 8;    // 与 MSL 的 BMAX 一致
+constexpr int kBmax      = 8;    // 与 MSL 的 BMAX 一致（mm2_* 的 token 摊薄）
+constexpr int kMmaBm     = 32;   // 与 MSL 的 MMA_BM 一致（mm3_* 的 token 摊薄）
+constexpr int kMmaBn     = 64;   // 与 MSL 的 MMA_BN 一致
+constexpr int kMmaNk     = 32;   // 与 MSL 的 MMA_NK 一致
 constexpr int kSgPerTg   = 4;    // 与 MSL 的 SG_PER_TG 一致（matvec 用）
 constexpr int kMvRows    = 2;    // 与 MSL 的 MV_R 一致
 constexpr int kMmSgPerTg = 8;    // 与 MSL 的 MM_SG_PER_TG 一致
