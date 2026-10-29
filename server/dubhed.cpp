@@ -7,14 +7,24 @@
 //   GET  /v1/models
 //   POST /v1/chat/completions      OpenAI 兼容（stream / 非 stream）
 //   GET  /api/state                运行时状态（硬件、模型、统计）
-//   POST /api/load                 切换模型
-//   POST /api/tokenize             调试用
+//   GET  /api/models               本地模型清单（扫描 --model-dir）
+//   POST /api/load                 切换模型（卸载 → 加载 → 失败自动装回旧的）
+//   GET  /api/files                列目录（JSON）
+//   GET  /api/files/read           读文本文件
+//   GET  /api/tools                工具清单
+//   POST /api/tools/run            手动执行一个工具
+//   GET  /api/kb                   知识库文档与统计
+//   POST /api/kb/add               索引文件/目录
+//   POST /api/kb/remove|clear|rag  移除 / 清空 / 开关自动注入
+//   POST /api/kb/search            BM25 检索
 #include <dubhe/dubhe.h>
 
 #include "http.h"
 #include "json.h"
 
 #include <ifaddrs.h>
+#include <dirent.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -33,6 +43,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -86,6 +97,401 @@ std::string model_id_of(const std::string& path) {
     std::string n = (a == std::string::npos) ? path : path.substr(a + 1);
     if (n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0) n.resize(n.size() - 5);
     return n.empty() ? "dubhe" : n;
+}
+
+// ---------------------------------------------------------------- 路径
+//
+// UI 的「文件」和「知识库」两个视图要能浏览工作区，所以这里给一组
+// 最小但完备的路径工具。安全边界只有一条：**不许出现 ".."**，并且
+// 解析后的绝对路径必须落在白名单根目录之下。用 realpath 而不是字符串
+// 比较 —— 符号链接可以把 /tmp/x 指到 /etc，字符串前缀检查拦不住。
+
+bool is_dir_p(const std::string& p) {
+    struct stat st {};
+    return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+bool is_file_p(const std::string& p) {
+    struct stat st {};
+    return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+std::string path_join(const std::string& a, const std::string& b) {
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    if (a.back() == '/') return a + b;
+    return a + "/" + b;
+}
+std::string path_base(const std::string& p) {
+    const size_t a = p.find_last_of('/');
+    return (a == std::string::npos) ? p : p.substr(a + 1);
+}
+std::string path_dir(const std::string& p) {
+    const size_t a = p.find_last_of('/');
+    if (a == std::string::npos) return ".";
+    if (a == 0) return "/";
+    return p.substr(0, a);
+}
+
+// 相对路径按工作区解析；~ 展开成家目录
+std::string path_abs(const std::string& p) {
+    if (p.empty()) return g.workspace;
+    if (p[0] == '~') {
+        const char* h = getenv("HOME");
+        return std::string(h ? h : "") + p.substr(1);
+    }
+    if (p[0] == '/') return p;
+    return path_join(g.workspace, p);
+}
+
+// 白名单根：工作区、模型目录、家目录下的 .dubhe。realpath 之后比较。
+bool path_allowed(const std::string& p) {
+    if (p.find("..") != std::string::npos) return false;
+    char buf[PATH_MAX];
+    std::string real = p;
+    if (realpath(p.c_str(), buf)) real = buf;
+    // 不存在的新文件：退到父目录再判
+    if (!is_file_p(p) && !is_dir_p(p)) {
+        std::string par = path_dir(p);
+        if (realpath(par.c_str(), buf)) real = path_join(buf, path_base(p));
+        else return false;
+    }
+    const char* h = getenv("HOME");
+    std::vector<std::string> roots = {g.workspace};
+    if (h) {
+        roots.push_back(std::string(h));
+        roots.push_back(std::string(h) + "/.dubhe");
+    }
+    if (!g.model_dir.empty()) roots.push_back(g.model_dir);
+    if (!g.tmp_dir.empty()) roots.push_back(g.tmp_dir);
+    for (const auto& r : roots) {
+        if (r.empty()) continue;
+        std::string rr = r;
+        char rb[PATH_MAX];
+        if (realpath(r.c_str(), rb)) rr = rb;
+        if (real == rr) return true;
+        if (real.size() > rr.size() && real.compare(0, rr.size(), rr) == 0 &&
+            real[rr.size()] == '/')
+            return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- 文件浏览
+const char* kTextExt[] = {".txt", ".md",  ".markdown", ".json", ".jsonl", ".yaml", ".yml",
+                          ".toml", ".csv", ".tsv",      ".c",    ".h",     ".cc",   ".cpp",
+                          ".hpp", ".mm",  ".py",        ".js",   ".ts",    ".html", ".css",
+                          ".sh",  ".rs",  ".go",        ".java", ".kt",    ".swift", ".log",
+                          ".ini", ".conf", ".xml",      ".sql",  ".gitignore"};
+
+bool has_text_ext(const std::string& p) {
+    std::string low = p;
+    for (auto& c : low) c = (char)std::tolower((unsigned char)c);
+    for (const char* e : kTextExt) {
+        const size_t n = std::strlen(e);
+        if (low.size() >= n && low.compare(low.size() - n, n, e) == 0) return true;
+    }
+    return false;
+}
+
+// UTF-8 边界。中文一个字 3 字节，按字节切块/截断一定会切在字中间，
+// 而 json::dump 是原样输出的 —— 半个汉字出去就是非法 UTF-8，前端
+// JSON.parse 直接抛错。这两个小函数是唯一可靠的挡板。
+size_t utf8_next(const std::string& s, size_t i) {
+    while (i < s.size() && ((unsigned char)s[i] & 0xC0) == 0x80) i++;
+    return i;
+}
+size_t utf8_back(const std::string& s, size_t i) {
+    if (i > s.size()) i = s.size();
+    while (i > 0 && i < s.size() && ((unsigned char)s[i] & 0xC0) == 0x80) i--;
+    return i;
+}
+
+// 读文本：超过上限就截断。二进制文件直接拒绝（用 0 字节判断）。
+std::string read_text_file(const std::string& p, size_t max_bytes, bool* truncated) {
+    if (truncated) *truncated = false;
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return "";
+    std::string s;
+    s.resize(max_bytes);
+    f.read(&s[0], (std::streamsize)max_bytes);
+    const size_t got = (size_t)f.gcount();
+    s.resize(got);
+    if (f.peek() != EOF && truncated) *truncated = true;
+    // 截断点落在汉字中间的话，退到字符起点
+    if (got == max_bytes) s.resize(utf8_back(s, got));
+    return s;
+}
+
+// ---------------------------------------------------------------- 知识库
+//
+// 为什么是 BM25 而不是向量检索
+// ---------------------------
+// 本地没有 embedding 模型。为了做 RAG 硬塞一个 300 MB 的 bge 进来，
+// 在 1.7B 的模型旁边等于多背一个 1/4 大小的权重，而收益只是"语义相近"。
+// BM25 是零模型、零显存、结果可解释（能指出命中了哪几个词）的，
+// 对"哪段话里有这个词"这类问题足够。真要做向量检索，接口形状不用变。
+//
+// 中文没有空格，用 bigram 切："本地推理" → 本地 / 地推 / 推理。
+// 这不是分词，但对 BM25 够用 —— 召回偏高、精度略低，配合长度归一化后
+// 排序仍然稳。英文和数字按 [a-z0-9_]+ 切，统一小写。
+//
+// 索引不落盘，只落"文档清单"。启动时按清单重读文件重建 —— 几十个文件
+// 只要几十毫秒，而把倒排表序列化出去既容易和源文件不同步，又得处理
+// 版本兼容。源文件才是唯一真源。
+
+struct KbDoc {
+    std::string path;
+    long long mtime = 0;
+    long long bytes = 0;
+    int chunks = 0;
+    bool missing = false;
+};
+
+struct KbChunk {
+    int doc = 0;
+    int len = 0;          // 词数，BM25 的长度归一化用
+    size_t off = 0;       // 在原文里的起点（做 snippet 用）
+    std::string text;
+};
+
+std::vector<KbDoc> g_kb_docs;
+std::vector<KbChunk> g_kb_chunks;
+std::unordered_map<std::string, std::vector<std::pair<int, int>>> g_kb_post;  // term → (chunk, tf)
+double g_kb_avg = 1.0;
+std::mutex g_kb_mu;
+bool g_kb_loaded = false;
+bool g_kb_rag = true;   // 是否把检索结果自动注入对话
+
+std::vector<std::string> kb_tokenize(const std::string& s) {
+    std::vector<std::string> out;
+    std::string word;
+    std::vector<std::string> cjk;
+    auto flush_word = [&]() {
+        if (!word.empty()) {
+            out.push_back(word);
+            word.clear();
+        }
+    };
+    auto flush_cjk = [&]() {
+        if (cjk.empty()) return;
+        if (cjk.size() == 1) {
+            out.push_back(cjk[0]);
+        } else {
+            for (size_t j = 0; j + 1 < cjk.size(); j++) out.push_back(cjk[j] + cjk[j + 1]);
+        }
+        cjk.clear();
+    };
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) {
+            flush_cjk();
+            if (std::isalnum(c) || c == '_') word += (char)std::tolower(c);
+            else flush_word();
+            i++;
+            continue;
+        }
+        flush_word();
+        const int n = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 1;
+        if (i + (size_t)n > s.size()) break;
+        cjk.push_back(s.substr(i, (size_t)n));
+        i += (size_t)n;
+    }
+    flush_word();
+    flush_cjk();
+    return out;
+}
+
+// 切块：约 700 字节一块、重叠 120 字节。断点优先段落，其次句号。
+// 重叠是必要的 —— 一个答案横跨切点时，没有重叠就两边都搜不到。
+std::vector<std::pair<size_t, std::string>> kb_split(const std::string& text) {
+    std::vector<std::pair<size_t, std::string>> out;
+    const size_t kMax = 700, kOverlap = 120;
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t end = std::min(text.size(), i + kMax);
+        if (end < text.size()) {
+            size_t p = text.rfind('\n', end);
+            if (p == std::string::npos || p < i + kMax / 3) p = text.rfind("。", end);
+            if (p == std::string::npos || p < i + kMax / 3) p = text.rfind('.', end);
+            if (p != std::string::npos && p > i + kMax / 3) end = p + 1;
+        }
+        size_t a = i, b = end;
+        while (a < b && std::isspace((unsigned char)text[a])) a++;
+        while (b > a && std::isspace((unsigned char)text[b - 1])) b--;
+        // 断点可能落在 '。' 的第 2 字节上，往前退到字符起点
+        b = utf8_back(text, b);
+        a = utf8_next(text, a);
+        if (b > a) out.emplace_back(a, text.substr(a, b - a));
+        if (end >= text.size()) break;
+        const size_t prev = i;
+        i = (end > kOverlap) ? end - kOverlap : end;
+        if (i <= prev) i = end;       // 重叠量比前进量还大时退化成不重叠
+        if (i <= prev) break;         // 兜底：绝不原地打转
+    }
+    return out;
+}
+
+std::string kb_manifest_path() {
+    const char* h = getenv("HOME");
+    return std::string(h ? h : "/tmp") + "/.dubhe/kb/docs.tsv";
+}
+
+void kb_save_manifest() {
+    const std::string p = kb_manifest_path();
+    ::mkdir(path_dir(p).c_str(), 0755);
+    ::mkdir(path_dir(path_dir(p)).c_str(), 0755);
+    std::ofstream f(p, std::ios::trunc);
+    if (!f) return;
+    for (const auto& d : g_kb_docs)
+        f << d.path << '\t' << d.mtime << '\t' << d.bytes << '\n';
+}
+
+void kb_load_manifest() {
+    std::ifstream f(kb_manifest_path());
+    if (!f) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t a = line.find('\t');
+        if (a == std::string::npos) continue;
+        const size_t b = line.find('\t', a + 1);
+        KbDoc d;
+        d.path = line.substr(0, a);
+        d.mtime = atoll(line.substr(a + 1, b == std::string::npos ? std::string::npos : b - a - 1).c_str());
+        if (b != std::string::npos) d.bytes = atoll(line.substr(b + 1).c_str());
+        g_kb_docs.push_back(std::move(d));
+    }
+}
+
+// 全量重建。文档数在几十的量级，重建比增量维护简单得多，也不会不同步。
+void kb_rebuild() {
+    g_kb_chunks.clear();
+    g_kb_post.clear();
+    double total = 0;
+    for (size_t di = 0; di < g_kb_docs.size(); di++) {
+        KbDoc& d = g_kb_docs[di];
+        d.chunks = 0;
+        d.missing = false;
+        struct stat st {};
+        if (stat(d.path.c_str(), &st) != 0) {
+            d.missing = true;
+            continue;
+        }
+        bool tr = false;
+        const std::string txt = read_text_file(d.path, 2 * 1024 * 1024, &tr);
+        if (txt.empty()) {
+            d.missing = true;
+            continue;
+        }
+        for (auto& seg : kb_split(txt)) {
+            KbChunk ch;
+            ch.doc = (int)di;
+            ch.off = seg.first;
+            ch.text = seg.second;
+            const auto toks = kb_tokenize(ch.text);
+            ch.len = (int)toks.size();
+            if (ch.len == 0) continue;
+            const int ci = (int)g_kb_chunks.size();
+            std::unordered_map<std::string, int> tf;
+            for (const auto& t : toks) tf[t]++;
+            for (const auto& kv : tf) g_kb_post[kv.first].emplace_back(ci, kv.second);
+            total += ch.len;
+            d.chunks++;
+            g_kb_chunks.push_back(std::move(ch));
+        }
+    }
+    g_kb_avg = g_kb_chunks.empty() ? 1.0 : total / (double)g_kb_chunks.size();
+}
+
+struct KbHit {
+    int chunk = 0;
+    double score = 0;
+    std::string snippet;
+    std::string path;
+};
+
+std::vector<KbHit> kb_search(const std::string& q, int topk) {
+    std::vector<KbHit> hits;
+    if (g_kb_chunks.empty()) return hits;
+    auto toks = kb_tokenize(q);
+    if (toks.empty()) return hits;
+    std::vector<std::string> uniq;
+    for (auto& t : toks)
+        if (std::find(uniq.begin(), uniq.end(), t) == uniq.end()) uniq.push_back(t);
+
+    const double k1 = 1.2, b = 0.75;
+    const int N = (int)g_kb_chunks.size();
+    std::unordered_map<int, double> score;
+    std::unordered_map<int, std::string> best_term;
+    for (const auto& t : uniq) {
+        auto it = g_kb_post.find(t);
+        if (it == g_kb_post.end()) continue;
+        const double df = (double)it->second.size();
+        const double idf = std::log(1.0 + (N - df + 0.5) / (df + 0.5));
+        for (const auto& [ci, tf] : it->second) {
+            const double len = (double)g_kb_chunks[ci].len;
+            const double s = idf * ((double)tf * (k1 + 1.0)) /
+                             ((double)tf + k1 * (1.0 - b + b * len / g_kb_avg));
+            score[ci] += s;
+            // snippet 以第一个命中的查询词为中心 —— 查询词顺序本身就是
+            // 用户心里的权重顺序，不必再挑 IDF 最大的那个
+            if (best_term.find(ci) == best_term.end()) best_term[ci] = t;
+        }
+    }
+    std::vector<std::pair<double, int>> order;
+    order.reserve(score.size());
+    for (const auto& kv : score) order.emplace_back(kv.second, kv.first);
+    std::sort(order.begin(), order.end(),
+              [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+                  return a.first > b.first;
+              });
+    if ((int)order.size() > topk) order.resize((size_t)topk);
+    for (const auto& [sc, ci] : order) {
+        const KbChunk& ch = g_kb_chunks[ci];
+        KbHit h;
+        h.chunk = ci;
+        h.score = sc;
+        h.path = g_kb_docs[(size_t)ch.doc].path;
+        // snippet：以命中词为中心取前后 140 字节
+        std::string sn = ch.text;
+        const std::string& term = best_term[ci];
+        size_t at = term.empty() ? std::string::npos : sn.find(term);
+        if (at != std::string::npos && sn.size() > 300) {
+            size_t a = (at > 140) ? at - 140 : 0;
+            a = utf8_next(sn, a);
+            size_t b = std::min(sn.size(), a + 300);
+            b = utf8_back(sn, b);
+            sn = (a > 0 ? "…" : "") + sn.substr(a, b - a) + (b < sn.size() ? "…" : "");
+        } else if (sn.size() > 300) {
+            sn = sn.substr(0, utf8_back(sn, 300)) + "…";
+        }
+        h.snippet = sn;
+        hits.push_back(std::move(h));
+    }
+    return hits;
+}
+
+// 懒加载：第一次用到时才读清单 + 重建。调用方持 g_kb_mu。
+void kb_ensure_loaded() {
+    if (g_kb_loaded) return;
+    kb_load_manifest();
+    kb_rebuild();
+    g_kb_loaded = true;
+}
+
+// 给对话用的上下文块。检索不到就返回空串，调用方据此不加东西。
+//
+// 门槛 5.0：BM25 分数随语料规模变，但"明显相关"的命中在几百个块上
+// 通常 10 以上，而闲聊撞到的词只有 1~3。不设门槛的话每句"你好"都会
+// 拖进三段文档 —— 1.7B 这种小模型会当场被带跑，去复述上下文而不是回答。
+std::string kb_context_for(const std::string& q, int topk) {
+    const auto hits = kb_search(q, topk);
+    if (hits.empty() || hits[0].score < 5.0) return "";
+    std::string s = "\n\n以下是从本地知识库检索到的资料，回答时优先依据它们：\n";
+    for (size_t i = 0; i < hits.size(); i++) {
+        s += "\n[" + std::to_string(i + 1) + "] " + path_base(hits[i].path) + "\n";
+        s += hits[i].snippet + "\n";
+    }
+    return s;
 }
 
 std::string random_key() {
@@ -539,6 +945,31 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
         for (auto& m : flat.arr)
             if (m.s("role") == "user") prompt = m.s("content");
     } else {
+        // ---- 知识库：把检索到的片段前置成一条 system。
+        // 只在纯文本 + 非 raw 时做 —— 多模态的 prompt 里带 <|image|> 占位符，
+        // 往前面塞文本会让占位符和特征对不上位置。
+        if (g_kb_rag && media.empty()) {
+            std::string last_user;
+            for (auto& m : flat.arr)
+                if (m.s("role") == "user") last_user = m.s("content");
+            if (!last_user.empty()) {
+                std::string ctx;
+                {
+                    std::lock_guard<std::mutex> lk(g_kb_mu);
+                    if (!g_kb_docs.empty()) {
+                        kb_ensure_loaded();
+                        ctx = kb_context_for(last_user, 3);
+                    }
+                }
+                if (!ctx.empty()) {
+                    json::Value sys = json::Value::make_obj();
+                    sys.set("role", json::Value::make_str("system"));
+                    // kb_context_for 以两个换行开头，给拼 prompt 用；单独成条时去掉
+                    sys.set("content", json::Value::make_str(ctx.substr(ctx.find_first_not_of('\n'))));
+                    flat.arr.insert(flat.arr.begin(), sys);
+                }
+            }
+        }
         prompt = build_prompt(flat, chatml, with_tools);
     }
 
@@ -697,6 +1128,124 @@ std::string now_id() {
     return "chatcmpl-" + std::to_string((long long)time(nullptr)) + "-" + std::to_string(n++);
 }
 
+// ---------------------------------------------------------------- 模型清单
+struct ModelEntry {
+    std::string path, name;
+    long long bytes = 0;
+    long long mtime = 0;
+};
+
+void scan_models(const std::string& dir, std::vector<ModelEntry>* out, int depth) {
+    if (depth > 3 || out->size() >= 400) return;
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    while (dirent* e = readdir(d)) {
+        const std::string n = e->d_name;
+        if (n == "." || n == "..") continue;
+        const std::string full = path_join(dir, n);
+        struct stat st {};
+        if (stat(full.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            scan_models(full, out, depth + 1);
+        } else if (n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0) {
+            ModelEntry m;
+            m.path = full;
+            m.name = n.substr(0, n.size() - 5);
+            m.bytes = (long long)st.st_size;
+            m.mtime = (long long)st.st_mtime;
+            out->push_back(std::move(m));
+        }
+    }
+    closedir(d);
+}
+
+// 从文件名猜量化类型。顺序要紧：长的先匹配，"Q4_K_M" 必须排在 "Q4_0" 前面，
+// 否则 Q4_K_M 会被识别成 Q4_0。
+std::string guess_quant(const std::string& n) {
+    std::string u = n;
+    for (auto& c : u) c = (char)std::toupper((unsigned char)c);
+    static const char* kQ[] = {"IQ4_XS", "IQ4_NL", "IQ3_M",  "IQ2_XS", "IQ2_M", "Q8_K",
+                               "Q8_0",   "Q6_K",   "Q5_K_M", "Q5_K_S", "Q5_1",  "Q5_0",
+                               "Q4_K_M", "Q4_K_S", "Q4_1",   "Q4_0",   "Q3_K_L", "Q3_K_M",
+                               "Q3_K_S", "Q2_K",   "BF16",   "F16",    "F32"};
+    for (const char* q : kQ)
+        if (u.find(q) != std::string::npos) return q;
+    return "";
+}
+
+// 从文件名猜参数量（"LFM3-1.7B" → 1.7e9）。猜不出来就返回 0，
+// 前端会显示"—"而不是编一个数字。
+double guess_params(const std::string& n) {
+    for (size_t i = 0; i < n.size(); i++) {
+        if (n[i] != 'B' && n[i] != 'b') continue;
+        size_t j = i;
+        while (j > 0 && (std::isdigit((unsigned char)n[j - 1]) || n[j - 1] == '.')) j--;
+        if (j == i) continue;
+        const std::string num = n.substr(j, i - j);
+        const double v = atof(num.c_str());
+        if (v > 0.05 && v < 300) return v * 1e9;
+    }
+    return 0;
+}
+
+json::Value list_dir_json(const std::string& dir) {
+    json::Value root = json::Value::make_obj();
+    root.set("path", json::Value::make_str(dir));
+    root.set("parent", json::Value::make_str(path_dir(dir)));
+    json::Value dirs = json::Value::make_arr();
+    json::Value files = json::Value::make_arr();
+    DIR* d = opendir(dir.c_str());
+    if (!d) {
+        root.set("error", json::Value::make_str("无法打开目录"));
+        root.set("items", dirs);
+        return root;
+    }
+    while (dirent* e = readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.empty() || n[0] == '.') continue;   // 隐藏文件先不列，减少噪声
+        const std::string full = path_join(dir, n);
+        struct stat st {};
+        if (stat(full.c_str(), &st) != 0) continue;
+        json::Value o = json::Value::make_obj();
+        o.set("name", json::Value::make_str(n));
+        o.set("path", json::Value::make_str(full));
+        o.set("dir", json::Value::make_bool(S_ISDIR(st.st_mode)));
+        o.set("bytes", json::Value::make_num((double)st.st_size));
+        o.set("mtime", json::Value::make_num((double)st.st_mtime));
+        o.set("text", json::Value::make_bool(S_ISREG(st.st_mode) && has_text_ext(n)));
+        if (S_ISDIR(st.st_mode)) dirs.arr.push_back(o);
+        else files.arr.push_back(o);
+    }
+    closedir(d);
+    auto by_name = [](const json::Value& a, const json::Value& b) {
+        return a.s("name") < b.s("name");
+    };
+    std::sort(dirs.arr.begin(), dirs.arr.end(), by_name);
+    std::sort(files.arr.begin(), files.arr.end(), by_name);
+    for (auto& v : files.arr) dirs.arr.push_back(v);
+    root.set("items", dirs);
+    return root;
+}
+
+// ---------------------------------------------------------------- 工具清单
+json::Value tools_json() {
+    json::Value arr = json::Value::make_arr();
+    auto add = [&](const char* name, const char* desc, const char* args, bool on) {
+        json::Value o = json::Value::make_obj();
+        o.set("name", json::Value::make_str(name));
+        o.set("desc", json::Value::make_str(desc));
+        o.set("args", json::Value::make_str(args));
+        o.set("enabled", json::Value::make_bool(on));
+        arr.arr.push_back(o);
+    };
+    add("read_file", "读取文本文件，最多 256 KB", "path", true);
+    add("list_dir", "列出目录内容", "path", true);
+    add("write_file", "写入文件（覆盖）", "path, content", true);
+    add("shell", "执行 shell 命令", "command", g.allow_shell);
+    return arr;
+}
+
+
 }  // namespace
 
 // ---------------------------------------------------------------- handlers
@@ -720,6 +1269,7 @@ int main(int argc, char** argv) {
         else if (a == "-c" || a == "--ctx") ctx = atoi(next().c_str());
         else if (a == "-t" || a == "--threads") threads = atoi(next().c_str());
         else if (a == "--allow-shell") g.allow_shell = true;
+        else if (a == "--model-dir") g.model_dir = next();
         else if (a == "--no-gpu") no_gpu = true;
         else if (a == "--api-key") g.api_key = next();
         else if (a == "--mmproj") mmprojs.push_back(next());
@@ -758,6 +1308,13 @@ int main(int argc, char** argv) {
     g.workspace = ".";
     char cwd[1024];
     if (getcwd(cwd, sizeof(cwd))) g.workspace = cwd;
+
+    // 模型目录默认 ~/.dubhe/models（CLI 下载模型就放这儿）。
+    // UI 的「模型」视图靠它扫描，没指定时给个合理默认，否则那个视图永远是空的。
+    if (g.model_dir.empty()) {
+        const char* home = getenv("HOME");
+        if (home) g.model_dir = std::string(home) + "/.dubhe/models";
+    }
 
     dubhe_config cfg{};
     cfg.n_threads = threads;
@@ -918,6 +1475,382 @@ int main(int argc, char** argv) {
             }
         }
         c.send(200, "application/json", json::dump(o));
+    });
+
+    // ---- 模型清单：UI 的「模型」视图靠它列出本地所有 gguf。
+    // 只 stat 文件、不读 GGUF 头 —— 一个目录几十个模型时读头要好几百毫秒，
+    // 而名字里已经带了量化和参数量。真正加载时才读头。
+    srv.get("/api/models", [](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        std::vector<ModelEntry> ms;
+        if (!g.model_dir.empty()) scan_models(g.model_dir, &ms, 0);
+        std::sort(ms.begin(), ms.end(),
+                  [](const ModelEntry& a, const ModelEntry& b) { return a.name < b.name; });
+        json::Value root = json::Value::make_obj();
+        root.set("dir", json::Value::make_str(g.model_dir));
+        root.set("current", json::Value::make_str(g.model_path));
+        json::Value arr = json::Value::make_arr();
+        for (const auto& m : ms) {
+            json::Value o = json::Value::make_obj();
+            o.set("path", json::Value::make_str(m.path));
+            o.set("name", json::Value::make_str(m.name));
+            o.set("bytes", json::Value::make_num((double)m.bytes));
+            o.set("mtime", json::Value::make_num((double)m.mtime));
+            o.set("quant", json::Value::make_str(guess_quant(m.name)));
+            o.set("params", json::Value::make_num(guess_params(m.name)));
+            o.set("loaded", json::Value::make_bool(m.path == g.model_path));
+            arr.arr.push_back(o);
+        }
+        root.set("items", arr);
+        c.send(200, "application/json", json::dump(root));
+    });
+
+    // ---- 切换模型。文档里写了这个端点但一直没实现，UI 上点「切换」
+    // 只能弹一句"还在开发中"。补上：卸载 → 加载 → 更新 model_id。
+    // 加载失败要把旧模型装回去，否则一次误操作就让服务变成没有模型的状态。
+    srv.post("/api/load", [](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        std::string p = req.param("path");
+        if (p.empty() && json::parse(req.body, &body)) p = body.s("path");
+        if (p.empty()) {
+            c.send(400, "application/json", "{\"error\":\"缺少 path\"}");
+            return;
+        }
+        const std::string full = path_abs(p);
+        if (!path_allowed(full) || !is_file_p(full)) {
+            c.send(400, "application/json", "{\"error\":\"路径不允许或文件不存在\"}");
+            return;
+        }
+        if (g.busy.load()) {
+            c.send(409, "application/json", "{\"error\":\"正在生成，稍后再切换\"}");
+            return;
+        }
+        std::lock_guard<std::mutex> lk(g.mu);
+        const std::string old = g.model_path;
+        const auto t0 = std::chrono::steady_clock::now();
+        dubhe_unload_model(g.engine);
+        if (dubhe_load_model(g.engine, full.c_str()) != DUBHE_OK) {
+            const std::string err = dubhe_last_error();
+            g.model_path.clear();
+            g.model_id.clear();
+            if (!old.empty()) {
+                if (dubhe_load_model(g.engine, old.c_str()) == DUBHE_OK) {
+                    g.model_path = old;
+                    g.model_id = model_id_of(old);
+                }
+            }
+            json::Value e = json::Value::make_obj();
+            e.set("error", json::Value::make_str("加载失败: " + err));
+            e.set("restored", json::Value::make_str(g.model_path));
+            c.send(500, "application/json", json::dump(e));
+            return;
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+        g.model_path = full;
+        g.model_id = model_id_of(full);
+        json::Value o = json::Value::make_obj();
+        o.set("ok", json::Value::make_bool(true));
+        o.set("model", json::Value::make_str(g.model_path));
+        o.set("model_id", json::Value::make_str(g.model_id));
+        o.set("ms", json::Value::make_num((double)ms));
+        dubhe_model_info mi{};
+        if (dubhe_model_info_get(g.engine, &mi) == DUBHE_OK) {
+            o.set("arch", json::Value::make_str(mi.arch));
+            o.set("quant", json::Value::make_str(mi.quant_desc));
+            o.set("params", json::Value::make_num((double)mi.n_params));
+        }
+        c.send(200, "application/json", json::dump(o));
+    });
+
+    // ---- 文件浏览
+    srv.get("/api/files", [](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        const std::string full = path_abs(req.param("path"));
+        if (!is_dir_p(full)) {
+            c.send(404, "application/json", "{\"error\":\"目录不存在\"}");
+            return;
+        }
+        if (!path_allowed(full)) {
+            c.send(403, "application/json", "{\"error\":\"不在允许的范围内\"}");
+            return;
+        }
+        c.send(200, "application/json", json::dump(list_dir_json(full)));
+    });
+
+    srv.get("/api/files/read", [](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        const std::string full = path_abs(req.param("path"));
+        if (!is_file_p(full)) {
+            c.send(404, "application/json", "{\"error\":\"文件不存在\"}");
+            return;
+        }
+        if (!path_allowed(full)) {
+            c.send(403, "application/json", "{\"error\":\"不在允许的范围内\"}");
+            return;
+        }
+        bool tr = false;
+        std::string txt = read_text_file(full, 512 * 1024, &tr);
+        json::Value o = json::Value::make_obj();
+        o.set("path", json::Value::make_str(full));
+        o.set("name", json::Value::make_str(path_base(full)));
+        o.set("bytes", json::Value::make_num((double)txt.size()));
+        o.set("truncated", json::Value::make_bool(tr));
+        o.set("binary", json::Value::make_bool(txt.find('\0') != std::string::npos));
+        o.set("text", json::Value::make_str(txt));
+        c.send(200, "application/json", json::dump(o));
+    });
+
+    // ---- 工具：清单 + 手动执行（给 UI 的调试面板用，不必绕一圈模型）
+    srv.get("/api/tools", [](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value root = json::Value::make_obj();
+        root.set("items", tools_json());
+        root.set("workspace", json::Value::make_str(g.workspace));
+        c.send(200, "application/json", json::dump(root));
+    });
+
+    srv.post("/api/tools/run", [](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        if (!json::parse(req.body, &body)) {
+            c.send(400, "application/json", "{\"error\":\"JSON 解析失败\"}");
+            return;
+        }
+        const std::string name = body.s("name");
+        if (name.empty()) {
+            c.send(400, "application/json", "{\"error\":\"缺少 name\"}");
+            return;
+        }
+        // arguments 允许是对象，也允许直接平铺在顶层（方便 curl 手测）
+        json::Value args = json::Value::make_obj();
+        const json::Value* a = body.get("arguments");
+        if (a && a->type == json::Value::OBJ) args = *a;
+        else args = body;
+        // 文件类工具走路径白名单，和 UI 的文件视图同一套边界
+        for (const char* k : {"path", "content"}) {
+            const std::string v = args.s(k);
+            if (!v.empty() && std::strcmp(k, "path") == 0) {
+                const std::string full = path_abs(v);
+                if (!path_allowed(full)) {
+                    c.send(403, "application/json", "{\"error\":\"路径不在允许的范围内\"}");
+                    return;
+                }
+            }
+        }
+        const ToolResult r = run_tool(name, args);
+        json::Value o = json::Value::make_obj();
+        o.set("ok", json::Value::make_bool(r.ok));
+        o.set("output", json::Value::make_str(r.output));
+        c.send(200, "application/json", json::dump(o));
+    });
+
+    // ---- 知识库：索引 / 检索 / 开关
+    auto kb_snapshot = []() {
+        json::Value root = json::Value::make_obj();
+        json::Value arr = json::Value::make_arr();
+        long long total = 0;
+        for (const auto& d : g_kb_docs) {
+            json::Value o = json::Value::make_obj();
+            o.set("path", json::Value::make_str(d.path));
+            o.set("name", json::Value::make_str(path_base(d.path)));
+            o.set("mtime", json::Value::make_num((double)d.mtime));
+            o.set("bytes", json::Value::make_num((double)d.bytes));
+            o.set("chunks", json::Value::make_num((double)d.chunks));
+            o.set("missing", json::Value::make_bool(d.missing));
+            total += d.bytes;
+            arr.arr.push_back(o);
+        }
+        root.set("docs", arr);
+        root.set("n_docs", json::Value::make_num((double)g_kb_docs.size()));
+        root.set("n_chunks", json::Value::make_num((double)g_kb_chunks.size()));
+        root.set("bytes", json::Value::make_num((double)total));
+        root.set("rag", json::Value::make_bool(g_kb_rag));
+        root.set("dir", json::Value::make_str(path_dir(kb_manifest_path())));
+        return root;
+    };
+
+    srv.get("/api/kb", [&](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        std::lock_guard<std::mutex> lk(g_kb_mu);
+        if (!g_kb_loaded) {
+            kb_load_manifest();
+            kb_rebuild();
+            g_kb_loaded = true;
+        }
+        c.send(200, "application/json", json::dump(kb_snapshot()));
+    });
+
+    // 递归收集文本文件（索引一个目录时用）
+    srv.post("/api/kb/add", [&](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        std::string p = req.param("path");
+        if (p.empty() && json::parse(req.body, &body)) p = body.s("path");
+        if (p.empty()) {
+            c.send(400, "application/json", "{\"error\":\"缺少 path\"}");
+            return;
+        }
+        const std::string full = path_abs(p);
+        if (!path_allowed(full)) {
+            c.send(403, "application/json", "{\"error\":\"路径不在允许的范围内\"}");
+            return;
+        }
+        std::vector<std::string> files;
+        std::function<void(const std::string&, int)> walk = [&](const std::string& d, int dep) {
+            if (dep > 4 || files.size() >= 200) return;
+            if (is_file_p(d)) {
+                if (has_text_ext(d)) files.push_back(d);
+                return;
+            }
+            DIR* dp = opendir(d.c_str());
+            if (!dp) return;
+            while (dirent* e = readdir(dp)) {
+                const std::string n = e->d_name;
+                if (n.empty() || n[0] == '.') continue;
+                walk(path_join(d, n), dep + 1);
+            }
+            closedir(dp);
+        };
+        walk(full, 0);
+        if (files.empty()) {
+            c.send(400, "application/json", "{\"error\":\"这里没有可索引的文本文件\"}");
+            return;
+        }
+        std::lock_guard<std::mutex> lk(g_kb_mu);
+        if (!g_kb_loaded) {
+            kb_load_manifest();
+            g_kb_loaded = true;
+        }
+        int added = 0;
+        for (const auto& f : files) {
+            struct stat st {};
+            if (stat(f.c_str(), &st) != 0) continue;
+            bool exists = false;
+            for (auto& d : g_kb_docs) {
+                if (d.path == f) {
+                    d.mtime = (long long)st.st_mtime;
+                    d.bytes = (long long)st.st_size;
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                KbDoc d;
+                d.path = f;
+                d.mtime = (long long)st.st_mtime;
+                d.bytes = (long long)st.st_size;
+                g_kb_docs.push_back(std::move(d));
+                added++;
+            }
+        }
+        kb_rebuild();
+        kb_save_manifest();
+        json::Value o = kb_snapshot();
+        o.set("added", json::Value::make_num((double)added));
+        c.send(200, "application/json", json::dump(o));
+    });
+
+    srv.post("/api/kb/remove", [&](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        std::string p = req.param("path");
+        if (p.empty() && json::parse(req.body, &body)) p = body.s("path");
+        std::lock_guard<std::mutex> lk(g_kb_mu);
+        kb_ensure_loaded();
+        const size_t before = g_kb_docs.size();
+        g_kb_docs.erase(std::remove_if(g_kb_docs.begin(), g_kb_docs.end(),
+                                       [&](const KbDoc& d) { return d.path == p || path_base(d.path) == p; }),
+                        g_kb_docs.end());
+        kb_rebuild();
+        kb_save_manifest();
+        json::Value o = kb_snapshot();
+        o.set("removed", json::Value::make_num((double)(before - g_kb_docs.size())));
+        c.send(200, "application/json", json::dump(o));
+    });
+
+    srv.post("/api/kb/clear", [&](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        std::lock_guard<std::mutex> lk(g_kb_mu);
+        g_kb_docs.clear();
+        kb_rebuild();
+        kb_save_manifest();
+        c.send(200, "application/json", json::dump(kb_snapshot()));
+    });
+
+    srv.post("/api/kb/rag", [&](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        if (json::parse(req.body, &body)) g_kb_rag = body.flag("on", g_kb_rag);
+        std::lock_guard<std::mutex> lk(g_kb_mu);
+        kb_ensure_loaded();
+        c.send(200, "application/json", json::dump(kb_snapshot()));
+    });
+
+    srv.post("/api/kb/search", [&](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        if (!json::parse(req.body, &body)) {
+            c.send(400, "application/json", "{\"error\":\"JSON 解析失败\"}");
+            return;
+        }
+        const std::string q = body.s("q");
+        int k = (int)body.n("k", 6);
+        if (k < 1) k = 1;
+        if (k > 30) k = 30;
+        std::lock_guard<std::mutex> lk(g_kb_mu);
+        kb_ensure_loaded();
+        const auto hits = kb_search(q, k);
+        json::Value root = json::Value::make_obj();
+        json::Value arr = json::Value::make_arr();
+        for (const auto& h : hits) {
+            json::Value o = json::Value::make_obj();
+            o.set("path", json::Value::make_str(h.path));
+            o.set("name", json::Value::make_str(path_base(h.path)));
+            o.set("score", json::Value::make_num(h.score));
+            o.set("snippet", json::Value::make_str(h.snippet));
+            arr.arr.push_back(o);
+        }
+        root.set("hits", arr);
+        root.set("q", json::Value::make_str(q));
+        c.send(200, "application/json", json::dump(root));
     });
 
     srv.get("/v1/models", [](const http::Request& req, http::Conn& c) {

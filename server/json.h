@@ -186,9 +186,14 @@ inline bool parse(const std::string& text, Value* out) {
 }
 
 // ---------------------------------------------------------------- 序列化
+//
+// 字符串原样输出，但 >= 0x80 的字节要先验一遍 UTF-8 —— 前端是 JSON.parse，
+// 收到半个汉字（比如按字节截断的 snippet，或者 GBK 编码的文本文件）会直接
+// 抛异常，整个响应就废了。非法序列替换成 U+FFFD，宁可显示一个"�"。
 inline void escape_to(std::string* o, const std::string& s) {
     *o += '"';
-    for (unsigned char c : s) {
+    for (size_t i = 0; i < s.size(); i++) {
+        const unsigned char c = (unsigned char)s[i];
         switch (c) {
             case '"': *o += "\\\""; break;
             case '\\': *o += "\\\\"; break;
@@ -198,8 +203,27 @@ inline void escape_to(std::string* o, const std::string& s) {
             case '\b': *o += "\\b"; break;
             case '\f': *o += "\\f"; break;
             default:
-                if (c < 0x20) { char b[8]; std::snprintf(b, sizeof(b), "\\u%04x", c); *o += b; }
-                else *o += (char)c;
+                if (c < 0x20) {
+                    char b[8];
+                    std::snprintf(b, sizeof(b), "\\u%04x", c);
+                    *o += b;
+                } else if (c < 0x80) {
+                    *o += (char)c;
+                } else {
+                    const int n = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 0;
+                    bool ok = n > 0 && i + (size_t)n <= s.size();
+                    if (ok) {
+                        for (int k = 1; k < n; k++) {
+                            if (((unsigned char)s[i + (size_t)k] & 0xC0) != 0x80) { ok = false; break; }
+                        }
+                    }
+                    if (!ok) {
+                        *o += "\xEF\xBF\xBD";
+                    } else {
+                        *o += s.substr(i, (size_t)n);
+                        i += (size_t)n - 1;
+                    }
+                }
         }
     }
     *o += '"';
