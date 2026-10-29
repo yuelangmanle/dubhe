@@ -2,6 +2,8 @@
 #include "internal.h"
 
 #include "../include/dubhe/dubhe.h"
+#include "image.h"
+#include "mmproj.h"
 
 #include <sys/sysctl.h>
 #include <sys/types.h>
@@ -22,6 +24,13 @@ struct dubhe_engine {
     dubhe_config cfg{};
     std::atomic<bool> abort{false};
     std::mutex mu;
+    // 多模态特征（图像/音频塔的输出）。由 dubhe_set_mm_embeds 拷进来，
+    // 因为调用方的缓冲区随时可能释放，而生成是异步长过程。
+    std::vector<float> mm_embeds;
+    int32_t mm_n = 0;
+    int32_t mm_at = -1;
+    // 多模态投影器（mmproj GGUF）。独立于语言模型加载，一张图只跑一次。
+    std::unique_ptr<MmProj> mmproj;
 };
 
 namespace {
@@ -198,6 +207,90 @@ int32_t dubhe_token_to_piece(const dubhe_engine* e, int32_t token, char* buf, in
     return (int32_t)s.size();
 }
 
+int dubhe_load_mmproj(dubhe_engine* e, const char* path) {
+    if (!e || !path) return DUBHE_ERR_INVALID_ARG;
+    std::string err;
+    auto p = std::make_unique<MmProj>();
+    if (!p->load(path, &err)) { set_err("mmproj 加载失败: " + err); return DUBHE_ERR_FORMAT; }
+    std::lock_guard<std::mutex> lock(e->mu);
+    e->mmproj = std::move(p);
+    return DUBHE_OK;
+}
+
+int dubhe_encode_image(dubhe_engine* e, const char* image_path, float** embeds,
+                       int32_t* n_tokens, int32_t* dim) {
+    if (!e || !image_path || !embeds || !n_tokens || !dim) return DUBHE_ERR_INVALID_ARG;
+    if (!e->mmproj) { set_err("未加载 mmproj，无法处理图像"); return DUBHE_ERR_STATE; }
+
+    int w = 0, h = 0;
+    std::vector<uint8_t> rgb;
+    std::string err;
+    if (!load_image_rgb(image_path, &w, &h, &rgb, &err)) {
+        set_err("读图失败: " + err);
+        return DUBHE_ERR_IO;
+    }
+    const auto& c = e->mmproj->config();
+    int oh = 0, ow = 0;
+    e->mmproj->smart_resize(h, w, &oh, &ow);
+    std::vector<uint8_t> resized((size_t)ow * (size_t)oh * 3);
+    resize_bicubic(rgb.data(), w, h, resized.data(), ow, oh);
+
+    const int gh = oh / c.patch, gw = ow / c.patch;
+    const int64_t np = (int64_t)gh * gw;
+    std::vector<float> pixels((size_t)(np * c.patch_dim()));
+    if (!e->mmproj->pack_pixels(resized.data(), ow, oh, pixels.data())) {
+        set_err("pack_pixels 失败");
+        return DUBHE_ERR_FORMAT;
+    }
+    const int64_t nt = np / (c.merge * c.merge);
+    // 引擎的 n_embd 必须和视觉塔输出宽度一致，否则注入时就是乱码。
+    const int n_embd = e->model.loaded() ? e->model.cfg().n_embd : c.out_dim;
+    if (c.out_dim != n_embd) {
+        set_err("视觉塔输出 " + std::to_string(c.out_dim) + " 维，模型需要 " +
+                std::to_string(n_embd) + " 维");
+        return DUBHE_ERR_FORMAT;
+    }
+    float* buf = (float*)std::malloc(sizeof(float) * (size_t)nt * (size_t)c.out_dim);
+    if (!buf) { set_err("内存不足"); return DUBHE_ERR_OOM; }
+    if (!e->mmproj->encode(pixels.data(), gh, gw, buf, &err)) {
+        std::free(buf);
+        set_err("视觉塔前向失败: " + err);
+        return DUBHE_ERR_STATE;
+    }
+    *embeds = buf;
+    *n_tokens = (int32_t)nt;
+    *dim = c.out_dim;
+    return DUBHE_OK;
+}
+
+void dubhe_free_embeds(float* embeds) { std::free(embeds); }
+
+int dubhe_set_mm_embeds(dubhe_engine* e, const float* embeds, int32_t n_tokens,
+                        int32_t at_pos, int32_t dim) {
+    if (!e || !embeds || n_tokens <= 0) { set_err("多模态特征为空"); return DUBHE_ERR_INVALID_ARG; }
+    if (!e->model.loaded()) { set_err("模型未加载"); return DUBHE_ERR_STATE; }
+    const int n_embd = e->model.cfg().n_embd;
+    if (dim != n_embd) {
+        set_err("特征维度 " + std::to_string(dim) + " 与模型 n_embd " +
+                std::to_string(n_embd) + " 不符");
+        return DUBHE_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(e->mu);
+    e->mm_embeds.assign(embeds, embeds + (size_t)n_tokens * (size_t)n_embd);
+    e->mm_n = n_tokens;
+    e->mm_at = at_pos < 0 ? 0 : at_pos;
+    return DUBHE_OK;
+}
+
+void dubhe_clear_mm_embeds(dubhe_engine* e) {
+    if (!e) return;
+    std::lock_guard<std::mutex> lock(e->mu);
+    e->mm_embeds.clear();
+    e->mm_n = 0;
+    e->mm_at = -1;
+    e->model.clear_mm_embeds();
+}
+
 int dubhe_generate(dubhe_engine* e,
                    const int32_t* prompt, int32_t n_prompt,
                    const dubhe_sampling* sp,
@@ -216,6 +309,19 @@ int dubhe_generate(dubhe_engine* e,
     std::lock_guard<std::mutex> lock(e->mu);
     e->abort = false;
     e->model.reset_kv();
+
+    // 多模态特征：位置必须在 prompt 之内，否则说明调用方算错了占位 token 数，
+    // 静默忽略会得到"模型看得见但没看"的诡异结果，所以直接报错。
+    if (e->mm_n > 0 && !e->mm_embeds.empty()) {
+        if (e->mm_at + e->mm_n > n_prompt) {
+            set_err("多模态特征位置越界：at=" + std::to_string(e->mm_at) + " n=" +
+                    std::to_string(e->mm_n) + " 但 prompt 只有 " + std::to_string(n_prompt));
+            return DUBHE_ERR_INVALID_ARG;
+        }
+        e->model.set_mm_embeds(e->mm_embeds.data(), e->mm_n, e->mm_at);
+    } else {
+        e->model.clear_mm_embeds();
+    }
 
     const int n_vocab = e->model.cfg().n_vocab;
     std::vector<float> logits(n_vocab, 0.f);

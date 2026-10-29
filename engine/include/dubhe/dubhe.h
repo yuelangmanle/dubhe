@@ -104,6 +104,25 @@ int32_t dubhe_tokenize(const dubhe_engine* e, const char* text, int add_special,
 /* 返回写入的字节数；buf 为 NULL 时只返回长度。token 可能是半个 UTF-8 字符。 */
 int32_t dubhe_token_to_piece(const dubhe_engine* e, int32_t token, char* buf, int32_t cap);
 
+/* ---------- 多模态 ---------- */
+/* 加载 mmproj（视觉/音频塔的 GGUF，独立于语言模型）。 */
+int  dubhe_load_mmproj(dubhe_engine* e, const char* path);
+
+/* 把一张图编码成可直接注入的特征：返回 *embeds（n_tokens × dim，行主序
+ * float32，调用方用 dubhe_free_embeds 释放）。这一步是纯 CPU 的视觉塔前向，
+ * 一张 640×640 的图目前要十几秒，调用方应放到后台线程。 */
+int  dubhe_encode_image(dubhe_engine* e, const char* image_path, float** embeds,
+                        int32_t* n_tokens, int32_t* dim);
+void dubhe_free_embeds(float* embeds);
+
+/* 把图像/音频塔的输出注入下一次 dubhe_generate：序列里 [at_pos, at_pos+n_tokens)
+ * 这些位置的 token 嵌入会被 embeds 覆盖（占位 token 本身是什么无所谓）。
+ * embeds 是 n_tokens × dim 的行主序 float32，dim 必须等于模型的 n_embd。
+ * 数据会被拷贝，调用后即可释放；生成结束前一直有效，直到下一次 set/clear。 */
+int  dubhe_set_mm_embeds(dubhe_engine* e, const float* embeds, int32_t n_tokens,
+                         int32_t at_pos, int32_t dim);
+void dubhe_clear_mm_embeds(dubhe_engine* e);
+
 /* ---------- 生成 ---------- */
 int dubhe_generate(dubhe_engine* e,
                    const int32_t* prompt, int32_t n_prompt,

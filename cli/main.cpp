@@ -12,6 +12,8 @@ struct Args {
     std::string cmd;
     std::string model;
     std::string prompt;
+    std::string mmproj;      // 视觉/音频塔
+    std::string image;       // 输入图片
     int   n_predict = 256;
     float temp = 0.7f;
     int   top_k = 40;
@@ -31,11 +33,14 @@ void usage() {
         "用法:\n"
         "  dubhe inspect -m <model.gguf>\n"
         "  dubhe run     -m <model.gguf> -p \"提示词\" [-n 256] [--temp 0.7] [--raw] [--stats]\n"
+        "  dubhe run     -m <vl.gguf> --mmproj <mmproj.gguf> --image <pic.jpg> -p \"描述这张图\"\n"
         "  dubhe chat    -m <model.gguf> [--temp 0.7] [-c 4096]\n"
         "  dubhe bench   -m <model.gguf> [-n 128] [--concurrency 1]\n\n"
         "选项:\n"
         "  -m, --model <path>     GGUF 模型路径\n"
         "  -p, --prompt <text>    提示词\n"
+        "      --mmproj <path>    多模态投影器（视觉塔），配合 --image 使用\n"
+        "      --image <path>     输入图片；prompt 里的 <|image|> 会被替换成图像特征\n"
         "  -n, --predict <N>      最多生成 token 数 (默认 256)\n"
         "  -c, --ctx <N>          上下文长度 (默认取模型训练值)\n"
         "  -t, --threads <N>      线程数 (默认自动)\n"
@@ -70,6 +75,8 @@ bool parse(int argc, char** argv, Args* a) {
         else if (k == "--top-k") { if (!next(&v)) return false; a->top_k = atoi(v); }
         else if (k == "--top-p") { if (!next(&v)) return false; a->top_p = (float)atof(v); }
         else if (k == "--repeat") { if (!next(&v)) return false; a->rep = (float)atof(v); }
+        else if (k == "--mmproj") { if (!next(&v)) return false; a->mmproj = v; }
+        else if (k == "--image") { if (!next(&v)) return false; a->image = v; }
         else if (k == "--concurrency") { if (!next(&v)) return false; a->concurrency = atoi(v); }
         else if (k == "--stats") a->stats = true;
         else if (k == "--raw") a->raw = true;
@@ -106,6 +113,26 @@ void cb_token(void* ud, int32_t, const char* piece) {
     (void)ud;
     if (piece) std::fputs(piece, stdout);
     std::fflush(stdout);
+}
+
+// 把 prompt 里单个 <|image|> 展开成 n 个（HF 的 replace_image_token 就是
+// image_token * num_image_tokens）。展开后返回第一个的位置，即注入起点。
+// 位置必须是**展开之后**的下标，因为注入是按绝对位置覆盖的。
+bool expand_image_token(dubhe_engine* e, std::vector<int32_t>* toks, int n,
+                        int32_t* at, std::string* err) {
+    int32_t ph = -1;
+    if (dubhe_tokenize(e, "<|image|>", 0, &ph, 1) != 1) {
+        *err = "词表里找不到 <|image|>（这个模型可能不支持图像）";
+        return false;
+    }
+    size_t pos = toks->size();
+    for (size_t i = 0; i < toks->size(); i++)
+        if ((*toks)[i] == ph) { pos = i; break; }
+    if (pos == toks->size()) { *err = "prompt 里没有 <|image|> 占位符"; return false; }
+    toks->erase(toks->begin() + (long)pos);
+    toks->insert(toks->begin() + (long)pos, (size_t)n, ph);
+    *at = (int32_t)pos;
+    return true;
 }
 
 int cmd_inspect(const Args& a) {
@@ -169,6 +196,44 @@ int cmd_run(const Args& a) {
     std::vector<int32_t> toks((size_t)n);
     dubhe_tokenize(e, text.c_str(), 1, toks.data(), n);
 
+    // 图像：先跑视觉塔，再把占位 token 展开成 n_image_tokens 个，
+    // 最后把特征按位置挂上去。顺序不能反 —— 展开后的下标才是注入起点。
+    float* emb = nullptr;
+    int32_t n_img = 0, img_dim = 0, img_at = -1;
+    if (!a.image.empty()) {
+        if (a.mmproj.empty()) {
+            std::fprintf(stderr, "用了 --image 就必须给 --mmproj\n");
+            dubhe_destroy(e);
+            return 1;
+        }
+        if (dubhe_load_mmproj(e, a.mmproj.c_str()) != DUBHE_OK) {
+            std::fprintf(stderr, "mmproj 加载失败: %s\n", dubhe_last_error());
+            dubhe_destroy(e);
+            return 1;
+        }
+        std::fprintf(stderr, "视觉塔编码中…\n");
+        if (dubhe_encode_image(e, a.image.c_str(), &emb, &n_img, &img_dim) != DUBHE_OK) {
+            std::fprintf(stderr, "图像编码失败: %s\n", dubhe_last_error());
+            dubhe_destroy(e);
+            return 1;
+        }
+        std::string err;
+        if (!expand_image_token(e, &toks, n_img, &img_at, &err)) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            dubhe_free_embeds(emb);
+            dubhe_destroy(e);
+            return 1;
+        }
+        if (dubhe_set_mm_embeds(e, emb, n_img, img_at, img_dim) != DUBHE_OK) {
+            std::fprintf(stderr, "注入失败: %s\n", dubhe_last_error());
+            dubhe_free_embeds(emb);
+            dubhe_destroy(e);
+            return 1;
+        }
+        std::fprintf(stderr, "图像 %d token × %d 维，占位在 prompt[%d]\n", n_img, img_dim, img_at);
+        n = (int32_t)toks.size();
+    }
+
     dubhe_sampling sp{};
     sp.max_tokens = a.n_predict;
     sp.temperature = a.temp;
@@ -183,6 +248,7 @@ int cmd_run(const Args& a) {
     std::printf("\n");
     if (a.stats) print_stats(st);
 
+    if (emb) dubhe_free_embeds(emb);
     dubhe_destroy(e);
     return rc == DUBHE_OK ? 0 : 1;
 }

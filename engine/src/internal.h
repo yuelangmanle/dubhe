@@ -304,6 +304,16 @@ public:
     // 批量前向（prefill）：tokens[0..n) 连续喂入，pos0 是首 token 的位置。
     // 只有最后一个 token 的 logits 有效。n==1 时等价于 forward()。
     bool forward_batch(const int32_t* tokens, int n, int32_t pos0, float* logits, std::string* err);
+
+    // 多模态：把序列里 [at, at+n) 这些**绝对位置**的 token 嵌入换成外部特征
+    // （视觉塔 / 音频塔的输出）。调用方保证 embeds 活到生成结束。
+    // 用绝对位置而不是相对下标：prefill 是分块喂的，pos0 会变，只有绝对位置
+    // 才不依赖分块大小。
+    void set_mm_embeds(const float* embeds, int n_tokens, int at) {
+        mm_embeds_ = embeds; mm_n_ = n_tokens; mm_at_ = at;
+    }
+    void clear_mm_embeds() { mm_embeds_ = nullptr; mm_n_ = 0; mm_at_ = -1; }
+    bool has_mm_embeds() const { return mm_embeds_ != nullptr && mm_n_ > 0; }
     // 引擎实际使用的批大小（GPU 不可用时为 1）
     int  batch_size() const;
     void reset_kv();
@@ -334,6 +344,10 @@ private:
     Tokenizer tok_;
     ModelConfig cfg_;
     bool loaded_ = false;
+    // 多模态嵌入覆盖（见 set_mm_embeds）
+    const float* mm_embeds_ = nullptr;
+    int  mm_n_ = 0;
+    int  mm_at_ = -1;
     mutable bool gpu_active_ = false;   // GPU 出错时 matvec 会就地降级，故 mutable
     // CPU 参考路径是否强制用纯 f32 点积（关掉激活 Q8 量化）。
     // GPU 校验时必须打开：Q8 激活本身就有 ~1e-2 的相对误差，

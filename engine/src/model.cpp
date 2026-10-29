@@ -907,6 +907,16 @@ bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* log
                           (size_t)tokens[i] * type_row_bytes(tok_embd_.type, n_embd);
         dequant_row(tok_embd_.type, row, xbatch_.data() + (size_t)i * n_embd, n_embd);
     }
+    // 图像/音频 token 的嵌入由塔算好，直接覆盖掉占位 token 的词嵌入
+    if (mm_embeds_) {
+        for (int i = 0; i < n; i++) {
+            const int p = pos0 + i;
+            if (p < mm_at_ || p >= mm_at_ + mm_n_) continue;
+            std::memcpy(xbatch_.data() + (size_t)i * n_embd,
+                        mm_embeds_ + (size_t)(p - mm_at_) * n_embd,
+                        sizeof(float) * (size_t)n_embd);
+        }
+    }
 
     if (!metal::fwd_batch(xbatch_.data(), n, pos0, logits, err)) {
         gpu_active_ = false;
@@ -934,6 +944,10 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
         const void* row = (const char*)file_.tensor_data(tok_embd_) +
                           (size_t)token * type_row_bytes(tok_embd_.type, n_embd);
         dequant_row(tok_embd_.type, row, x_.data(), n_embd);
+    }
+    if (mm_embeds_ && pos >= mm_at_ && pos < mm_at_ + mm_n_) {
+        std::memcpy(x_.data(), mm_embeds_ + (size_t)(pos - mm_at_) * n_embd,
+                    sizeof(float) * (size_t)n_embd);
     }
 
     if (gpu_fused_) {
