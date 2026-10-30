@@ -34,7 +34,10 @@ constexpr int kSgPerTg = 4;
 // 与着色器里的 MV_R 必须一致：解码时一个 simdgroup 同时算几行。
 // 解码是延迟受限的，一个 simdgroup 只算一行时 outstanding load 太少，
 // 带宽上不去（Q4_K 实测只有 39 GB/s，而 Q8_0 能到 67 GB/s）。
-constexpr int kMvRows = 2;
+//
+// 这个数在 init() 里被 DUBHE_MV_R 覆盖，并在编译着色器前作为 `#define MV_R`
+// 注入到 MSL 源码最前面 —— 两边必须同一个值，所以只有这一个来源。
+int g_mv_rows = 2;
 
 // ---- 二维分块 matmul（prefill）的派发参数，必须与着色器一致
 constexpr int kMmSgPerTg = 8;    // 256 线程/threadgroup
@@ -129,7 +132,18 @@ bool init(std::string* err) {
     // 这里不显式设置以免踩到 macOS 15 的弃用告警。
     MTLCompileOptions* opt = [MTLCompileOptions new];
     NSError* e = nil;
-    g_lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:kDubheMSL]
+
+    // MV_R 是解码 matvec 的行数（一个 simdgroup 同时算几行）。它决定寄存器
+    // 压力和 outstanding load 深度，最优值随量化格式和 GPU 代数变，所以做成
+    // 运行期注入：着色器源码最前面拼一行 `#define MV_R n`，C++ 侧读同一个
+    // g_mv_rows 算派发网格。两边**必须**一致，否则行号错位 —— 结果是错的
+    // 而不是崩的，这种 bug 最贵。
+    if (const char* s = getenv("DUBHE_MV_R")) {
+        const int v = atoi(s);
+        if (v >= 1 && v <= 16) g_mv_rows = v;
+    }
+    std::string src = "#define MV_R " + std::to_string(g_mv_rows) + "\n" + kDubheMSL;
+    g_lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()]
                                 options:opt
                                   error:&e];
     if (!g_lib) {
@@ -247,10 +261,10 @@ bool mfvec(uint32_t type, const float* x, float* y, int n_out, int n_in, uint64_
     [enc setBytes:&woff length:sizeof(woff) atIndex:4];
     [enc setBytes:&nout length:sizeof(nout) atIndex:5];
 
-    // 一个 threadgroup = 4 个 simdgroup，每个 simdgroup 算 kMvRows 行。
+    // 一个 threadgroup = 4 个 simdgroup，每个 simdgroup 算 g_mv_rows 行。
     // 必须按 threadgroup 派发并自己判越界：dispatchThreads 的非均匀裁剪
     // 只在 thread 粒度生效，而这里内核用的是 threadgroup_position_in_grid。
-    const NSUInteger per_tg = (NSUInteger)(kSgPerTg * kMvRows);
+    const NSUInteger per_tg = (NSUInteger)(kSgPerTg * g_mv_rows);
     const NSUInteger tgc = (NSUInteger)((n_out + per_tg - 1) / per_tg);
     [enc dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -650,7 +664,7 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
             return;
         }
 
-        // 单 token：matvec。一个 simdgroup 算 kMvRows 行。
+        // 单 token：matvec。一个 simdgroup 算 g_mv_rows 行。
         [en setComputePipelineState:g_pipe[k]];
         [en setBuffer:g_w offset:0 atIndex:0];
         [en setBuffer:xin offset:0 atIndex:1];
@@ -658,7 +672,7 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         [en setBytes:&nin length:sizeof(nin) atIndex:3];
         [en setBytes:&woff length:sizeof(woff) atIndex:4];
         [en setBytes:&nout length:sizeof(nout) atIndex:5];
-        const int per_tg = kSgPerTg * kMvRows;
+        const int per_tg = kSgPerTg * g_mv_rows;
         const NSUInteger tgc = (NSUInteger)((n_out + per_tg - 1) / per_tg);
         [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];

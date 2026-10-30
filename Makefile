@@ -79,7 +79,7 @@ TOOL_OBJS   := $(BUILD)/tools/selftest.o $(BUILD)/tools/ggufdump.o
 
 MODEL ?= $(HOME)/.dubhe/models/qwen2.5-0.5b-instruct/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
-.PHONY: all clean tools run inspect bench serve check gpu optest shader-check mm2 engine
+.PHONY: all clean tools run inspect bench serve check gpu optest shader-check mm2 engine membw mvbench
 
 all: $(BIN) $(SRV) tools
 
@@ -190,6 +190,25 @@ optest: $(BUILD)/optest
 mm2: $(BUILD)/mm2_check
 	./$(BUILD)/mm2_check
 	./$(BUILD)/mm2_check --bench
+
+# 只读带宽天花板（按访问形状分）：解码优化前先量清楚天花板在哪
+$(BUILD)/membw: tools/membw.mm
+	@mkdir -p $(dir $@)
+	$(CXX) $(OBJCXXFLAGS) $< -o $@ $(LDFLAGS)
+	@echo "✓ $@"
+
+# 单个 mv_* 内核的吞吐 + 对拍。秒级出数，不用加载整个模型
+$(BUILD)/mvbench: tools/mvbench.mm engine/src/quant.cpp engine/src/gguf.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(OBJCXXFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "✓ $@"
+
+membw: $(BUILD)/membw
+	./$(BUILD)/membw 1073741824 15
+
+mvbench: $(BUILD)/mvbench
+	./$(BUILD)/mvbench q4_k 8192 2048 10
+	./$(BUILD)/mvbench q4_k 2048 8192 10
 
 # GPU / CPU 对比
 gpu: $(BIN)
