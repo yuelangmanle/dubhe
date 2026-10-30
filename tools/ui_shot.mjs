@@ -4,7 +4,9 @@ const url = process.argv[2] || 'http://127.0.0.1:7777/';
 const out = process.argv[3] || '/tmp/ui.png';
 const prompt = process.argv[4] || '用三句话解释什么是本地推理引擎';
 
-const base = 'http://127.0.0.1:9222';
+// 调试端口可用 CDP_URL 覆盖。默认 9222；上一个无头 Chrome 没退干净、
+// 端口还被占着的时候，换一个端口起新的就行，不用去翻进程表。
+const base = process.env.CDP_URL || 'http://127.0.0.1:9222';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

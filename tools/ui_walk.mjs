@@ -10,7 +10,9 @@
 // 用法：node tools/ui_walk.mjs [url] [outdir]
 const url = process.argv[2] || 'http://127.0.0.1:7788/';
 const outdir = process.argv[3] || '/tmp/uiwalk';
-const base = 'http://127.0.0.1:9222';
+// 调试端口可用 CDP_URL 覆盖。默认 9222；上一个无头 Chrome 没退干净、
+// 端口还被占着的时候，换一个端口起新的就行，不用去翻进程表。
+const base = process.env.CDP_URL || 'http://127.0.0.1:9222';
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 
@@ -189,14 +191,21 @@ await evalJs(`document.getElementById('send').click()`);
 await sleep(1200);
 await shot('02-chat-streaming');
 
-// 等流式结束（气泡里出现统计或 12 秒超时）
+// 等流式结束。
+//
+// 判据不能是"消息区里出现了 tok/s"：第二次跑的时候，历史消息里早就有这个
+// 字样，循环会在 600 ms 时就退出，然后读到 tok=0 的仪表 —— 看起来像产品
+// 的统计坏了，其实只是测得太早。改成和发送前快照比长度：必须比原来长，
+// 并且尾部出现了统计行。
+const baseLen = (await evalJs(`document.getElementById('messages').innerText`)).length;
 let waited = 0;
 let text = '';
-while (waited < 15000) {
+while (waited < 20000) {
   await sleep(600);
   waited += 600;
   text = await evalJs(`document.getElementById('messages').innerText`);
-  if (/tok\/s|tokens/.test(text) && text.length > 40) break;
+  const grew = text.length > baseLen + 20;
+  if (grew && /tok\/s|tokens/.test(text.slice(baseLen))) break;
 }
 await shot('03-chat-done');
 console.log('回复长度:', text.length, '字');
@@ -207,7 +216,7 @@ const gauge = await evalJs(`
   JSON.stringify({
     tps: (document.getElementById('gTps')||{}).textContent,
     tok: (document.getElementById('gTok')||{}).textContent,
-    tpot: (document.getElementById('gTime')||{}).textContent,
+    total: (document.getElementById('gTime')||{}).textContent,
     ttft: (document.getElementById('gTtft')||{}).textContent,
   })
 `);

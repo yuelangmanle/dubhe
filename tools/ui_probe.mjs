@@ -6,7 +6,9 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 
 const url = process.argv[2] || 'http://127.0.0.1:7788/';
 const outdir = process.argv[3] || '/tmp/uiprobe';
-const base = 'http://127.0.0.1:9222';
+// 调试端口可用 CDP_URL 覆盖。默认 9222；上一个无头 Chrome 没退干净、
+// 端口还被占着的时候，换一个端口起新的就行，不用去翻进程表。
+const base = process.env.CDP_URL || 'http://127.0.0.1:9222';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 mkdirSync(outdir, { recursive: true });
 
@@ -88,33 +90,49 @@ await sleep(900);
 await shot('api-panel');
 const apiText = await ev(`
   (() => {
+    // 不能用 offsetParent 判断可见性：这个面板是 position: fixed，
+    // 而 offsetParent 对 fixed 元素永远返回 null —— 面板明明弹着也会被判成"没打开"。
+    // 直接看 computedStyle 和内容。
     const s = document.getElementById('sheet');
-    if (s && s.getAttribute('aria-hidden') !== 'true' && s.offsetParent !== null)
-      return document.getElementById('sheetBody').innerText.slice(0, 300);
-    return '（面板未打开）';
+    if (!s) return '（没有 sheet 元素）';
+    const cs = getComputedStyle(s);
+    const shown = cs.display !== 'none' && cs.visibility !== 'hidden'
+      && parseFloat(cs.opacity || '1') > 0;
+    if (!shown) return '（面板未打开：display=' + cs.display + ' opacity=' + cs.opacity + '）';
+    const t = (document.getElementById('sheetBody') || {}).innerText || '';
+    return t.slice(0, 300) || '（面板打开了但正文是空的）';
   })()
 `);
 console.log('API 面板:', apiOpened, '→', JSON.stringify(apiText).slice(0, 200));
+if (!/BASE URL|base url|v1/i.test(String(apiText))) problems.push('API 面板没打开或内容不对');
 
 // 关掉面板
 await ev(`(() => { const c = document.getElementById('sheetClose'); if (c) c.click(); })()`);
 await sleep(300);
 
-// 2) 附件按钮：没有多模态模型时应该给提示而不是静默失败
-for (const [bid, label] of [['btnImage', '图片'], ['btnFile', '文件'], ['btnWeb', '联网']]) {
-  const r = await ev(`
-    (() => {
-      const b = document.getElementById('${bid}');
-      if (!b) return 'missing';
-      if (b.disabled) return 'disabled';
-      b.click();
-      return 'clicked';
-    })()
-  `);
-  await sleep(500);
-  const hint = await ev(`(document.getElementById('hint')||{}).textContent||''`);
-  console.log(`  ${label} 按钮: ${r}  提示="${String(hint).slice(0, 60)}"`);
-}
+// 2) 附件入口：能不能用完全由 /api/state 的 mm_vision / mm_audio 决定。
+//
+// 这里只读状态、不点。点一下会拉起原生文件选择框，无头浏览器里既看不到
+// 也没法关掉，只会让后面的步骤全部卡住。真正"点了能不能用"由 ui_mm.mjs
+// 走完整流程验证。
+const att = await ev(`
+  (() => {
+    const box = document.getElementById('btnAttach');
+    const img = document.getElementById('btnImage');
+    const mic = document.getElementById('btnMic');
+    return {
+      attachHidden: box ? box.hidden : null,
+      imageDisabled: img ? img.disabled : null,
+      micDisabled: mic ? mic.disabled : null,
+    };
+  })()
+`);
+const mmState = await ev(`fetch('/api/state').then(r=>r.json()).then(s=>({mm:s.mm, vision:s.mm_vision, audio:s.mm_audio}))`);
+console.log('  附件入口:', JSON.stringify(att), '| 后端:', JSON.stringify(mmState));
+// 前端显示必须和后端能力一致，否则用户会看到一个点了没反应的按钮
+if (att.attachHidden === false && !mmState.mm) problems.push('后端没有多模态能力，附件按钮却露着');
+if (att.attachHidden === true && mmState.mm) problems.push('后端有多模态能力，附件按钮却藏着');
+if (att.imageDisabled === false && !mmState.vision) problems.push('没有视觉塔，图片按钮却是可点的');
 
 // 3) 窄屏
 await size(390, 844);
