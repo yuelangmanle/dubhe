@@ -197,10 +197,13 @@ $(BUILD)/membw: tools/membw.mm
 	$(CXX) $(OBJCXXFLAGS) $< -o $@ $(LDFLAGS)
 	@echo "✓ $@"
 
-# 单个 mv_* 内核的吞吐 + 对拍。秒级出数，不用加载整个模型
-$(BUILD)/mvbench: tools/mvbench.mm engine/src/quant.cpp engine/src/gguf.cpp
+# 单个 mv_* 内核的吞吐 + 对拍。秒级出数，不用加载整个模型。
+# 注意用 $(MVBENCH_SRCS) 而不是 $^：-MMD 会把 internal.h 也塞进依赖里，
+# $^ 展开后头文件会被当成源文件传给编译器（报 "cannot specify -o"）。
+MVBENCH_SRCS := tools/mvbench.mm engine/src/quant.cpp engine/src/gguf.cpp
+$(BUILD)/mvbench: $(MVBENCH_SRCS)
 	@mkdir -p $(dir $@)
-	$(CXX) $(OBJCXXFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CXX) $(OBJCXXFLAGS) $(MVBENCH_SRCS) -o $@ $(LDFLAGS)
 	@echo "✓ $@"
 
 membw: $(BUILD)/membw

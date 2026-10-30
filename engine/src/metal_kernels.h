@@ -279,6 +279,91 @@ kernel void mv_q5_0(device const uchar* w     [[buffer(0)]],
     }
 }
 
+// ------------------------------------------------- Q5_0 解码 v2：lane 认领**块**
+//
+// 为什么要重写：上面那版是"lane = 块内元素下标"，32 条 lane 一起吃掉
+// 一个 22 字节的块。一个 warp 指令周期只搬运 22 字节，而 Q5_0 每 22 字节
+// 要 4 条 load（d 2 字节、qh 4 字节、qs 1 字节、x 1 个 float），于是
+// **3.7 字节/指令**。
+//
+// 这不是理论推演，是同进程实测出来的相关性：
+//   Q8_0  8.5 字节/指令 → 83 GB/s（lm_head，144 MB）
+//   Q5_0  3.7 字节/指令 → 38 GB/s（ffn gate+up，144 MB）
+//   比值 2.3x vs 2.2x —— 斜率几乎就是 1，说明**是发射端卡住，不是显存**。
+//
+// 改法：一条 lane 认领一整块（32 个元素），一个 warp 一次吃掉 32 块 = 704
+// 字节。nibble 区用 ld16s 读 16 字节（22 的块跨度只保证 2 字节对齐，
+// 不能用 uint4，见 ld16s 的注释）。
+//
+// 代价是 x 变成"每条 lane 要一整段 32 个 float"。所以：
+//   * 用 float4 读进寄存器（8 条指令换 128 字节），
+//   * 在 MVR 行之间复用（同一块的 x 对所有行都一样）。
+// 综合下来每行约 40 条指令，上面那版是 168 条。
+//
+// n_in=896 时 nb=28 < 32，会有 4 条 lane 空转；这是可接受的，因为
+// 真正省掉的是 28 次循环迭代。
+kernel void mv_q5_0_v2(device const uchar* w     [[buffer(0)]],
+                       device const float* x     [[buffer(1)]],
+                       device float* y           [[buffer(2)]],
+                       constant uint& n_in       [[buffer(3)]],
+                       constant ulong& woff      [[buffer(4)]],
+                       constant uint& n_out      [[buffer(5)]],
+                       uint tgid [[threadgroup_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]],
+                       uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
+    if (row0 >= n_out) return;
+    const uint nok = min(uint(MVR), n_out - row0);
+    const uint nb = n_in >> 5;
+    const ulong rbytes = (ulong)nb * 22u;
+
+    device const uchar* p[MV_R];
+    for (uint r = 0; r < MVR; r++)
+        p[r] = w + woff + (ulong)(row0 + (r < nok ? r : 0u)) * rbytes;
+
+    float acc[MV_R];
+    for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
+
+    for (uint b = lane; b < nb; b += 32u) {
+        // 这一块的 x 切片 [b*32, b*32+32)，32 个 float 全进寄存器
+        const ulong xb = (ulong)b * 32u;
+        float xl[32];
+        #pragma unroll
+        for (uint t = 0; t < 8u; t++) {
+            const float4 v = *(device const float4*)(x + xb + (t << 2));
+            xl[t * 4u + 0u] = v.x;
+            xl[t * 4u + 1u] = v.y;
+            xl[t * 4u + 2u] = v.z;
+            xl[t * 4u + 3u] = v.w;
+        }
+
+        for (uint r = 0; r < MVR; r++) {
+            device const uchar* q = p[r] + (ulong)b * 22u;
+            const uint4 qs = ld16s(q + 6u);          // 16 字节 nibble 区
+            const uint h0 = uint(q[2]) | (uint(q[3]) << 8);   // 元素 0..15 的高位
+            const uint h1 = uint(q[4]) | (uint(q[5]) << 8);   // 元素 16..31 的高位
+            const uint qw[4] = {qs.x, qs.y, qs.z, qs.w};
+            float s = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 16u; i++) {
+                const uint byte = (qw[i >> 2] >> ((i & 3u) << 3)) & 0xFFu;
+                const uint lo = (byte & 0x0Fu) | (((h0 >> i) & 1u) << 4);
+                const uint hi = (byte >> 4)    | (((h1 >> i) & 1u) << 4);
+                s += float(int(lo) - 16) * xl[i];
+                s += float(int(hi) - 16) * xl[16u + i];
+            }
+            acc[r] += rd_f16(q) * s;
+        }
+    }
+
+    // 归约：lane L 只累加了第 L, L+32, ... 块，所以 simd_sum 正好是整行的和
+    for (uint r = 0; r < MVR; r++) {
+        const float s = simd_sum(acc[r]);
+        if (lane == 0u && r < nok) y[row0 + r] = s;
+    }
+}
+
 // ---------------------------------------------------------------- Q8_0（34 字节 / 32 元）
 kernel void mv_q8_0(device const uchar* w     [[buffer(0)]],
                     device const float* x     [[buffer(1)]],

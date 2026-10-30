@@ -52,6 +52,15 @@ const char* const kNames[K_COUNT] = {
     "mv_f32", "mv_f16", "mv_q4_0", "mv_q5_0", "mv_q8_0", "mv_q4_k", "mv_q6_k"
 };
 
+// 解码 matvec 的候选实现（第 2 版）。空串 = 这一档没有候选，直接用 kNames。
+//
+// 为什么单开一张表而不是直接替换：新内核必须能在**同一个二进制**里 A/B，
+// 否则又要回到"跨轮比较绝对数字"的老坑（同一份二进制跨轮能差 1.5x）。
+// 用 DUBHE_MV_V2=0 关掉，默认开。
+const char* const kNames2[K_COUNT] = {
+    "", "", "", "mv_q5_0_v2", "", "", ""
+};
+
 // 分块 matmul 的函数名。Q4_0/Q5_0 没有分块版本（空串），派发时回退到 mm_*。
 const char* const kM2Names[K_COUNT] = {
     "mm2_f32", "mm2_f16", "", "", "mm2_q8_0", "mm2_q4_k", "mm2_q6_k"
@@ -79,6 +88,7 @@ size_t              g_y_cap = 0;
 bool                g_ready = false;
 std::string         g_err;
 id<MTLComputePipelineState> g_pipe[K_COUNT] = {nil};
+id<MTLComputePipelineState> g_pipe2[K_COUNT] = {nil};
 
 int kind_of(uint32_t t) {
     switch (t) {
@@ -155,6 +165,10 @@ bool init(std::string* err) {
         return false;
     }
 
+    // 第 2 版解码内核：有就编，编不出来就退回第 1 版（不是致命错误）。
+    // 默认开，DUBHE_MV_V2=0 关掉用于 A/B。
+    const bool want_v2 = getenv("DUBHE_MV_V2") == nullptr ||
+                         atoi(getenv("DUBHE_MV_V2")) != 0;
     for (int i = 0; i < K_COUNT; i++) {
         id<MTLFunction> fn = [g_lib newFunctionWithName:[NSString stringWithUTF8String:kNames[i]]];
         if (!fn) {
@@ -167,6 +181,19 @@ bool init(std::string* err) {
             g_err = pe ? [[pe localizedDescription] UTF8String] : "pipeline 创建失败";
             if (err) *err = std::string("pipeline ") + kNames[i] + " 失败: " + g_err;
             return false;
+        }
+        if (want_v2 && kNames2[i][0] != '\0') {
+            id<MTLFunction> fn2 = [g_lib newFunctionWithName:
+                [NSString stringWithUTF8String:kNames2[i]]];
+            if (fn2) {
+                NSError* pe2 = nil;
+                g_pipe2[i] = [g_dev newComputePipelineStateWithFunction:fn2 error:&pe2];
+                if (!g_pipe2[i])
+                    std::fprintf(stderr, "  %s pipeline 失败，退回 %s\n",
+                                 kNames2[i], kNames[i]);
+            } else {
+                std::fprintf(stderr, "  着色器缺少 %s，退回 %s\n", kNames2[i], kNames[i]);
+            }
         }
     }
     g_ready = true;
@@ -185,7 +212,7 @@ void unbind_weights() {
 
 void shutdown() {
     fwd_release();
-    for (int i = 0; i < K_COUNT; i++) g_pipe[i] = nil;
+    for (int i = 0; i < K_COUNT; i++) { g_pipe[i] = nil; g_pipe2[i] = nil; }
     g_w = nil;
     g_x = nil;
     g_y = nil;
@@ -253,7 +280,7 @@ bool mfvec(uint32_t type, const float* x, float* y, int n_out, int n_in, uint64_
     uint32_t nout = (uint32_t)n_out;
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    [enc setComputePipelineState:g_pipe[k]];
+    [enc setComputePipelineState:(g_pipe2[k] ? g_pipe2[k] : g_pipe[k])];
     [enc setBuffer:g_w offset:0 atIndex:0];
     [enc setBuffer:g_x offset:0 atIndex:1];
     [enc setBuffer:g_y offset:0 atIndex:2];
@@ -550,11 +577,43 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
     static const bool want_split = getenv("DUBHE_GPU_SPLIT") != nullptr;
     const auto t_enc0 = std::chrono::steady_clock::now();
 
+    // 诊断：DUBHE_SKIP=<位掩码> 按组跳过，用来给 decode 的时间做归因。
+    //
+    // 微基准量不出「真实前向里这一组占多少时间」：同一个内核在 6 个 dispatch
+    // 的 command buffer 里和在 435 个的里面表现完全不同（并行度、DVFS、L2
+    // 复用全变了）。唯一可靠的归因是**在真实前向里把它拿掉**，看时间掉多少。
+    //
+    //   bit0 = 注意力 q/k/v        bit1 = 注意力 out
+    //   bit2 = FFN gate+up         bit3 = FFN down
+    //   bit4 = lm_head             bit5 = 全部逐元素算子
+    //   bit6 = 注意力内核（含 RoPE / v 写入 / 拆分合并）
+    //
+    // 拿掉之后输出必然是乱的，只用来计时 —— 而且必须同时设
+    // DUBHE_NO_FUSED_CHECK=1，否则融合校验会把整条路径踢回 CPU，
+    // 量到的是 CPU 的 10 tok/s（踩过）。
+    //
+    // 之前试过的另一条路是「插 N 个空 dispatch 看斜率」，结果每个空 dispatch
+    // 折合 ~2 ms，明显不合理 —— 那个探针写的是 g_bxb，Metal 的资源依赖追踪
+    // 每次都要把整块缓冲的 hazard 处理一遍，量到的是它自己引入的刷新，不是
+    // 派发成本。删掉了，别再走这条路。
+    static const int kSkip = []() {
+        const char* s = getenv("DUBHE_SKIP");
+        return s ? atoi(s) : 0;
+    }();
+    const bool skip_qkv  = (kSkip & 1) != 0;
+    const bool skip_attn = (kSkip & 2) != 0;
+    const bool skip_ffn1 = (kSkip & 4) != 0;
+    const bool skip_ffn2 = (kSkip & 8) != 0;
+    const bool skip_lmh  = (kSkip & 16) != 0;
+    const bool skip_ew   = (kSkip & 32) != 0;   // 逐元素（norm / add / silu / bias）
+    const bool skip_attk = (kSkip & 64) != 0;   // 注意力内核本体
+
     // 逐元素算子：2D 网格（行内下标 × 行号）。
     // 注意：每个算子必须自己绑全部 buffer —— 早先版本把它们收进一个只
     // setPipeline 的公共 lambda，结果 k_add 读到的是上一次 gemm 留下的
     // 绑定，残差被加进了权重 mmap 里，症状是"输出等于输入 embedding"。
     auto add = [&](id<MTLBuffer> d, id<MTLBuffer> s) {
+        if (skip_ew) return;
         uint32_t n = (uint32_t)n_embd;
         [en setComputePipelineState:g_fpipe[F_ADD]];
         [en setBuffer:d offset:0 atIndex:0];
@@ -565,6 +624,7 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
     };
 
     auto silu_mul = [&]() {
+        if (skip_ew) return;
         uint32_t n = (uint32_t)n_ff;
         [en setComputePipelineState:g_fpipe[F_SILU]];
         [en setBuffer:g_bffn offset:0 atIndex:0];
@@ -665,7 +725,7 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         }
 
         // 单 token：matvec。一个 simdgroup 算 g_mv_rows 行。
-        [en setComputePipelineState:g_pipe[k]];
+        [en setComputePipelineState:(g_pipe2[k] ? g_pipe2[k] : g_pipe[k])];
         [en setBuffer:g_w offset:0 atIndex:0];
         [en setBuffer:xin offset:0 atIndex:1];
         [en setBuffer:yout offset:0 atIndex:2];
@@ -679,6 +739,7 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
     };
 
     auto rmsnorm = [&](id<MTLBuffer> xin, uint64_t woff, id<MTLBuffer> yout, int rows) {
+        if (skip_ew) return;
         uint32_t n = (uint32_t)n_embd;
         float eps = g_spec.rms_eps;
         [en setComputePipelineState:g_fpipe[F_RMSNORM]];
@@ -693,7 +754,7 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
     };
 
     auto bias = [&](id<MTLBuffer> y, uint64_t boff, int n) {
-        if (boff == ~0ull) return;
+        if (skip_ew || boff == ~0ull) return;
         uint32_t nn = (uint32_t)n;
         [en setComputePipelineState:g_fpipe[F_BIAS]];
         [en setBuffer:y offset:0 atIndex:0];
@@ -709,6 +770,7 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
     // 每 head 的 QK RMSNorm：一个 threadgroup 一个 head。
     // nh 是这张张量的 head 数——q 是 n_head，k 只有 n_head_kv，两者不能混用。
     auto headnorm = [&](id<MTLBuffer> x, uint64_t woff, int nh, int rows) {
+        if (skip_ew) return;
         uint32_t nhv = (uint32_t)nh, d = (uint32_t)hd;
         float eps = g_spec.rms_eps;
         [en setComputePipelineState:g_fpipe[F_HEADNORM]];
@@ -725,6 +787,7 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
 
     // 逐 head 的 sigmoid 输出门
     auto gate_mul = [&](int rows) {
+        if (skip_ew) return;
         uint32_t nh = (uint32_t)n_head, d = (uint32_t)hd;
         [en setComputePipelineState:g_fpipe[F_GATE_MUL]];
         [en setBuffer:g_batt offset:0 atIndex:0];
@@ -756,6 +819,7 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
     // 一行一个 dispatch，多行时按行序连续派发——同一 command buffer 内的
     // compute dispatch 顺序执行，所以 state 能逐行正确递推。
     auto conv_step = [&](uint64_t slot_off, uint64_t kwoff, int rows) {
+        if (skip_ew) return;
         const uint32_t n = (uint32_t)n_embd;
         const uint32_t K = (uint32_t)g_spec.conv_l_cache;
         for (int r = 0; r < rows; r++) {
@@ -813,9 +877,11 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
             gemm(L.ex_type[metal::X_CONV_OUT], g_bconvy, g_bxb,
                  L.ex_off[metal::X_CONV_OUT], n_embd, n_embd, nrow);
         } else {
-            gemm(L.type[metal::S_Q], g_bxb, g_bq, L.off[metal::S_Q], q_dim,  n_embd, nrow);
-            gemm(L.type[metal::S_K], g_bxb, g_bk, L.off[metal::S_K], kv_dim, n_embd, nrow);
-            gemm(L.type[metal::S_V], g_bxb, g_bv, L.off[metal::S_V], kv_dim, n_embd, nrow);
+            if (!skip_qkv) {
+                gemm(L.type[metal::S_Q], g_bxb, g_bq, L.off[metal::S_Q], q_dim,  n_embd, nrow);
+                gemm(L.type[metal::S_K], g_bxb, g_bk, L.off[metal::S_K], kv_dim, n_embd, nrow);
+                gemm(L.type[metal::S_V], g_bxb, g_bv, L.off[metal::S_V], kv_dim, n_embd, nrow);
+            }
 
             bias(g_bq, L.bias[0], q_dim);
             bias(g_bk, L.bias[1], kv_dim);
@@ -879,9 +945,32 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
                 if (L.kind == G_ATTN_SWA && g_spec.n_swa > 0) win = (uint32_t)g_spec.n_swa;
                 const int nlen_max = std::min(pos0 + nrow,
                                               win > 0 ? (int)win : (pos0 + nrow));
-                uint32_t nsp = (uint32_t)std::min(kAttnSplits, std::max(1, nlen_max / 96));
+                // 切几段（split-K）。
+                //
+                // 这里的分母决定了短上下文时的并行度：一个 threadgroup 只
+                // 吃 4 个头，n_head=14 时整张网格只有 4 个 threadgroup = 16
+                // 个 warp，而 M4 有 10 个 GPU 核 —— 每个核摊不到 2 个 warp，
+                // 而内核在位置上是一条**带 simd_sum 屏障的串行链**，延迟完全
+                // 盖不住。实测 64 token 上下文时注意力独占 1.13 ms/token
+                // （decode 的 13%），全部是并行度不足。
+                //
+                // 所以分母不能只按"上下文多长"来定，还得按"网格够不够满"。
+                //
+                // 6 是交替采样量出来的（同一进程外的 12 次对比，div=6 六轮
+                // 全胜）：中位 decode 124.7 → 135.7 tok/s，+8.8%。原来的
+                // 96 在 64 token 上下文下只切 1 段，等于没切。
+                // DUBHE_ATTN_DIV 留了个口子继续扫。
+                static const int attn_div = []() {
+                    const char* s = getenv("DUBHE_ATTN_DIV");
+                    const int v = s ? atoi(s) : 6;
+                    return v >= 1 && v <= 512 ? v : 6;
+                }();
+                uint32_t nsp = (uint32_t)std::min(kAttnSplits,
+                                                  std::max(1, nlen_max / attn_div));
 
-                if (nsp == 1) {
+                if (skip_attk) {
+                    // 诊断开关：跳过注意力本体（保留 RoPE 与 v 写入）
+                } else if (nsp == 1) {
                     // 短上下文：融合版一步到位，省掉 partial 缓冲与 combine
                     [en setComputePipelineState:g_fpipe[F_ATTN]];
                     [en setBuffer:g_bq offset:0 atIndex:0];
@@ -938,7 +1027,8 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
             }
 
             // 输出投影 → g_bxb（与 conv 路径统一落点）
-            gemm(L.type[metal::S_OUT], g_batt, g_bxb, L.off[metal::S_OUT], n_embd, n_embd, nrow);
+            if (!skip_attn)
+                gemm(L.type[metal::S_OUT], g_batt, g_bxb, L.off[metal::S_OUT], n_embd, n_embd, nrow);
         }
 
         // sandwich norm：子层输出先归一化再加残差
@@ -948,10 +1038,13 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
 
         // FFN
         rmsnorm(g_bx, L.off[metal::S_FFN_NORM], g_bxb, nrow);
-        gemm(L.type[metal::S_GATE], g_bxb, g_bgate, L.off[metal::S_GATE], n_ff, n_embd, nrow);
-        gemm(L.type[metal::S_UP],   g_bxb, g_bup,   L.off[metal::S_UP],   n_ff, n_embd, nrow);
+        if (!skip_ffn1) {
+            gemm(L.type[metal::S_GATE], g_bxb, g_bgate, L.off[metal::S_GATE], n_ff, n_embd, nrow);
+            gemm(L.type[metal::S_UP],   g_bxb, g_bup,   L.off[metal::S_UP],   n_ff, n_embd, nrow);
+        }
         silu_mul();
-        gemm(L.type[metal::S_DOWN], g_bffn, g_bxb, L.off[metal::S_DOWN], n_embd, n_ff, nrow);
+        if (!skip_ffn2)
+            gemm(L.type[metal::S_DOWN], g_bffn, g_bxb, L.off[metal::S_DOWN], n_embd, n_ff, nrow);
         if (L.ex_off[metal::X_POST_FFN] != ~0ull)
             rmsnorm(g_bxb, L.ex_off[metal::X_POST_FFN], g_bxb, nrow);
         add(g_bx, g_bxb);
@@ -973,7 +1066,8 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     rmsnorm(g_bxb, g_spec.off_out_norm, g_bfinal, 1);
-    gemm(g_spec.type_out_w, g_bfinal, g_blogits, g_spec.off_out_w, g_spec.n_vocab, n_embd, 1);
+    if (!skip_lmh)
+        gemm(g_spec.type_out_w, g_bfinal, g_blogits, g_spec.off_out_w, g_spec.n_vocab, n_embd, 1);
 
     [en endEncoding];
     const auto t_enc1 = std::chrono::steady_clock::now();
