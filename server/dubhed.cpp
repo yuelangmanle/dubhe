@@ -1887,6 +1887,35 @@ int main(int argc, char** argv) {
         const bool stream = body.flag("stream", false);
         const bool with_tools = body.get("tools") != nullptr || body.flag("dubhe_tools", false);
 
+        // ---- 串行化：整条请求（含多模态编码和工具两轮）放进同一把锁
+        //
+        // 先澄清一件事：**生成本身早就是串行的**。engine.cpp 的 dubhe_generate
+        // 进来就 lock_guard(e->mu)，一直持到出结果，而且开头就 reset_kv()。
+        // 所以两个请求同时来不会互相踩 KV，也不会串台 —— 这一点
+        // tools/concurrent_check.py 能验证（改动前的二进制同样通过）。
+        //
+        // 这把锁补的是引擎锁**盖不住**的那一段：
+        //
+        //   1. build_tokens 会跑视觉/语音编码器，它调 dubhe_encode_image /
+        //      dubhe_encode_audio，那些函数只在"赋值给 e->mm_embeds"那一瞬间
+        //      加锁。于是 A 编码完、还没开始 generate 时，B 的编码可以把
+        //      mm_embeds 覆盖掉 —— A 拿到的就是 B 的图。这条竞态只在
+        //      "多模态 + 并发"时出现，纯文本复现不了。
+        //   2. 工具调用是两轮 generate，中间引擎锁是松开的。
+        //
+        // 锁放这里而不是只包 generate，就是为了把上面两段一起罩住。
+        // 后来的请求**排队等**而不是返回 409：本地单机场景下"等一下再答"
+        // 比"直接失败"符合直觉；排到队时打一行日志，免得以为卡死了。
+        std::unique_lock<std::mutex> gen_lk(g.mu, std::defer_lock);
+        if (!gen_lk.try_lock()) {
+            std::fprintf(stderr, "[dubhed] 生成中，请求排队等待…\n");
+            gen_lk.lock();
+        }
+        g.busy = true;
+        struct BusyGuard {
+            ~BusyGuard() { g.busy = false; }
+        } busy_guard;
+
         dubhe_model_info mi{};
         dubhe_model_info_get(g.engine, &mi);
         const bool chatml = mi.has_chat_template != 0;
