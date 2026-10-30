@@ -108,9 +108,23 @@ int32_t dubhe_token_to_piece(const dubhe_engine* e, int32_t token, char* buf, in
 /* 加载 mmproj（视觉/音频塔的 GGUF，独立于语言模型）。 */
 int  dubhe_load_mmproj(dubhe_engine* e, const char* path);
 
+/* 卸载已加载的视觉塔和语音塔。
+ *
+ * 为什么必须有这个：塔是跟模型配套的，不是跟引擎配套的。换模型时不换塔，
+ * 维度检查也拦不住 —— LFM3-VL-2B 和 LFM3-1.7B 的 hidden 都是 2048，
+ * 特征能顺利注入，然后模型回一段完全无关的话（实测切到 F16 后发一张图，
+ * 回的是"They provided a block of text that appears to be some garbled
+ * mix…"）。HTTP 200、无异常、无日志，比直接报错难查得多。
+ * 所以换模型的一方必须显式调用本函数。 */
+void dubhe_unload_mmproj(dubhe_engine* e);
+
 /* 已加载的多模态能力位掩码：1 = 图像/视频（视觉塔），2 = 语音（音频塔）。
  * 都没加载返回 0。服务端靠它决定 UI 上该露出哪些附件入口。 */
 int  dubhe_mm_caps(dubhe_engine* e);
+
+/* 视觉塔投影后的宽度（= 文本模型的 hidden）。没加载视觉塔返回 0。
+ * 换模型时用它做一次对齐检查，比等到注入阶段才发现要早。 */
+int  dubhe_mm_dim(dubhe_engine* e);
 
 /* 把一张图编码成可直接注入的特征：返回 *embeds（n_tokens × dim，行主序
  * float32，调用方用 dubhe_free_embeds 释放）。这一步是纯 CPU 的视觉塔前向，

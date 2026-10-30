@@ -138,6 +138,22 @@
     return s.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').replace(/<tool_result>[\s\S]*?<\/tool_result>/g, '').trim();
   }
 
+  // 助手正文的 HTML。
+  //
+  // 为什么要单独一个函数：小模型（尤其带图的场景）有时会把整段输出包进
+  // <tool_call>/<tool_result> 里，但并没有真的调用工具。stripToolCalls
+  // 一剥，什么都不剩，界面上就是"已完成 · 9 tokens"加一片空白 ——
+  // 用户完全不知道发生了什么，也没法判断是不是自己用错了。
+  // 所以剥完是空、又没有工具卡片可看的时候，把原文露出来：难看，但诚实。
+  function bodyHtml(content, hasTools) {
+    const raw = (content || '').trim();
+    const visible = stripToolCalls(raw);
+    if (visible) return renderMarkdown(visible);
+    if (!raw || hasTools) return '';
+    return '<div class="raw-note">模型这段输出被识别成工具调用，没有可显示的正文字。原文：</div>'
+      + '<pre class="raw-out">' + escapeHtml(raw.slice(0, 2000)) + '</pre>';
+  }
+
   // ---------------------------------------------------------------- 渲染
   function renderConvList() {
     const list = $('#convList');
@@ -223,7 +239,7 @@
     }
 
     const body = el('div', 'body');
-    body.innerHTML = renderMarkdown(stripToolCalls(m.content || ''));
+    body.innerHTML = bodyHtml(m.content, m.tools && m.tools.length);
     col.appendChild(body);
 
     if (m.tools && m.tools.length) {
@@ -675,6 +691,13 @@
 
     try {
       state.abort = new AbortController();
+      // 带附件时关掉工具说明。
+      //
+      // 小模型（LFM3-VL-2B 这类 2B 级）看到工具说明 + 一张图，很容易把
+      // 整段输出写成 <tool_result>{...}，但它并没有真的调用工具 ——
+      // 结果就是界面上一条"已完成 9 tokens"的空气泡。图片问答本来也不该
+      // 走工具循环，关掉对双方都更省。真要图文 + 工具，用 API 显式传 tools。
+      const withTools = settings.tools && state.tools && !att;
       const resp = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -685,7 +708,7 @@
           temperature: settings.temperature,
           top_p: settings.top_p,
           max_tokens: settings.max_tokens,
-          dubhe_tools: settings.tools && state.tools,
+          dubhe_tools: withTools,
         }),
       });
       if (!resp.ok) throw new Error(await resp.text());
@@ -697,7 +720,7 @@
       let genTick = 0;
 
       const paint = () => {
-        body.innerHTML = renderMarkdown(stripToolCalls(ai.content)) || '<p></p>';
+        body.innerHTML = bodyHtml(ai.content, false) || '<p></p>';
         if (raf) return;
         raf = requestAnimationFrame(() => { raf = null; scrollBottom(); });
       };
@@ -1226,13 +1249,16 @@
       const ico = el('div', 'vico');
       ico.appendChild(iconNode('cube'));
       row.appendChild(ico);
-      // mmproj 是多模态塔（视觉/语音编码器），不是能单独加载的语言模型：
-      // 它得跟着主模型一起用 --mmproj 挂上去。列出来是为了让人看得见，
-      // 但绝不能给一个点了必然失败的"加载"按钮。
+      // 后端已经把 mmproj 从模型清单里摘掉了（它是塔，不能单独加载）。
+      // 这里保留一道同名判断只是兜底：万一指向的是别的目录结构，
+      // 也不会给一个点了必然失败的"加载"按钮。
       const isMm = /^mmproj/i.test(m.name);
       const main = el('div', 'vmain');
       const nm = el('div', 'vname', m.name);
       if (m.loaded) nm.appendChild(el('span', 'vtag on', '当前'));
+      // 同目录下有配套的塔 → 这个模型能看图/听音。切换过去时后端会自动挂上。
+      // 已加载的也要标：它同时是"当前"和"多模态"，两个标签不冲突。
+      if (m.mmproj) nm.appendChild(el('span', 'vtag', '多模态'));
       if (isMm) nm.appendChild(el('span', 'vtag', '多模态塔'));
       main.appendChild(nm);
       const bits = [];
@@ -1251,6 +1277,13 @@
             const r = await vpost('/api/load', { path: m.path });
             b.textContent = '已加载 ' + Math.round(r.ms) + ' ms';
             await refreshState();
+            // 塔加载失败（文件坏了、维度和模型对不上）不该静默吞掉：
+            // 结果是"模型能跑但看不了图"，不说清楚用户会以为是图片的问题。
+            if (r.mm_note) {
+              const note = el('div', 'vnote bad', '模型已切换，但' + r.mm_note);
+              card.parentNode.insertBefore(note, card);
+              setTimeout(() => note.remove(), 8000);
+            }
             viewModels();
           } catch (e) {
             b.disabled = false;

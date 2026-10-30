@@ -923,6 +923,29 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
     json::Value flat = flatten_messages(messages, &media, err);
     if (flat.type != json::Value::ARR) return false;
 
+    // 附件必须和已加载的塔配套。
+    //
+    // 这一条不能靠"注入时维度对不对"来兜底：LFM3 全家的 hidden 都是 2048，
+    // 视觉塔的输出能顺利塞进任何一个 LFM3 文本模型，然后模型回一段和图片
+    // 毫无关系的话。实测把 LFM3-1.7B-F16 配上 VL 的塔，问"这张图是什么
+    // 颜色"，回的是 "They provided a block of text that appears to be
+    // some garbled mix…"。HTTP 200、无异常、无日志 —— 比报错难查得多。
+    // 所以在这里直接拒掉，把原因说清楚。
+    if (!media.empty()) {
+        const int caps = dubhe_mm_caps(e);
+        for (const auto& m : media) {
+            const bool is_audio = (m.kind == "audio");
+            if ((caps & (is_audio ? 2 : 1)) == 0) {
+                if (err) {
+                    *err = is_audio
+                        ? "当前模型没有加载语音塔，无法处理音频。请到「模型」视图换一个带语音能力的模型。"
+                        : "当前模型没有加载视觉塔，无法处理图片/视频。请到「模型」视图换一个多模态模型。";
+                }
+                return false;
+            }
+        }
+    }
+
     // 只给了一段音频、一个字都没打 —— 用户要的就是转写。
     // 这时候走 chat 模板反而害事：LFM3-Audio 进了对话状态后会把音频当成
     // "待推理的问题"，输出 "We need to answer the question: …" 这种分析过程，
@@ -1051,7 +1074,32 @@ struct StreamCtx {
     bool decided = false;
     bool suppress = false;
     std::string pending;
+    // 上一片末尾没凑齐的多字节字符。引擎是按 token 吐字节的，一个汉字
+    // （3 字节）经常被切在两个 token 之间；半截字节进了 JSON，浏览器那边
+    // 就只能解成 U+FFFD —— 中文回复里随机冒出"均���的"这种方块。
+    std::string tail;
 };
+
+// 返回 s 末尾"不完整的多字节序列"占几个字节；0 表示末尾是干净的。
+//
+// UTF-8 的续字节最高两位是 10，首字节决定了整个字符要几个字节。
+// 从后往前找第一个非续字节，看它声明的长度和实际剩下的字节数对不对得上。
+static size_t utf8_incomplete_tail(const std::string& s) {
+    const size_t n = s.size();
+    if (n == 0) return 0;
+    for (size_t back = 1; back <= 4 && back <= n; back++) {
+        const size_t i = n - back;
+        const unsigned char c = (unsigned char)s[i];
+        if ((c & 0xC0) == 0x80) continue;          // 续字节，继续往前找首字节
+        size_t need = 1;
+        if ((c & 0xE0) == 0xC0) need = 2;
+        else if ((c & 0xF0) == 0xE0) need = 3;
+        else if ((c & 0xF8) == 0xF0) need = 4;
+        else return 0;                              // 非法首字节，不拦，交给上层
+        return back < need ? back : 0;               // 够长就完整，不够就把这几字节留住
+    }
+    return 0;
+}
 
 void emit_delta(StreamCtx* x, const std::string& delta) {
     std::string s = "data: {\"id\":\"" + *x->id +
@@ -1069,11 +1117,23 @@ void on_piece(void* ud, int32_t /*tok*/, const char* piece) {
     x->acc->append(piece);
     if (x->suppress) return;
 
+    // 先和上一片留下的半截字符拼起来，再把末尾凑不齐的部分留住，
+    // 剩下的才是能安全写进 JSON 的。
+    std::string s = x->tail + std::string(piece);
+    const size_t hold = utf8_incomplete_tail(s);
+    if (hold) {
+        x->tail.assign(s, s.size() - hold, hold);
+        s.resize(s.size() - hold);
+    } else {
+        x->tail.clear();
+    }
+    if (s.empty()) return;   // 这一片整个是半截字符，等下一片
+
     if (x->decided) {
-        emit_delta(x, piece);
+        emit_delta(x, s);
         return;
     }
-    x->pending += piece;
+    x->pending += s;
     // 去掉前导空白后再判断
     size_t i = 0;
     while (i < x->pending.size() && (x->pending[i] == ' ' || x->pending[i] == '\n' ||
@@ -1086,6 +1146,7 @@ void on_piece(void* ud, int32_t /*tok*/, const char* piece) {
         x->suppress = true;
         x->decided = true;
         x->pending.clear();
+        x->tail.clear();
         return;
     }
     if (head.size() >= 16) {
@@ -1103,6 +1164,13 @@ void flush_pending(StreamCtx* x) {
         x->pending.clear();
         x->decided = true;
         emit_delta(x, all);
+    }
+    // 正常回复的最后一片是完整的字符，不会留尾巴。真留了（比如被 max_tokens
+    // 截断在半个汉字上）也一起吐出去 —— 让前端自己决定怎么显示，总比丢字好。
+    if (!x->tail.empty() && !x->suppress) {
+        const std::string t = x->tail;
+        x->tail.clear();
+        emit_delta(x, t);
     }
 }
 
@@ -1133,6 +1201,7 @@ struct ModelEntry {
     std::string path, name;
     long long bytes = 0;
     long long mtime = 0;
+    std::string mmproj;   // 同目录配套的塔；空表示纯文本
 };
 
 void scan_models(const std::string& dir, std::vector<ModelEntry>* out, int depth) {
@@ -1148,6 +1217,10 @@ void scan_models(const std::string& dir, std::vector<ModelEntry>* out, int depth
         if (S_ISDIR(st.st_mode)) {
             scan_models(full, out, depth + 1);
         } else if (n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0) {
+            // mmproj 是塔，不是模型。以前它会被当成可选模型列出来，点一下就
+            // 拿视觉塔去当语言模型加载 —— 必然失败，但用户不知道为什么会失败。
+            // 这里直接排除，改成挂到同目录的模型上（见 mmproj 字段）。
+            if (n.compare(0, 6, "mmproj") == 0) continue;
             ModelEntry m;
             m.path = full;
             m.name = n.substr(0, n.size() - 5);
@@ -1186,6 +1259,34 @@ double guess_params(const std::string& n) {
         if (v > 0.05 && v < 300) return v * 1e9;
     }
     return 0;
+}
+
+// 找一个模型"配套"的多模态塔。
+//
+// 约定：塔的 GGUF 和模型放在同一个目录，文件名以 mmproj 开头。这是
+// llama.cpp 和 LM Studio 下载下来的默认布局，本机 ~/.dubhe/models 也是这个形状
+// （lfm3-vl-2b/ 下是模型 + mmproj-*.gguf，lfm3-audio-2b/ 同理）。
+//
+// 只认同目录、不往上层找：上层是 models/ 根，那里放的是别的模型的塔，
+// 拿错了就是"维度对得上、语义对不上"的静默垃圾。
+std::string find_sibling_mmproj(const std::string& model_path) {
+    const std::string dir = path_dir(model_path);
+    DIR* d = opendir(dir.c_str());
+    if (!d) return "";
+    std::string best;
+    while (dirent* e = readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.size() < 11) continue;
+        if (n.compare(0, 6, "mmproj") != 0) continue;
+        if (n.compare(n.size() - 5, 5, ".gguf") != 0) continue;
+        const std::string full = path_join(dir, n);
+        if (!is_file_p(full)) continue;
+        // 一个目录里同时有视觉塔和语音塔时，先拿到哪个算哪个：
+        // 调用方会按 dim 和 caps 再校验一遍，拿错的那次加载会被回退。
+        if (best.empty() || full < best) best = full;
+    }
+    closedir(d);
+    return best;
 }
 
 json::Value list_dir_json(const std::string& dir) {
@@ -1257,6 +1358,7 @@ int main(int argc, char** argv) {
     int ctx = 0;
     int threads = 0;
     bool no_gpu = false;
+    bool no_mmproj = false;
     std::vector<std::string> mmprojs;
 
     for (int i = 1; i < argc; i++) {
@@ -1273,6 +1375,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-gpu") no_gpu = true;
         else if (a == "--api-key") g.api_key = next();
         else if (a == "--mmproj") mmprojs.push_back(next());
+        else if (a == "--no-mmproj") no_mmproj = true;
         else if (a == "--tmp-dir") g.tmp_dir = next();
         else if (a == "--share") {
             // 对外分享：监听所有网卡，并自动生成访问密钥
@@ -1287,6 +1390,8 @@ int main(int argc, char** argv) {
                 "             [--mmproj <mmproj.gguf>] [--tmp-dir /tmp]\n"
                 "             [--share] [--api-key <key>]\n\n"
                 "  --mmproj P     加载视觉塔或语音塔（可给多次，Omni 模型两个都要）\n"
+                "                 不给的话，模型同目录下的 mmproj*.gguf 会自动挂上\n"
+                "  --no-mmproj    不自动挂塔，纯文本启动\n"
                 "  --share        监听 0.0.0.0 并自动生成 API Key（手机/其他设备可接入）\n"
                 "  --api-key K    指定 API Key（/v1/* 需要 Authorization: Bearer K）\n",
                 dubhe_version());
@@ -1344,6 +1449,19 @@ int main(int argc, char** argv) {
 
     if (g.tmp_dir.empty()) g.tmp_dir = "/tmp";
 
+    // 没显式给 --mmproj 时，看模型旁边有没有塔，有就自动挂上。
+    // 规则和 /api/load 一致：同一个目录 = 同一套东西。这样
+    // `dubhed -m ~/.dubhe/models/lfm3-vl-2b/xxx.gguf` 直接就能看图，
+    // 不用再把塔的路径也背一遍。要纯文本启动就加 --no-mmproj。
+    if (mmprojs.empty() && !no_mmproj && !model.empty()) {
+        const std::string sib = find_sibling_mmproj(model);
+        if (!sib.empty()) {
+            std::fprintf(stderr, "模型旁边有配套的塔，自动加载 %s（纯文本启动用 --no-mmproj）\n",
+                         path_base(sib).c_str());
+            mmprojs.push_back(sib);
+        }
+    }
+
     // 多模态塔加载失败不该让整个服务起不来：纯文本照常可用，只是 UI 上
     // 不显示附件入口（/api/state 的 mm 字段会是 0）。
     // --mmproj 可以给多次：Omni 模型是视觉塔 + 语音塔两个独立文件。
@@ -1359,6 +1477,18 @@ int main(int argc, char** argv) {
         const int caps = dubhe_mm_caps(g.engine);
         std::fprintf(stderr, "  → 就绪 %.0f ms · 现有能力: %s\n", (double)ms,
                      caps == 3 ? "图像/视频 + 语音" : (caps & 2 ? "语音" : "图像/视频"));
+        // 维度对不上时在启动阶段就喊出来。注入阶段也有同样的检查，但那时
+        // 用户已经在等回答了；这里至少让他一眼看到"我挂错了塔"。
+        {
+            dubhe_model_info mi{};
+            dubhe_model_info_get(g.engine, &mi);
+            const int d = dubhe_mm_dim(g.engine);
+            if (d > 0 && mi.n_embd > 0 && d != (int)mi.n_embd) {
+                std::fprintf(stderr,
+                             "  !! 这个塔输出 %d 维，当前模型要 %d 维 —— 注入会失败，请换配套的塔\n",
+                             d, (int)mi.n_embd);
+            }
+        }
         if (!g.mmproj_path.empty()) g.mmproj_path += ",";
         g.mmproj_path += mp;
     }
@@ -1492,6 +1622,7 @@ int main(int argc, char** argv) {
         json::Value root = json::Value::make_obj();
         root.set("dir", json::Value::make_str(g.model_dir));
         root.set("current", json::Value::make_str(g.model_path));
+        for (auto& m : ms) m.mmproj = find_sibling_mmproj(m.path);
         json::Value arr = json::Value::make_arr();
         for (const auto& m : ms) {
             json::Value o = json::Value::make_obj();
@@ -1502,6 +1633,10 @@ int main(int argc, char** argv) {
             o.set("quant", json::Value::make_str(guess_quant(m.name)));
             o.set("params", json::Value::make_num(guess_params(m.name)));
             o.set("loaded", json::Value::make_bool(m.path == g.model_path));
+            // 有配套塔就能看图/听音。这里只报"有没有塔"和塔的路径，
+            // 不报具体是视觉还是语音 —— 那要读塔的 GGUF 头，而几十个模型
+            // 逐个读头是几百毫秒。真正的 caps 在 /api/state 里，加载后自然知道。
+            o.set("mmproj", json::Value::make_str(m.mmproj));
             arr.arr.push_back(o);
         }
         root.set("items", arr);
@@ -1534,24 +1669,75 @@ int main(int argc, char** argv) {
         }
         std::lock_guard<std::mutex> lk(g.mu);
         const std::string old = g.model_path;
+        const std::string old_mm = g.mmproj_path;
         const auto t0 = std::chrono::steady_clock::now();
+
+        // 塔必须先卸：塔是跟模型配套的，留着旧的只会让 /api/state 报出
+        // 一个"其实对不上"的 mm_vision=true，UI 于是继续露出图片按钮，
+        // 用户点下去拿到一段和图片毫无关系的话。
+        dubhe_unload_mmproj(g.engine);
+        g.mmproj_path.clear();
+
         dubhe_unload_model(g.engine);
         if (dubhe_load_model(g.engine, full.c_str()) != DUBHE_OK) {
             const std::string err = dubhe_last_error();
             g.model_path.clear();
             g.model_id.clear();
+            // 装回旧模型，并把旧模型原来的塔也装回去 —— 否则一次误操作
+            // 会让服务从"能看图"退化成"不能看图"，而且没有任何提示。
             if (!old.empty()) {
                 if (dubhe_load_model(g.engine, old.c_str()) == DUBHE_OK) {
                     g.model_path = old;
                     g.model_id = model_id_of(old);
+                    std::string tmp = old_mm;
+                    size_t p = 0;
+                    while (p <= tmp.size() && !tmp.empty()) {
+                        const size_t q = tmp.find(',', p);
+                        const std::string one = tmp.substr(p, q == std::string::npos ? std::string::npos : q - p);
+                        if (!one.empty() && dubhe_load_mmproj(g.engine, one.c_str()) == DUBHE_OK) {
+                            if (!g.mmproj_path.empty()) g.mmproj_path += ",";
+                            g.mmproj_path += one;
+                        }
+                        if (q == std::string::npos) break;
+                        p = q + 1;
+                    }
                 }
             }
             json::Value e = json::Value::make_obj();
             e.set("error", json::Value::make_str("加载失败: " + err));
             e.set("restored", json::Value::make_str(g.model_path));
+            e.set("mm", json::Value::make_num(dubhe_mm_caps(g.engine)));
             c.send(500, "application/json", json::dump(e));
             return;
         }
+
+        // ---- 给新模型配塔。
+        // 显式传了 mmproj 就用传的；没传就在模型同目录里找 mmproj*.gguf。
+        // 找到之后必须过一道维度校验：LFM3 家族的 hidden 都是 2048，
+        // 拿错塔不会报错，只会静默输出垃圾，所以这里宁可卸载也不将就。
+        std::string want_mm = body.s("mmproj");
+        if (want_mm.empty()) want_mm = req.param("mmproj");
+        if (want_mm.empty()) want_mm = find_sibling_mmproj(full);
+        std::string mm_note;
+        if (!want_mm.empty()) {
+            if (!is_file_p(want_mm) || !path_allowed(want_mm)) {
+                mm_note = "塔文件不存在或路径不允许: " + want_mm;
+            } else if (dubhe_load_mmproj(g.engine, want_mm.c_str()) != DUBHE_OK) {
+                mm_note = std::string("塔加载失败: ") + dubhe_last_error();
+            } else {
+                const int need = dubhe_mm_dim(g.engine);
+                dubhe_model_info chk{};
+                dubhe_model_info_get(g.engine, &chk);
+                if (need > 0 && chk.n_embd > 0 && need != (int)chk.n_embd) {
+                    dubhe_unload_mmproj(g.engine);
+                    mm_note = "塔输出 " + std::to_string(need) + " 维，模型要 " +
+                              std::to_string(chk.n_embd) + " 维，已跳过";
+                } else {
+                    g.mmproj_path = want_mm;
+                }
+            }
+        }
+
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - t0).count();
         g.model_path = full;
@@ -1561,6 +1747,9 @@ int main(int argc, char** argv) {
         o.set("model", json::Value::make_str(g.model_path));
         o.set("model_id", json::Value::make_str(g.model_id));
         o.set("ms", json::Value::make_num((double)ms));
+        o.set("mm", json::Value::make_num(dubhe_mm_caps(g.engine)));
+        o.set("mmproj", json::Value::make_str(g.mmproj_path));
+        if (!mm_note.empty()) o.set("mm_note", json::Value::make_str(mm_note));
         dubhe_model_info mi{};
         if (dubhe_model_info_get(g.engine, &mi) == DUBHE_OK) {
             o.set("arch", json::Value::make_str(mi.arch));
@@ -1948,7 +2137,7 @@ int main(int argc, char** argv) {
         if (stream) {
             c.begin_stream();
             std::string acc;
-            StreamCtx ctx{&c, &acc, &id, created, true, false, false, {}};
+            StreamCtx ctx{&c, &acc, &id, created, true, false, false, {}, {}};
 
             dubhe_stats st{};
             dubhe_generate(g.engine, toks.data(), n, &sp, on_piece, nullptr, &ctx, &st);
@@ -1992,6 +2181,7 @@ int main(int argc, char** argv) {
                 ctx.decided = false;
                 ctx.suppress = false;
                 ctx.pending.clear();
+                ctx.tail.clear();
                 dubhe_stats st2{};
                 if (!t2.empty())
                     dubhe_generate(g.engine, t2.data(), (int32_t)t2.size(), &sp, on_piece, nullptr,

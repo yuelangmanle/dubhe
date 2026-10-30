@@ -222,6 +222,20 @@ int dubhe_mm_caps(dubhe_engine* e) {
     return c;
 }
 
+void dubhe_unload_mmproj(dubhe_engine* e) {
+    if (!e) return;
+    // 两个塔一起卸。调用方是"换模型"这一件事，没有只换一半的语义。
+    std::lock_guard<std::mutex> lock(e->mu);
+    e->mmproj.reset();
+    e->audio_mm.reset();
+}
+
+int dubhe_mm_dim(dubhe_engine* e) {
+    if (!e) return 0;
+    std::lock_guard<std::mutex> lock(e->mu);
+    return e->mmproj ? e->mmproj->config().out_dim : 0;
+}
+
 
 // 预处理像素上限。视觉塔跑在 **CPU** 上（mmproj 走 mm_math，不走 Metal），
 // 耗时随 patch 数近似平方增长。实测 LFM3-VL-2B（mmproj Q8_0，1024 边长）：
