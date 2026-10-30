@@ -222,6 +222,41 @@ int dubhe_mm_caps(dubhe_engine* e) {
     return c;
 }
 
+
+// 预处理像素上限。视觉塔跑在 **CPU** 上（mmproj 走 mm_math，不走 Metal），
+// 耗时随 patch 数近似平方增长。实测 LFM3-VL-2B（mmproj Q8_0，1024 边长）：
+//
+//   512²  → 192 token   约  5 s
+//   768²  → 588 token   约 23 s
+//   1024² → 1045 token  约 75 s
+//
+// mmproj 自己带的 max_pixels 是 16.7M（4096²），等于没有上限 —— 一张普通
+// 手机照片就能让用户等一分多钟。所以在这里补一道默认上限，压到 512²（约
+// 5 s）：聊天场景下看清"图里是什么"够用。要看细节/读小字，用
+// DUBHE_MM_MAX_PIXELS 调大，代价按上面的曲线估。
+static int mm_max_pixels() {
+    static const int v = []() {
+        const char* s = getenv("DUBHE_MM_MAX_PIXELS");
+        const int x = s ? atoi(s) : 0;
+        return x > 0 ? x : 512 * 512;
+    }();
+    return v;
+}
+
+// 在 smart_resize 之后再压一道：保持长宽比，两边重新对齐到 patch*merge。
+static void clamp_pixels(int patch, int merge, int cap, int* oh, int* ow) {
+    const int64_t px = (int64_t)(*oh) * (*ow);
+    if (cap <= 0 || px <= (int64_t)cap) return;
+    const int factor = (patch > 0 ? patch : 1) * (merge > 0 ? merge : 1);
+    const double beta = std::sqrt((double)px / (double)cap);
+    int nh = (int)((double)*oh / beta) / factor * factor;
+    int nw = (int)((double)*ow / beta) / factor * factor;
+    if (nh < factor) nh = factor;
+    if (nw < factor) nw = factor;
+    *oh = nh;
+    *ow = nw;
+}
+
 int dubhe_encode_image(dubhe_engine* e, const char* image_path, float** embeds,
                        int32_t* n_tokens, int32_t* dim) {
     if (!e || !image_path || !embeds || !n_tokens || !dim) return DUBHE_ERR_INVALID_ARG;
@@ -237,6 +272,7 @@ int dubhe_encode_image(dubhe_engine* e, const char* image_path, float** embeds,
     const auto& c = e->mmproj->config();
     int oh = 0, ow = 0;
     e->mmproj->smart_resize(h, w, &oh, &ow);
+    clamp_pixels(c.patch, c.merge, std::min(mm_max_pixels(), c.max_pixels), &oh, &ow);
     std::vector<uint8_t> resized((size_t)ow * (size_t)oh * 3);
     resize_bicubic(rgb.data(), w, h, resized.data(), ow, oh);
 
@@ -330,6 +366,7 @@ int dubhe_encode_video(dubhe_engine* e, const char* video_path, double fps, int3
     const auto& c = e->mmproj->config();
     int oh = 0, ow = 0;
     e->mmproj->smart_resize(h, w, &oh, &ow);
+    clamp_pixels(c.patch, c.merge, std::min(mm_max_pixels(), c.max_pixels), &oh, &ow);
     const int gh = oh / c.patch, gw = ow / c.patch;
     const int64_t np = (int64_t)gh * gw;
     const int64_t nt_step = np / (c.merge * c.merge);
