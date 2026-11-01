@@ -6,6 +6,62 @@
 
 ---
 
+## [0.14.0] · 2026-11-01 · 工具调用一直不通，原来是四层错叠在一起
+
+### 修复
+
+- **解码器把 USER_DEFINED 特殊 token 当噪声丢了**。`is_special()` 同时覆盖
+  CONTROL(type 3) 和 USER_DEFINED(type 4)，而 `<tool_call>`、`<function=`、
+  `<parameter=`、`<think>`、`<tool_response>` 在 LFM3 词表里全是 type 4。
+  模型完整吐出来的工具调用被一段段剔掉，只剩
+  `read_file>\npath>\n.gitignore` —— 看着像模型不会用工具，其实是解码器
+  在吃它。改成只丢 CONTROL（llama.cpp 的约定：CONTROL 是结构标记，
+  USER_DEFINED 是内容）。编码仍然两种都整段匹配。
+
+- **工具调用格式教错了**。LFM3 的模板输出
+  `<tool_call>\n<function=read_file>\n<parameter=path>\nv\n</parameter>...`，
+  不是 JSON。原来给所有模型灌同一段 JSON 说明，模型照着写就产出半 JSON
+  半 XML 的残片。现在按模型自带模板分两套。
+
+- **工具返回的标记不对**。Qwen2.5 和 LFM3 的模板都用 `<tool_response>`，
+  我们发 `<tool_result>`。模型不认这个块是结果，把同一个工具再要一遍。
+  启动和换模型时读 GGUF 的 `tokenizer.chat_template` 来认标记。
+
+- **思考块默认开着**。LFM3 模板 `enable_thinking` 默认 true，生成提示是
+  `<|im_start|>assistant\n<think>`，模型把整段推理写进正文。改走空块
+  `<think></think>`；历史里的助手轮也补空块。
+
+- **传 `role:"tool"` 的请求会再执行一遍工具**。客户端自己跑循环时服务端
+  不该插手 —— `write_file` / `shell` 是真副作用。现在只把 `tool_calls`
+  报回去，并按协议发 `delta.tool_calls`。
+
+- **第二轮正文被抑制逻辑整段吞掉**，界面显示"已完成 · 0 tokens"。
+  抑制的前提是"后面还有一轮会说人话"，现在只有确实有人接手时才抑制。
+
+### 新增
+
+- 工具循环上限 2 轮 + 同参数重复检测，到顶时说一句人话而不是把原始 JSON
+  摆给用户。
+- `DUBHE_DUMP_PROMPT=1`：拼出来的 prompt 直接打到 stderr。这一轮的四个
+  问题全靠它确认。
+- `tools/toolconv.py`：工具调用收敛测试，判据是服务端发了几次
+  `tool_result`（不是回复里有没有关键词 —— 模型编一段也能骗过关键词）。
+
+### 变更
+
+- 前端工具说明默认关闭，并做 localStorage 迁移（旧默认值写进了存储，
+  光改默认值救不了老用户）。Agent 视图改成单次开启，不写进设置。
+- Agent 视图说明文案：原来那句"2B 级模型工具调用不可靠"已经不成立。
+
+### 基准
+
+| 模型 | 修复前 | 修复后 |
+|---|---|---|
+| LFM3-1.7B-Q4_K_M | 0 次调用，输出残片 | 1 次调用，读到真实内容，3/3 |
+| Qwen2.5-0.5B | 重复调用，永不收敛 | 1 次调用收敛 |
+
+---
+
 ## [0.13.2] · 2026-10-31 · 换模型不换塔，图片被静默喂给不认识的模型
 
 ### 修复
