@@ -544,6 +544,13 @@ int dubhe_generate(dubhe_engine* e,
     // 从 start 开始：前面 start 个 token 的 KV 已经算好了，不重算。
     {
         const int nb = std::max(1, e->model.batch_size());
+        if (std::getenv("DUBHE_KV_DEBUG")) {
+            static bool once = false;
+            if (!once) {
+                once = true;
+                std::fprintf(stderr, "[dubhe] prefill 批大小=%d\n", nb);
+            }
+        }
         for (int32_t i = start; i < n_prompt; ) {
             const int take = std::min<int>(nb, n_prompt - i);
             if (!e->model.forward_batch(prompt + i, take, i, logits.data(), &err)) {
