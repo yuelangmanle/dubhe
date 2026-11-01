@@ -38,6 +38,8 @@ using namespace mm;   // 共用的量化 matmul / NEON 点积 / norm，见 mm_ma
 
 // ---------------------------------------------------------------- 加载
 
+MmProj::~MmProj() { vit_gpu_release(); }
+
 bool MmProj::load(const char* path, std::string* err) {
     if (!f_.open(path, err)) return false;
     auto& c = cfg_;
@@ -127,6 +129,10 @@ bool MmProj::load(const char* path, std::string* err) {
         else if (L.conv_in.ok()) c.is_attn[(size_t)i] = 0;
         else { if (err) *err = "第 " + std::to_string(i) + " 层既无 attn_q 也无 conv2d_in_proj"; return false; }
     }
+
+    // 把 mmap 登记给视觉塔的 GPU matmul。很轻（不建设备、不编着色器），
+    // 真正的初始化推迟到第一次 matmul —— 纯文本场景不该为视觉塔付这笔钱。
+    vit_bind(f_.mapping(), f_.file_size());
 
     loaded_ = true;
     return true;
@@ -247,6 +253,30 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
     std::vector<float> wbuf, y((size_t)(N * std::max<int64_t>(D, c.ffn)));
     std::vector<float> xn;
 
+    // ---- 每层的临时缓冲：**在循环外声明一次**
+    //
+    // 原来这些都写在 14 层循环体内（`std::vector<float> kt(KV*N*HD)` 之类），
+    // 一层合计约 50 MB：分配 + 零初始化 + 首次触页。14 层就是 ~700 MB 的
+    // 无谓搬运 —— 把 matmul 搬到 GPU 之后，这反而成了最大的单项开销
+    // （GPU 那版 1875 ms 里有 767 ms 在 matmul 之外）。
+    //
+    // 这些都是"整个缓冲区会被完全覆盖"的用途，所以只 resize（首次会零初始化，
+    // 之后复用）就够了，不需要每次 assign 清零。
+    std::vector<float> wqn, wkn;                                   // 每 head 的 QK norm
+    std::vector<float> kt, vt, o;                                  // 注意力转置 / 输出
+    std::vector<float> wc, g3, grid, conv, back;                   // 深度卷积那一路
+    std::vector<float> fg, fu;                                     // FFN 门控
+
+    kt.resize((size_t)(KV * N * HD));
+    vt.resize((size_t)(KV * N * HD));
+    o.resize((size_t)(N * H * HD));
+    g3.resize((size_t)(N * 3 * D));
+    grid.resize((size_t)(N * D));
+    conv.resize((size_t)(N * D));
+    back.resize((size_t)(N * D));
+    fg.resize((size_t)(N * c.ffn));
+    fu.resize((size_t)(N * c.ffn));
+
     // token 序号 → (blk_y, blk_x, sub)。merge-block 序，sub = dy·M + dx。
     auto coords = [&](int64_t n, int* by, int* bx, int* sub) {
         const int64_t blk = n / (M * M);
@@ -320,7 +350,7 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
         for (int64_t n = 0; n < N; n++) rmsnorm(xn.data() + n * D, D, wbuf.data(), c.norm_eps);
 
         if (c.is_attn[(size_t)li]) {
-            std::vector<float> wqn, wkn;
+            wqn.clear(); wkn.clear();
             if (!deq_all(L.q_norm, wqn, err) || !deq_all(L.k_norm, wkn, err)) return false;
 
             matmul_qt(L.q, D, qdim, xn.data(), N, q.data());
@@ -357,7 +387,6 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
             //  2) 按 head 并行，每个线程用自己的 softmax 暂存。
             const float scale = 1.0f / std::sqrt((float)HD);
             const int group = H / KV;
-            std::vector<float> kt((size_t)(KV * N * HD)), vt((size_t)(KV * N * HD));
             for (int kvh = 0; kvh < KV; kvh++)
                 for (int64_t j = 0; j < N; j++) {
                     std::memcpy(kt.data() + ((size_t)kvh * N + j) * HD,
@@ -365,7 +394,6 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
                     std::memcpy(vt.data() + ((size_t)kvh * N + j) * HD,
                                 v.data() + j * kdim + kvh * HD, sizeof(float) * HD);
                 }
-            std::vector<float> o((size_t)(N * qdim));
             auto head_body = [&](int h0, int h1) {
                 std::vector<float> sc((size_t)N);
                 for (int hh = h0; hh < h1; hh++) {
@@ -408,11 +436,10 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
             matmul_qt(L.o, qdim, D, o.data(), N, y.data());
         } else {
             // 门控 2D 深度卷积
-            std::vector<float> wc;
+            wc.clear();
             if (!deq_all(L.conv_spatial, wc, err)) return false;   // 每层只有 9×1024，随便反量化
 
             const int64_t c3 = 3 * D;
-            std::vector<float> g3((size_t)(N * c3));
             matmul_qt(L.conv_in, D, c3, xn.data(), N, g3.data());
 
             // 栅格化：[token][merge²][C] → [C][gh][gw]
@@ -421,7 +448,6 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
             //   这里曾经漏掉那一段：数值不会崩、也不会报错，只是整体质量悄悄变差。
             // grid / conv 都是 D×N 个 float（1600 patch 时各 6.5 MB），会被完整
             // 覆盖，所以用不初始化的裸数组 —— std::vector 的零初始化在这里是纯浪费。
-            auto grid = std::make_unique<float[]>((size_t)(D * N));
             for (int64_t n = 0; n < N; n++) {
                 int by, bx, sub;
                 coords(n, &by, &bx, &sub);
@@ -436,11 +462,10 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
 
             // 3×3 depthwise，padding 1
             const int K = 3, pad = 1;
-            auto conv = std::make_unique<float[]>((size_t)(D * N));
             for (int ch = 0; ch < D; ch++) {
                 const float* kern = wc.data() + (size_t)ch * K * K;
-                const float* src = grid.get() + (size_t)ch * N;
-                float* dst = conv.get() + (size_t)ch * N;
+                const float* src = grid.data() + (size_t)ch * N;
+                float* dst = conv.data() + (size_t)ch * N;
                 for (int yy = 0; yy < gh; yy++)
                     for (int xx = 0; xx < gw; xx++) {
                         float s = 0.0f;
@@ -459,7 +484,6 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
 
             // 摊回 merge-block 序，乘**输出门**（in_proj 的第 2 段），再过 out_proj。
             // HF 原式：return self.out_proj(C * conv_output)，C 就是中间那段。
-            std::vector<float> back((size_t)(N * D));
             for (int64_t n = 0; n < N; n++) {
                 int by, bx, sub;
                 coords(n, &by, &bx, &sub);
@@ -479,7 +503,6 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
         if (!deq_all(L.ln2, wbuf, err)) return false;
         for (int64_t n = 0; n < N; n++) rmsnorm(xn.data() + n * D, D, wbuf.data(), c.norm_eps);
 
-        std::vector<float> fg((size_t)(N * c.ffn)), fu((size_t)(N * c.ffn));
         matmul_qt(L.ffn_gate, D, c.ffn, xn.data(), N, fg.data());
         matmul_qt(L.ffn_up, D, c.ffn, xn.data(), N, fu.data());
         for (int64_t i = 0; i < N * c.ffn; i++) fg[(size_t)i] = silu(fg[(size_t)i]) * fu[(size_t)i];

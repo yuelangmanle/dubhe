@@ -75,7 +75,9 @@ struct MmProjLayer {
 class MmProj {
 public:
     MmProj() = default;
-    ~MmProj() = default;
+    // 卸载时必须通知视觉塔的 GPU 模块：它的权重缓冲是包在 f_ 的 mmap 上的，
+    // 文件一关这块内存就没了，留着指针下次会踩到野地址。
+    ~MmProj();
     MmProj(const MmProj&) = delete;
     MmProj& operator=(const MmProj&) = delete;
 

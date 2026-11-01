@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "mmproj.h"   // MmTensor
+#include "vit_gpu.h"  // matmul_qt 的 GPU 快路
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -109,6 +110,20 @@ inline void matmul_qt(const MmTensor& W, int64_t n_in, int64_t n_out, const floa
     const int64_t t0 = tr.on ? now_ns() : 0;
     const int64_t xs = x_stride > 0 ? x_stride : n_in;
     const size_t  rb = type_row_bytes(W.type, (int64_t)n_in);
+
+    // GPU 快路：视觉塔 5 s 的耗时里 95% 在这里，而 CPU 侧已经贴着 NEON 上限
+    // （6 核 62 GFLOP/s），只有换硬件才提得上去。返回 false 的每一档
+    // （类型不支持、行宽不是 256 的倍数、带跨度的 patchify、非 Apple 平台）
+    // 都原样落回下面的 CPU 路径。
+    if (vit_gemm_gpu(W.data, W.type, n_in, n_out, X, n_tok, Y, xs)) {
+        if (tr.on) {
+            tr.ns_mm.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+            tr.n_calls.fetch_add(1, std::memory_order_relaxed);
+            tr.n_elems.fetch_add(n_out * n_tok, std::memory_order_relaxed);
+        }
+        return;
+    }
+
     auto body = [&](int64_t o0, int64_t o1) {
         std::vector<float> row((size_t)n_in);
         for (int64_t o = o0; o < o1; o++) {

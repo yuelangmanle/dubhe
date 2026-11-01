@@ -23,7 +23,8 @@ ENGINE_SRCS := engine/src/gguf.cpp engine/src/quant.cpp engine/src/quant_q8.cpp 
 # Metal 后端只在 Apple 平台编译。着色器在运行时编译（newLibraryWithSource:），
 # 所以不需要离线 Metal Toolchain。
 ifeq ($(PLATFORM),Darwin)
-  ENGINE_SRCS += engine/src/metal.mm engine/src/image.mm engine/src/audiofile.mm
+  ENGINE_SRCS += engine/src/metal.mm engine/src/image.mm engine/src/audiofile.mm \
+                 engine/src/vit_gpu.mm
   OBJCXXFLAGS := $(CXXFLAGS) -fobjc-arc
   LDFLAGS     := -framework Metal -framework Foundation -framework ImageIO \
                  -framework CoreGraphics -framework CoreFoundation \
@@ -59,10 +60,12 @@ else ifeq ($(PLATFORM),android)
   CXXFLAGS += --target=$(ANDROID_TARGET) $(ANDROID_ARCH_FLAGS) -fPIC -fno-omit-frame-pointer
   # 静态链 libc++：Android 系统里没有 libc++.so，动态链会装不上
   LDFLAGS  := --target=$(ANDROID_TARGET) -static-libstdc++ -Wl,--gc-sections -lm
-  ENGINE_SRCS += engine/src/metal_stub.cpp engine/src/image_stub.cpp engine/src/audiofile_stub.cpp
+  ENGINE_SRCS += engine/src/metal_stub.cpp engine/src/image_stub.cpp engine/src/audiofile_stub.cpp \
+                 engine/src/vit_gpu_stub.cpp
   BUILD := build-android-$(ANDROID_ABI)
 else
-  ENGINE_SRCS += engine/src/metal_stub.cpp engine/src/image_stub.cpp engine/src/audiofile_stub.cpp
+  ENGINE_SRCS += engine/src/metal_stub.cpp engine/src/image_stub.cpp engine/src/audiofile_stub.cpp \
+                 engine/src/vit_gpu_stub.cpp
   LDFLAGS     :=
 endif
 
