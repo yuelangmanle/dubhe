@@ -212,6 +212,15 @@ public:
     bool    is_special(int32_t id) const {
         return id >= 0 && id < (int32_t)special_flag_.size() && special_flag_[(size_t)id] != 0;
     }
+    // 只有 CONTROL 类（type 3）才是真正的"结构标记"，必须从输出里剔掉。
+    //
+    // USER_DEFINED 类（type 4）是内容：<tool_call>、<function=、<parameter=、
+    // <think>、<tool_response> 都在这一类里。按 is_special 一刀切会把它们
+    // 全丢掉 —— 模型明明吐了完整的工具调用，到用户手里只剩
+    // "read_file>\npath>\n.gitignore" 这种残片，看着像解码器坏了。
+    bool    is_control(int32_t id) const {
+        return id >= 0 && id < (int32_t)control_flag_.size() && control_flag_[(size_t)id] != 0;
+    }
     bool    is_chatml() const { return im_start_ >= 0 && im_end_ >= 0; }
     const std::string& chat_template() const { return chat_template_; }
 
@@ -224,7 +233,8 @@ private:
     std::unordered_map<std::string, int32_t> token_to_id_;
     std::map<std::pair<std::string, std::string>, int> merges_;
     std::vector<int32_t> specials_;
-    std::vector<uint8_t> special_flag_;
+    std::vector<uint8_t> special_flag_;   // type 3 + 4：编码时要整段匹配
+    std::vector<uint8_t> control_flag_;   // 只有 type 3：解码时不该出现
     std::string byte_to_char_[256];
     std::unordered_map<std::string, uint8_t> char_to_byte_;
     std::string chat_template_;

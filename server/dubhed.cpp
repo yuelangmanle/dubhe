@@ -596,16 +596,57 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
     return r;
 }
 
-const char* kToolPrompt =
-    "\n\n你可以调用以下工具来完成任务。需要调用时，输出一个 JSON 块，格式严格如下：\n"
-    "<tool_call>{\"name\":\"工具名\",\"arguments\":{...}}</tool_call>\n"
-    "一次只调用一个工具。工具结果会以 <tool_result> 的形式返回给你，然后你继续回答。\n"
-    "可用工具：\n"
-    "- read_file(path): 读取文本文件\n"
-    "- list_dir(path): 列出目录内容\n"
-    "- write_file(path, content): 写入文件\n"
-    "- shell(command): 执行 shell 命令（可能被禁用）\n"
-    "不需要工具时直接回答，不要输出 tool_call。";
+// 工具说明。
+//
+// 写法上有一条踩过的教训：**不要把工具结果的格式教给模型**。
+// 原来这里有一句"工具结果会以 <tool_result> 的形式返回给你"，结果 2B 级的
+// 模型（LFM3-VL-2B）学会了这个标签就直接用它编答案 —— 实测 5 个问题里
+// 有 2 个输出 <tool_result>{"name":"read_file",...}</tool_result>，把"调用"
+// 写进了"结果"标签，服务端一次工具都没执行，用户却看到一段像是真读到了
+// 文件的内容（问 README.md 首行，它编出"# 我的家常菜谱"）。
+//
+// 所以现在只说"怎么调用"，并明确禁止它自己输出 <tool_result>。
+// 工具返回块用的标记，跟着模型模板走。Qwen2.5 和 LFM3 都是 <tool_response>，
+// 早期通用写法是 <tool_result>；用错了模型不认这是结果，会把同一个工具再要一遍。
+static std::string g_tool_open = "<tool_result>";
+static std::string g_tool_close = "</tool_result>";
+
+// 工具调用格式有两种，各家模板不一样：
+//   0 = JSON      <tool_call>{"name":…,"arguments":{…}}</tool_call>   （Qwen 系）
+//   1 = LFM3      <tool_call>\n<function=name>\n<parameter=k>\nv\n</parameter>\n
+//                 </function>\n</tool_call>
+//
+// 这个必须跟模型自己的模板一致。教错了不是"效果差一点"——LFM3 被教成 JSON
+// 之后输出的是 "read_file>\npath>\n.gitignore" 这种尖括号全丢的残片，
+// 一次都调不到工具，而且看起来像解码器坏了。
+static int g_tool_fmt = 0;
+
+std::string tool_prompt() {
+    std::string s =
+        "\n\n需要读文件、列目录、写文件或执行命令时，调用工具。格式严格如下：\n";
+    if (g_tool_fmt == 1) {
+        s +=
+            "<tool_call>\n<function=工具名>\n<parameter=参数名>\n参数值\n</parameter>\n"
+            "</function>\n</tool_call>\n"
+            "例如读取 a.txt，你这一轮就只输出：\n"
+            "<tool_call>\n<function=read_file>\n<parameter=path>\na.txt\n</parameter>\n"
+            "</function>\n</tool_call>\n";
+    } else {
+        s +=
+            "<tool_call>{\"name\":\"工具名\",\"arguments\":{...}}</tool_call>\n"
+            "例如读取 a.txt，你这一轮就只输出：\n"
+            "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}</tool_call>\n";
+    }
+    s +=
+        "一次只调用一个工具。可用工具：\n"
+        "- read_file(path): 读取文本文件\n"
+        "- list_dir(path): 列出目录内容\n"
+        "- write_file(path, content): 写入文件\n"
+        "- shell(command): 执行 shell 命令（可能被禁用）\n"
+        "不需要工具时直接回答。不要描述你打算怎么做，直接输出工具调用。"
+        "不要自己写工具返回块（" + g_tool_open + "），那是系统给你的，不是你输出的。";
+    return s;
+}
 
 // 从 p 开始截取第一个配平的 {...}（考虑字符串内的括号与转义）
 bool first_json_object(const std::string& text, size_t p, std::string* out, size_t* end) {
@@ -633,10 +674,69 @@ bool first_json_object(const std::string& text, size_t p, std::string* out, size
     return false;
 }
 
+// LFM3 系的工具调用格式（见模板里的 render_tool_calls）：
+//
+//   <tool_call>
+//   <function=read_file>
+//   <parameter=path>
+//   .gitignore
+//   </parameter>
+//   </function>
+//   </tool_call>
+//
+// 不是 JSON。少了这一条分支，LFM3 的调用永远解析不出来 —— 原文被抑制逻辑
+// 藏起来，用户看到的就是"已完成 · 0 tokens"加一片空白。
+bool extract_lfm_tool_call(const std::string& text, std::string* name, json::Value* args) {
+    const size_t a = text.find("<tool_call>");
+    if (a == std::string::npos) return false;
+    size_t b = text.find("</tool_call>", a);
+    if (b == std::string::npos) b = text.size();   // 截断在 max_tokens 上也认
+    const std::string body = text.substr(a, b - a);
+
+    const size_t f = body.find("<function=");
+    if (f == std::string::npos) return false;
+    const size_t fe = body.find('>', f);
+    if (fe == std::string::npos) return false;
+    *name = body.substr(f + 10, fe - f - 10);
+    while (!name->empty() && (name->back() == ' ' || name->back() == '\n' || name->back() == '\r'))
+        name->pop_back();
+    if (name->empty()) return false;
+
+    *args = json::Value::make_obj();
+    size_t p = fe;
+    while (true) {
+        const size_t k = body.find("<parameter=", p);
+        if (k == std::string::npos) break;
+        const size_t ke = body.find('>', k);
+        if (ke == std::string::npos) break;
+        const std::string key = body.substr(k + 11, ke - k - 11);
+        size_t vs = ke + 1;
+        while (vs < body.size() && (body[vs] == '\n' || body[vs] == '\r')) vs++;
+        const size_t ve = body.find("</parameter>", vs);
+        if (ve == std::string::npos) break;
+        std::string val = body.substr(vs, ve - vs);
+        while (!val.empty() &&
+               (val.back() == '\n' || val.back() == '\r' || val.back() == ' ')) val.pop_back();
+        // 参数值可能是数字/布尔/对象，先按 JSON 解；解不了就当字符串
+        json::Value pv;
+        if (!val.empty() && json::parse(val, &pv)) args->set(key, pv);
+        else args->set(key, json::Value::make_str(val));
+        p = ve + 12;
+    }
+    return true;
+}
+
 // 从文本中提取第一个工具调用。
 // 两种形态都接受：<tool_call>{...}</tool_call> 和裸的 {"name":...}
 bool extract_tool_call(const std::string& text, std::string* name, json::Value* args,
                        size_t* end_pos) {
+    // 模型模板是 <function=> 风格时优先按它解析 —— 同一个模型不会两种混用，
+    // 但两种都试一遍没有代价，还能兜住模板判断失误的情况。
+    if (extract_lfm_tool_call(text, name, args)) {
+        const size_t c = text.find("</tool_call>");
+        if (end_pos) *end_pos = (c == std::string::npos) ? text.size() : c + 12;
+        return true;
+    }
     const std::string open = "<tool_call>";
     const std::string close = "</tool_call>";
     size_t a = text.find(open);
@@ -665,6 +765,21 @@ bool extract_tool_call(const std::string& text, std::string* name, json::Value* 
     if (auto* a2 = v.get("arguments")) *args = *a2;
     if (end_pos) *end_pos = obj_end;
     return true;
+}
+
+// 请求里已经带了工具结果（role:"tool"）→ 说明调用方在按 OpenAI 协议自己
+// 跑循环：模型出 tool_calls，它执行，再把结果发回来。
+//
+// 这种情况下服务端**不能再执行一遍**。读文件重跑一次只是浪费，但
+// write_file / shell 是有副作用的 —— 客户端写一次、服务端再写一次，
+// 表现就是"文件里内容重复了两遍"，而且看日志两边都很正常。
+bool has_tool_result(const json::Value& messages) {
+    if (messages.type != json::Value::ARR) return false;
+    for (const auto& m : messages.arr) {
+        if (m.type != json::Value::OBJ) continue;
+        if (m.s("role") == "tool") return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------- ChatML
@@ -861,6 +976,141 @@ void prepend_bos(dubhe_engine* e, std::vector<int32_t>* toks) {
         toks->insert(toks->begin(), id);
 }
 
+// ---------------------------------------------------------------- GGUF 元数据
+//
+// 只读 KV 段，遇到张量信息之前就停 —— 够拿到 tokenizer.chat_template。
+//
+// 为什么要读它：各家模板给"工具返回"用的标记不一样，用错了模型就不认这是
+// 结果，于是把同一个工具再要一遍。
+//   Qwen2.5    <|im_start|>user\n<tool_response>…</tool_response><|im_end|>
+//   通用写法    <|im_start|>user\n<tool_result>…</tool_result><|im_end|>
+// 实测 Qwen2.5-0.5B：发 <tool_result> 时它第二轮改口要 "/.gitignore"（绝对
+// 路径），第三轮再要一次，永远收敛不了；换成它模板里的 <tool_response> 之后
+// 一次就答上了。
+struct GgufReader {
+    FILE* f = nullptr;
+    bool v3 = true;   // GGUF v3 起字符串长度是 u64，v2 是 u32
+
+    bool rd(void* p, size_t n) { return std::fread(p, 1, n, f) == n; }
+    bool str(std::string* out) {
+        uint64_t n = 0;
+        if (v3) {
+            if (!rd(&n, 8)) return false;
+        } else {
+            uint32_t n32 = 0;
+            if (!rd(&n32, 4)) return false;
+            n = n32;
+        }
+        if (n > (1u << 22)) return false;   // 元数据字符串不该这么大
+        out->resize((size_t)n);
+        return n == 0 || rd(&(*out)[0], (size_t)n);
+    }
+    bool skip(uint32_t t) {
+        switch (t) {
+            case 0: case 1: case 7: return fseek(f, 1, SEEK_CUR) == 0;
+            case 2: case 3: return fseek(f, 2, SEEK_CUR) == 0;
+            case 4: case 5: case 6: return fseek(f, 4, SEEK_CUR) == 0;
+            case 10: case 11: case 12: return fseek(f, 8, SEEK_CUR) == 0;
+            case 8: { std::string s; return str(&s); }
+            case 9: {   // 数组：元素类型 + 个数 + 元素
+                uint32_t et = 0;
+                uint64_t n = 0;
+                if (!rd(&et, 4)) return false;
+                if (v3) { if (!rd(&n, 8)) return false; }
+                else { uint32_t n32 = 0; if (!rd(&n32, 4)) return false; n = n32; }
+                size_t sz = 0;
+                switch (et) {
+                    case 0: case 1: case 7: sz = 1; break;
+                    case 2: case 3: sz = 2; break;
+                    case 4: case 5: case 6: sz = 4; break;
+                    case 10: case 11: case 12: sz = 8; break;
+                    default: break;
+                }
+                if (sz) return fseek(f, (long)(sz * n), SEEK_CUR) == 0;
+                for (uint64_t i = 0; i < n; i++) if (!skip(et)) return false;
+                return true;
+            }
+            default: return false;
+        }
+    }
+};
+
+std::string gguf_meta_string(const std::string& path, const std::string& key) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return {};
+    std::string out;
+    char magic[4] = {0};
+    uint32_t ver = 0;
+    uint64_t nt = 0, nkv = 0;
+    GgufReader r;
+    r.f = f;
+    if (std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "GGUF", 4) != 0) {
+        std::fclose(f);
+        return {};
+    }
+    if (!r.rd(&ver, 4) || !r.rd(&nt, 8) || !r.rd(&nkv, 8)) {
+        std::fclose(f);
+        return {};
+    }
+    if (ver < 2 || ver > 3) {
+        std::fclose(f);
+        return {};
+    }
+    r.v3 = (ver >= 3);
+    for (uint64_t i = 0; i < nkv; i++) {
+        std::string k;
+        uint32_t t = 0;
+        if (!r.str(&k)) break;
+        if (!r.rd(&t, 4)) break;
+        if (k == key && t == 8) {
+            r.str(&out);
+            break;
+        }
+        if (!r.skip(t)) break;
+    }
+    std::fclose(f);
+    return out;
+}
+
+// 当前模型的"工具返回"标记。换模型时跟着换 —— 模板变了标记就得变。
+// （g_tool_open / g_tool_close 在 tool_prompt 之前就声明了。）
+
+// 思考块。LFM3 的模板里有 enable_thinking，默认 true：
+//   <|im_start|>assistant\n<think>      ← 想了再答
+//   <|im_start|>assistant\n<think></think>  ← 直接答
+// 开着的时候模型会把整段推理写进正文，界面上看到的就是
+// "用户要求我使用 read_file 工具……我需要先调用……"，答案被埋在最后。
+// 对话产品要的是答案，所以统一走"不想"那条路。
+static int g_think_style = 0;   // 0 = 模板没有思考标记；1 = LFM3 系
+
+void refresh_model_markers(const std::string& model_path) {
+    g_tool_open = "<tool_result>";
+    g_tool_close = "</tool_result>";
+    g_think_style = 0;
+    g_tool_fmt = 0;
+    const std::string tpl = gguf_meta_string(model_path, "tokenizer.chat_template");
+    if (tpl.empty()) {
+        std::fprintf(stderr, "  模板: 模型没带 chat_template，用通用写法（%s）\n", g_tool_open.c_str());
+        return;
+    }
+    if (tpl.find("<tool_response>") != std::string::npos) {
+        g_tool_open = "<tool_response>";
+        g_tool_close = "</tool_response>";
+    } else if (tpl.find("<tool_result>") != std::string::npos) {
+        g_tool_open = "<tool_result>";
+        g_tool_close = "</tool_result>";
+    }
+    if (tpl.find("enable_thinking") != std::string::npos &&
+        tpl.find("<think>") != std::string::npos) {
+        g_think_style = 1;
+    }
+    // <function=name> 是 LFM3 系 render_tool_calls 的写法，和 JSON 完全不同
+    if (tpl.find("<function=") != std::string::npos) g_tool_fmt = 1;
+    std::fprintf(stderr, "  模板: 返回 %s · 调用 %s · 思考块 %s\n", g_tool_open.c_str(),
+                 g_tool_fmt ? "<function=> 风格" : "JSON 风格",
+                 g_think_style ? "有（已关闭）" : "无");
+}
+
 std::string build_prompt(const json::Value& messages, bool chatml, bool with_tools) {
     std::string p;
     if (!chatml) {
@@ -880,20 +1130,30 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
         std::string content = m.s("content");
         if (role == "system") {
             has_system = true;
-            if (with_tools) content += kToolPrompt;
+            if (with_tools) content += tool_prompt();
             p += "<|im_start|>system\n" + content + "<|im_end|>\n";
         } else if (role == "user") {
             p += "<|im_start|>user\n" + content + "<|im_end|>\n";
         } else if (role == "assistant") {
+            // 历史里的助手轮也要带上"空思考块"。模板在 keep_thinking 为假时
+            // 会补一个，我们自己拼 prompt 就得手动补 —— 少了它，模型看到
+            // 自己上一轮"没有思考块"，会以为格式错了，接着把推理写出来。
+            if (g_think_style && content.rfind("<think>", 0) != 0) content = "<think></think>" + content;
             p += "<|im_start|>assistant\n" + content + "<|im_end|>\n";
         } else if (role == "tool") {
-            p += "<|im_start|>user\n<tool_result>" + content + "</tool_result><|im_end|>\n";
+            // 光把结果摆上去，小模型会以为"我还没调用"，于是再要一次同样的工具，
+            // 循环永远不收敛。明确说一句"已经执行完了，直接用结果回答"，
+            // 这一句能把大部分原地打转掐掉。
+            p += "<|im_start|>user\n" + g_tool_open + content + g_tool_close +
+                 "\n工具已经执行完毕，上面就是返回结果。"
+                 "请直接基于这个结果回答，不要再调用同一个工具。<|im_end|>\n";
         }
     }
     if (!has_system && with_tools) {
-        p = std::string("<|im_start|>system\n") + kToolPrompt + "<|im_end|>\n" + p;
+        p = std::string("<|im_start|>system\n") + tool_prompt() + "<|im_end|>\n" + p;
     }
     p += "<|im_start|>assistant\n";
+    if (g_think_style) p += "<think></think>";   // 空块 = 这轮不要思考，直接答
     return p;
 }
 
@@ -996,6 +1256,15 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
         prompt = build_prompt(flat, chatml, with_tools);
     }
 
+    // 拼出来的 prompt 长什么样，是这类"模型不听话"问题里唯一可靠的证据。
+    // 靠猜模板、猜标记会来回改很多轮；打出来看一眼往往一次就定位。
+    if (const char* dump = std::getenv("DUBHE_DUMP_PROMPT")) {
+        if (dump[0] != '0') {
+            std::fprintf(stderr, "\n===== prompt (%zu 字节, chatml=%d tools=%d) =====\n%s\n=====\n",
+                         prompt.size(), (int)chatml, (int)with_tools, prompt.c_str());
+        }
+    }
+
     const int32_t n = dubhe_tokenize(e, prompt.c_str(), 1, nullptr, 0);
     if (n <= 0) { if (err) *err = "分词失败"; return false; }
     toks->assign((size_t)n, 0);
@@ -1073,7 +1342,16 @@ struct StreamCtx {
     // 那样原始 JSON 会先流到用户眼前。所以先攒几个字符再决定要不要抑制。
     bool decided = false;
     bool suppress = false;
+    // 第二轮（带着工具结果的那一轮）是最终回答，不该再被工具判定拦下来。
+    // 实测 2B 模型看到工具结果后会再吐一次 tool_call，抑制逻辑把它整段
+    // 吞掉，用户看到的就是"生成中"转很久然后一片空白 —— 比直接显示
+    // 原始内容难查得多。
+    bool no_suppress = false;
     std::string pending;
+    // 思考块。我们已经在 prompt 里把 enable_thinking 关掉了，这里是兜底：
+    // 万一模型还是写了 <think>…</think>，整段丢掉，别让推理过程占满气泡。
+    bool in_think = false;
+    std::string think_buf;
     // 上一片末尾没凑齐的多字节字符。引擎是按 token 吐字节的，一个汉字
     // （3 字节）经常被切在两个 token 之间；半截字节进了 JSON，浏览器那边
     // 就只能解成 U+FFFD —— 中文回复里随机冒出"均���的"这种方块。
@@ -1110,11 +1388,47 @@ void emit_delta(StreamCtx* x, const std::string& delta) {
     x->first = false;
 }
 
+// 按 OpenAI 的流式协议把工具调用发出去。
+//
+// 外部 SDK（openai-python 之类）只认 delta.tool_calls，不认我们的 dubhe 扩展
+// 事件。少了这一段，客户端会收到 finish_reason=tool_calls，却一条调用都拿不到，
+// 只能干看着 —— 比报错更难查。
+void emit_tool_calls_delta(StreamCtx* x, const std::string& name, const json::Value& args) {
+    std::string s = "data: {\"id\":\"" + *x->id +
+                    "\",\"object\":\"chat.completion.chunk\",\"created\":" +
+                    std::to_string(x->created) +
+                    ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_" +
+                    std::to_string(x->created) + "\",\"type\":\"function\",\"function\":{\"name\":" +
+                    json_escape(name) + ",\"arguments\":" + json_escape(json::dump(args)) +
+                    "}}]},\"finish_reason\":null}]}\n\n";
+    x->c->write_chunk(s);
+}
+
 // 前 16 个字符足以判断"这是不是一段工具调用"
 void on_piece(void* ud, int32_t /*tok*/, const char* piece) {
     auto* x = (StreamCtx*)ud;
     if (!piece) return;
     x->acc->append(piece);
+
+    // 思考块：整段吞掉，不进正文
+    {
+        const std::string pc(piece);
+        if (pc == "<think>") {
+            x->in_think = true;
+            x->think_buf.clear();
+            return;
+        }
+        if (pc == "</think>") {
+            x->in_think = false;
+            x->think_buf.clear();
+            return;
+        }
+        if (x->in_think) {
+            x->think_buf += pc;
+            return;
+        }
+    }
+
     if (x->suppress) return;
 
     // 先和上一片留下的半截字符拼起来，再把末尾凑不齐的部分留住，
@@ -1128,6 +1442,17 @@ void on_piece(void* ud, int32_t /*tok*/, const char* piece) {
         x->tail.clear();
     }
     if (s.empty()) return;   // 这一片整个是半截字符，等下一片
+
+    // 这一轮不该抑制（最后一段回答，或者调用方自己管循环）→ 直接吐。
+    //
+    // 抑制是为了藏住 tool_call 的原始 JSON，前提是"后面还有一轮会说人话"。
+    // 一旦没有下一轮，抑制就等于把整条回复吞掉 —— 界面上只剩
+    // "已完成 · 0 tokens" 和一片空白，比露出 JSON 难查得多。
+    if (x->no_suppress) {
+        x->decided = true;
+        emit_delta(x, s);
+        return;
+    }
 
     if (x->decided) {
         emit_delta(x, s);
@@ -1159,6 +1484,17 @@ void on_piece(void* ud, int32_t /*tok*/, const char* piece) {
 
 // 流结束后把还没吐出去的缓冲补发
 void flush_pending(StreamCtx* x) {
+    // 思考块没闭合（多半是被 max_tokens 截断在中间）。这时候丢弃等于一个字
+    // 都不给，用户看到的是空白气泡 —— 与其这样，不如把它原样吐出来。
+    if (x->in_think) {
+        x->in_think = false;
+        if (!x->think_buf.empty()) {
+            const std::string t = x->think_buf;
+            x->think_buf.clear();
+            x->decided = true;
+            emit_delta(x, t);
+        }
+    }
     if (!x->decided && !x->pending.empty()) {
         const std::string all = x->pending;
         x->pending.clear();
@@ -1439,6 +1775,7 @@ int main(int argc, char** argv) {
                       std::chrono::steady_clock::now() - t0).count();
         g.model_path = model;
         g.model_id = model_id_of(model);
+        refresh_model_markers(model);
         dubhe_model_info mi{};
         dubhe_model_info_get(g.engine, &mi);
         std::fprintf(stderr, "就绪 %.0f ms · %s · %s · %.2fB\n", (double)ms, mi.arch, mi.quant_desc,
@@ -1689,6 +2026,7 @@ int main(int argc, char** argv) {
                 if (dubhe_load_model(g.engine, old.c_str()) == DUBHE_OK) {
                     g.model_path = old;
                     g.model_id = model_id_of(old);
+                    refresh_model_markers(old);
                     std::string tmp = old_mm;
                     size_t p = 0;
                     while (p <= tmp.size() && !tmp.empty()) {
@@ -1742,6 +2080,7 @@ int main(int argc, char** argv) {
                             std::chrono::steady_clock::now() - t0).count();
         g.model_path = full;
         g.model_id = model_id_of(full);
+        refresh_model_markers(full);
         json::Value o = json::Value::make_obj();
         o.set("ok", json::Value::make_bool(true));
         o.set("model", json::Value::make_str(g.model_path));
@@ -2136,59 +2475,154 @@ int main(int argc, char** argv) {
 
         if (stream) {
             c.begin_stream();
-            std::string acc;
-            StreamCtx ctx{&c, &acc, &id, created, true, false, false, {}, {}};
+
+            // 当前这一轮的正文。每轮单独攒：工具调用要从**本轮**输出里找，
+            // 拿整个累积文本去找的话，第一轮的 tool_call 在第二轮还会被再匹配到。
+            std::string rtext;
+            // 逐字段赋值而不是聚合初始化：这个结构体会加字段（tail、no_suppress
+            // 都是后补的），聚合初始化一漏就悄悄错位到相邻字段，编译器只会
+            // 给一句 missing field 警告。
+            StreamCtx ctx{};
+            ctx.c = &c;
+            ctx.acc = &rtext;
+            ctx.id = &id;
+            ctx.created = created;
 
             dubhe_stats st{};
-            dubhe_generate(g.engine, toks.data(), n, &sp, on_piece, nullptr, &ctx, &st);
-            flush_pending(&ctx);
 
-            // 工具调用：一轮
-            std::string tname;
-            json::Value targs;
-            size_t endpos = 0;
-            if (with_tools && extract_tool_call(acc, &tname, &targs, &endpos)) {
-                std::string ev = "data: {\"dubhe\":{\"type\":\"tool_call\",\"name\":" + json_escape(tname) +
-                                 ",\"arguments\":" + json::dump(targs) + "}}\n\n";
-                c.write_chunk(ev);
+            // 调用方自己跑循环时服务端一轮都不执行；否则最多跑两轮工具。
+            //
+            // 上限不是随手定的：2B 级别的模型看到工具结果后经常又吐一次
+            // tool_call（尤其结果里有代码/JSON 时），不设上限会来回打转。
+            // 两轮足够覆盖"读文件→读目录→回答"这种最常见的组合。
+            const bool client_drives = has_tool_result(*msgs);
+            const int max_rounds = client_drives ? 0 : 2;
+            int rounds = 0;
+            std::vector<int32_t> cur = toks;
+            std::string last_sig;      // 上一次执行的工具签名，用来发现原地打转
+            const char* finish = "stop";
+
+            while (!cur.empty()) {
+                rtext.clear();
+                ctx.acc = &rtext;
+                ctx.first = true;
+                ctx.decided = false;
+                ctx.suppress = false;
+                ctx.pending.clear();
+                ctx.tail.clear();
+                ctx.in_think = false;
+                ctx.think_buf.clear();
+                // 有工具说明时才做抑制判定 —— 否则根本没在找 tool_call，
+                // 直接往外吐就是最快的路。
+                ctx.no_suppress = !with_tools;
+
+                dubhe_stats s{};
+                dubhe_generate(g.engine, cur.data(), (int32_t)cur.size(), &sp, on_piece, nullptr,
+                               &ctx, &s);
+                flush_pending(&ctx);
+
+                st.n_generated += s.n_generated;
+                st.decode_tps = s.decode_tps;
+                if (s.n_prompt) st.n_prompt = s.n_prompt;
+
+                if (!with_tools) break;
+
+                std::string tname;
+                json::Value targs;
+                size_t endpos = 0;
+                if (!extract_tool_call(rtext, &tname, &targs, &endpos)) {
+                    // 开头的字符看着像工具调用，原文被藏了，可解析不出来
+                    // （模型少个尖括号、JSON 截断在 max_tokens 上，都很常见）。
+                    // 藏了又没人接手 —— 用户看到的就是"已完成 · 0 tokens"加一片空白。
+                    // 原文吐回去，难看至少能读。
+                    if (ctx.suppress) emit_delta(&ctx, rtext);
+                    break;
+                }
+
+                // 调用方自己在跑循环 → 只把调用报回去，服务端不执行。
+                if (client_drives) {
+                    emit_tool_calls_delta(&ctx, tname, targs);
+                    c.write_chunk("data: {\"dubhe\":{\"type\":\"tool_call\",\"name\":" +
+                                  json_escape(tname) + ",\"arguments\":" + json::dump(targs) +
+                                  "}}\n\n");
+                    finish = "tool_calls";
+                    break;
+                }
+                if (rounds >= max_rounds) {
+                    // 到顶了模型还在要工具。把原始 JSON 摆给用户没有意义 ——
+                    // 他看不懂，也做不了什么，只能以为程序坏了。说清楚发生了什么，
+                    // 已经拿到的工具结果还留在上面的卡片里。
+                    emit_delta(&ctx, "（模型反复请求调用工具 " + tname + "，已达 " +
+                                         std::to_string(max_rounds) +
+                                         " 轮上限，已停止。可以换个问法再试。）");
+                    break;
+                }
+
+                // 同一个工具、同一组参数，再跑一遍结果一模一样，循环不可能收敛。
+                // 2B 级别的模型很容易卡在这里（尤其"读文件→再读一次"），
+                // 直接停下比再等一轮十几秒的 prefill 强。
+                const std::string sig = tname + "|" + json::dump(targs);
+                if (sig == last_sig) {
+                    emit_delta(&ctx, "（模型在重复调用同一个工具 " + tname +
+                                         "，结果不会变，已停止。可以换个问法再试。）");
+                    break;
+                }
+                last_sig = sig;
+
+                c.write_chunk("data: {\"dubhe\":{\"type\":\"tool_call\",\"name\":" +
+                              json_escape(tname) + ",\"arguments\":" + json::dump(targs) +
+                              "}}\n\n");
 
                 ToolResult tr = run_tool(tname, targs);
-                std::string ev2 = "data: {\"dubhe\":{\"type\":\"tool_result\",\"ok\":" +
-                                  std::string(tr.ok ? "true" : "false") + ",\"output\":" +
-                                  json_escape(tr.output.substr(0, 8000)) + "}}\n\n";
-                c.write_chunk(ev2);
+                c.write_chunk("data: {\"dubhe\":{\"type\":\"tool_result\",\"ok\":" +
+                              std::string(tr.ok ? "true" : "false") + ",\"output\":" +
+                              json_escape(tr.output.substr(0, 8000)) + "}}\n\n");
+                rounds++;
 
-                // 第二轮：带上工具结果
+                // 下一轮：把这一轮的调用和结果追加进对话。
+                //
+                // 助手这一轮**必须重建成规范的 <tool_call> 包裹形式**，不能原样
+                // 塞回模型输出。模型经常吐裸 JSON（{"name":...}），原样拼回去
+                // 它自己都认不出那是刚才的调用，于是把同一个工具再要一遍 ——
+                // 实测 Qwen2.5 就是这样：第一轮 .gitignore，第二轮 /.gitignore。
+                json::Value call = json::Value::make_obj();
+                call.set("name", json::Value::make_str(tname));
+                call.set("arguments", targs);
                 json::Value msgs2 = *msgs;
                 json::Value am = json::Value::make_obj();
                 am.set("role", json::Value::make_str("assistant"));
-                am.set("content", json::Value::make_str(acc));
+                std::string call_text;
+                if (g_tool_fmt == 1) {
+                    call_text = "<tool_call>\n<function=" + tname + ">\n";
+                    if (targs.type == json::Value::OBJ) {
+                        for (const auto& kv : targs.obj) {
+                            std::string v = (kv.second.type == json::Value::STR)
+                                                ? kv.second.str
+                                                : json::dump(kv.second);
+                            call_text += "<parameter=" + kv.first + ">\n" + v + "\n</parameter>\n";
+                        }
+                    }
+                    call_text += "</function>\n</tool_call>";
+                } else {
+                    call_text = "<tool_call>" + json::dump(call) + "</tool_call>";
+                }
+                am.set("content", json::Value::make_str(call_text));
                 msgs2.arr.push_back(am);
                 json::Value tm = json::Value::make_obj();
                 tm.set("role", json::Value::make_str("tool"));
                 tm.set("content", json::Value::make_str(tr.output));
                 msgs2.arr.push_back(tm);
 
-                // 第二轮复用第一轮编好的特征：图片不重编，只重新分词
+                // 复用第一轮编好的特征：图片不重编，只重新分词
                 std::vector<int32_t> t2;
                 std::string e2;
-                if (!build_tokens(g.engine, msgs2, chatml, with_tools, force_raw, &t2, &mcache, &e2)) {
+                if (!build_tokens(g.engine, msgs2, chatml, with_tools, force_raw, &t2, &mcache,
+                                  &e2)) {
                     c.write_chunk("data: {\"dubhe\":{\"type\":\"error\",\"message\":" +
                                   json_escape(e2) + "}}\n\n");
+                    break;
                 }
-
-                // 第二轮重新判定：这次应该是正常回答了
-                ctx.decided = false;
-                ctx.suppress = false;
-                ctx.pending.clear();
-                ctx.tail.clear();
-                dubhe_stats st2{};
-                if (!t2.empty())
-                    dubhe_generate(g.engine, t2.data(), (int32_t)t2.size(), &sp, on_piece, nullptr,
-                                   &ctx, &st2);
-                flush_pending(&ctx);
-                st.n_generated += st2.n_generated;
-                st.decode_tps = st2.decode_tps;
+                cur = std::move(t2);
             }
 
             g.last_decode_tps = st.decode_tps;
@@ -2196,7 +2630,8 @@ int main(int argc, char** argv) {
             g.total_tokens += st.n_generated;
 
             std::string done = "data: {\"id\":\"" + id +
-                               "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":" +
+                               "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" +
+                               std::string(finish) + "\"}],\"usage\":{\"completion_tokens\":" +
                                std::to_string(st.n_generated) + ",\"prompt_tokens\":" +
                                std::to_string(st.n_prompt) + ",\"decode_tps\":" +
                                std::to_string(st.decode_tps) + "}}\n\n";

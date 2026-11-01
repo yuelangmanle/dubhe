@@ -518,9 +518,12 @@ int dubhe_generate(dubhe_engine* e,
         int32_t tok = sample_token(logits.data(), n_vocab, s, hist, rng);
         hist.push_back(tok);
 
-        // EOS 与 <|im_start|> 这类控制 token 不能当成正文吐给用户
+        // EOS 与 <|im_start|> 这类控制 token 不能当成正文吐给用户。
+        // 注意这里判的是 CONTROL 而不是"所有特殊 token"：<tool_call>、
+        // <function=、<parameter= 这些是 USER_DEFINED，属于模型正常输出，
+        // 剔掉的话工具调用会被削成 "read_file>\npath>\n.gitignore"。
         if (tok == eos) break;
-        const bool special = e->model.tok().is_special(tok);
+        const bool special = e->model.tok().is_control(tok);
 
         if (on_token && !special) {
             std::string piece = e->model.tok().decode_piece(tok);

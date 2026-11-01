@@ -98,7 +98,12 @@ bool Tokenizer::init(const GgufFile& f, std::string* err) {
     }
 
     // 特殊 token：type 3(CONTROL) / 4(USER_DEFINED)
+    //
+    // 两个用途不一样，分开记：
+    //   编码时  两种都要整段匹配，不然 "<tool_call>" 会被拆成散字节
+    //   解码时  只有 CONTROL 该剔掉；USER_DEFINED 是内容，必须原样吐出来
     special_flag_.assign(id_to_token_.size(), 0);
+    control_flag_.assign(id_to_token_.size(), 0);
     if (auto* tt = f.get("tokenizer.ggml.token_type"); tt) {
         for (int32_t i = 0; i < (int32_t)tt->arr_i32.size() && i < (int32_t)id_to_token_.size(); i++) {
             int t = tt->arr_i32[i];
@@ -106,6 +111,7 @@ bool Tokenizer::init(const GgufFile& f, std::string* err) {
                 specials_.push_back(i);
                 special_flag_[(size_t)i] = 1;
             }
+            if (t == 3) control_flag_[(size_t)i] = 1;
         }
     }
     // 长 token 优先匹配
