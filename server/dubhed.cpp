@@ -1333,14 +1333,33 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
         for (auto& m : flat.arr)
             if (m.s("role") == "user") prompt = m.s("content");
     } else {
-        // ---- 知识库：把检索到的片段前置成一条 system。
+        // ---- 知识库：把检索到的片段拼在**最后一条用户消息前面**。
         // 只在纯文本 + 非 raw 时做 —— 多模态的 prompt 里带 <|image|> 占位符，
         // 往前面塞文本会让占位符和特征对不上位置。
-        if (g_kb_rag && media.empty()) {
+        //
+        // 为什么不插成最前面的 system：那样一来每条新问题的检索结果一变，
+        // 整个 prompt 的第一个字节就变了，前缀缓存全部作废 —— 多轮对话
+        // 里每一轮都要重新 prefill 整段历史（实测 7 秒）。拼在末尾之后，
+        // 前面的历史一个字节都不动，缓存照常命中。
+        // 顺带这也更符合 RAG 的常规做法：资料紧贴着问题。
+        //
+        // 带工具时不注入。实测（LFM3-1.7B）两者会打架：知识库里本来就有
+        // README，把它的片段塞进 prompt 之后，模型把"资料已经在这儿了"
+        // 当成任务，回的是"我们需要执行 read_file……"然后一个工具都不调；
+        // 关掉 RAG 同一句话 1.45 秒就正确调用。1.7B 这种规模一次只能抓住
+        // 一个意图，而工具模式下"去读真实内容"本来就比"复述旧片段"更对。
+        if (g_kb_rag && media.empty() && !with_tools) {
             std::string last_user;
-            for (auto& m : flat.arr)
-                if (m.s("role") == "user") last_user = m.s("content");
-            if (!last_user.empty()) {
+            size_t last_idx = 0;
+            bool has_last = false;
+            for (size_t i = 0; i < flat.arr.size(); i++) {
+                if (flat.arr[i].s("role") == "user") {
+                    last_user = flat.arr[i].s("content");
+                    last_idx = i;
+                    has_last = true;
+                }
+            }
+            if (has_last && !last_user.empty()) {
                 std::string ctx;
                 {
                     std::lock_guard<std::mutex> lk(g_kb_mu);
@@ -1350,11 +1369,11 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
                     }
                 }
                 if (!ctx.empty()) {
-                    json::Value sys = json::Value::make_obj();
-                    sys.set("role", json::Value::make_str("system"));
-                    // kb_context_for 以两个换行开头，给拼 prompt 用；单独成条时去掉
-                    sys.set("content", json::Value::make_str(ctx.substr(ctx.find_first_not_of('\n'))));
-                    flat.arr.insert(flat.arr.begin(), sys);
+                    // kb_context_for 以两个换行开头，去掉后拼在问题前面
+                    const std::string body = ctx.substr(ctx.find_first_not_of('\n'));
+                    flat.arr[last_idx].set(
+                        "content",
+                        json::Value::make_str(body + "\n\n" + last_user));
                 }
             }
         }
