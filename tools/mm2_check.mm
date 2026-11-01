@@ -139,35 +139,48 @@ int main(int argc, char** argv) {
                 {2048, 7680, "ffn gate / up"},
                 {7680, 2048, "ffn down"},
             };
-            const int nrow = kBmax;
             double total_macs = 0, total_ms = 0;
+            // mm3_* 的 token 摊薄是 kMmaBm（32），mm2_* 是 kBmax（8）。三代内核的
+            // 网格形状和参数表都不一样，所以必须先认代数、再决定缓冲区大小。
+            const bool is_old = std::strncmp(g_kernel, "mm_", 3) == 0;
+            const bool is_m3  = std::strncmp(g_kernel, "mm3_", 4) == 0;
+            const int nrow = is_m3 ? dubhe_msl::kMmaBm : kBmax;
             for (const auto& s : shapes) {
                 const size_t nblocks_row = (size_t)(s.n_in / 256);
                 const size_t wbytes = nblocks_row * (size_t)s.n_out * 144;
                 std::vector<uint8_t> W(wbytes);
                 fill_w(W, 144, nblocks_row * (size_t)s.n_out, 0);
-                std::vector<float> XT((size_t)s.n_in * kBmax, 0.5f);
-                id<MTLBuffer> bw = buf(wbytes);
-                std::memcpy([bw contents], W.data(), wbytes);
+                std::vector<float> XT((size_t)s.n_in * nrow, 0.5f);
+                // MMC_COLD=1：把权重复制成 8 份、每次派发换一份，让每次读都
+                // 落到 DRAM 而不是 SLC。真实前向里每块权重一个 chunk 只读一遍
+                // （1 GB 模型 ≫ 8 MB SLC），微基准连着读 20 遍则大半命中缓存 ——
+                // 这个开关就是用来量「命中缓存」到底值多少的。
+                const bool cold = getenv("MMC_COLD") != nullptr;
+                const int NCOPY = cold ? 8 : 1;
+                id<MTLBuffer> bw = buf(wbytes * (size_t)NCOPY);
+                for (int c = 0; c < NCOPY; c++)
+                    std::memcpy((uint8_t*)[bw contents] + (size_t)c * wbytes, W.data(), wbytes);
                 id<MTLBuffer> bxt = buf(XT.size() * 4);
                 std::memcpy([bxt contents], XT.data(), XT.size() * 4);
-                id<MTLBuffer> by = buf((size_t)s.n_out * kBmax * 4);
+                id<MTLBuffer> by = buf((size_t)s.n_out * nrow * 4);
 
                 id<MTLComputePipelineState> p = pipe(g_kernel);
-                if (false) {
+                const int nr3 = nrow;
+                if (getenv("MMC_INFO")) {
                     // maxTotalThreadsPerThreadgroup 会被寄存器占用率压下来：
                     // 它等于 min(1024, 32768/寄存器数)。看到 256 就说明
                     // 每线程约 128 个寄存器 → 每个 core 只能驻留一个 threadgroup。
-                    std::printf("  [mm2_q4_k] maxTotalThreadsPerThreadgroup = %lu, "
+                    std::printf("  [%s] maxTotalThreadsPerThreadgroup = %lu, "
                                 "静态 threadgroup 内存 = %lu 字节\n",
+                                g_kernel,
                                 (unsigned long)p.maxTotalThreadsPerThreadgroup,
                                 (unsigned long)p.staticThreadgroupMemoryLength);
                 }
-                uint32_t nin = (uint32_t)s.n_in, nout = (uint32_t)s.n_out, nr = (uint32_t)nrow;
-                uint64_t woff = 0;
-                const bool is_old = std::strncmp(g_kernel, "mm_", 3) == 0;
-                const int rows_per_tg = is_old ? 4 : kMmRows;
-                const int nthreads = is_old ? 128 : kMmSgPerTg * 32;
+                uint32_t nin = (uint32_t)s.n_in, nout = (uint32_t)s.n_out, nr = (uint32_t)nr3;
+                uint32_t xstride = (uint32_t)nrow;
+                uint64_t woff = 0, yoff = 0;
+                const int rows_per_tg = is_old ? 4 : (is_m3 ? dubhe_msl::kMmaBn : kMmRows);
+                const int nthreads = is_old ? 128 : (is_m3 ? 128 : kMmSgPerTg * 32);
                 const NSUInteger tgc = (NSUInteger)((s.n_out + rows_per_tg - 1) / rows_per_tg);
 
                 // 一次 commit 里编 INNER 次派发再除以 INNER。单次 commit+wait
@@ -181,10 +194,15 @@ int main(int argc, char** argv) {
                     [en setBuffer:bxt offset:0 atIndex:1];
                     [en setBuffer:by offset:0 atIndex:2];
                     [en setBytes:&nin length:4 atIndex:3];
-                    [en setBytes:&woff length:8 atIndex:4];
                     [en setBytes:&nout length:4 atIndex:5];
                     [en setBytes:&nr length:4 atIndex:6];
+                    if (is_m3) {
+                        [en setBytes:&xstride length:4 atIndex:7];
+                        [en setBytes:&yoff length:8 atIndex:8];
+                    }
                     for (int t = 0; t < times; t++) {
+                        uint64_t wo = woff + (uint64_t)(t % NCOPY) * (uint64_t)wbytes;
+                        [en setBytes:&wo length:8 atIndex:4];
                         [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
                             threadsPerThreadgroup:MTLSizeMake(nthreads, 1, 1)];
                     }
