@@ -26,13 +26,19 @@
 
   const STORE_KEY = 'dubhe.conv.v1';
   const SET_KEY = 'dubhe.settings.v1';
+  // 用户在设置面板里亲手拨过"启用工具调用"的开关。
+  // 有这个标记才认存储里的 tools 值；没有就说明那个 true 是旧默认值留下的。
+  const TOOLS_TOUCHED = 'dubhe.tools.touched';
 
   const state = {
     convs: [],
     current: null,
     streaming: false,
     server: null,
-    tools: true,
+    // 工具说明默认关。2B 级模型带工具说明会"讲计划"或"编造结果"，
+    // 普通对话被污染的成本远大于偶尔能自动读个文件的收益。
+    // 要用就走 Agent 视图（单次开启），或者在设置里显式打开。
+    tools: false,
     attach: null,   // 待发送的图片/音频/视频（一次只允许一个）
     logs: [],       // 右栏系统日志：只记真实事件，不编
     gen: null,      // 本轮生成统计 { tokens, tps, total, ttft }
@@ -43,9 +49,17 @@
   };
 
   const settings = Object.assign(
-    { temperature: 0.7, top_p: 0.95, max_tokens: 1024, system: '', tools: true },
+    { temperature: 0.7, top_p: 0.95, max_tokens: 1024, system: '', tools: false },
     JSON.parse(localStorage.getItem(SET_KEY) || '{}')
   );
+  // 迁移：老版本的默认值是 tools:true，而且它随其它设置一起被存进了
+  // localStorage。光把默认值改成 false 救不了老用户 —— Object.assign
+  // 会被存储里的 true 盖掉。没拨过开关就说明这个 true 不是用户选的。
+  if (!localStorage.getItem(TOOLS_TOUCHED)) settings.tools = false;
+  // 输入框旁的工具栏按钮切的是 state.tools（本次会话），设置面板切的是
+  // settings.tools（持久偏好）。两个开关如果各判各的，就会出现"按钮亮着
+  // 但没生效"这种没法解释的状态。启动时以偏好为准，之后按钮独立。
+  state.tools = settings.tools;
 
   // ---------------------------------------------------------------- 存储
   function saveConvs() {
@@ -241,6 +255,19 @@
     const body = el('div', 'body');
     body.innerHTML = bodyHtml(m.content, m.tools && m.tools.length);
     col.appendChild(body);
+
+    // 模型编造工具结果。
+    //
+    // 小模型（2B 级）看到工具说明后，经常不去调工具，而是直接吐一段
+    // <tool_result>{"content":"..."}</tool_result> —— 内容看着像真的读到了
+    // 文件，其实是编的。实测让它"读 README.md 第一行"，它编出了
+    // {"content":"# README\n..."}，服务端一次工具都没执行。
+    // 这比空白危险得多：用户会当真。所以在气泡上直接标出来。
+    if (!(m.tools && m.tools.length) && /<tool_result>/.test(m.content || '')) {
+      const warn = el('div', 'fake-tool');
+      warn.textContent = '注意：这段内容里的工具结果是模型编造的，实际没有执行任何工具。';
+      col.insertBefore(warn, body);
+    }
 
     if (m.tools && m.tools.length) {
       for (const t of m.tools) {
@@ -627,7 +654,13 @@
   }
 
   // ---------------------------------------------------------------- 发送
-  async function send(text) {
+  // opts.tools 可以单次覆盖工具开关。
+  //
+  // Agent 视图需要一次带工具的请求，但它不该把这个选择写进 settings ——
+  // 否则从 Agent 里跑完一次，之后所有普通对话都会带上工具说明。实测
+  // 2B 级模型带着工具说明问"今天天气怎么样"，回的是"我需要调用工具…"，
+  // 一个一次性动作污染了长期配置。
+  async function send(text, opts = {}) {
     if (state.streaming) return;
     const content = (text != null ? text : $('#input').value).trim();
     const att = state.attach;
@@ -697,7 +730,7 @@
       // 整段输出写成 <tool_result>{...}，但它并没有真的调用工具 ——
       // 结果就是界面上一条"已完成 9 tokens"的空气泡。图片问答本来也不该
       // 走工具循环，关掉对双方都更省。真要图文 + 工具，用 API 显式传 tools。
-      const withTools = settings.tools && state.tools && !att;
+      const withTools = (opts.tools !== undefined ? opts.tools : state.tools) && !att;
       const resp = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -952,7 +985,7 @@
       slider(body, '最大输出', '单次回复的 token 上限', 'max_tokens', 128, 4096, 64, (v) => String(v));
 
       body.appendChild(el('div', 'group-title', '工具'));
-      toggle(body, '启用工具调用', '允许模型读取文件、列目录、执行命令', () => settings.tools, (v) => { settings.tools = v; saveSettings(); });
+      toggle(body, '启用工具调用', '允许模型读取文件、列目录、执行命令', () => settings.tools, (v) => { settings.tools = v; state.tools = v; localStorage.setItem(TOOLS_TOUCHED, '1'); saveSettings(); });
       if (state.server) {
         row(body, '服务端 Shell', state.server.shell ? '已启用' : '未启用（启动加 --allow-shell）', el('span', 'value', state.server.shell ? '开' : '关'));
       }
@@ -1406,7 +1439,18 @@
     const card = el('div', 'vcard');
     card.style.padding = '13px';
     card.appendChild(el('div', 'vname', '要做什么'));
-    card.appendChild(el('div', 'vmeta', '会切回对话并把工具调用打开，模型自己决定读哪个文件、跑哪条命令。'));
+    card.appendChild(el('div', 'vmeta', '会切回对话并临时打开工具调用，让模型自己决定读哪个文件、跑哪条命令。'));
+
+    // 这段限制是实测出来的，不是免责声明。工具调用能不能成，主要看模型：
+    // LFM3-1.7B 稳定一次调用就收敛；更小的模型会把计划说出来而不真调。
+    // 写"模型自己决定"会让人以为工具坏了 —— 把边界摆在入口处更诚实。
+    const lim = el('div', 'vnote');
+    lim.style.marginTop = '9px';
+    lim.textContent =
+      '工具调用取决于模型。模型只把计划说出来、或一直重复调同一个工具时，' +
+      '这里会给出提示并停下，不会空转。要确定能跑通，去「工具」视图直接试运行 —— ' +
+      '那条路径不依赖模型判断。';
+    card.appendChild(lim);
 
     const inp = el('textarea');
     inp.rows = 3;
@@ -1420,11 +1464,10 @@
     go.onclick = () => {
       const t = inp.value.trim();
       if (!t) { inp.focus(); return; }
-      state.tools = true;
-      settings.tools = true;
-      saveSettings();
       closeView();
-      send(t);
+      // 单次开启，不写进 settings —— 从这里跑完一次不该让之后所有
+      // 普通对话都背上工具说明。
+      send(t, { tools: true });
     };
     card.appendChild(go);
     body.appendChild(card);
@@ -1790,7 +1833,9 @@
       state.tools = !state.tools;
       $('#btnTools').classList.toggle('on', state.tools);
     };
-    $('#btnTools').classList.toggle('on', true);
+    // 按钮的亮灭必须跟着 state.tools 走。这里原来是硬编码的 true，
+    // 工具关掉之后按钮还亮着 —— 用户点一下变成"关"，实际什么都没变。
+    $('#btnTools').classList.toggle('on', state.tools);
 
     $('#btnAttach').onclick = pickAttachment;
     $('#fileInput').onchange = async (e) => {

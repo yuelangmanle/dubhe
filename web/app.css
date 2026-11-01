@@ -668,6 +668,14 @@ body::after {
   white-space: pre-wrap; word-break: break-word;
 }
 
+/* 模型编造工具结果时的警示条。放在正文上面，先看到再读内容。 */
+.fake-tool {
+  font-size: 12px; line-height: 1.5; margin-bottom: 9px; padding: 7px 10px;
+  border-radius: 8px; color: var(--text);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--red) 34%, transparent);
+}
+
 .body p { margin: 0 0 12px; }
 .body h1, .body h2, .body h3 { margin: 20px 0 9px; line-height: 1.28; font-weight: 700; letter-spacing: -.02em; }
 .body h1 { font-size: 21px; } .body h2 { font-size: 18px; } .body h3 { font-size: 16px; }

@@ -76,6 +76,13 @@ await send('Emulation.setDeviceMetricsOverride', {
 await send('Page.navigate', { url });
 await sleep(2500);
 
+// 先清掉上一个测试留下的会话。不清的话历史消息会一起进 prompt ——
+// ui_tools 刚问过"读一下 README.md 的第一行"，这里再发图，模型会接着
+// 聊那个文件，完全不看图片，看起来像多模态坏了。
+await ev(`localStorage.clear()`);
+await send('Page.reload');
+await sleep(2500);
+
 // 视觉塔有没有加载，看界面上的按钮状态最直接（state 在闭包里取不到）
 const enabled = await ev(`
   (() => { const b = document.getElementById('btnImage'); return b ? !b.disabled : 'missing'; })()
