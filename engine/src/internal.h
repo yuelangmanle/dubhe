@@ -321,12 +321,31 @@ public:
     // 才不依赖分块大小。
     void set_mm_embeds(const float* embeds, int n_tokens, int at) {
         mm_embeds_ = embeds; mm_n_ = n_tokens; mm_at_ = at;
+        // 图像/音频 token 的嵌入来自外部，同一串 token id 配不同的图
+        // 算出来的 KV 完全不同。缓存必须作废，否则会拿上一张图的 KV
+        // 去回答这一张图 —— 输出看着通顺，内容全是错的。
+        kv_toks_.clear();
     }
-    void clear_mm_embeds() { mm_embeds_ = nullptr; mm_n_ = 0; mm_at_ = -1; }
+    void clear_mm_embeds() {
+        // 只有在真的挂过特征时才作废 KV 缓存：没挂过就调用（纯文本每轮都走
+        // 这条）不该把前缀缓存清掉，否则多轮对话永远复用不上。
+        if (mm_embeds_ || mm_n_) kv_toks_.clear();
+        mm_embeds_ = nullptr; mm_n_ = 0; mm_at_ = -1;
+    }
     bool has_mm_embeds() const { return mm_embeds_ != nullptr && mm_n_ > 0; }
     // 引擎实际使用的批大小（GPU 不可用时为 1）
     int  batch_size() const;
     void reset_kv();
+
+    // 当前 KV 里已经算好的 token 数
+    int  kv_len() const { return kv_len_; }
+    // 新 prompt 能复用多少已算好的前缀。只有返回值等于 kv_len() 时才表示
+    // "整段 KV 都还能用"，调用方才可以跳过 reset。返回 0 一律当不能用。
+    int  kv_prefix_len(const int32_t* toks, int n) const;
+    // 调试用：KV 里第 i 个 token（越界返回 -1）
+    int32_t kv_tok_at(int i) const {
+        return (i >= 0 && i < (int)kv_toks_.size()) ? kv_toks_[(size_t)i] : -1;
+    }
 
     // 供 UI / 统计使用
     uint64_t n_params() const { return n_params_; }
@@ -376,6 +395,17 @@ private:
     // KV cache: [n_layer][n_ctx][n_head_kv * head_dim]
     std::vector<float> k_cache_, v_cache_;
     int kv_len_ = 0;
+    // 当前 KV 里躺着的 token 序列（长度恒等于 kv_len_）。
+    //
+    // 用途只有一个：判断下一次请求能不能跳过 prefill。多轮对话每一轮都会
+    // 把整段历史重新发一遍，不比对就只能每次从头 prefill —— 2000 token 的
+    // 历史在 2B 模型上要好几秒，而实际新增的往往只有用户刚说的那十几个字。
+    //
+    // 为什么只认"整段 KV 都是新 prompt 的前缀"，不做常见的"最长公共前缀"：
+    // LFM3 的 ShortConv 是**滚动状态**，不是按位置索引的缓存。KV 可以按
+    // 位置覆盖写，conv 状态不行 —— 它没法回退到第 k 个 token。所以只要
+    // 新 prompt 在某处与 KV 分叉，就只能整体 reset，没有中间选项。
+    std::vector<int32_t> kv_toks_;
 
     std::vector<float> x_, xb_, xb2_, q_, k_, v_, attn_out_, gate_, up_, ffn_out_;
     std::vector<float> logits_;

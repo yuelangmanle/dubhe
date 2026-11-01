@@ -82,6 +82,9 @@ typedef struct {
     double  t_gen_ms;
     double  prefill_tps;
     double  decode_tps;
+    /* 本轮跳过 prefill、直接复用上一轮 KV 的 token 数。
+     * 多轮对话里这个数接近 n_prompt 就说明前缀缓存生效了。 */
+    int32_t n_reused;
 } dubhe_stats;
 
 /* 流式回调：每产出一个 token 调一次。piece 可为 NULL（无对应字节片段）。 */

@@ -486,7 +486,13 @@ void kb_ensure_loaded() {
 std::string kb_context_for(const std::string& q, int topk) {
     const auto hits = kb_search(q, topk);
     if (hits.empty() || hits[0].score < 5.0) return "";
-    std::string s = "\n\n以下是从本地知识库检索到的资料，回答时优先依据它们：\n";
+    // 措辞很重要。原来写的是"回答时优先依据它们"，结果 1.7B 会把资料当圣旨：
+    // 问"今天天气怎么样"，它去复述文档里那句"今天天气很好，我们一起"的
+    // 测试样例 —— 检索没错（那句话确实在库里），错在没给它"这跟我无关"
+    // 这个选项。现在明确说可能不相关、不相关就当没看见。
+    std::string s = "\n\n以下是从本地知识库检索到的片段，可能相关，也可能不相关。\n"
+                    "只有确实能回答用户问题时才引用；不相关就忽略，不要复述，"
+                    "也不要说「资料里提到」。\n";
     for (size_t i = 0; i < hits.size(); i++) {
         s += "\n[" + std::to_string(i + 1) + "] " + path_base(hits[i].path) + "\n";
         s += hits[i].snippet + "\n";
@@ -1172,6 +1178,59 @@ struct MmCache {
     int32_t dim = 0;
 };
 
+// 上一次**真正喂给引擎**的那段 prompt：文本 ↔ token 序列。
+//
+// 为什么要存 token 而不是只存文本：模型生成的 token 不一定等于"贪婪分词"
+// 的结果。实测 LFM3 会把 "：\n\n" 当成一个 token 吐出来，而把同样的文字
+// 重新分词得到的是 "：" + "\n\n"。字一模一样，token 边界不同，KV 前缀就
+// 对不上 —— 引擎那边的复用逻辑只能整体放弃，长上下文多轮等于没优化。
+//
+// 所以这里存"当时真的喂进去的那串 token"。下一轮如果新 prompt 的文本以
+// 它开头，就直接沿用这串 token，只对剩下的部分分词。这样前缀逐 token
+// 完全一致，KV 能整段复用。
+//
+// 只对纯文本生效：带图/带音频的请求 token 一样但特征不同，KV 不能复用。
+struct PromptCache {
+    std::mutex mu;
+    uint64_t id = 0;          // 每次 set 自增，用来判断"这一轮还算不算同一段"
+    std::string text;
+    std::vector<int32_t> toks;
+
+    uint64_t set(const std::string& t, const std::vector<int32_t>& k) {
+        std::lock_guard<std::mutex> lk(mu);
+        text = t;
+        toks = k;
+        return ++id;
+    }
+    // 命中就把缓存的 token 拷出来、并告诉调用方吃掉了多长的前缀
+    bool splice(const std::string& p, std::vector<int32_t>* out, size_t* used) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (toks.empty() || text.size() < 8 || p.size() <= text.size()) return false;
+        if (p.compare(0, text.size(), text) != 0) return false;
+        *out = toks;
+        *used = text.size();
+        return true;
+    }
+    uint64_t current_id() {
+        std::lock_guard<std::mutex> lk(mu);
+        return id;
+    }
+    // 生成完之后把"这一轮新吐出来的字和 token"接到缓存尾巴上
+    void extend(uint64_t want, const std::string& t, const std::vector<int32_t>& k) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (want != id || t.empty()) return;   // 期间被别的请求改过，别乱接
+        text += t;
+        toks.insert(toks.end(), k.begin(), k.end());
+    }
+    void clear() {
+        std::lock_guard<std::mutex> lk(mu);
+        text.clear();
+        toks.clear();
+        id++;
+    }
+};
+static PromptCache g_pcache;
+
 // messages → token 序列：摊平 content 数组 → 分词 → 补 BOS → 编码媒体 →
 // 展开占位符 → 注入特征。返回 false 时 err 里是可以直接回给客户端的原因。
 //
@@ -1267,14 +1326,39 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
 
     const int32_t n = dubhe_tokenize(e, prompt.c_str(), 1, nullptr, 0);
     if (n <= 0) { if (err) *err = "分词失败"; return false; }
-    toks->assign((size_t)n, 0);
-    if (dubhe_tokenize(e, prompt.c_str(), 1, toks->data(), n) != n) {
-        if (err) *err = "分词失败";
-        return false;
+
+    // 前缀复用：新 prompt 的文本以上次喂进去的那段开头时，沿用它的 token，
+    // 只给剩下的部分分词。这样前缀逐 token 一致，引擎能整段跳过 prefill。
+    bool spliced = false;
+    size_t used = 0;
+    if (!raw && media.empty() && g_pcache.splice(prompt, toks, &used)) {
+        const size_t at = toks->size();
+        const std::string rest = prompt.substr(used);
+        if (!rest.empty()) {
+            const int32_t m = dubhe_tokenize(e, rest.c_str(), 0, nullptr, 0);
+            if (m > 0) {
+                toks->resize(at + (size_t)m);
+                if (dubhe_tokenize(e, rest.c_str(), 0, toks->data() + at, m) != m) {
+                    toks->resize(at);
+                } else {
+                    spliced = true;
+                }
+            }
+        }
+        if (!spliced) toks->clear();   // 剩下的部分分不出来，退回整段重分
     }
-    // raw 也必须补 BOS。不补的话模型不知道自己站在序列开头，转写内容是对的，
-    // 但一句接一句复读到 max_tokens 也不吐 EOS；补上之后它写完就停。
-    prepend_bos(e, toks);
+    if (!spliced) {
+        toks->assign((size_t)n, 0);
+        if (dubhe_tokenize(e, prompt.c_str(), 1, toks->data(), n) != n) {
+            if (err) *err = "分词失败";
+            return false;
+        }
+        // raw 也必须补 BOS。不补的话模型不知道自己站在序列开头，转写内容是对的，
+        // 但一句接一句复读到 max_tokens 也不吐 EOS；补上之后它写完就停。
+        prepend_bos(e, toks);
+    }
+    // 记下"这一轮喂进去的到底是什么"，生成完之后再把新吐的字接上来。
+    if (!raw && media.empty()) g_pcache.set(prompt, *toks);
 
     // 上一轮请求可能留了特征，不主动清掉的话，这一轮纯文本也会被覆盖。
     dubhe_clear_mm_embeds(e);
@@ -1356,6 +1440,8 @@ struct StreamCtx {
     // （3 字节）经常被切在两个 token 之间；半截字节进了 JSON，浏览器那边
     // 就只能解成 U+FFFD —— 中文回复里随机冒出"均���的"这种方块。
     std::string tail;
+    // 这一轮真正生成的 token 序列，用来给前缀缓存接尾巴
+    std::vector<int32_t> gtoks;
 };
 
 // 返回 s 末尾"不完整的多字节序列"占几个字节；0 表示末尾是干净的。
@@ -1405,10 +1491,11 @@ void emit_tool_calls_delta(StreamCtx* x, const std::string& name, const json::Va
 }
 
 // 前 16 个字符足以判断"这是不是一段工具调用"
-void on_piece(void* ud, int32_t /*tok*/, const char* piece) {
+void on_piece(void* ud, int32_t tok, const char* piece) {
     auto* x = (StreamCtx*)ud;
     if (!piece) return;
     x->acc->append(piece);
+    x->gtoks.push_back(tok);
 
     // 思考块：整段吞掉，不进正文
     {
@@ -2081,6 +2168,8 @@ int main(int argc, char** argv) {
         g.model_path = full;
         g.model_id = model_id_of(full);
         refresh_model_markers(full);
+        // 换了模型，上一段 prompt 的 token 和 KV 全部作废
+        g_pcache.clear();
         json::Value o = json::Value::make_obj();
         o.set("ok", json::Value::make_bool(true));
         o.set("model", json::Value::make_str(g.model_path));
@@ -2515,6 +2604,9 @@ int main(int argc, char** argv) {
             std::vector<int32_t> cur = toks;
             std::string last_sig;      // 上一次执行的工具签名，用来发现原地打转
             const char* finish = "stop";
+            // 这一轮喂进去的是哪段 prompt（前缀缓存的代号）。生成完要拿它
+            // 把"新吐出来的字和 token"接到缓存尾巴上。
+            uint64_t pcid = g_pcache.current_id();
 
             while (!cur.empty()) {
                 rtext.clear();
@@ -2526,6 +2618,7 @@ int main(int argc, char** argv) {
                 ctx.tail.clear();
                 ctx.in_think = false;
                 ctx.think_buf.clear();
+                ctx.gtoks.clear();
                 // 有工具说明时才做抑制判定 —— 否则根本没在找 tool_call，
                 // 直接往外吐就是最快的路。
                 ctx.no_suppress = !with_tools;
@@ -2538,6 +2631,17 @@ int main(int argc, char** argv) {
                 st.n_generated += s.n_generated;
                 st.decode_tps = s.decode_tps;
                 if (s.n_prompt) st.n_prompt = s.n_prompt;
+                // 工具轮的第二轮几乎整段都是上一轮算过的，复用数按轮累加
+                // 才有意义：单看最后一轮会小得让人以为缓存没生效。
+                st.n_reused += s.n_reused;
+
+                // 把这一轮新吐出来的字和 token 接到前缀缓存尾巴上。
+                //
+                // 接的是 rtext 而不是 emitted：KV 里装的是引擎吐出来的**全部**
+                // token，包括被抑制掉、没发给用户的工具调用原文。拿 emitted
+                // 去接的话，工具轮第二轮的 prompt 就和 KV 对不上了 ——
+                // 而工具轮恰恰是最需要复用的一轮（3600 token 的 prefill）。
+                if (!ctx.gtoks.empty()) g_pcache.extend(pcid, rtext, ctx.gtoks);
 
                 if (!with_tools) break;
 
@@ -2599,6 +2703,12 @@ int main(int argc, char** argv) {
                 // 塞回模型输出。模型经常吐裸 JSON（{"name":...}），原样拼回去
                 // 它自己都认不出那是刚才的调用，于是把同一个工具再要一遍 ——
                 // 实测 Qwen2.5 就是这样：第一轮 .gitignore，第二轮 /.gitignore。
+                //
+                // 但"重建"会让这段文本和模型刚才真正吐出来的逐字节不同，
+                // token 边界一变，第一轮算好的 KV 就整段作废（3600 token 的
+                // prefill 是十几秒）。所以分两种情况：模型自己就写对了规范
+                // 格式时原样用（KV 能接上），只有它吐裸 JSON 时才重建 ——
+                // 那种情况本来也对不上，重建不影响什么。
                 json::Value call = json::Value::make_obj();
                 call.set("name", json::Value::make_str(tname));
                 call.set("arguments", targs);
@@ -2620,7 +2730,17 @@ int main(int argc, char** argv) {
                 } else {
                     call_text = "<tool_call>" + json::dump(call) + "</tool_call>";
                 }
-                am.set("content", json::Value::make_str(call_text));
+                // 模型自己就写成了规范包裹形式 → 原样用它，KV 才能接上。
+                // 判据看 rtext 而不是 emitted：rtext 才是 KV 里那段 token 的
+                // 文本（工具调用本来就被抑制，emitted 是空的）。
+                std::string am_content = call_text;
+                {
+                    const size_t s0 = rtext.find_first_not_of(" \t\r\n");
+                    if (s0 != std::string::npos && rtext.compare(s0, 11, "<tool_call>") == 0) {
+                        am_content = rtext;
+                    }
+                }
+                am.set("content", json::Value::make_str(am_content));
                 msgs2.arr.push_back(am);
                 json::Value tm = json::Value::make_obj();
                 tm.set("role", json::Value::make_str("tool"));
@@ -2677,6 +2797,9 @@ int main(int argc, char** argv) {
                                   "}}\n\n");
                 }
                 cur = std::move(t2);
+                // 第二轮重新拼了 prompt，前缀缓存的代号换了 —— 这一轮生成完
+                // 要往"新的那一段"上接，不能再用第一轮的代号。
+                pcid = g_pcache.current_id();
             }
 
             g.last_decode_tps = st.decode_tps;
@@ -2688,7 +2811,8 @@ int main(int argc, char** argv) {
                                std::string(finish) + "\"}],\"usage\":{\"completion_tokens\":" +
                                std::to_string(st.n_generated) + ",\"prompt_tokens\":" +
                                std::to_string(st.n_prompt) + ",\"decode_tps\":" +
-                               std::to_string(st.decode_tps) + "}}\n\n";
+                               std::to_string(st.decode_tps) + ",\"reused_tokens\":" +
+                               std::to_string(st.n_reused) + "}}\n\n";
             c.write_chunk(done);
             c.write_chunk("data: [DONE]\n\n");
             c.end_stream();
@@ -2750,6 +2874,7 @@ int main(int argc, char** argv) {
         usage.set("prompt_tokens", json::Value::make_num(st.n_prompt));
         usage.set("completion_tokens", json::Value::make_num(st.n_generated));
         usage.set("decode_tps", json::Value::make_num(st.decode_tps));
+        usage.set("reused_tokens", json::Value::make_num(st.n_reused));
         root.set("usage", usage);
         c.send(200, "application/json", json::dump(root));
     });

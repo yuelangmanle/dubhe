@@ -162,6 +162,7 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
     k_cache_.assign((size_t)cfg_.n_layer * kv_cap_ * kv_dim, 0.f);
     v_cache_.assign((size_t)cfg_.n_layer * kv_cap_ * kv_dim, 0.f);
     kv_len_ = 0;
+    kv_toks_.clear();
 
     x_.assign(cfg_.n_embd, 0.f);
     xb_.assign(cfg_.n_embd, 0.f);
@@ -486,9 +487,9 @@ bool Model::enable_gpu(std::string* err) {
             if (rel_batch > rel) { rel = rel_batch; bad_step = -2; }   // -2 标记批处理路径
             if (std::getenv("DUBHE_FUSED_CHECK_VERBOSE")) {
                 std::fprintf(stderr,
-                             "[dubhe] 融合对拍: 最差 rel=%.2e @pos %d  max|Δ|=%.3e  "
+                             "[dubhe] 融合对拍: 最差 rel=%.2e @pos %d  max|Δ|=%.3e  max|ref|=%.3e  "
                              "argmax gpu=%d cpu=%d  每步argmax一致=%d\n",
-                             rel, bad_step, mx, arg_g, arg_c, int(all_am));
+                             rel, bad_step, mx, mref, arg_g, arg_c, int(all_am));
             }
             // 两级判据。
             //
@@ -698,6 +699,8 @@ void Model::unload() {
     layers_.clear();
     k_cache_.clear();
     v_cache_.clear();
+    kv_toks_.clear();
+    kv_len_ = 0;
     x_.clear();
     xb_.clear();
     xb2_.clear();
@@ -720,11 +723,23 @@ void Model::unload() {
 
 void Model::reset_kv() {
     kv_len_ = 0;
+    kv_toks_.clear();
     clear_conv_state();
     if (gpu_fused_) metal::fwd_reset_conv();
 }
 
 void Model::clear_conv_state() { std::fill(conv_state_.begin(), conv_state_.end(), 0.f); }
+
+int Model::kv_prefix_len(const int32_t* toks, int n) const {
+    // kv_toks_ 与 kv_len_ 必须严格等长，否则说明中途有别的入口动过 KV
+    // （换模型、挂多模态、异常提前返回）。这种情况一律不复用。
+    if (kv_toks_.empty() || (int)kv_toks_.size() != kv_len_) return 0;
+    if (!toks || n <= 0) return 0;
+    const int lim = std::min((int)kv_toks_.size(), n);
+    int k = 0;
+    while (k < lim && kv_toks_[(size_t)k] == toks[k]) k++;
+    return k;
+}
 
 bool Model::grow_kv(int need) {
     if (need <= kv_cap_) return true;
@@ -939,6 +954,11 @@ bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* log
         if (err && err->empty()) *err = "GPU 批处理前向失败";
         return false;
     }
+    // 记录 KV 里现在装着什么，供下一次请求判断能不能跳过 prefill。
+    // pos0 不等于 kv_len_ 说明这不是顺序追加（调用方自己动过位置），
+    // 缓存就此作废 —— 宁可下次多 prefill 一遍，也不能拿错位的 KV 出字。
+    if (pos0 != kv_len_) kv_toks_.clear();
+    kv_toks_.insert(kv_toks_.end(), tokens, tokens + n);
     kv_len_ = pos0 + n;
     return true;
 }
@@ -975,6 +995,8 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
             if (err && err->empty()) *err = "GPU 前向失败";
             return false;
         }
+        if (pos != kv_len_) kv_toks_.clear();
+        kv_toks_.push_back(token);
         kv_len_ = pos + 1;
         return true;
     }
@@ -1069,6 +1091,8 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
     rmsnorm(xb_.data(), x_.data(), out_norm_, n_embd);
     matvec(logits, xb_.data(), out_w_, cfg_.n_vocab, n_embd);
 
+    if (pos != kv_len_) kv_toks_.clear();
+    kv_toks_.push_back(token);
     kv_len_ = pos + 1;
     return true;
 }

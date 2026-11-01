@@ -468,11 +468,59 @@ int dubhe_generate(dubhe_engine* e,
 
     std::lock_guard<std::mutex> lock(e->mu);
     e->abort = false;
-    e->model.reset_kv();
+
+    // ---- 前缀复用：多轮对话不该每轮都从头 prefill
+    //
+    // 每轮请求都会把整段历史重新发一遍，真正新增的往往只有用户刚说的那
+    // 十几个 token。原来的做法是 reset_kv() 之后把整段重算一遍 —— 2000
+    // token 的历史在 2B 模型上就是好几秒的首字延迟。
+    //
+    // 判据只有一条：**KV 里那串 token 必须严格等于新 prompt 的开头**。
+    // 不做"最长公共前缀"，因为 LFM3 的 ShortConv 是滚动状态，没法回退
+    // 到中间位置；一旦分叉就只能整体重来。这正好覆盖多轮对话和工具轮
+    // （第二轮 = 第一轮 prompt + 助手轮 + 工具结果）。
+    //
+    // 多模态不参与复用：同一串 token id 配不同的图，算出来的 KV 完全不同，
+    // 而 prompt 里的占位 token 是一样的，光比对 token 分不出来。
+    const bool has_mm = e->mm_n > 0 && !e->mm_embeds.empty();
+    int start = 0;
+    if (!has_mm) {
+        const int k = e->model.kv_prefix_len(prompt, n_prompt);
+        // k 必须严格小于 n_prompt：至少要喂一个 token，logits 才是这一轮的
+        if (k > 0 && k == e->model.kv_len() && k < n_prompt) start = k;
+        if (std::getenv("DUBHE_KV_DEBUG")) {
+            // 复用没生效时，需要知道是"没匹配上"还是"匹配了但没采用"
+            const int kvl = e->model.kv_len();
+            std::fprintf(stderr,
+                         "[dubhe] 前缀: kv_len=%d prompt=%d 匹配=%d 采用=%d"
+                         " 分叉处 kv=%d prompt=%d\n",
+                         kvl, n_prompt, k, start,
+                         e->model.kv_tok_at(k), k < n_prompt ? prompt[k] : -1);
+            // 分叉点前后各几个 token 逐个解出来，直接看切分边界差在哪
+            if (k < kvl && k < n_prompt) {
+                auto dump = [&](const char* tag, bool use_kv) {
+                    std::fprintf(stderr, "[dubhe]   %s:", tag);
+                    for (int i = k - 2; i < k + 6; i++) {
+                        const int32_t id = use_kv ? e->model.kv_tok_at(i)
+                                                  : (i < n_prompt ? prompt[i] : -1);
+                        if (id < 0) break;
+                        char buf[256];
+                        const int32_t nb = dubhe_token_to_piece(e, id, buf, sizeof(buf));
+                        std::string p = nb > 0 ? std::string(buf, (size_t)nb) : std::string();
+                        std::fprintf(stderr, " %d[%s]", id, p.c_str());
+                    }
+                    std::fprintf(stderr, "\n");
+                };
+                dump("kv    ", true);
+                dump("prompt", false);
+            }
+        }
+    }
+    if (start == 0) e->model.reset_kv();
 
     // 多模态特征：位置必须在 prompt 之内，否则说明调用方算错了占位 token 数，
     // 静默忽略会得到"模型看得见但没看"的诡异结果，所以直接报错。
-    if (e->mm_n > 0 && !e->mm_embeds.empty()) {
+    if (has_mm) {
         if (e->mm_at + e->mm_n > n_prompt) {
             set_err("多模态特征位置越界：at=" + std::to_string(e->mm_at) + " n=" +
                     std::to_string(e->mm_n) + " 但 prompt 只有 " + std::to_string(n_prompt));
@@ -493,9 +541,10 @@ int dubhe_generate(dubhe_engine* e,
     std::string err;
     // prefill：按引擎实际批大小切块。GPU 上一次提交吃 8 个 token，
     // 权重只读一遍就摊到 8 个 token 上——这是首字延迟的关键。
+    // 从 start 开始：前面 start 个 token 的 KV 已经算好了，不重算。
     {
         const int nb = std::max(1, e->model.batch_size());
-        for (int32_t i = 0; i < n_prompt; ) {
+        for (int32_t i = start; i < n_prompt; ) {
             const int take = std::min<int>(nb, n_prompt - i);
             if (!e->model.forward_batch(prompt + i, take, i, logits.data(), &err)) {
                 set_err(err);
@@ -546,8 +595,12 @@ int dubhe_generate(dubhe_engine* e,
         stats->n_generated = n_gen;
         stats->t_prompt_ms = t1 - t0;
         stats->t_gen_ms = t2 - t1;
-        stats->prefill_tps = (t1 - t0) > 0 ? n_prompt / ((t1 - t0) / 1000.0) : 0.0;
+        // 分母是"这一轮真正算了的 token 数"，不是 n_prompt —— 复用前缀之后
+        // 拿 n_prompt 去除非但会把吞吐吹上天，也会掩盖复用到底有没有生效。
+        const int computed = n_prompt - start;
+        stats->prefill_tps = (t1 - t0) > 0 ? computed / ((t1 - t0) / 1000.0) : 0.0;
         stats->decode_tps = (t2 - t1) > 0 ? std::max(0, n_gen - 1) / ((t2 - t1) / 1000.0) : 0.0;
+        stats->n_reused = start;
     }
     return DUBHE_OK;
 }
