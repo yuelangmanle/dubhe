@@ -556,10 +556,55 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
     if (name == "read_file") {
         std::string p = args.s("path");
         if (p.empty()) { r.output = "缺少 path 参数"; return r; }
-        std::string content = read_file(p);
+        const std::string content = read_file(p);
         if (content.empty()) { r.output = "文件为空或无法读取: " + p; return r; }
+
+        // 分页读。一次把整个文件塞进 prompt 是工具轮里最贵的一步：读一个
+        // 10 KB 的 README 就是 3158 个 token，prefill 要十几秒 —— 而用户
+        // 问的可能只是"第一行写了什么"。
+        //
+        // 给 offset/limit 之后，模型可以"先读开头、需要再往下翻"，
+        // 结果大小由它自己控制，而不是由文件大小决定。
+        // 默认只给前 120 行：这个数不是拍的，是按"工具结果不该吃掉半个
+        // 上下文"倒推的 —— README 这种密排文档 120 行大约 1700 token，
+        // 在 4096 的上下文里还留得下对话和回答。要更多就用 offset 往下翻。
+        const int off = std::max(1, (int)args.n("offset", 1));
+        const int lim = std::max(1, (int)args.n("limit", 120));
+
+        std::string out;
+        int line_no = 0, taken = 0, total = 0;
+        size_t i = 0;
+        const size_t n = content.size();
+        // 逐行扫。i < n 而不是 i <= n：文件以换行结尾时，最后那个换行后面
+        // 不是"多出来的一行"（否则 240 行的 README 会报成 241 行）。
+        while (i < n) {
+            const size_t e = content.find('\n', i);
+            const size_t end = (e == std::string::npos) ? n : e;
+            line_no++;
+            if (line_no >= off && taken < lim) {
+                out.append(content, i, end - i);
+                out.push_back('\n');
+                taken++;
+            }
+            if (e == std::string::npos) break;
+            i = e + 1;
+        }
+        total = line_no;
         r.ok = true;
-        r.output = content;
+        r.output = out;
+        if (taken == 0) {
+            r.output = "文件只有 " + std::to_string(total) + " 行，offset=" +
+                       std::to_string(off) + " 已经超出范围。";
+        } else if (off > 1 || off + taken - 1 < total) {
+            // 说清楚"给了哪一段、总共多少"，模型才知道要不要接着翻
+            r.output += "\n…（这是第 " + std::to_string(off) + "–" +
+                        std::to_string(off + taken - 1) + " 行，全文共 " +
+                        std::to_string(total) + " 行）";
+            if (off + taken - 1 < total) {
+                r.output += "。要看后面的内容，用 offset=" + std::to_string(off + taken) +
+                            " 再读一次。";
+            }
+        }
         return r;
     }
     if (name == "list_dir") {
@@ -645,7 +690,8 @@ std::string tool_prompt() {
     }
     s +=
         "一次只调用一个工具。可用工具：\n"
-        "- read_file(path): 读取文本文件\n"
+        "- read_file(path, offset, limit): 读取文本文件，默认给前 120 行。\n"
+        "  文件很长时先读开头；需要后面的内容再用 offset=121 往下翻。\n"
         "- list_dir(path): 列出目录内容\n"
         "- write_file(path, content): 写入文件\n"
         "- shell(command): 执行 shell 命令（可能被禁用）\n"
@@ -1762,7 +1808,7 @@ json::Value tools_json() {
         o.set("enabled", json::Value::make_bool(on));
         arr.arr.push_back(o);
     };
-    add("read_file", "读取文本文件，最多 256 KB", "path", true);
+    add("read_file", "读取文本文件，默认前 120 行，可用 offset/limit 分页", "path, offset, limit", true);
     add("list_dir", "列出目录内容", "path", true);
     add("write_file", "写入文件（覆盖）", "path, content", true);
     add("shell", "执行 shell 命令", "command", g.allow_shell);
