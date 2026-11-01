@@ -693,9 +693,13 @@
     const empty = $('#emptyState');
     if (empty && empty.parentNode) empty.remove();
     box.appendChild(messageNode(userMsg));
-    const node = messageNode(ai);
+    // node / body 必须是 let：工具卡片到达时要整块重绘，重绘后这两个引用
+    // 得指向新节点。原来写成 const，重绘那行会抛 TypeError，而且是被
+    // 外层 catch 吞掉的那种 —— 界面上只剩一个永远"生成中"的空气泡，
+    // 控制台一句错都不报，查起来极难。
+    let node = messageNode(ai);
     box.appendChild(node);
-    const body = node.querySelector('.body');
+    let body = node.querySelector('.body');
     body.classList.add('typing');
     scrollBottom(true);
 
@@ -785,12 +789,15 @@
                 last.ms = performance.now() - (last.t0 || performance.now());
               }
               renderTools();
-              // 重绘以显示工具卡片
+              // 重绘以显示工具卡片。
+              //
+              // 注意这两行必须改的是外层 let：工具结果一到，整个气泡换成
+              // 带卡片的新节点，后面所有增量都得写进新节点的 .body。
               const fresh = messageNode(ai);
               node.replaceWith(fresh);
               node = fresh;
-              node.querySelector('.body').classList.add('typing');
               body = node.querySelector('.body');
+              body.classList.add('typing');
             }
             continue;
           }
@@ -844,9 +851,25 @@
       } else {
         log('Stopped.', 'err');
       }
+      // 收尾一律替换"当前还挂在文档里"的那个节点。
+      // 工具卡片到达时整块重绘过，早期抓到的引用已经脱离文档；对它
+      // replaceWith 等于什么都没做 —— 结果是气泡永远停在"生成中…"，
+      // 正文一个字都渲染不出来。
+      if (!node.isConnected) box.appendChild(node);
       const finalNode = messageNode(ai);
       node.replaceWith(finalNode);
+      node = finalNode;
+      body = node.querySelector('.body');
       body.classList.remove('typing');
+      // "已完成 · 0 tokens"的空气泡比报错更让人困惑：真空了就直说。
+      if (!String(ai.content || '').trim() && !(ai.tools && ai.tools.length)) {
+        ai.content = '（这一轮没有任何输出。可能是上下文放不下，或者模型直接收尾了，换个问法再试。）';
+        const nn = messageNode(ai);
+        node.replaceWith(nn);
+        node = nn;
+        body = node.querySelector('.body');
+        body.classList.remove('typing');
+      }
       saveConvs();
       scrollBottom(true);
       renderTools();

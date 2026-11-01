@@ -2470,6 +2470,20 @@ int main(int argc, char** argv) {
         }
         const int32_t n = (int32_t)toks.size();
 
+        // 输入本身就超过上下文时，generate 会一开始就 break：没有报错、没有
+        // 正文，界面上是"生成中"转很久然后什么都没有。这里直接说清楚。
+        dubhe_model_info lim{};
+        dubhe_model_info_get(g.engine, &lim);
+        if (lim.n_ctx_limit > 0 && n >= lim.n_ctx_limit) {
+            c.send(400, "application/json",
+                   "{\"error\":{\"message\":" +
+                       json_escape("输入太长：" + std::to_string(n) + " tokens，超过当前上下文上限 " +
+                                   std::to_string(lim.n_ctx_limit) +
+                                   "。请缩短问题、清空历史，或换一个上下文更长的模型。") +
+                       ",\"type\":\"invalid_request_error\"}}");
+            return;
+        }
+
         const std::string id = now_id();
         long long created = (long long)time(nullptr);
 
@@ -2613,14 +2627,54 @@ int main(int argc, char** argv) {
                 tm.set("content", json::Value::make_str(tr.output));
                 msgs2.arr.push_back(tm);
 
-                // 复用第一轮编好的特征：图片不重编，只重新分词
+                // 工具结果可能比整个上下文还长（read_file 读一个 10KB 的
+                // README 就接近 4096 的上限）。不截的话第二轮 prompt 直接
+                // 越过 n_ctx，generate 一开始就 break —— 界面上是"生成中"
+                // 转两分钟然后什么都没有，比报错难查得多。
+                //
+                // 按实际 token 数往回缩，而不是按字符数猜比例：中英混排的
+                // 字符/ token 比能差 4 倍。
+                dubhe_model_info ctx_mi{};
+                dubhe_model_info_get(g.engine, &ctx_mi);
+                const int reserve = std::min((int)sp.max_tokens, 512);
+                const int room = ctx_mi.n_ctx_limit - reserve;
+
                 std::vector<int32_t> t2;
                 std::string e2;
-                if (!build_tokens(g.engine, msgs2, chatml, with_tools, force_raw, &t2, &mcache,
-                                  &e2)) {
-                    c.write_chunk("data: {\"dubhe\":{\"type\":\"error\",\"message\":" +
-                                  json_escape(e2) + "}}\n\n");
+                size_t keep = tr.output.size();
+                bool truncated = false;
+                for (int attempt = 0; attempt < 6; attempt++) {
+                    std::string body = tr.output;
+                    if (keep < body.size()) {
+                        // 别切在半个汉字上：往回退到 UTF-8 边界
+                        size_t cut = keep;
+                        while (cut > 0 && ((unsigned char)body[cut] & 0xC0) == 0x80) cut--;
+                        body = body.substr(0, cut) +
+                               "\n\n…（结果过长，已截断到 " + std::to_string(cut) + " 字节）";
+                        truncated = true;
+                    }
+                    msgs2.arr.back().set("content", json::Value::make_str(body));
+                    t2.clear();
+                    if (!build_tokens(g.engine, msgs2, chatml, with_tools, force_raw, &t2, &mcache,
+                                      &e2)) {
+                        c.write_chunk("data: {\"dubhe\":{\"type\":\"error\",\"message\":" +
+                                      json_escape(e2) + "}}\n\n");
+                        break;
+                    }
+                    if ((int)t2.size() <= room) break;
+                    keep = keep * 3 / 4;
+                }
+                if (t2.empty()) break;
+                if ((int)t2.size() > room) {
+                    emit_delta(&ctx, "（工具返回的内容超过了上下文长度，即使截断也放不下。"
+                                     "换个小一点的读取目标再试。）");
                     break;
+                }
+                if (truncated) {
+                    c.write_chunk("data: {\"dubhe\":{\"type\":\"note\",\"message\":" +
+                                  json_escape("工具返回的内容较长，已截断到 " +
+                                              std::to_string(t2.size()) + " tokens 以内") +
+                                  "}}\n\n");
                 }
                 cur = std::move(t2);
             }
