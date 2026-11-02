@@ -2085,6 +2085,9 @@ int main(int argc, char** argv) {
                 m.set("quant", json::Value::make_str(mi.quant_desc));
                 m.set("n_ctx", json::Value::make_num(mi.n_ctx_limit));
                 m.set("n_ctx_train", json::Value::make_num(mi.n_ctx_train));
+                // 这台机器装得下的上限。前端拿它去画"上下文用量条"的满格，
+                // 拿 n_ctx 当"这次能用多少"，两者不再混为一谈。
+                m.set("n_ctx_ceiling", json::Value::make_num(mi.n_ctx_ceiling));
                 m.set("n_layer", json::Value::make_num(mi.n_layer));
                 m.set("n_embd", json::Value::make_num(mi.n_embd));
                 m.set("n_vocab", json::Value::make_num(mi.n_vocab));

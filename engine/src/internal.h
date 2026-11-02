@@ -363,6 +363,7 @@ public:
     // 供 UI / 统计使用
     uint64_t n_params() const { return n_params_; }
     int      n_ctx_limit() const { return n_ctx_; }
+    int      n_ctx_ceiling() const { return n_ctx_ceiling_; }
     const char* quant_desc() const { return quant_desc_.c_str(); }
     bool gpu_active() const { return gpu_active_; }
     const char* gpu_note() const { return gpu_note_.c_str(); }
@@ -399,7 +400,11 @@ private:
     // 但逐算子的 matvec 仍然走 GPU，所以这两个标志必须分开。
     bool gpu_fused_ = false;
     std::string gpu_note_;              // GPU 状态说明（供 UI / 日志展示）
-    int  n_ctx_ = 0;    // 可用上下文上限
+    int  n_ctx_ = 0;    // 当前生效的上下文上限
+    // 这台机器装得下的上限（训练上下文与内存两条夹完之后的那个数）。
+    // 和 n_ctx_ 的区别：n_ctx_ 是"现在用多少"，这个是"最多能给多少"。
+    // 用户没给 -c 时两者相等（默认就用满）；给了 -c 就听用户的，但不超过它。
+    int  n_ctx_ceiling_ = 0;
     int  kv_cap_ = 0;   // KV cache 已分配槽位
 
     TensorInfo tok_embd_, out_norm_, out_w_;

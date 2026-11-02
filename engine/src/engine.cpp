@@ -174,6 +174,7 @@ int dubhe_model_info_get(const dubhe_engine* e, dubhe_model_info* out) {
     out->n_vocab = c.n_vocab;
     out->n_ctx_train = c.n_ctx_train;
     out->n_ctx_limit = e->model.n_ctx_limit();
+    out->n_ctx_ceiling = e->model.n_ctx_ceiling();
     out->n_embd = c.n_embd;
     out->n_layer = c.n_layer;
     out->n_head = c.n_head;
@@ -260,17 +261,19 @@ int dubhe_mm_dim(dubhe_engine* e) {
 }
 
 
-// 预处理像素上限。视觉塔跑在 **CPU** 上（mmproj 走 mm_math，不走 Metal），
-// 耗时随 patch 数近似平方增长。实测 LFM3-VL-2B（mmproj Q8_0，1024 边长）：
+// 预处理像素上限。视觉塔现在走 Metal（mmproj 的 matmul 和双向注意力都在
+// GPU 上，见 vit_gpu.mm），但**预处理像素仍然直接决定耗时**：patch 数是
+// (w/16)·(h/16)，注意力是 O(N²)，边长翻倍就是 4 倍 token、16 倍注意力。
+// 实测 LFM3-VL-2B（mmproj Q8_0，GPU 路径）：
 //
-//   512²  → 192 token   约  5 s
-//   768²  → 588 token   约 23 s
-//   1024² → 1045 token  约 75 s
+//   512²  → 1024 patch / 256 token   722 ms
+//   768²  → 2304 patch / 576 token  1311 ms
+//   1024² → 4096 patch /1024 token  2706 ms
 //
 // mmproj 自己带的 max_pixels 是 16.7M（4096²），等于没有上限 —— 一张普通
-// 手机照片就能让用户等一分多钟。所以在这里补一道默认上限，压到 512²（约
-// 5 s）：聊天场景下看清"图里是什么"够用。要看细节/读小字，用
-// DUBHE_MM_MAX_PIXELS 调大，代价按上面的曲线估。
+// 手机照片就是 6 万 patch、几十秒。所以在这里补一道默认上限，压到 512²：
+// 聊天场景下看清"图里是什么"够用。要看细节/读小字，用 DUBHE_MM_MAX_PIXELS
+// 调大，代价按上面的曲线估。
 static int mm_max_pixels() {
     static const int v = []() {
         const char* s = getenv("DUBHE_MM_MAX_PIXELS");

@@ -987,7 +987,13 @@
         kv('量化', i.quant);
         kv('层数 / 维度', `${i.n_layer} / ${i.n_embd}`);
         kv('词表', String(i.n_vocab));
-        kv('上下文', i.n_ctx + (i.n_ctx_train > i.n_ctx ? ' / 训练 ' + i.n_ctx_train : ''));
+        // 三个数分清楚：n_ctx 是这次能用的，n_ctx_ceiling 是这台机器装得下的，
+        // n_ctx_train 是模型训练时见过的。三者不同时全列出来，否则用户会以为
+        // "模型支持 256K，为什么 118K 就报满"。
+        kv('上下文', fmtCtx(i.n_ctx)
+          + (i.n_ctx_ceiling > i.n_ctx ? ' / 上限 ' + fmtCtx(i.n_ctx_ceiling) : '')
+          + (i.n_ctx_train > (i.n_ctx_ceiling || i.n_ctx)
+            ? ' / 训练 ' + fmtCtx(i.n_ctx_train) : ''));
         kv('Chat 模板', i.chatml ? 'ChatML' : '无');
         body.appendChild(box);
       } else {

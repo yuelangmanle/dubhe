@@ -135,10 +135,16 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
         }
     }
     cfg_.n_ctx_train = std::max(cfg_.n_ctx_train, 512);
-    // KV cache 不预分配满训练上下文（32K 上下文 × 24 层 = 800MB，纯浪费）。
-    // 先给一个够用的窗口，不够时按 2 倍增长，上限 = 用户/训练上下文。
-    n_ctx_ = (n_ctx > 0) ? std::min(n_ctx, cfg_.n_ctx_train) : std::min(cfg_.n_ctx_train, 4096);
-    kv_cap_ = std::min(n_ctx_, 1024);
+    // KV cache 不预分配满上下文（262144 × 24 层 = 25.8 GB，纯浪费）。
+    // 先给一个够用的窗口，不够时按 2 倍增长，上限 = 下面算出来的天花板。
+    //
+    // 这里**不再写死 4096**。以前默认 `min(n_ctx_train, 4096)`，结果是
+    // `inspect` 打出"可用上下文 4096（受内存/参数限制）"，而实际上这台机器
+    // 装得下 10 万 —— 用户贴一篇长文就撞"上下文已满"，还以为引擎不行。
+    // 默认改成"用满天板"是安全的：kv_cap_ 起步只有 1024 个槽，真正的分配
+    // 发生在 grow_kv（也就是用户真喂了那么长的输入时），没用到就不占内存。
+    n_ctx_ceiling_ = cfg_.n_ctx_train;
+    n_ctx_ = (n_ctx > 0) ? std::min(n_ctx, cfg_.n_ctx_train) : cfg_.n_ctx_train;
 
     // ------------------------------------------------------- 上下文 × 内存
     //
@@ -170,19 +176,22 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
             if (weights < cap85 && cap85 - weights < kv_budget) kv_budget = cap85 - weights;
 
             const uint64_t fit = kv_budget / per_ctx;
-            if (fit < (uint64_t)n_ctx_) {
+            if (fit < (uint64_t)n_ctx_ceiling_) {
                 int64_t c = (int64_t)fit / 256 * 256;
                 if (c < 1024) c = 1024;
-                if (c < n_ctx_) {
-                    std::fprintf(stderr,
-                                 "[dubhe] 上下文 %d → %d：每 1k 上下文要 %.1f MB KV，"
-                                 "这台机器的内存只装得下这么多\n",
-                                 n_ctx_, (int)c, (double)per_ctx * 1024.0 / 1048576.0);
-                    n_ctx_ = (int)c;
-                    kv_cap_ = std::min(n_ctx_, 1024);
-                }
+                if (c < n_ctx_ceiling_) n_ctx_ceiling_ = (int)c;
             }
         }
+        // 只有"用户明确要了但装不下"才值得说一句。默认值被夹是正常行为，
+        // 每次都打一行反而像警告。
+        if (n_ctx_ > n_ctx_ceiling_) {
+            std::fprintf(stderr,
+                         "[dubhe] 上下文 %d → %d：每 1k 上下文要 %.1f MB KV，"
+                         "这台机器的内存只装得下这么多\n",
+                         n_ctx_, n_ctx_ceiling_, (double)per_ctx * 1024.0 / 1048576.0);
+            n_ctx_ = n_ctx_ceiling_;
+        }
+        kv_cap_ = std::min(n_ctx_, 1024);
     }
 
     if (!tok_.init(file_, err)) return false;

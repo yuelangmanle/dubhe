@@ -194,13 +194,18 @@ int cmd_inspect(const Args& a) {
     std::printf("FFN 维度    %d\n", mi.n_ff);
     std::printf("词表        %d\n", mi.n_vocab);
     std::printf("训练上下文  %d\n", mi.n_ctx_train);
-    // 实际可用上下文：可能被内存夹过（见 model.cpp 里"上下文 × 内存"那段），
-    // 也可能被 -c 限制。和训练上下文不一样时要说出来，否则用户会以为
-    // "模型支持 262144" 然后困惑为什么聊到一半就报越界。
-    if (mi.n_ctx_limit != mi.n_ctx_train)
-        std::printf("可用上下文  %d  （受内存/参数限制）\n", mi.n_ctx_limit);
+    // 三个数要分清楚，否则用户会困惑"模型支持 262144，为什么聊到一半就报越界"：
+    //   n_ctx_train    模型训练时见过的长度（GGUF 里写的）
+    //   n_ctx_ceiling  这台机器装得下的长度（训练上下文与内存夹完）
+    //   n_ctx_limit    这次实际生效的长度（-c 给的，没给就等于 ceiling）
+    if (mi.n_ctx_ceiling < mi.n_ctx_train)
+        std::printf("可用上下文  %d  （内存上限；模型训练到 %d，但 KV 装不下）\n",
+                    mi.n_ctx_ceiling, mi.n_ctx_train);
     else
-        std::printf("可用上下文  %d\n", mi.n_ctx_limit);
+        std::printf("可用上下文  %d\n", mi.n_ctx_ceiling);
+    if (mi.n_ctx_limit < mi.n_ctx_ceiling)
+        std::printf("本次生效    %d  （-c 指定的；可调到 %d）\n", mi.n_ctx_limit,
+                    mi.n_ctx_ceiling);
     std::printf("Chat 模板   %s\n", mi.has_chat_template ? "ChatML" : "无");
     std::printf("计算后端    %s\n", mi.backend);
     std::printf("硬件        %s\n", dubhe_hardware_info());
