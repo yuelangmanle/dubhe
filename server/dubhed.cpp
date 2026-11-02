@@ -81,6 +81,14 @@ struct AppState {
     bool allow_write = true;    // 写文件 / 改文件
     bool allow_net = true;      // 联网（web_search / fetch_url）
     bool sandbox = true;        // shell 用 seatbelt 限制写盘范围
+    // 一次提问里最多跑几轮工具。
+    //
+    // 原来是写死的 2。2 轮只够"读文件 → 回答"，而实际任务经常是
+    // "grep 找位置 → 读那一处 → 再读一个相关文件 → 改 → 回答"，第三轮就被
+    // 掐断，用户拿到的是"已达 2 轮上限"加一坨没消化完的材料。上限本身是必要
+    // 的（2B 模型看到工具结果会反复要工具），但 2 太紧；改成可调，默认 6，
+    // 同时保留"同一个工具同样的参数连调两次就停"的原地打转保护。
+    int max_tool_rounds = 6;
     // 写域默认只到当前项目文件夹。读可以看整个家目录（模型权重就在
     // ~/.dubhe 下，读不到等于残废），但"能读"和"能改"不该是同一个范围 ——
     // 这是 DeepSeek Harness 的 workspace-write 默认值，也是用户把文件夹
@@ -3090,6 +3098,7 @@ int main(int argc, char** argv) {
         o.set("sandbox_cfg", json::Value::make_bool(g.sandbox));
         o.set("write_outside", json::Value::make_bool(g.allow_write_outside));
         o.set("shell_timeout_s", json::Value::make_num(g.shell_timeout_ms / 1000.0));
+        o.set("tool_rounds", json::Value::make_num(g.max_tool_rounds));
         o.set("api_key", json::Value::make_str(is_local(req) ? g.api_key : ""));
         o.set("lan_url", json::Value::make_str(g.lan_url));
         o.set("auth", json::Value::make_bool(!g.api_key.empty()));
@@ -3401,6 +3410,8 @@ int main(int argc, char** argv) {
                 g.allow_write_outside = body.flag("write_outside", g.allow_write_outside);
             const double t = body.n("shell_timeout_s", 0);
             if (t >= 1 && t <= 600) g.shell_timeout_ms = (int)(t * 1000);
+            const double tr = body.n("tool_rounds", 0);
+            if (tr >= 1 && tr <= 24) g.max_tool_rounds = (int)tr;
             // 工作目录：必须是已存在的目录，且落在白名单根之内
             const std::string wd = body.s("workspace");
             if (!wd.empty()) {
@@ -3426,6 +3437,7 @@ int main(int argc, char** argv) {
         o.set("sandbox_cfg", json::Value::make_bool(g.sandbox));
         o.set("write_outside", json::Value::make_bool(g.allow_write_outside));
         o.set("shell_timeout_s", json::Value::make_num(g.shell_timeout_ms / 1000.0));
+        o.set("tool_rounds", json::Value::make_num(g.max_tool_rounds));
         o.set("workspace", json::Value::make_str(g.workspace));
         c.send(200, "application/json", json::dump(o));
     });
@@ -4036,16 +4048,20 @@ int main(int argc, char** argv) {
 
             dubhe_stats st{};
 
-            // 调用方自己跑循环时服务端一轮都不执行；否则最多跑两轮工具。
+            // 调用方自己跑循环时服务端一轮都不执行；否则最多跑 g.max_tool_rounds 轮。
             //
-            // 上限不是随手定的：2B 级别的模型看到工具结果后经常又吐一次
+            // 上限本身是必要的：2B 级别的模型看到工具结果后经常又吐一次
             // tool_call（尤其结果里有代码/JSON 时），不设上限会来回打转。
-            // 两轮足够覆盖"读文件→读目录→回答"这种最常见的组合。
+            // 但原来写死 2 太紧 —— "grep 定位 → 读那处 → 读相关文件 → 改 →
+            // 回答"这种最普通的组合第三轮就被掐断。现在默认 6，可调，
+            // 并且保留下面那个"同样的调用连做两次就停"的保护。
             const bool client_drives = has_tool_result(*msgs);
-            const int max_rounds = client_drives ? 0 : 2;
+            const int max_rounds = client_drives ? 0 : std::max(1, g.max_tool_rounds);
             int rounds = 0;
             std::vector<int32_t> cur = toks;
-            std::string last_sig;      // 上一次执行的工具签名，用来发现原地打转
+            // 这一轮请求里跑过的所有工具签名。用"见过没有"而不是"和上一次比"，
+            // 因为模型打转的方式是 A B A B 交替，不是 A A A。
+            std::vector<std::string> seen_sigs;
             const char* finish = "stop";
             // 每一轮都从 msgs 出发重新拼（工具结果追加到副本上），所以它必须
             // 活到下一轮 —— 轮次用完时要用"上一轮那份含工具结果的对话"去开
@@ -4054,6 +4070,33 @@ int main(int argc, char** argv) {
             // 这一轮喂进去的是哪段 prompt（前缀缓存的代号）。生成完要拿它
             // 把"新吐出来的字和 token"接到缓存尾巴上。
             uint64_t pcid = g_pcache.current_id();
+
+            // "最后一轮只回答"。
+            //
+            // 两种情况下都会走到：轮次用完了，或者发现模型在原地打转。两处
+            // 原来各写各的 —— 轮次那处会补一轮不带工具的回答，打转那处只
+            // emit 一句"已停止"就 break，用户拿到的是一句告警加零结论。
+            // 抽成一个 lambda，两条路径都以"拿到回答"收尾。
+            //
+            // 返回 false 表示连这一轮都拼不出来（上下文放不下），调用方只能
+            // 如实说停在哪。
+            auto final_answer_round = [&](const std::string& why) -> bool {
+                json::Value fin = msgs2;
+                json::Value note = json::Value::make_obj();
+                note.set("role", json::Value::make_str("user"));
+                note.set("content", json::Value::make_str(why));
+                fin.arr.push_back(note);
+                std::vector<int32_t> t3;
+                std::string e3;
+                if (!build_tokens(g.engine, fin, chatml, false, force_raw, &t3, &mcache, &e3) ||
+                    t3.empty()) {
+                    return false;
+                }
+                cur = std::move(t3);
+                with_tools = false;   // 下一轮不再找 tool_call，也不再抑制
+                pcid = g_pcache.current_id();
+                return true;
+            };
 
             while (!cur.empty()) {
                 rtext.clear();
@@ -4131,20 +4174,9 @@ int main(int argc, char** argv) {
                     // 结果的对话原样摆回去，末尾补一句"工具次数用完了，直接用
                     // 上面的结果回答"。这一轮的 prompt 前缀和上一轮完全一致，
                     // 只是尾巴多了一句，KV 前缀缓存还能接上，代价很小。
-                    json::Value fin = msgs2;
-                    json::Value note = json::Value::make_obj();
-                    note.set("role", json::Value::make_str("user"));
-                    note.set("content", json::Value::make_str(
-                        "工具调用次数已经用完。不要再调用任何工具，"
-                        "直接用上面拿到的结果回答问题；拿不到的部分就说没拿到。"));
-                    fin.arr.push_back(note);
-                    std::vector<int32_t> t3;
-                    std::string e3;
-                    if (build_tokens(g.engine, fin, chatml, false, force_raw, &t3, &mcache, &e3) &&
-                        !t3.empty()) {
-                        cur = std::move(t3);
-                        with_tools = false;   // 下一轮不再找 tool_call，也不再抑制
-                        pcid = g_pcache.current_id();
+                    if (final_answer_round(
+                            "工具调用次数已经用完。不要再调用任何工具，"
+                            "直接用上面拿到的结果回答问题；拿不到的部分就说没拿到。")) {
                         continue;
                     }
                     // 连这一步都拼不出来（上下文放不下），只能如实说停在哪。
@@ -4155,15 +4187,24 @@ int main(int argc, char** argv) {
                 }
 
                 // 同一个工具、同一组参数，再跑一遍结果一模一样，循环不可能收敛。
-                // 2B 级别的模型很容易卡在这里（尤其"读文件→再读一次"），
-                // 直接停下比再等一轮十几秒的 prefill 强。
+                //
+                // 原来是"和上一次比"（last_sig），只挡得住 A A A 这种连发。
+                // 实测 1.7B 更常见的是 A B A B 来回切：list_dir → read_file →
+                // list_dir → read_file，连续两次永远不相同，守卫一次都没触发，
+                // 六轮全烧在这种乒乓上。改成"和这一轮请求里所有跑过的比"，
+                // 一旦出现重复就直接进"只回答"那一轮。
                 const std::string sig = tname + "|" + json::dump(targs);
-                if (sig == last_sig) {
+                if (std::find(seen_sigs.begin(), seen_sigs.end(), sig) != seen_sigs.end()) {
+                    if (final_answer_round(
+                            "这个工具和参数你前面已经调用过了，结果不会变。"
+                            "不要再调用工具，直接用已经拿到的结果回答。")) {
+                        continue;
+                    }
                     emit_delta(&ctx, "（模型在重复调用同一个工具 " + tname +
                                          "，结果不会变，已停止。可以换个问法再试。）");
                     break;
                 }
-                last_sig = sig;
+                seen_sigs.push_back(sig);
 
                 c.write_chunk("data: {\"dubhe\":{\"type\":\"tool_call\",\"name\":" +
                               json_escape(tname) + ",\"arguments\":" + json::dump(targs) +

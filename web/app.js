@@ -2149,6 +2149,24 @@
       });
       row(body, '命令超时', '超过这个时间整组进程会被杀掉', tmo);
 
+      // 工具轮数。
+      //
+      // 这条以前根本不在界面上，服务端写死 2 —— 一个"grep 找位置 → 读那一处
+      // → 读相关文件 → 改 → 回答"的任务第三轮就被掐断，用户看到的是
+      // "已达 2 轮上限"。轮数越多越慢（每轮都要重做一次 prefill），所以
+      // 给几档让用户按任务复杂度自己选，而不是替他定死。
+      const rnd = el('div', 'seg');
+      [2, 4, 6, 12].forEach((n) => {
+        const b = el('button', 'seg-item' + ((srv().tool_rounds || 6) === n ? ' on' : ''), String(n));
+        b.onclick = async () => {
+          await setPerm('tool_rounds', n);
+          rnd.querySelectorAll('.seg-item').forEach((x) => x.classList.remove('on'));
+          b.classList.add('on');
+        };
+        rnd.appendChild(b);
+      });
+      row(body, '工具轮数', '一次提问里最多连续跑几轮工具。任务复杂就调大，但每轮都要重算一遍输入。', rnd);
+
       // 工作目录 = 工具眼里的"根"。相对路径全部相对它解析。
       const wd = el('div');
       wd.style.display = 'flex';
