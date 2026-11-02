@@ -1001,6 +1001,44 @@ GateOut gate(const std::string& name, const json::Value& args) {
     // "缺少 path 参数"，不知道该怎么办。这里统一说清楚缺哪个键。
     if (path_required && args.s("path").empty()) return gate_deny("缺少 path 参数");
     if (name == "shell" && args.s("command").empty()) return gate_deny("缺少 command 参数");
+
+    // ---- 不可逆命令的硬闸
+    //
+    // 这不是沙箱，是最后一道闸。理由是：seatbelt 在本机套不上的时候（见
+    // shell 分支的退出码 71 降级），写盘限制其实是**没生效**的，而 1.7B 级的
+    // 模型迟早会吐出一条 `rm -rf ~`。
+    //
+    // 故意做得很窄：只挡"一旦执行就不可逆"的那几种，不做通用命令审计。
+    // 通用审计要么拦不住（拼个变量就绕了），要么误伤正常命令，两头都不讨好。
+    // 真要放开 sudo 这类，用户在设置里关掉沙箱就是在表达"我知道风险"。
+    if (name == "shell") {
+        std::string c = args.s("command");
+        // 折叠空白：`rm   -rf   /` 和 `rm -rf /` 是同一件事
+        std::string flat;
+        flat.reserve(c.size());
+        bool sp = false;
+        for (char ch : c) {
+            if (ch == ' ' || ch == '\t' || ch == '\n') {
+                if (!sp) flat.push_back(' ');
+                sp = true;
+            } else {
+                flat.push_back(ch);
+                sp = false;
+            }
+        }
+        static const char* kDanger[] = {
+            "rm -rf /",   "rm -rf ~",  "rm -rf *",   "rm -fr /",   "rm -fr ~",
+            "mkfs",       "dd if=",    "dd of=/dev", ":(){",       "> /dev/disk",
+            "diskutil erase", "chmod -R 777 /",     "chown -R /",
+        };
+        for (const char* d : kDanger) {
+            if (flat.find(d) != std::string::npos)
+                return gate_deny(std::string("这条命令被拦下了（匹配到 \"") + d +
+                                 "\"）。它会删掉或覆盖不可恢复的东西，"
+                                 "换个范围明确的做法：删目录就写全路径，"
+                                 "覆盖文件就用 write_file。");
+        }
+    }
     if (name == "grep" && args.s("pattern").empty()) return gate_deny("缺少 pattern 参数");
     if (name == "glob" && args.s("pattern").empty()) return gate_deny("缺少 pattern 参数");
     if (name == "fetch_url" && args.s("url").empty()) return gate_deny("缺少 url 参数");
