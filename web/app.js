@@ -448,6 +448,7 @@
     if (card === 'diff') return meta.is_new ? '新建' : '已改';
     if (card === 'search') {
       if (meta.truncated) return '已截断';
+      if (meta.shape === 'kb') return (meta.count || 0) + ' 段';
       return meta.shape === 'matches' ? (meta.total || 0) + ' 处' : (meta.count || 0) + ' 个';
     }
     if (card === 'web') return meta.kind === 'fetch' ? '抓取' : (meta.count || 0) + ' 条';
@@ -597,6 +598,16 @@
     head.appendChild(ic);
     head.appendChild(el('span', 'tool-name', cardTitle(t, meta)));
     const sub = cardSub(t, meta);
+    // 沙箱没生效这件事必须让用户看见。
+    //
+    // 原来服务端把这句提示塞进命令的 stdout，模型会把"当前环境不支持沙箱"
+    // 当成命令输出的一部分拿去引用；而 /api/state 里又一直写着 sandbox:true，
+    // 界面上一切正常。结果是"以为有写盘隔离，其实裸跑"。现在隔离状态走 meta，
+    // 在这里画一个琥珀色小标，只有真的没隔离时才出现。
+    // 放在 sub 之前：sub 有 margin-left:auto，会把自己和后面的东西一起推到右边。
+    if (card === 'terminal' && meta.no_sandbox && !t.denied) {
+      head.appendChild(el('span', 'tool-chip warn', '未隔离'));
+    }
     if (sub) head.appendChild(el('span', 'tool-sub', sub));
     box.appendChild(head);
 
@@ -2116,6 +2127,14 @@
         () => !!srv().net, (v) => setPerm('net', v));
       toggle(body, '命令沙箱', '命令只能写工作区与 /tmp。关掉就是完全放开。',
         () => srv().sandbox !== false, (v) => setPerm('sandbox', v));
+      // 开关"开着但不生效"是最坏的一种状态：用户以为有隔离，其实命令在裸跑。
+      // 服务端把配置值和实际探测结果分成两个字段，这里把差异说出来。
+      if (srv().sandbox_cfg && srv().sandbox === false) {
+        const warn = el('div', 'perm-warn',
+          '本机的 sandbox-exec 套不上（外层已有沙箱或系统限制），命令是未隔离执行的。' +
+          '写盘限制目前不生效 —— 模型自己的 write_file 仍然只写项目内。');
+        body.appendChild(warn);
+      }
 
       // 命令超时：给几档就够，没必要拉滑块
       const tmo = el('div', 'seg');

@@ -723,6 +723,37 @@ struct ProcOut {
     std::string out;
 };
 
+// seatbelt 到底套不套得上：探一次，全局缓存。
+//
+// 为什么值得单独探一次：`sandbox-exec` 在外层已经有沙箱约束的进程里会直接
+// 报 `sandbox_apply: Operation not permitted` 并以 71 退出 —— 命令**根本没
+// 执行**。原来的做法是"先套沙箱跑一遍，看到 71 再裸跑一遍"，也就是每条命令
+// 都要 fork 两次；更糟的是 `/api/state` 里 `sandbox` 一直写的是配置值 `true`，
+// 界面上显示"已隔离"，实际早就退化成裸跑了 —— 这种"以为有保护其实没有"比
+// 明确说没有更危险。
+//
+// 探测本身用最小 profile 跑 `/bin/true`：套得上退出码 0，套不上 71。
+// 用 once_flag 保证只探一次，多个 shell 工具并发进来也只 fork 一次。
+bool seatbelt_works() {
+    static std::once_flag once;
+    static bool ok = false;
+    std::call_once(once, [] {
+        const int rc = std::system(
+            "/usr/bin/sandbox-exec -p '(version 1)(allow default)' /bin/true "
+            ">/dev/null 2>&1");
+        ok = (rc == 0);
+        if (!ok) {
+            std::fprintf(stderr,
+                         "[dubhe] seatbelt 不可用（sandbox_apply 被拒绝），"
+                         "shell 将裸跑，写盘限制不生效\n");
+        }
+    });
+    return ok;
+}
+
+// 实际生效的沙箱状态 = 用户开了 且 本机套得上。给 /api/state 和工具用同一个口径。
+bool sandbox_active() { return g.sandbox && seatbelt_works(); }
+
 ProcOut run_proc(const std::string& cmd, const std::string& cwd,
                  int timeout_ms, size_t max_bytes, bool sandbox_writes) {
     ProcOut r;
@@ -1094,7 +1125,7 @@ GateOut gate(const std::string& name, const json::Value& args, bool approved = f
     // 而不是"它绕过了所有权限"。fail-closed 的全部意义就在这里。
     static const char* kKnown[] = {"read_file", "list_dir", "write_file", "edit_file",
                                    "grep",      "glob",     "fetch_url",  "web_search",
-                                   "shell"};
+                                   "kb_search", "shell"};
     bool known = false;
     for (const char* k : kKnown) {
         if (name == k) {
@@ -1408,6 +1439,40 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
         r.meta.set("truncated", json::Value::make_bool(hits >= 200));
         return r;
     }
+    if (name == "kb_search") {
+        // 知识库原来只做"自动注入"：用户提问时服务端偷偷检索一次塞进 system。
+        // 模型自己**没有**查文档的手段 —— 它想问"ADR-0003 怎么说的"，只能靠
+        // 注入那一把，注入没命中就只能编。这个工具把同一个检索器开给它自己用，
+        // 区别是它可以换个词再试一次。
+        const std::string q = args.s("query");
+        if (q.empty()) { r.output = "缺少 query 参数"; return r; }
+        int k = (int)args.n("k", 5);
+        if (k < 1) k = 1;
+        if (k > 20) k = 20;
+        std::vector<KbHit> hits;
+        {
+            std::lock_guard<std::mutex> lk(g_kb_mu);
+            kb_ensure_loaded();
+            hits = kb_search(q, k);
+        }
+        if (hits.empty()) {
+            r.ok = true;
+            r.output = "知识库里没有匹配的片段。可以换个更具体的关键词再试。";
+        } else {
+            std::string s;
+            for (size_t i = 0; i < hits.size(); i++) {
+                s += "[" + std::to_string(i + 1) + "] " + path_base(hits[i].path) + "\n";
+                s += hits[i].snippet + "\n\n";
+            }
+            r.ok = true;
+            r.output = s;
+        }
+        r.card = "search";
+        r.meta.set("shape", json::Value::make_str("kb"));
+        r.meta.set("pattern", json::Value::make_str(q));
+        r.meta.set("count", json::Value::make_num((double)hits.size()));
+        return r;
+    }
     if (name == "fetch_url") {
         const std::string url = args.s("url");
         if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
@@ -1457,25 +1522,23 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
     if (name == "shell") {
         const std::string cmd = args.s("command");
         const std::string cwd = args.s("cwd", g.workspace);
+        const bool sb = sandbox_active();   // 探过一次就缓存，不再每条命令 fork 两次
         ProcOut po = run_proc(cmd, cwd.empty() ? g.workspace : cwd,
-                              g.shell_timeout_ms, 96 * 1024, g.sandbox);
-        // seatbelt 在某些环境里套不上（进程本身已经被更外层的沙箱约束，
-        // 例如 App 沙箱或某些 CI 容器），报的是
-        // `sandbox-exec: sandbox_apply: Operation not permitted` + 退出码 71。
-        // 这时候不该让用户看到"命令执行失败"——命令根本没跑。退一步裸跑，
-        // 并在结果里说明"沙箱没生效"，让用户自己决定要不要继续用。
-        bool no_sandbox = false;
-        if (g.sandbox && po.exit_code == 71 && po.out.find("sandbox_apply") != std::string::npos) {
+                              g.shell_timeout_ms, 96 * 1024, sb);
+        // 探测说套得上、真跑时却还是 71 —— 说明这个 profile 本身被拒（例如
+        // workspace 路径里有沙箱解析不了的东西）。这时候命令没执行，退一步
+        // 裸跑，并把"未隔离"记到 meta 里让界面显示。
+        bool no_sandbox = !sb;
+        if (sb && po.exit_code == 71 && po.out.find("sandbox_apply") != std::string::npos) {
             po = run_proc(cmd, cwd.empty() ? g.workspace : cwd,
                           g.shell_timeout_ms, 96 * 1024, false);
             no_sandbox = true;
         }
         r.ok = (po.exit_code == 0) && !po.timed_out;
         r.output = po.out;
-        if (no_sandbox) {
-            r.output = "[提示] 当前环境不支持 seatbelt 沙箱，这条命令是**未隔离**执行的"
-                       "（写盘限制未生效）。\n" + r.output;
-        }
+        // 不再把这句提示塞进 output。output 是模型眼里的 stdout，前面挂一段
+        // 中文告警会让它把告警当成命令输出的一部分（实测它会引用"当前环境
+        // 不支持…"来回答"这条命令输出了什么"）。隔离状态走 meta，界面画徽章。
         if (po.timed_out) {
             r.output += "\n[超时] 命令超过 " + std::to_string(g.shell_timeout_ms / 1000) +
                         " 秒被终止。拆小一点，或者只跑必要的那一步。";
@@ -1547,6 +1610,8 @@ std::string tool_prompt() {
         "- write_file(path, content): 写入文件（覆盖）\n"
         "- edit_file(path, old, new): 把文件里一段原文替换掉。old 必须唯一。\n"
         "- shell(command, cwd): 执行 shell 命令\n"
+        "- kb_search(query, k): 在本地知识库（项目文档）里检索相关片段。\n"
+        "  问“这个项目怎么设计的”这类问题时先用它，比 grep 更懂语义。\n"
         "- web_search(query, n): 联网搜索\n"
         "- fetch_url(url): 抓取网页正文\n"
         "不需要工具时直接回答。不要描述你打算怎么做，直接输出工具调用。"
@@ -2793,6 +2858,7 @@ json::Value tools_json() {
     add("edit_file", "精确替换文件里的一段原文（只改一处，要求唯一）", "path, old, new", g.allow_write);
     add("shell", "执行 shell 命令（有超时与写盘沙箱）", "command, cwd", g.allow_shell);
     add("web_search", "联网搜索", "query, n", g.allow_net);
+    add("kb_search", "在本地知识库（项目文档）里检索相关片段", "query, k", true);
     add("fetch_url", "抓取网页并转成纯文本", "url", g.allow_net);
     return arr;
 }
@@ -3018,7 +3084,10 @@ int main(int argc, char** argv) {
         o.set("shell", json::Value::make_bool(g.allow_shell));
         o.set("write", json::Value::make_bool(g.allow_write));
         o.set("net", json::Value::make_bool(g.allow_net));
-        o.set("sandbox", json::Value::make_bool(g.sandbox));
+        o.set("sandbox", json::Value::make_bool(sandbox_active()));
+        // 配置值单列一个字段：sandbox=false 且 sandbox_cfg=true，说明用户开了
+        // 但本机套不上（外层沙箱/CI 容器），界面据此给一句解释而不是静默失效。
+        o.set("sandbox_cfg", json::Value::make_bool(g.sandbox));
         o.set("write_outside", json::Value::make_bool(g.allow_write_outside));
         o.set("shell_timeout_s", json::Value::make_num(g.shell_timeout_ms / 1000.0));
         o.set("api_key", json::Value::make_str(is_local(req) ? g.api_key : ""));
@@ -3351,7 +3420,10 @@ int main(int argc, char** argv) {
         o.set("shell", json::Value::make_bool(g.allow_shell));
         o.set("write", json::Value::make_bool(g.allow_write));
         o.set("net", json::Value::make_bool(g.allow_net));
-        o.set("sandbox", json::Value::make_bool(g.sandbox));
+        o.set("sandbox", json::Value::make_bool(sandbox_active()));
+        // 配置值单列一个字段：sandbox=false 且 sandbox_cfg=true，说明用户开了
+        // 但本机套不上（外层沙箱/CI 容器），界面据此给一句解释而不是静默失效。
+        o.set("sandbox_cfg", json::Value::make_bool(g.sandbox));
         o.set("write_outside", json::Value::make_bool(g.allow_write_outside));
         o.set("shell_timeout_s", json::Value::make_num(g.shell_timeout_ms / 1000.0));
         o.set("workspace", json::Value::make_str(g.workspace));
@@ -3402,7 +3474,8 @@ int main(int argc, char** argv) {
         root.set("shell", json::Value::make_bool(g.allow_shell));
         root.set("write", json::Value::make_bool(g.allow_write));
         root.set("net", json::Value::make_bool(g.allow_net));
-        root.set("sandbox", json::Value::make_bool(g.sandbox));
+        root.set("sandbox", json::Value::make_bool(sandbox_active()));
+        root.set("sandbox_cfg", json::Value::make_bool(g.sandbox));
         c.send(200, "application/json", json::dump(root));
     });
 
