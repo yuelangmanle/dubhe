@@ -1036,6 +1036,27 @@
     return { type: 'input_audio', input_audio: { data: a.dataUrl, format: a.fmt } };
   }
 
+  // 附件收口。三种媒体各要一座塔，没有塔的时候现在就在这儿拦下来。
+  //
+  // 以前是发出去让服务端回 400（"当前模型没有视觉塔"），用户看到的是
+  // 一条红色错误、附件已经贴在上面了，得自己删掉再换模型 —— 而现在
+  // 拖进来的一瞬间就知道不行。
+  async function useAttachment(a) {
+    const s = state.server || {};
+    if ((a.kind === 'image' || a.kind === 'video') && !s.mm_vision) {
+      alert('当前模型没有视觉塔，看不了' + (a.kind === 'video' ? '视频' : '图片') +
+            '。换 lfm3-vl 这类带 mmproj 的模型再试。');
+      return;
+    }
+    if (a.kind === 'audio' && !s.mm_audio) {
+      alert('当前模型没有语音塔，听不了音频。换 lfm3-audio 这类带 mmproj 的模型再试。');
+      return;
+    }
+    if (a.kind === 'image') a.thumb = await makeThumb(a.dataUrl);
+    state.attach = a;
+    renderAttach();
+  }
+
   // ---------------------------------------------------------------- 语音输入
   //
   // 录成 16 kHz 单声道 WAV，而不是拿 MediaRecorder 直接录一段 webm/opus。
@@ -2791,10 +2812,7 @@
       if (!f) return;
       if (f.size > 64 * 1024 * 1024) { alert('文件太大，上限 64 MB'); return; }
       try {
-        const a = await readAttachment(f);
-        if (a.kind === 'image') a.thumb = await makeThumb(a.dataUrl);
-        state.attach = a;
-        renderAttach();
+        await useAttachment(await readAttachment(f));
       } catch (err) {
         alert('读取文件失败：' + err.message);
       }
@@ -2809,10 +2827,7 @@
       if (!f) return;
       if (f.size > 64 * 1024 * 1024) { alert('文件太大，上限 64 MB'); return; }
       try {
-        const a = await readAttachment(f);
-        if (a.kind === 'image') a.thumb = await makeThumb(a.dataUrl);
-        state.attach = a;
-        renderAttach();
+        await useAttachment(await readAttachment(f));
       } catch (err) {
         alert('读取文件失败：' + err.message);
       }
