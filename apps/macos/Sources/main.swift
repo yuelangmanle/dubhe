@@ -148,7 +148,8 @@ private func dbg(_ s: String) {
 }
 
 // ---------------------------------------------------------------- 主界面
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
+                         WKNavigationDelegate, WKScriptMessageHandler {
     private var window: NSWindow!
     private var webView: WKWebView!
     private var engine: Process?
@@ -160,6 +161,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var signalSources: [DispatchSourceSignal] = []
     private var logHandle: FileHandle?
     private var titleObserver: NSKeyValueObservation?
+    private var stateTimer: DispatchSourceTimer?
+    private var usedRememberedModel = false
+    private var logInitialized = false
+
+    // 上次在界面里加载过的模型。存路径而不是名字：同名模型可能在两个目录里。
+    private static let lastModelKey = "lastModelPath"
+
+    private func rememberedModel() -> String? {
+        guard let p = UserDefaults.standard.string(forKey: Self.lastModelKey), !p.isEmpty else {
+            return nil
+        }
+        // 文件被删了就别再拿它去启动，否则每次开都失败一次。
+        return FileManager.default.fileExists(atPath: p) ? p : nil
+    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // 第二次双击时不要再起一份引擎：macOS 一般会把已经开着的那个激活，
@@ -214,9 +229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "关于 Dubhe",
-                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
-                        keyEquivalent: "")
+        appMenu.addItem(withTitle: "关于 Dubhe", action: #selector(showAbout), keyEquivalent: "")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "隐藏 Dubhe",
                         action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
@@ -224,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                         action: #selector(NSApplication.hideOtherApplications(_:)),
                         keyEquivalent: "h").keyEquivalentModifierMask = [.command, .option]
         appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "打开模型目录", action: #selector(openModelDir), keyEquivalent: "")
         appMenu.addItem(withTitle: "打开引擎日志", action: #selector(openEngineLog), keyEquivalent: "")
         appMenu.addItem(withTitle: "在 Finder 中显示日志", action: #selector(revealEngineLog),
                         keyEquivalent: "")
@@ -249,6 +263,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let viewItem = NSMenuItem()
         let view = NSMenu(title: "显示")
         view.addItem(withTitle: "重新载入", action: #selector(reload), keyEquivalent: "r")
+        view.addItem(withTitle: "重启引擎", action: #selector(restartEngine),
+                     keyEquivalent: "r").keyEquivalentModifierMask = [.command, .shift]
         view.addItem(.separator())
         view.addItem(withTitle: "放大", action: #selector(zoomIn), keyEquivalent: "+")
         view.addItem(withTitle: "缩小", action: #selector(zoomOut), keyEquivalent: "-")
@@ -285,6 +301,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         NSWorkspace.shared.activateFileViewerSelecting([engineLogURL()])
     }
 
+    @objc private func openModelDir() {
+        let dir = NSHomeDirectory() + "/.dubhe/models"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(URL(fileURLWithPath: dir))
+    }
+
+    // 关于面板里放真正有用的东西：版本、引擎端口、当前模型。用户来这儿
+    // 通常就是为了抄这几个数去提 issue。
+    @objc private func showAbout() {
+        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        var lines = ["本地大模型推理引擎", "版本 \(ver)"]
+        if port != 0 { lines.append("引擎端口 \(port)") }
+        if let m = UserDefaults.standard.string(forKey: Self.lastModelKey), !m.isEmpty {
+            lines.append("模型 \((m as NSString).lastPathComponent)")
+        }
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: lines.joined(separator: "\n")])
+    }
+
     private func buildWindow() {
         let rect = NSRect(x: 0, y: 0, width: 1100, height: 760)
         window = NSWindow(contentRect: rect,
@@ -299,6 +333,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let cfg = WKWebViewConfiguration()
         // 关掉"用 ⌘ 点链接开新窗口"这类网页行为，桌面 App 里不该有
         cfg.preferences.javaScriptCanOpenWindowsAutomatically = false
+        // 转圈页上的"重试"按钮没法直接调 Swift，走一条 JS → 原生的小通道。
+        // 只认两个字符串，不做通用 bridge。
+        let ucc = WKUserContentController()
+        ucc.add(self, name: "shell")
+        cfg.userContentController = ucc
         webView = WKWebView(frame: rect, configuration: cfg)
         webView.autoresizingMask = [.width, .height]
         webView.navigationDelegate = self
@@ -317,7 +356,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         showSplash("正在启动本地引擎…")
     }
 
-    private func showSplash(_ text: String) {
+    // retry = true 时多给两个按钮：重试、看日志。出错的页面不该只有一个
+    // 转不完的圈 —— 用户能做的最合理动作就是"再来一次"，其次是"看看为什么"。
+    private func showSplash(_ text: String, retry: Bool = false) {
+        let buttons = retry ? """
+        <div class="row">
+          <button onclick="post('retry')">重试</button>
+          <button class="ghost" onclick="post('openLog')">查看日志</button>
+        </div>
+        """ : ""
+        let spinner = retry ? "" : #"<div class="dot"></div>"#
         let html = """
         <!doctype html><meta charset="utf-8">
         <style>
@@ -331,9 +379,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                  animation:spin .9s linear infinite; }
           @keyframes spin { to { transform:rotate(360deg); } }
           .sub { opacity:.55; font-size:13px; margin-top:6px; }
+          .row { margin-top:20px; display:flex; gap:10px; justify-content:center; }
+          button { font:inherit; font-size:14px; padding:7px 18px; border-radius:8px;
+                   border:0; background:#7aa2ff; color:#0b1020; cursor:pointer; }
+          button:hover { filter:brightness(1.08); }
+          button.ghost { background:transparent; color:#e8eaed;
+                         box-shadow:inset 0 0 0 1px rgba(232,234,237,.28); }
         </style>
-        <div class="box"><div class="dot"></div><div>\(text)</div>
-        <div class="sub">首次启动要加载权重，可能要几秒</div></div>
+        <div class="box">\(spinner)<div>\(text)</div>
+        <div class="sub">首次启动要加载权重，可能要几秒</div>
+        \(buttons)</div>
+        <script>
+          function post(m){ try { window.webkit.messageHandlers.shell.postMessage(m); } catch (e) {} }
+        </script>
         """
         uiLoaded = false
         webView.loadHTMLString(html, baseURL: nil)
@@ -342,7 +400,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     // ------------------------------------------------------------ 起引擎
     private func startEngine() {
         guard let bin = resolveEngine() else {
-            showSplash("找不到 dubhed —— 用 DUBHE_BIN 指一下路径，或者先 make all")
+            showSplash("找不到 dubhed —— 用 DUBHE_BIN 指一下路径，或者先 make all", retry: true)
             return
         }
 
@@ -365,8 +423,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             args += ["--web", web]
         }
         // 模型可以不指定：UI 会用 /api/models 列目录、/api/load 换模型。
-        // 指定了就用它，省一次点击。
+        // 但每次打开都从"未加载"开始太烦 —— 记住上次在界面里选的那个，
+        // 下次直接加载。DUBHE_MODEL 优先（调试/多模型切换时用）。
+        var modelArg: String?
         if let m = ProcessInfo.processInfo.environment["DUBHE_MODEL"], !m.isEmpty {
+            modelArg = m
+        } else if let m = rememberedModel() {
+            modelArg = m
+            usedRememberedModel = true
+            dbg("remembered model \(m)")
+        }
+        if let m = modelArg {
             args += ["-m", m]
         }
 
@@ -374,16 +441,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         proc.executableURL = URL(fileURLWithPath: bin)
         proc.arguments = args
         // 引擎的日志走 stderr。不能给管道：没人读的话写满 64 KB 引擎就阻塞；
-        // 也不能丢 /dev/null：白屏的时候没有地方可查。落文件，每次启动重写。
+        // 也不能丢 /dev/null：白屏的时候没有地方可查。落文件。
+        //
+        // 只在本次进程的第一次启动时截断，之后（重启引擎、坏模型退回）都
+        // 追加 —— 否则"上一次为什么失败"正好会被下一次启动擦掉，而那恰恰
+        // 是最需要看的一段。
         let logURL = engineLogURL()
-        if let old = try? FileManager.default.attributesOfItem(atPath: logURL.path),
-           let size = old[.size] as? Int, size > 8 << 20 {
-            let prev = logURL.deletingPathExtension().appendingPathExtension("log.1")
-            try? FileManager.default.removeItem(at: prev)
-            try? FileManager.default.moveItem(at: logURL, to: prev)
+        if !logInitialized {
+            logInitialized = true
+            if let old = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+               let size = old[.size] as? Int, size > 8 << 20 {
+                let prev = logURL.deletingPathExtension().appendingPathExtension("log.1")
+                try? FileManager.default.removeItem(at: prev)
+                try? FileManager.default.moveItem(at: logURL, to: prev)
+            }
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        } else {
+            // 注意别用 createFile 兜底：它对已存在的文件是"覆盖"，
+            // 会把上一次失败的日志直接抹掉。
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            }
+            if let f = FileHandle(forWritingAtPath: logURL.path) {
+                f.seekToEndOfFile()
+                f.write("\n──── 重启引擎 ────\n".data(using: .utf8) ?? Data())
+                f.closeFile()
+            }
         }
-        FileManager.default.createFile(atPath: logURL.path, contents: nil)
         let fh = FileHandle(forWritingAtPath: logURL.path)
+        fh?.seekToEndOfFile()
         logHandle = fh
         proc.standardOutput = fh ?? FileHandle(forWritingAtPath: "/dev/null")
         proc.standardError = fh ?? FileHandle(forWritingAtPath: "/dev/null")
@@ -393,16 +479,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                 let code = pr.terminationStatus
                 self.stopPolling()
                 self.engine = nil
+
+                // 启动阶段就挂了，而且用的是"上次记住的模型"——多半是那个
+                // 模型文件坏了/不兼容。忘掉它，退回到无模型状态再来一次，
+                // 别让用户卡在一个永远起不来的循环里。只退一次。
+                if !self.uiLoaded && self.usedRememberedModel {
+                    self.usedRememberedModel = false
+                    UserDefaults.standard.removeObject(forKey: Self.lastModelKey)
+                    dbg("remembered model failed (exit \(code)), forgetting it")
+                    self.showSplash("上次用的模型没能加载（退出码 \(code)），已重置。正在重新启动…")
+                    self.startEngine()
+                    return
+                }
+
                 self.showSplash(self.uiLoaded
-                    ? "引擎已退出（退出码 \(code)）。关掉窗口重开试试。"
-                    : "引擎启动失败（退出码 \(code)）。")
+                    ? "引擎已退出（退出码 \(code)）。"
+                    : "引擎启动失败（退出码 \(code)）。", retry: true)
             }
         }
         do {
             try proc.run()
             engine = proc
         } catch {
-            showSplash("起不来 dubhed：\(error.localizedDescription)")
+            showSplash("起不来 dubhed：\(error.localizedDescription)", retry: true)
             return
         }
         waitForReady()
@@ -410,6 +509,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     private func stopEngine() {
         stopPolling()
+        stopStateWatch()
         guard let e = engine, e.isRunning else { return }
         e.terminate()                       // SIGTERM，引擎会走正常收尾
         let deadline = Date().addingTimeInterval(3)
@@ -418,6 +518,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
         if e.isRunning { kill(e.processIdentifier, SIGKILL) }
         engine = nil
+    }
+
+    // 换模型、卡住、或者干脆想重来时用。走的是和冷启动完全一样的一条路，
+    // 所以"重启能修好的问题，冷启动也一定能修好"这句话是成立的。
+    @objc private func restartEngine() {
+        dbg("restart engine")
+        stopEngine()
+        uiLoaded = false
+        showSplash("正在重启本地引擎…")
+        startEngine()
+    }
+
+    // ------------------------------------------------------------ 转圈页上的按钮
+    //
+    // 只认两个字符串，不做通用 bridge：转圈页是我们自己写死的一小段 HTML，
+    // 页面本身不加载任何外部内容。
+    func userContentController(_ ucc: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard message.name == "shell", let cmd = message.body as? String else { return }
+        dbg("shell message \(cmd)")
+        switch cmd {
+        case "retry":   restartEngine()
+        case "openLog": openEngineLog()
+        default:        break
+        }
     }
 
     // ------------------------------------------------------------ 等就绪
@@ -443,7 +568,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             ticks += 1
             if self.pollsLeft <= 0 {
                 self.stopPolling()
-                self.showSplash("引擎 5 分钟没有就绪，请检查 dubhed 能否单独跑起来")
+                self.showSplash("引擎 5 分钟没有就绪，请检查 dubhed 能否单独跑起来", retry: true)
                 return
             }
             if ticks == 600 {                   // 30 秒
@@ -498,18 +623,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         uiLoaded = true
         webView.load(URLRequest(url: url))
         window.makeFirstResponder(webView)
+        startStateWatch()
         scheduleAutoCloseIfAsked()
+    }
+
+    // ------------------------------------------------------------ 记住模型
+    //
+    // 界面里换模型走的是 /api/load，外壳不知道。与其把 web/app.js 和外壳
+    // 耦合起来，不如每 10 秒问一次 /api/state —— 本地请求，200 字节，
+    // 而且顺带能发现"引擎还活着但模型掉了"这类情况。
+    private func startStateWatch() {
+        stateTimer?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 2, repeating: 10)
+        t.setEventHandler { [weak self] in self?.captureModel() }
+        stateTimer = t
+        t.resume()
+    }
+
+    private func stopStateWatch() {
+        stateTimer?.cancel()
+        stateTimer = nil
+    }
+
+    private func captureModel() {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/state") else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 3
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self, let data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  obj["loaded"] as? Bool == true,
+                  let m = obj["model"] as? String, !m.isEmpty else { return }
+            // 走到这儿说明"上次记住的模型"这次也加载成功了，不用再退。
+            self.usedRememberedModel = false
+            if UserDefaults.standard.string(forKey: Self.lastModelKey) != m {
+                UserDefaults.standard.set(m, forKey: Self.lastModelKey)
+                dbg("remember model \(m)")
+            }
+        }.resume()
     }
 
     // 验收用：DUBHE_SHELL_AUTOCLOSE=3 表示界面加载完 3 秒后自己关窗口。
     // 走的是真实路径（关窗口 → applicationShouldTerminateAfterLastWindowClosed
     // → applicationWillTerminate → stopEngine），不是直接 exit()。
     private func scheduleAutoCloseIfAsked() {
-        guard let s = ProcessInfo.processInfo.environment["DUBHE_SHELL_AUTOCLOSE"],
-              let secs = Double(s), secs > 0 else { return }
-        dbg("autoclose in \(secs)s")
-        DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
-            self?.window.performClose(nil)
+        let env = ProcessInfo.processInfo.environment
+        if let s = env["DUBHE_SHELL_AUTOCLOSE"], let secs = Double(s), secs > 0 {
+            dbg("autoclose in \(secs)s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
+                self?.window.performClose(nil)
+            }
+        }
+        // 同理：DUBHE_SHELL_AUTORESTART=2 验证"重启引擎"这条路（⌘⇧R 同一条）。
+        if let s = env["DUBHE_SHELL_AUTORESTART"], let secs = Double(s), secs > 0 {
+            dbg("autorestart in \(secs)s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
+                self?.restartEngine()
+            }
         }
     }
 
@@ -552,7 +723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                  withError error: Error) {
         dbg("didFailProvisional \(error.localizedDescription)")
         if !uiLoaded { return }        // 转圈页自己失败不算
-        showSplash("打不开引擎界面：\(error.localizedDescription)")
+        showSplash("打不开引擎界面：\(error.localizedDescription)", retry: true)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
