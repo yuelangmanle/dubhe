@@ -364,6 +364,150 @@ kernel void mv_q5_0_v2(device const uchar* w     [[buffer(0)]],
     }
 }
 
+// ------------------------------------------------- Q4_0 解码 v2：lane 认领**块**
+//
+// 和 mv_q5_0_v2 是同一个形状，只是块小一圈、少一组高位：
+//   Q5_0  24 字节 = d(2) + qh(4) + qs(16)，v = d*(q - 16)
+//   Q4_0  18 字节 = d(2) +          qs(16)，v = d*(q -  8)
+//
+// 为什么非补不可：Q4_0 是 llama.cpp 生态里下载量最大的格式，而它此前只有
+// 老写法（lane = 块内元素下标，一个 warp 一个周期只搬 18 字节、要发 4 条
+// load → 4.5 字节/指令）。同机实测 Q4_0 解码 111 tok/s，比 Q5_0 的 161
+// 还低 —— 权重更小反而更慢，只可能是发射端卡住，不是显存。
+//
+// 18 = 2×9，块跨度只保证 2 字节对齐，qs 在 q+2 处也不能用 uint4，
+// 同样走 ld16s 退 4 字节再拼。
+kernel void mv_q4_0_v2(device const uchar* w     [[buffer(0)]],
+                       device const float* x     [[buffer(1)]],
+                       device float* y           [[buffer(2)]],
+                       constant uint& n_in       [[buffer(3)]],
+                       constant ulong& woff      [[buffer(4)]],
+                       constant uint& n_out      [[buffer(5)]],
+                       uint tgid [[threadgroup_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]],
+                       uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
+    if (row0 >= n_out) return;
+    const uint nok = min(uint(MVR), n_out - row0);
+    const uint nb = n_in >> 5;
+    const ulong rbytes = (ulong)nb * 18u;
+
+    device const uchar* p[MV_R];
+    for (uint r = 0; r < MVR; r++)
+        p[r] = w + woff + (ulong)(row0 + (r < nok ? r : 0u)) * rbytes;
+
+    float acc[MV_R];
+    for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
+
+    for (uint b = lane; b < nb; b += 32u) {
+        const ulong xb = (ulong)b * 32u;
+        float xl[32];
+        #pragma unroll
+        for (uint t = 0; t < 8u; t++) {
+            const float4 v = *(device const float4*)(x + xb + (t << 2));
+            xl[t * 4u + 0u] = v.x;
+            xl[t * 4u + 1u] = v.y;
+            xl[t * 4u + 2u] = v.z;
+            xl[t * 4u + 3u] = v.w;
+        }
+
+        for (uint r = 0; r < MVR; r++) {
+            device const uchar* q = p[r] + (ulong)b * 18u;
+            const uint4 qs = ld16s(q + 2u);
+            const uint qw[4] = {qs.x, qs.y, qs.z, qs.w};
+            float s = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 16u; i++) {
+                const uint byte = (qw[i >> 2] >> ((i & 3u) << 3)) & 0xFFu;
+                s += float(int(byte & 0x0Fu) - 8) * xl[i];
+                s += float(int(byte >> 4)    - 8) * xl[16u + i];
+            }
+            acc[r] += rd_f16(q) * s;
+        }
+    }
+
+    for (uint r = 0; r < MVR; r++) {
+        const float s = simd_sum(acc[r]);
+        if (lane == 0u && r < nok) y[row0 + r] = s;
+    }
+}
+
+// ---------------------------------------------------------------- Q5_1（24 字节 / 32 元）
+//
+// 和 Q5_0 只差一处：多一个 m，解量化是 d*q + m 而不是 d*(q-16)。
+// 看着更简单，但 m 项要乘 sum(x)，所以还是得把 32 个 x 累一遍 —— 好在它们
+// 本来就在寄存器里，而 sum(x) 对 MVR 行是共用的，提到行循环外只算一次。
+//
+// 为什么照 v2（一条 lane 认领一整块）而不是照 mv_q5_0 的旧写法：旧写法是
+// 3.7 字节/指令的发射受限版本，Q5_1 块更大（24 vs 22）只会更差。
+//
+// 这个格式为什么值得单开一档：Qwen 官方放出来的 "q5_k_m" 文件里，绝大多数
+// 张量其实是 Q5_1（不是 Q5_K），所以它是"能跑起来"和"跑不动"的分界线。
+kernel void mv_q5_1(device const uchar* w     [[buffer(0)]],
+                    device const float* x     [[buffer(1)]],
+                    device float* y           [[buffer(2)]],
+                    constant uint& n_in       [[buffer(3)]],
+                    constant ulong& woff      [[buffer(4)]],
+                    constant uint& n_out      [[buffer(5)]],
+                    uint tgid [[threadgroup_position_in_grid]],
+                    uint lane [[thread_index_in_simdgroup]],
+                    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
+    if (row0 >= n_out) return;
+    const uint nok = min(uint(MVR), n_out - row0);
+    const uint nb = n_in >> 5;
+    const ulong rbytes = (ulong)nb * 24u;
+
+    device const uchar* p[MV_R];
+    for (uint r = 0; r < MVR; r++)
+        p[r] = w + woff + (ulong)(row0 + (r < nok ? r : 0u)) * rbytes;
+
+    float acc[MV_R];
+    for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
+
+    for (uint b = lane; b < nb; b += 32u) {
+        const ulong xb = (ulong)b * 32u;
+        float xl[32];
+        #pragma unroll
+        for (uint t = 0; t < 8u; t++) {
+            const float4 v = *(device const float4*)(x + xb + (t << 2));
+            xl[t * 4u + 0u] = v.x;
+            xl[t * 4u + 1u] = v.y;
+            xl[t * 4u + 2u] = v.z;
+            xl[t * 4u + 3u] = v.w;
+        }
+        float sx = 0.0f;
+        #pragma unroll
+        for (uint i = 0; i < 32u; i++) sx += xl[i];
+
+        for (uint r = 0; r < MVR; r++) {
+            device const uchar* q = p[r] + (ulong)b * 24u;
+            // 块跨度 24 = 8×3，q+8 只保证 8 字节对齐 → 用 ld16s
+            const uint4 qs = ld16s(q + 8u);
+            const uint qh = uint(q[4]) | (uint(q[5]) << 8) |
+                            (uint(q[6]) << 16) | (uint(q[7]) << 24);
+            const uint qw[4] = {qs.x, qs.y, qs.z, qs.w};
+            float s = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 16u; i++) {
+                const uint byte = (qw[i >> 2] >> ((i & 3u) << 3)) & 0xFFu;
+                const uint lo = (byte & 0x0Fu) | (((qh >> i) & 1u) << 4);
+                const uint hi = (byte >> 4)    | (((qh >> (16u + i)) & 1u) << 4);
+                s += float(lo) * xl[i];
+                s += float(hi) * xl[16u + i];
+            }
+            acc[r] += fma(rd_f16(q), s, rd_f16(q + 2u) * sx);
+        }
+    }
+
+    for (uint r = 0; r < MVR; r++) {
+        const float s = simd_sum(acc[r]);
+        if (lane == 0u && r < nok) y[row0 + r] = s;
+    }
+}
+
 // ---------------------------------------------------------------- Q8_0（34 字节 / 32 元）
 kernel void mv_q8_0(device const uchar* w     [[buffer(0)]],
                     device const float* x     [[buffer(1)]],
@@ -635,6 +779,105 @@ kernel void mv_q6_k(device const uchar* w     [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------- Q5_K（176 字节 / 256 元）
+//
+// 和 Q4_K 的唯一区别：每个元素还有第 5 位，存在 32 字节的 qh 里。
+//
+// 位序不是"元素 i 用 qh 的第 i 位"（那样 32 字节正好 256 位，看着很像），
+// 而是把 8 个子块的第 5 位**交错**在同一个字节里：
+//     元素 32s + t  →  qh[t] 的第 s 位      (s = 子块 0..7, t = 子块内 0..31)
+// 这个排法让一条 lane 管 32 个元素（跨子块 2k / 2k+1）时，两半用的是**同一批**
+// qh 字节（16g .. 16g+15），只是取的位不同（2k / 2k+1）—— 所以只多一条
+// uint4 读，而不是两条。位下标恰好等于子块下标，取位时不用再算。
+//
+// 映射、尾块处理、块头为什么不做成向量读，全部沿用 mv_q4_k 的结论
+// （那里试过的两条死路，别在这里重走）。
+kernel void mv_q5_k(device const uchar* w     [[buffer(0)]],
+                    device const float* x     [[buffer(1)]],
+                    device float* y           [[buffer(2)]],
+                    constant uint& n_in       [[buffer(3)]],
+                    constant ulong& woff      [[buffer(4)]],
+                    constant uint& n_out      [[buffer(5)]],
+                    uint tgid [[threadgroup_position_in_grid]],
+                    uint lane [[thread_index_in_simdgroup]],
+                    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    const uint row0 = (tgid * SG_PER_TG + sg) * MVR;
+    if (row0 >= n_out) return;
+    const uint nok = min(uint(MVR), n_out - row0);
+    const uint nb = n_in >> 8;
+    const ulong rbytes = (ulong)nb * 176u;
+    device const uchar* p[MV_R];
+    for (uint r = 0; r < MVR; r++)
+        p[r] = w + woff + (ulong)(row0 + (r < nok ? r : 0u)) * rbytes;
+    float acc[MV_R];
+    for (uint r = 0; r < MVR; r++) acc[r] = 0.0f;
+
+    const uint blk  = lane >> 3;             // 0..3
+    const uint m    = lane & 7u;             // 0..7
+    const uint k    = m >> 1;                // 0..3
+    const uint g    = m & 1u;                // 0..1
+    const uint boff = 48u + (k << 5) + (g << 4);   // qs 起点（Q4_K 是 16）
+    const uint hoff = 16u + (g << 4);              // qh 起点
+    const uint xlo  = (k << 6) + (g << 4);
+    const uint xhi  = xlo + 32u;
+    const uint sb0  = k << 1;                      // 低半字节 → 子块 2k
+
+    const uint nbi = (nb + 3u) >> 2;
+    for (uint bi = 0; bi < nbi; bi++) {
+        const uint braw = (bi << 2) + blk;
+        const bool ok   = (braw < nb);
+        const uint b    = ok ? braw : (nb - 1u);
+        const float msk = ok ? 1.0f : 0.0f;
+        const ulong xb  = (ulong)b * 256u;
+
+        float xl[16], xh[16];
+        #pragma unroll
+        for (uint t = 0; t < 4u; t++) {
+            const float4 v = *(device const float4*)(x + xb + xlo + (t << 2));
+            xl[t*4u+0] = v.x; xl[t*4u+1] = v.y; xl[t*4u+2] = v.z; xl[t*4u+3] = v.w;
+            const float4 w = *(device const float4*)(x + xb + xhi + (t << 2));
+            xh[t*4u+0] = w.x; xh[t*4u+1] = w.y; xh[t*4u+2] = w.z; xh[t*4u+3] = w.w;
+        }
+
+        for (uint r = 0; r < MVR; r++) {
+            device const uchar* q = p[r] + (ulong)b * 176u;
+            uchar s0, n0, s1, n1;
+            k4_scale_min(int(sb0), q + 4u, s0, n0);
+            k4_scale_min(int(sb0 + 1u), q + 4u, s1, n1);
+            const float dl = rd_f16(q);
+            const float dm = rd_f16(q + 2u);
+            const float scl = dl * float(s0) * msk;
+            const float mnl = dm * float(n0) * msk;
+            const float sch = dl * float(s1) * msk;
+            const float mnh = dm * float(n1) * msk;
+            const uint4 raw = *(device const uint4*)(q + boff);
+            // qh：一条 uint4 覆盖 16 个字节，正好是本 lane 那 16 个元素
+            const uint4 hraw = *(device const uint4*)(q + hoff);
+            float a = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 16u; i++) {
+                const uint sh  = (i & 3u) << 3;
+                const uint word = (i < 4u) ? raw.x : (i < 8u) ? raw.y
+                                : (i < 12u) ? raw.z : raw.w;
+                const uint hword = (i < 4u) ? hraw.x : (i < 8u) ? hraw.y
+                                 : (i < 12u) ? hraw.z : hraw.w;
+                const uint byte = (word >> sh) & 0xFFu;
+                const uint hbyte = (hword >> sh) & 0xFFu;
+                const uint lo = (byte & 0x0Fu) | (((hbyte >> sb0) & 1u) << 4);
+                const uint hi = (byte >> 4)    | (((hbyte >> (sb0 + 1u)) & 1u) << 4);
+                a += (scl * float(lo) - mnl) * xl[i];
+                a += (sch * float(hi) - mnh) * xh[i];
+            }
+            acc[r] += a;
+        }
+    }
+    for (uint r = 0; r < MVR; r++) {
+        const float s = simd_sum(acc[r]);
+        if (lane == 0u && r < nok) y[row0 + r] = s;
+    }
+}
+
 // ================================================================ matmul（prefill，B=nrow≤8）
 //
 // 为什么值：解码时每个 token 必须把全部权重读一遍，带宽就是天花板。
@@ -893,6 +1136,93 @@ kernel void mm_q6_k(device const uchar* w     [[buffer(0)]],
     RED8();
 }
 
+// ---------------------------------------------------------------- Q5_1 / Q5_K 的单行版
+//
+// 为什么需要这一代：mm2_* 按 TILE_K=256 切片，要求 n_in % 256 == 0；
+// mm3_* 也一样。而 Qwen2.5 的 n_embd = 896（896 = 3.5×256），**不满足**，
+// 于是 attn_q/k/v/o 与 ffn_gate/up 这几档（n_in=896）在 rows>1 时根本没有
+// 可用的分块内核 —— 只有这一代能吃任意 n_in。
+//
+// 缺了它们的症状不是"慢"而是**直接崩**：gemm 里 g_mpipe[k] 是 nil，
+// setComputePipelineState:nil 当场炸。这也是给新格式加内核时必须一起补齐
+// 的一档，不能只写 mm2/mm3。
+kernel void mm_q5_1(device const uchar* w     [[buffer(0)]],
+                    device const float* X     [[buffer(1)]],
+                    device float* Y           [[buffer(2)]],
+                    constant uint& n_in       [[buffer(3)]],
+                    constant ulong& woff      [[buffer(4)]],
+                    constant uint& n_out      [[buffer(5)]],
+                    constant uint& nrow       [[buffer(6)]],
+                    constant ulong& yoff      [[buffer(7)]],
+                    uint tgid [[threadgroup_position_in_grid]],
+                    uint lane [[thread_index_in_simdgroup]],
+                    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    const uint row = tgid * SG_PER_TG + sg;
+    if (row >= n_out) return;
+    Y += yoff;
+    const uint nb = n_in >> 5;
+    device const uchar* p = w + woff + (ulong)row * (ulong)nb * 24u;
+    const uint idx = lane & 15u;
+    const bool hi  = lane >= 16u;
+    float acc[BMAX];
+    for (int j = 0; j < BMAX; j++) acc[j] = 0.0f;
+    for (uint b = 0; b < nb; b++) {
+        device const uchar* q = p + b * 24u;
+        const uint qh = uint(q[4]) | (uint(q[5]) << 8) |
+                        (uint(q[6]) << 16) | (uint(q[7]) << 24);
+        const int bit5 = int((qh >> lane) & 1u) << 4;
+        const uint byte = uint(q[8u + idx]);
+        const int v = hi ? (int(byte >> 4) | bit5) : (int(byte & 0x0Fu) | bit5);
+        const uint e = (b << 5) + lane;
+        device const float4* xp = (device const float4*)(X + (ulong)e * BMAX);
+        FMA8(fma(rd_f16(q), float(v), rd_f16(q + 2u)));
+    }
+    RED8();
+}
+
+kernel void mm_q5_k(device const uchar* w     [[buffer(0)]],
+                    device const float* X     [[buffer(1)]],
+                    device float* Y           [[buffer(2)]],
+                    constant uint& n_in       [[buffer(3)]],
+                    constant ulong& woff      [[buffer(4)]],
+                    constant uint& n_out      [[buffer(5)]],
+                    constant uint& nrow       [[buffer(6)]],
+                    constant ulong& yoff      [[buffer(7)]],
+                    uint tgid [[threadgroup_position_in_grid]],
+                    uint lane [[thread_index_in_simdgroup]],
+                    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    const uint row = tgid * SG_PER_TG + sg;
+    if (row >= n_out) return;
+    Y += yoff;
+    const uint nb = n_in >> 8;
+    device const uchar* p = w + woff + (ulong)row * (ulong)nb * 176u;
+    float acc[BMAX];
+    for (int j = 0; j < BMAX; j++) acc[j] = 0.0f;
+    for (uint b = 0; b < nb; b++) {
+        device const uchar* q  = p + b * 176u;
+        device const uchar* qh = q + 16u;
+        const float dl = rd_f16(q);
+        const float dm = rd_f16(q + 2u);
+        // 8 个子块各一轮，lane 覆盖子块内 32 个元素
+        for (uint k = 0; k < 8u; k++) {
+            const uint chunk = k >> 1;
+            const uint hi    = k & 1u;
+            const uint byte  = uint(q[48u + (chunk << 5) + lane]);
+            const uint lo    = hi ? (byte >> 4) : (byte & 0x0Fu);
+            const uint hb    = (uint(qh[lane]) >> k) & 1u;
+            uchar sc_, m_;
+            k4_scale_min(int(k), q + 4u, sc_, m_);
+            const int v = int(lo | (hb << 4));
+            const uint e = (b << 8) + (k << 5) + lane;
+            device const float4* xp = (device const float4*)(X + (ulong)e * BMAX);
+            FMA8(fma(dl * float(sc_), float(v), -dm * float(m_)));
+        }
+    }
+    RED8();
+}
+
 // ================================================================ 二维分块 matmul
 //
 // 上面 mm_* 系列一个 simdgroup 只算**一行**输出，于是同一块激活被 n_out 个
@@ -956,6 +1286,8 @@ static_assert(TILE_K >= 256, "TILE_K 必须 >= 32 lane × 8 元素");
 // 读的是同一 16 字节，一条事务就够，基本都命中 L1）。
 
 struct RawQ4K { uint2 q; };            // qs 8 字节
+struct RawQ5K { uint2 q; uint2 h; };   // qs 8 字节 + qh 8 字节
+struct RawQ51 { uint2 q; uint h; };    // qs 8 字节 + qh 4 字节
 struct RawQ6K { ushort ql[4]; ushort qh[4]; };  // ql 8 + qh 8
 struct RawQ8  { ushort q[4]; };        // 8 字节
 struct RawF16 { uint4 q; };            // 16 字节
@@ -964,6 +1296,28 @@ struct RawF32 { uint4 q; };            // 只预取前 16 字节，后 16 字节
 static inline RawQ4K ld_q4k(device const uchar* q, uint lane) {
     RawQ4K r;
     r.q = *(device const uint2*)(q + 16u + ((lane >> 3) << 5) + ((lane & 3u) << 3));
+    return r;
+}
+
+// Q5_K：qs 在 48（Q4_K 是 16），qh 在 16。两者都是 8 字节对齐
+// （块跨度 176 = 22×8，48/16/32 的偏移都是 8 的倍数），所以 uint2 安全。
+static inline RawQ5K ld_q5k(device const uchar* q, uint lane) {
+    RawQ5K r;
+    const uint o = (lane & 3u) << 3;
+    r.q = *(device const uint2*)(q + 48u + ((lane >> 3) << 5) + o);
+    r.h = *(device const uint2*)(q + 16u + o);
+    return r;
+}
+
+// Q5_1：块跨度 24，qh 只有 4 字节（32 个元素各 1 位）。
+// 一条 lane 管 8 个元素 = 子块内的 (lane&3)*8..+7，高位全在同一个 uint32 里。
+// 注意块偏移 (lane>>2)*24 不能漏 —— mm2 的 lane 同时承担"片内第几块"和
+// "块内第几组"，漏了它所有 lane 都去读第 0 块（结果错但不越界，最难查）。
+static inline RawQ51 ld_q51(device const uchar* q, uint lane) {
+    RawQ51 r;
+    const device uchar* b = q + (ulong)(lane >> 2) * 24u;
+    r.q = *(device const uint2*)(b + 8u + ((lane & 1u) << 3));
+    r.h = *(device const uint*)(b + 4u);
     return r;
 }
 
@@ -1006,6 +1360,47 @@ static inline RawF32 ld_f32(device const uchar* q, uint lane) {
 // ---------------------------------------------------------------- 换算
 // 约定：wv[0..7] 是本 lane 那 8 个元素的解量化结果（f32）。
 
+// Q5_K：子块下标 sb = 2·(lane>>3) + bit2，而**第 5 位的位号恰好等于 sb**，
+// 所以 nibble 的选择位和 qh 的位号是同一个值，一行算完两处都用。
+static inline void cv_q5k(device const uchar* q, RawQ5K raw, uint lane,
+                          thread float* wv) {
+    const float d_  = rd_f16(q);
+    const float dm_ = rd_f16(q + 2u);
+    const uint sb_  = ((lane >> 3) << 1) + ((lane >> 2) & 1u);
+    uchar s1_, m1_;
+    k4_scale_min(int(sb_), q + 4u, s1_, m1_);
+    const float sc_ = d_ * float(s1_);
+    const float mn_ = dm_ * float(m1_);
+    const uint sh_  = ((lane >> 2) & 1u) << 2;
+#pragma unroll
+    for (uint i_ = 0; i_ < 8u; i_++) {
+        const uint bit_ = (i_ & 3u) << 3;
+        const uint word_ = (i_ < 4u) ? raw.q.x : raw.q.y;
+        const uint hword_ = (i_ < 4u) ? raw.h.x : raw.h.y;
+        const uint v_ = ((word_ >> (bit_ + sh_)) & 0x0Fu)
+                      | (((hword_ >> bit_) >> sb_ & 1u) << 4);
+        wv[i_] = fma(sc_, float(v_), -mn_);
+    }
+}
+
+// Q5_1：d·q + m，没有 -16 的偏移。高位在同一个 uint32 里，
+// 位号 = (lane&3)*8 + i，正好是 ld 里那个 8 字节组的下标。
+static inline void cv_q51(device const uchar* q, RawQ51 raw, uint lane,
+                          thread float* wv) {
+    const float d_ = rd_f16(q);
+    const float m_ = rd_f16(q + 2u);
+    const uint hi_ = (lane & 3u) << 3;
+    const uint sh_ = ((lane >> 1) & 1u) << 2;
+#pragma unroll
+    for (uint i_ = 0; i_ < 8u; i_++) {
+        const uint bit_ = (i_ & 3u) << 3;
+        const uint word_ = (i_ < 4u) ? raw.q.x : raw.q.y;
+        const uint v_ = ((word_ >> (bit_ + sh_)) & 0x0Fu)
+                      | (((raw.h >> (hi_ + i_)) & 1u) << 4);
+        wv[i_] = fma(d_, float(v_), m_);
+    }
+}
+
 static inline void cv_q4k(device const uchar* q, RawQ4K raw, uint lane,
                           thread float* wv) {
     const float d_  = rd_f16(q);
@@ -1024,8 +1419,7 @@ static inline void cv_q4k(device const uchar* q, RawQ4K raw, uint lane,
 }
 
 static inline void cv_q6k(device const uchar* q, RawQ6K raw, uint lane,
-                          thread float* wv) {
-    const uint qq_ = lane >> 2;
+                          thread float* wv) {    const uint qq_ = lane >> 2;
     const float d_ = rd_f16(q + 208u) * float(((device const char*)(q + 192u))[lane >> 1]);
     const uint sh_ = ((qq_ & 2u) != 0u) << 2;
     const uint vh_ = 2u * (qq_ & 3u);
@@ -1166,6 +1560,10 @@ MM2_KERNEL(mm2_f16,  RawF16, ld_f16,  cv_f16,  (n_in * 2u),         (TILE_K * 2u
 MM2_KERNEL(mm2_q8_0, RawQ8,  ld_q8_0, cv_q8_0, ((n_in >> 5) * 34u), ((TILE_K >> 5) * 34u))
 MM2_KERNEL(mm2_q4_k, RawQ4K, ld_q4k,  cv_q4k,  ((n_in >> 8) * 144u), 144u)
 MM2_KERNEL(mm2_q6_k, RawQ6K, ld_q6k,  cv_q6k,  ((n_in >> 8) * 210u), 210u)
+// 注意 TB 是"一片 TILE_K=256 元素"的字节跨度，不是"一个块"的：
+// Q5_1 的块只有 32 元素，一片里有 8 个块 → 8×24=192。
+MM2_KERNEL(mm2_q5_k, RawQ5K, ld_q5k,  cv_q5k,  ((n_in >> 8) * 176u), 176u)
+MM2_KERNEL(mm2_q5_1, RawQ51, ld_q51,  cv_q51,  ((n_in >> 5) * 24u), ((TILE_K >> 5) * 24u))
 
 // ================================================================ MMA 分块 matmul（prefill，第 3 代）
 //
@@ -1353,6 +1751,270 @@ kernel void mm3_q4_k(device const uchar* w      [[buffer(0)]],
         const uint idx = tid * 16u + t;
         const uint m = idx >> 6;          // 0..31
         const uint n = idx & 63u;         // 0..63
+        if (m < nrow && row0 + n < n_out)
+            Y[yoff + (ulong)m * n_out + row0 + n] = cs[m * MMA_BN + n];
+    }
+}
+
+// ---------------------------------------------------------------- Q5_K
+//
+// 和 Q4_K 只差"第 5 位"。mm3 里本线程管的是**同一个子块内的 16 个连续元素**
+// （MMA_NK=32 且 e0 是 16 的倍数，16 个元素不会跨子块也不会跨 64 元素段），
+// 所以 qh 只需要一条 16 字节读，位号 = 子块下标，和 nibble 的选择位是同一个。
+kernel void mm3_q5_k(device const uchar* w      [[buffer(0)]],
+                     device const float* XT     [[buffer(1)]],
+                     device float* Y            [[buffer(2)]],
+                     constant uint& n_in        [[buffer(3)]],
+                     constant ulong& woff       [[buffer(4)]],
+                     constant uint& n_out       [[buffer(5)]],
+                     constant uint& nrow        [[buffer(6)]],
+                     constant uint& xstride     [[buffer(7)]],
+                     constant ulong& yoff       [[buffer(8)]],
+                     uint tgid [[threadgroup_position_in_grid]],
+                     uint tid  [[thread_position_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]],
+                     uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half smem[MMA_BM * MMA_BN * 2];
+    threadgroup half* ws = smem;
+    threadgroup half* xs = smem + MMA_BN * MMA_NK;
+
+    const uint row0 = tgid * MMA_BN;
+    const uint nb   = n_in / MMA_NK;
+    const ulong rbytes = (ulong)(n_in >> 8) * 176u;
+
+    const uint lr     = tid >> 1;
+    const uint half16 = tid & 1u;
+    const uint grow   = row0 + lr;
+    device const uchar* prow = w + woff + (ulong)min(grow, n_out - 1u) * rbytes;
+
+    simdgroup_float8x8 acc[2][4];
+    #pragma unroll
+    for (uint i = 0; i < 2u; i++)
+        #pragma unroll
+        for (uint j = 0; j < 4u; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    for (uint b = 0; b < nb; b++) {
+        const uint k0 = b * MMA_NK;
+
+        {
+            const uint e0    = k0 + (half16 << 4);
+            const uint inblk = e0 & 255u;
+            const uint chunk = inblk >> 6;           // 0..3
+            const uint inch  = inblk & 63u;          // 0/16/32/48
+            const bool hi    = inch >= 32u;
+            const uint sb    = inblk >> 5;           // 子块 0..7 == 第 5 位的位号
+            device const uchar* q = prow + (ulong)(e0 >> 8) * 176u;
+
+            uchar s1, m1;
+            k4_scale_min(int(sb), q + 4u, s1, m1);
+            const float sc = rd_f16(q)      * float(s1);
+            const float mn = rd_f16(q + 2u) * float(m1);
+
+            // qs 在 48（Q4_K 是 16），qh 在 16；两者偏移都是 16 的倍数，
+            // 块跨度 176 = 11×16，所以 uint4 对齐成立。
+            const uint4 raw = *(device const uint4*)(q + 48u + (chunk << 5) + (inch & 31u));
+            const uint4 hraw = *(device const uint4*)(q + 16u + (inch & 31u));
+            const uint words[4]  = { raw.x, raw.y, raw.z, raw.w };
+            const uint hwords[4] = { hraw.x, hraw.y, hraw.z, hraw.w };
+            const uint sh = hi ? 4u : 0u;
+            const uint hb = sb;
+            const uint4 o4 = uint4(lr * MMA_NK + (half16 << 4));
+
+            half4 h4[4];
+            #pragma unroll
+            for (uint t = 0; t < 4u; t++) {
+                #pragma unroll
+                for (uint j = 0; j < 4u; j++) {
+                    const uint bit = j << 3;
+                    const uint byte = (words[t] >> bit) & 0xFFu;
+                    const uint v = ((byte >> sh) & 0x0Fu)
+                                 | (((hwords[t] >> bit) >> hb & 1u) << 4);
+                    h4[t][j] = (half)fma(sc, float(v), -mn);
+                }
+            }
+            threadgroup half4* dst = (threadgroup half4*)(ws + (o4.x & ~3u));
+            #pragma unroll
+            for (uint t = 0; t < 4u; t++) dst[t] = h4[t];
+        }
+
+        #pragma unroll
+        for (uint t = 0; t < 2u; t++) {
+            const uint i4 = tid * 2u + t;
+            const uint m0 = (i4 & 7u) << 2;
+            const uint k  = i4 >> 3;
+            const float4 v = *(device const float4*)(XT + (ulong)(k0 + k) * xstride + m0);
+            *(threadgroup half4*)(xs + k * MMA_BM + m0) =
+                half4((half)v.x, (half)v.y, (half)v.z, (half)v.w);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint kk = 0; kk < 4u; kk++) {
+            simdgroup_half8x8 ma[4];
+            #pragma unroll
+            for (uint j = 0; j < 4u; j++)
+                simdgroup_load(ma[j], xs, MMA_BM, ulong2(j << 3, kk << 3), true);
+
+            simdgroup_half8x8 mb[2];
+            #pragma unroll
+            for (uint i = 0; i < 2u; i++)
+                simdgroup_load(mb[i], ws, MMA_NK, ulong2(kk << 3, (sg << 4) + (i << 3)), true);
+
+            #pragma unroll
+            for (uint i = 0; i < 2u; i++) {
+                #pragma unroll
+                for (uint j = 0; j < 4u; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], ma[j], mb[i], acc[i][j]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float* cs = (threadgroup float*)smem;
+    #pragma unroll
+    for (uint i = 0; i < 2u; i++) {
+        #pragma unroll
+        for (uint j = 0; j < 4u; j++)
+            simdgroup_store(acc[i][j], cs, MMA_BN,
+                            ulong2((sg << 4) + (i << 3), j << 3), false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    #pragma unroll
+    for (uint t = 0; t < 16u; t++) {
+        const uint idx = tid * 16u + t;
+        const uint m = idx >> 6;
+        const uint n = idx & 63u;
+        if (m < nrow && row0 + n < n_out)
+            Y[yoff + (ulong)m * n_out + row0 + n] = cs[m * MMA_BN + n];
+    }
+}
+
+// ---------------------------------------------------------------- Q5_1
+//
+// MMA_NK=32 正好等于一个 Q5_1 块，于是"本线程那 16 个元素"就是块的
+// 低半字节或高半字节 —— half16 直接就是 hi。这是所有格式里最省事的一档。
+kernel void mm3_q5_1(device const uchar* w      [[buffer(0)]],
+                     device const float* XT     [[buffer(1)]],
+                     device float* Y            [[buffer(2)]],
+                     constant uint& n_in        [[buffer(3)]],
+                     constant ulong& woff       [[buffer(4)]],
+                     constant uint& n_out       [[buffer(5)]],
+                     constant uint& nrow        [[buffer(6)]],
+                     constant uint& xstride     [[buffer(7)]],
+                     constant ulong& yoff       [[buffer(8)]],
+                     uint tgid [[threadgroup_position_in_grid]],
+                     uint tid  [[thread_position_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]],
+                     uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half smem[MMA_BM * MMA_BN * 2];
+    threadgroup half* ws = smem;
+    threadgroup half* xs = smem + MMA_BN * MMA_NK;
+
+    const uint row0 = tgid * MMA_BN;
+    const uint nb   = n_in / MMA_NK;
+    const ulong rbytes = (ulong)(n_in >> 5) * 24u;
+
+    const uint lr     = tid >> 1;
+    const uint half16 = tid & 1u;
+    const uint grow   = row0 + lr;
+    device const uchar* prow = w + woff + (ulong)min(grow, n_out - 1u) * rbytes;
+
+    simdgroup_float8x8 acc[2][4];
+    #pragma unroll
+    for (uint i = 0; i < 2u; i++)
+        #pragma unroll
+        for (uint j = 0; j < 4u; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    for (uint b = 0; b < nb; b++) {
+        const uint k0 = b * MMA_NK;
+
+        {
+            const uint e0 = k0 + (half16 << 4);
+            device const uchar* q = prow + (ulong)(e0 >> 5) * 24u;
+
+            const float d = rd_f16(q);
+            const float m = rd_f16(q + 2u);
+            const uint qh = *(device const uint*)(q + 4u);
+            // 块跨度 24 只保证 8 字节对齐 → 用 ld16s 读 nibble 区
+            const uint4 raw = ld16s(q + 8u);
+            const uint words[4] = { raw.x, raw.y, raw.z, raw.w };
+            const uint sh = half16 << 2;
+            const uint hb = half16 << 4;
+
+            half4 h4[4];
+            #pragma unroll
+            for (uint t = 0; t < 4u; t++) {
+                #pragma unroll
+                for (uint j = 0; j < 4u; j++) {
+                    const uint bit = j << 3;
+                    const uint byte = (words[t] >> bit) & 0xFFu;
+                    const uint v = ((byte >> sh) & 0x0Fu)
+                                 | (((qh >> (hb + (t << 2) + j)) & 1u) << 4);
+                    h4[t][j] = (half)fma(d, float(v), m);
+                }
+            }
+            threadgroup half4* dst = (threadgroup half4*)(ws + ((lr * MMA_NK + (half16 << 4)) & ~3u));
+            #pragma unroll
+            for (uint t = 0; t < 4u; t++) dst[t] = h4[t];
+        }
+
+        #pragma unroll
+        for (uint t = 0; t < 2u; t++) {
+            const uint i4 = tid * 2u + t;
+            const uint m0 = (i4 & 7u) << 2;
+            const uint k  = i4 >> 3;
+            const float4 v = *(device const float4*)(XT + (ulong)(k0 + k) * xstride + m0);
+            *(threadgroup half4*)(xs + k * MMA_BM + m0) =
+                half4((half)v.x, (half)v.y, (half)v.z, (half)v.w);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint kk = 0; kk < 4u; kk++) {
+            simdgroup_half8x8 ma[4];
+            #pragma unroll
+            for (uint j = 0; j < 4u; j++)
+                simdgroup_load(ma[j], xs, MMA_BM, ulong2(j << 3, kk << 3), true);
+
+            simdgroup_half8x8 mb[2];
+            #pragma unroll
+            for (uint i = 0; i < 2u; i++)
+                simdgroup_load(mb[i], ws, MMA_NK, ulong2(kk << 3, (sg << 4) + (i << 3)), true);
+
+            #pragma unroll
+            for (uint i = 0; i < 2u; i++) {
+                #pragma unroll
+                for (uint j = 0; j < 4u; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], ma[j], mb[i], acc[i][j]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float* cs = (threadgroup float*)smem;
+    #pragma unroll
+    for (uint i = 0; i < 2u; i++) {
+        #pragma unroll
+        for (uint j = 0; j < 4u; j++)
+            simdgroup_store(acc[i][j], cs, MMA_BN,
+                            ulong2((sg << 4) + (i << 3), j << 3), false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    #pragma unroll
+    for (uint t = 0; t < 16u; t++) {
+        const uint idx = tid * 16u + t;
+        const uint m = idx >> 6;
+        const uint n = idx & 63u;
         if (m < nrow && row0 + n < n_out)
             Y[yoff + (ulong)m * n_out + row0 + n] = cs[m * MMA_BN + n];
     }

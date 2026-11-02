@@ -135,8 +135,26 @@ bool init_gpu() {
     if (!g_pipe_tr) { g_dead = true; return false; }
 
     // mmap 起始地址是页对齐的，可以直接零拷贝包成 MTLBuffer。
+    //
+    // 长度必须**向上**取整到页，不能直接把文件大小递进去：
+    // 实测两个 mmproj（VL 2B / Audio 2B）的文件大小分别是
+    // 203031872 % 4096 = 1344、337862080 % 4096 = 3520 —— 都不是页整数倍。
+    // Metal 的零拷贝包装按页登记 vm 区间，长度取整方向一旦是向下，
+    // 尾部那一页里的张量就整块落在缓冲之外（和 metal.mm 里
+    // bind_weights 那个 bug 同源，那边已经修过，这里一并堵上）。
+    //
+    // 向上取整是安全的：mmap 的映射本来就覆盖到页边界，超出 EOF 的字节
+    // 读出来是 0，不会缺页。g_wsize 本身保持精确值不动 —— 它还要兼作
+    // 张量地址的越界检查上界（见 vit_gemm_gpu 里的 `wd >= g_base + g_wsize`）。
+    const size_t page = 4096;
+    if (((uintptr_t)g_base & (page - 1)) != 0) {
+        g_err = "mmproj 映射基址未页对齐，无法零拷贝";
+        g_dead = true;
+        return false;
+    }
+    const size_t wlen = (g_wsize + page - 1) & ~(page - 1);
     g_w = [g_dev newBufferWithBytesNoCopy:(void*)g_base
-                                   length:g_wsize
+                                   length:wlen
                                   options:MTLResourceStorageModeShared
                               deallocator:nil];
     if (!g_w) { g_err = "包装权重 mmap 失败"; g_dead = true; return false; }

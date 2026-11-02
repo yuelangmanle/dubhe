@@ -93,7 +93,8 @@ all: $(BIN) $(SRV) tools
 engine: $(BIN)
 
 tools: $(BUILD)/selftest $(BUILD)/ggufdump $(BUILD)/tokprobe \
-       $(BUILD)/mma_probe $(BUILD)/mm2_check $(BUILD)/vlprobe $(BUILD)/audprobe
+       $(BUILD)/mma_probe $(BUILD)/mm2_check $(BUILD)/vlprobe $(BUILD)/audprobe \
+       $(BUILD)/batchcheck $(BUILD)/mvbench
 
 # 分词 + 贪心生成探针：同一模型不同量化档输出不一致时，用它区分
 # "分词差异" 和 "前向差异"（对比打印出的 token id 序列即可）。

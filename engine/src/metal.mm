@@ -45,11 +45,15 @@ constexpr int kMmRows    = 32;   // MMR：每 threadgroup 的输出行数
 constexpr int kMmTileK   = 256;  // TILE_K：K 方向分片
 
 enum KernelKind {
-    K_F32 = 0, K_F16, K_Q4_0, K_Q5_0, K_Q8_0, K_Q4_K, K_Q6_K, K_COUNT
+    K_F32 = 0, K_F16, K_Q4_0, K_Q5_0, K_Q8_0, K_Q4_K, K_Q6_K,
+    // 新格式一律**追加在末尾**：所有表都是按这个下标平行索引的，
+    // 插在中间会让老下标整体错位（症状是格式张冠李戴，不报错）。
+    K_Q5_1, K_Q5_K, K_COUNT
 };
 
 const char* const kNames[K_COUNT] = {
-    "mv_f32", "mv_f16", "mv_q4_0", "mv_q5_0", "mv_q8_0", "mv_q4_k", "mv_q6_k"
+    "mv_f32", "mv_f16", "mv_q4_0", "mv_q5_0", "mv_q8_0", "mv_q4_k", "mv_q6_k",
+    "mv_q5_1", "mv_q5_k"
 };
 
 // 解码 matvec 的候选实现（第 2 版）。空串 = 这一档没有候选，直接用 kNames。
@@ -58,18 +62,20 @@ const char* const kNames[K_COUNT] = {
 // 否则又要回到"跨轮比较绝对数字"的老坑（同一份二进制跨轮能差 1.5x）。
 // 用 DUBHE_MV_V2=0 关掉，默认开。
 const char* const kNames2[K_COUNT] = {
-    "", "", "", "mv_q5_0_v2", "", "", ""
+    "", "", "mv_q4_0_v2", "mv_q5_0_v2", "", "", "", "", ""
 };
 
 // 分块 matmul 的函数名。Q4_0/Q5_0 没有分块版本（空串），派发时回退到 mm_*。
 const char* const kM2Names[K_COUNT] = {
-    "mm2_f32", "mm2_f16", "", "", "mm2_q8_0", "mm2_q4_k", "mm2_q6_k"
+    "mm2_f32", "mm2_f16", "", "", "mm2_q8_0", "mm2_q4_k", "mm2_q6_k",
+    "mm2_q5_1", "mm2_q5_k"
 };
 
-// MMA 版分块 matmul（第 3 代）。覆盖 F16 / Q4_K / Q6_K，其余回退 mm2_*。
-// 空串表示"没有这一档"，派发时跳过。
+// MMA 版分块 matmul（第 3 代）。覆盖 F16 / Q8_0 / Q4_K / Q6_K / Q5_1 / Q5_K，
+// 其余回退 mm2_*。空串表示"没有这一档"，派发时跳过。
 const char* const kM3Names[K_COUNT] = {
-    "", "mm3_f16", "", "", "mm3_q8_0", "mm3_q4_k", "mm3_q6_k"
+    "", "mm3_f16", "", "", "mm3_q8_0", "mm3_q4_k", "mm3_q6_k",
+    "mm3_q5_1", "mm3_q5_k"
 };
 
 // 与 MSL 的 MMA_BN / MMA_BM / MMA_NK 一致（全部取自 metal_kernels.h 的唯一真源）
@@ -96,8 +102,10 @@ int kind_of(uint32_t t) {
         case T_F16:  return K_F16;
         case T_Q4_0: return K_Q4_0;
         case T_Q5_0: return K_Q5_0;
+        case T_Q5_1: return K_Q5_1;
         case T_Q8_0: return K_Q8_0;
         case T_Q4_K: return K_Q4_K;
+        case T_Q5_K: return K_Q5_K;
         case T_Q6_K: return K_Q6_K;
         default:     return -1;
     }
@@ -236,12 +244,23 @@ bool bind_weights(const void* base, size_t size, std::string* err) {
     if (!base || size == 0) { if (err) *err = "权重地址无效"; return false; }
 
     // 必须页对齐，且长度取整到页（Metal 会校验）
+    //
+    // 取整方向只能是**向上**。原先是向下取整，等于把文件最后一页里的张量
+    // 整块切掉 —— 而 GGUF 的 `output_norm.weight` 恰恰经常就落在那里。
+    // 症状极其隐蔽：那个张量的 GPU 侧读出来全是 0，于是最后一层 rmsnorm
+    // 输出恒 0、logits 恒 0、argmax 恒 0（融合校验报 rel=1.0e+00 才发现）。
+    // 实测 Qwen2.5-0.5B 的 q5_0 文件：49,0471,776 + 3584 = 文件尾，
+    // 向下取整后这块整个在缓冲之外；q4_0 文件只被切掉最后 1888 字节，
+    // 前半段还对，所以校验勉强通过 —— 是个一直在的静默精度损失。
+    //
+    // 向上取整是安全的：mmap 的映射长度本来就按页上取整，最后一页里超出
+    // EOF 的字节读出来是 0，不会缺页。
     const size_t page = 4096;
     if (((uintptr_t)base & (page - 1)) != 0) {
         if (err) *err = "mmap 基址未页对齐，无法零拷贝";
         return false;
     }
-    const size_t len = size & ~(page - 1);
+    const size_t len = (size + page - 1) & ~(page - 1);
     if (len == 0) { if (err) *err = "映射长度不足一页"; return false; }
 
     g_w = [g_dev newBufferWithBytesNoCopy:(void*)base
@@ -355,7 +374,8 @@ id<MTLComputePipelineState> g_fpipe[F_COUNT] = {nil};
 // 批处理矩阵乘内核。顺序与 KernelKind 完全一致，所以可以直接用 kind_of()
 // 的下标同时索引 g_pipe[]（解码）与 g_mpipe[]（prefill）。
 const char* const kMmNames[K_COUNT] = {
-    "mm_f32", "mm_f16", "mm_q4_0", "mm_q5_0", "mm_q8_0", "mm_q4_k", "mm_q6_k"
+    "mm_f32", "mm_f16", "mm_q4_0", "mm_q5_0", "mm_q8_0", "mm_q4_k", "mm_q6_k",
+    "mm_q5_1", "mm_q5_k"
 };
 id<MTLComputePipelineState> g_mpipe[K_COUNT] = {nil};
 // 二维分块版本（prefill 主路径）。与 g_mpipe 并行存在，格式不支持时为 nil。
@@ -439,7 +459,7 @@ bool fwd_init(const Spec& s, std::string* err) {
         }
     }
     for (int i = 0; i < K_COUNT; i++) {
-        if (g_mpipe[i]) continue;
+        if (g_mpipe[i] || !kMmNames[i][0]) continue;
         id<MTLFunction> fn = [g_lib newFunctionWithName:[NSString stringWithUTF8String:kMmNames[i]]];
         if (!fn) { if (err) *err = std::string("着色器缺少函数 ") + kMmNames[i]; return false; }
         NSError* pe = nil;
