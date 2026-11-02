@@ -1027,7 +1027,17 @@ bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* log
 
     // 槽位 prefill：整段落在 slab0 之后，容量要按 slab0 + pos0 + n 算，
     // 只按 pos0 + n 算会让第 2 条以后的序列直接越界。
-    if ((int64_t)slab0 + pos0 + n > n_ctx_) { if (err) *err = "上下文已满"; return false; }
+    //
+    // 错误信息要带上数字和出路。原来只写"上下文已满"，用户看到的是
+    // 一段空白回复 + 四个字，既不知道差多少，也不知道能调 —— 而 CLI 的
+    // `-c`、服务端的 `--ctx` 都是现成的旋钮。
+    if ((int64_t)slab0 + pos0 + n > n_ctx_) {
+        if (err)
+            *err = "上下文已满：要写到位置 " + std::to_string(slab0 + pos0 + n) +
+                   "，上限 " + std::to_string(n_ctx_) +
+                   "（调大 -c/--ctx，或缩短输入）";
+        return false;
+    }
     if ((int64_t)slab0 + pos0 + n > kv_cap_ &&
         !grow_kv((int)(slab0 + pos0 + n))) {
         if (err) *err = "KV cache 扩容失败"; return false;
@@ -1107,7 +1117,12 @@ bool Model::forward_multi(const int32_t* tokens, int nrow, const int32_t* rpos,
 
 bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err) {
     if (!loaded_) { if (err) *err = "模型未加载"; return false; }
-    if (pos >= n_ctx_) { if (err) *err = "上下文已满"; return false; }
+    if (pos >= n_ctx_) {
+        if (err)
+            *err = "上下文已满：位置 " + std::to_string(pos) + " 已达上限 " +
+                   std::to_string(n_ctx_) + "（调大 -c/--ctx）";
+        return false;
+    }
     if (pos >= kv_cap_ && !grow_kv(pos + 1)) { if (err) *err = "KV cache 扩容失败"; return false; }
 
     const int n_embd = cfg_.n_embd;

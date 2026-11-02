@@ -562,6 +562,16 @@ int dubhe_generate(dubhe_engine* e,
 
     const double t0 = now_ms();
     std::string err;
+
+    // 上下文装不下整段 prompt 就先说清楚。否则错误是在 prefill 循环的某个
+    // 8 行批边界上冒出来的，数字是"首个失败批的结束位置"（4096+32=4128），
+    // 看着像"只超了 32 个 token"，而实际 prompt 可能有 5000 个。
+    if (n_prompt > e->model.n_ctx_limit()) {
+        set_err("上下文已满：prompt " + std::to_string(n_prompt) + " token，上限 " +
+                std::to_string(e->model.n_ctx_limit()) + "（调大 -c/--ctx，或缩短输入）");
+        return DUBHE_ERR_INVALID_ARG;
+    }
+
     // prefill：按引擎实际批大小切块。GPU 上一次提交吃 8 个 token，
     // 权重只读一遍就摊到 8 个 token 上——这是首字延迟的关键。
     // 从 start 开始：前面 start 个 token 的 KV 已经算好了，不重算。
