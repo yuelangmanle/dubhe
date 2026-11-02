@@ -65,16 +65,39 @@ int32_t sample_token(float* logits, int n_vocab, const dubhe_sampling& sp,
     }
 
     const float inv_t = 1.f / sp.temperature;
-    std::vector<std::pair<float, int>> cand;
-    cand.reserve(n_vocab);
-    for (int i = 0; i < n_vocab; i++) cand.emplace_back(logits[i] * inv_t, i);
-
     const int k = (sp.top_k > 0 && sp.top_k < n_vocab) ? sp.top_k : n_vocab;
+
+    // top-k 用**定长小顶堆**一遍扫完，不再为 12.8 万个候选建 vector。
+    //
+    // 原来这里是：reserve(n_vocab) → emplace_back 12.8 万次 → partial_sort
+    // 全量比较。两个开销都白给：
+    //   · 每个 token 分配并填满 1 MB（pair<float,int> × 128000），
+    //   · 再对 12.8 万个元素做 O(n log k) 比较。
+    // LFM3 的词表是 128000，这一步实测占掉解码里 1 ms 出头 —— 而解码的
+    // 墙钟只有 15 ms/token，GPU 那边忙 87%，剩下的空隙主要就是它。
+    //
+    // 堆的做法只保留 k 个元素（top_k 默认 40），每多一个候选只多一次比较，
+    // 命中的概率随扫描推进迅速衰减，实际进堆的次数是 O(k log(n/k)) 量级。
+    std::vector<std::pair<float, int>> cand;
     if (k < n_vocab) {
-        std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
-                          [](const auto& a, const auto& b) { return a.first > b.first; });
-        cand.resize(k);
+        cand.reserve((size_t)k);
+        const auto cmp = [](const auto& a, const auto& b) { return a.first > b.first; };
+        for (int i = 0; i < n_vocab; i++) {
+            const float v = logits[i] * inv_t;
+            if ((int)cand.size() < k) {
+                cand.emplace_back(v, i);
+                std::push_heap(cand.begin(), cand.end(), cmp);
+            } else if (v > cand.front().first) {
+                std::pop_heap(cand.begin(), cand.end(), cmp);
+                cand.back() = {v, i};
+                std::push_heap(cand.begin(), cand.end(), cmp);
+            }
+        }
+        std::sort_heap(cand.begin(), cand.end(), cmp);
     } else {
+        // top_k 没设或大于词表：只能全量排。这条路径在默认参数下不会走到。
+        cand.reserve((size_t)n_vocab);
+        for (int i = 0; i < n_vocab; i++) cand.emplace_back(logits[i] * inv_t, i);
         std::sort(cand.begin(), cand.end(),
                   [](const auto& a, const auto& b) { return a.first > b.first; });
     }

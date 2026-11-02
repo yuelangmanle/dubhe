@@ -406,6 +406,35 @@ int main(int argc, char** argv) {
         return rel < 1e-4;
     };
 
+    // 对拍前必须**重新跑一次干净的**（flags=0）。
+    // 诊断矩阵里后三个 case 会改写 y_new[0]：最后一个「重排·只读权」把
+    // flags 置成 3，内核跳过解包、只把原始字节异或起来。基准循环结束后
+    // y_new[0] 里就是那堆垃圾，直接拿来对拍会报 rel=2.24e+08 —— 看起来像
+    // 重排布局算错了，其实只是读了残值。y_old[0] 侥幸没坏（它只被 case 0
+    // 写），所以这个 bug 表现为"一边过一边不过"，更容易误判成内核问题。
+    auto dispatch_once = [&](bool use_new, uint32_t f) {
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
+        [en setComputePipelineState:use_new ? ps_new : ps_old];
+        [en setBuffer:(use_new ? w_new[0] : w_old[0]) offset:0 atIndex:0];
+        [en setBuffer:xbuf offset:0 atIndex:1];
+        [en setBuffer:(use_new ? y_new[0] : y_old[0]) offset:0 atIndex:2];
+        [en setBytes:&nin length:4 atIndex:3];
+        [en setBytes:&woff length:8 atIndex:4];
+        [en setBytes:&nout length:4 atIndex:5];
+        if (use_new && packed_ok) {
+            [en setBytes:&hoff length:8 atIndex:6];
+            [en setBytes:&f length:4 atIndex:7];
+        }
+        [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [en endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    };
+    dispatch_once(false, 0);
+    if (packed_ok) dispatch_once(true, 0);
+
     std::printf("\nMV_R=%d  threadgroup=%d 组 × 128 线程  每轮 %d 个 dispatch"
                 "（PASSES=%d）\n\n", mv_rows, (int)tgc, kPerRound, kPasses);
     std::printf("| 内核 | 每 dispatch | 带宽 | 相对现有 |\n|---|---:|---:|---:|\n");
