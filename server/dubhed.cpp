@@ -575,6 +575,16 @@ struct ToolResult {
     // 被门禁挡下来（不是工具执行失败）。前端据此把卡片画成"未执行"，
     // 而不是把一句权限提示渲染成命令输出。
     bool denied = false;
+    // ---- 三层分离里的另外两层
+    //
+    // output 只服务模型（拼进 prompt 的自然语言）。card + meta 服务界面：
+    // card 决定画哪种卡片，meta 是回放卡片要用的结构化事实。
+    //
+    // 这是从 DeepSeek Harness 的 presentCall/presentResult 抄的。原来只有
+    // 一个 output 字符串，前端只能把它整块塞进 <pre>，于是 shell、读文件、
+    // 改文件、搜索四种东西长成一个样 —— 用户看不出模型到底做了什么。
+    std::string card = "generic";   // generic|terminal|diff|read|search|web
+    json::Value meta = json::Value::make_obj();
 };
 
 // ---------------------------------------------------------------- 进程执行
@@ -1068,6 +1078,11 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         total = line_no;
         r.ok = true;
         r.output = out;
+        r.card = "read";
+        r.meta.set("path", json::Value::make_str(p));
+        r.meta.set("offset", json::Value::make_num(off));
+        r.meta.set("lines", json::Value::make_num(taken));
+        r.meta.set("total", json::Value::make_num(total));
         if (taken == 0) {
             r.output = "文件只有 " + std::to_string(total) + " 行，offset=" +
                        std::to_string(off) + " 已经超出范围。";
@@ -1113,6 +1128,10 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         for (auto& x : dirs) r.output += "  " + x + "\n";
         for (auto& x : files) r.output += "  " + x + "\n";
         if (dirs.empty() && files.empty()) r.output += "  （空目录）\n";
+        r.card = "search";
+        r.meta.set("shape", json::Value::make_str("paths"));
+        r.meta.set("path", json::Value::make_str(p));
+        r.meta.set("count", json::Value::make_num((double)(dirs.size() + files.size())));
         return r;
     }
     if (name == "write_file") {
@@ -1121,6 +1140,12 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         r.ok = write_file(p, c);
         r.output = r.ok ? ("已写入 " + std::to_string(c.size()) + " 字节到 " + p)
                         : ("写入失败: " + p);
+        r.card = "diff";
+        r.meta.set("path", json::Value::make_str(p));
+        r.meta.set("is_new", json::Value::make_bool(true));
+        r.meta.set("old", json::Value());              // 新文件：没有旧内容
+        r.meta.set("new", json::Value::make_str(c.substr(0, 8000)));
+        r.meta.set("bytes", json::Value::make_num((double)c.size()));
         return r;
     }
     if (name == "edit_file") {
@@ -1146,6 +1171,11 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         r.ok = write_file(p, body);
         r.output = r.ok ? ("已替换 1 处，文件现在是 " + std::to_string(body.size()) + " 字节")
                         : ("写入失败: " + p);
+        r.card = "diff";
+        r.meta.set("path", json::Value::make_str(p));
+        r.meta.set("is_new", json::Value::make_bool(false));
+        r.meta.set("old", json::Value::make_str(old_s.substr(0, 4000)));
+        r.meta.set("new", json::Value::make_str(new_s.substr(0, 4000)));
         return r;
     }
     if (name == "grep") {
@@ -1162,6 +1192,14 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         ProcOut po = run_proc(cmd, g.workspace, 15000, 48 * 1024, false);
         r.ok = true;
         r.output = po.out.empty() ? ("没有匹配: " + pat) : po.out;
+        int hits = 0;
+        for (char ch : po.out) if (ch == '\n') hits++;
+        r.card = "search";
+        r.meta.set("shape", json::Value::make_str("matches"));
+        r.meta.set("pattern", json::Value::make_str(pat));
+        r.meta.set("path", json::Value::make_str(base));
+        r.meta.set("total", json::Value::make_num(hits));
+        r.meta.set("truncated", json::Value::make_bool(hits >= limit));
         return r;
     }
     if (name == "glob") {
@@ -1178,6 +1216,14 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         ProcOut po = run_proc(cmd, g.workspace, 15000, 48 * 1024, false);
         r.ok = true;
         r.output = po.out.empty() ? ("没有匹配的文件: " + pat) : po.out;
+        int hits = 0;
+        for (char ch : po.out) if (ch == '\n') hits++;
+        r.card = "search";
+        r.meta.set("shape", json::Value::make_str("paths"));
+        r.meta.set("pattern", json::Value::make_str(pat));
+        r.meta.set("path", json::Value::make_str(base));
+        r.meta.set("count", json::Value::make_num(hits));
+        r.meta.set("truncated", json::Value::make_bool(hits >= 200));
         return r;
     }
     if (name == "fetch_url") {
@@ -1194,6 +1240,10 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         r.ok = po.exit_code == 0;
         r.output = html_to_text(po.out);
         if (r.output.empty()) r.output = "抓取失败或内容为空";
+        r.card = "web";
+        r.meta.set("kind", json::Value::make_str("fetch"));
+        r.meta.set("url", json::Value::make_str(url));
+        r.meta.set("bytes", json::Value::make_num((double)r.output.size()));
         return r;
     }
     if (name == "web_search") {
@@ -1201,6 +1251,17 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         r.output = web_search_text(q, (int)args.n("n", 6));
         r.ok = !r.output.empty();
         if (!r.ok) r.output = "搜索没有返回结果（可能被限流，或本机无法访问外网）";
+        r.card = "web";
+        r.meta.set("kind", json::Value::make_str("search"));
+        r.meta.set("query", json::Value::make_str(q));
+        int hits = 0;
+        // 数"以 [ 开头的行"。早先用 find("\n[") 数，第一条正好在位置 0，
+        // 于是 3 条结果永远报成 2 条 —— 卡片上的数字比实际少一个。
+        for (size_t i = 0; i < r.output.size(); i++) {
+            if (r.output[i] != '[') continue;
+            if (i == 0 || r.output[i - 1] == '\n') hits++;
+        }
+        r.meta.set("count", json::Value::make_num(hits));
         return r;
     }
     if (name == "shell") {
@@ -1232,6 +1293,13 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         if (po.truncated) r.output += "\n[截断] 输出超过 96 KB，只保留了前面部分。";
         if (po.out.empty() && r.ok) r.output = "（命令执行成功，没有输出）";
         else if (!po.out.empty()) r.output += "\n[退出码 " + std::to_string(po.exit_code) + "]";
+        r.card = "terminal";
+        r.meta.set("command", json::Value::make_str(cmd));
+        r.meta.set("cwd", json::Value::make_str(cwd.empty() ? g.workspace : cwd));
+        r.meta.set("exit", json::Value::make_num(po.exit_code));
+        r.meta.set("timed_out", json::Value::make_bool(po.timed_out));
+        r.meta.set("truncated", json::Value::make_bool(po.truncated));
+        r.meta.set("no_sandbox", json::Value::make_bool(no_sandbox));
         return r;
     }
     r.output = "未知工具: " + name;
@@ -3020,6 +3088,8 @@ int main(int argc, char** argv) {
         json::Value o = json::Value::make_obj();
         o.set("ok", json::Value::make_bool(r.ok));
         o.set("denied", json::Value::make_bool(r.denied));
+        o.set("card", json::Value::make_str(r.card));
+        o.set("meta", r.meta);
         o.set("output", json::Value::make_str(r.output));
         c.send(200, "application/json", json::dump(o));
     });
@@ -3547,10 +3617,22 @@ int main(int argc, char** argv) {
                               "}}\n\n");
 
                 ToolResult tr = run_tool(tname, targs);
-                c.write_chunk("data: {\"dubhe\":{\"type\":\"tool_result\",\"ok\":" +
-                              std::string(tr.ok ? "true" : "false") + ",\"denied\":" +
-                              std::string(tr.denied ? "true" : "false") + ",\"output\":" +
-                              json_escape(tr.output.substr(0, 8000)) + "}}\n\n");
+                {
+                    // 事件体走 json::dump 而不是手拼字符串：card/meta 里可能有
+                    // 引号、换行、反斜杠（命令本身、diff 的 old/new 都有），
+                    // 手拼一次漏转义就是前端 JSON.parse 失败 —— 而失败的样子
+                    // 是"工具卡片不出现"，看不出是转义问题。
+                    json::Value d = json::Value::make_obj();
+                    d.set("type", json::Value::make_str("tool_result"));
+                    d.set("ok", json::Value::make_bool(tr.ok));
+                    d.set("denied", json::Value::make_bool(tr.denied));
+                    d.set("card", json::Value::make_str(tr.card));
+                    d.set("meta", tr.meta);
+                    d.set("output", json::Value::make_str(tr.output.substr(0, 8000)));
+                    json::Value ev = json::Value::make_obj();
+                    ev.set("dubhe", d);
+                    c.write_chunk("data: " + json::dump(ev) + "\n\n");
+                }
                 rounds++;
 
                 // 下一轮：把这一轮的调用和结果追加进对话。

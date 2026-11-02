@@ -352,6 +352,101 @@
     }
   }
 
+  // ---- 工具卡片
+  //
+  // 服务端在 tool_result 里带 card + meta，这里只做映射：不读时钟、不做 I/O、
+  // 不看全局状态。原因是同一段数据要在两个时刻被画出来 —— 实时流进来的时候，
+  // 以及以后从会话记录回放的时候。只要它依赖了"现在几点"或"当前工作目录"，
+  // 回放出来的卡片就和当时看到的不一样（DSH 把这条写成硬规则：展示函数必须是
+  // 纯函数）。
+  //
+  // card 缺失（老会话记录、或工具没声明）一律走 generic，不抛错。
+  const CARD_ICON = {
+    terminal: 'terminal', diff: 'code', read: 'txt',
+    search: 'search', web: 'globe', generic: 'terminal',
+  };
+
+  const baseName = (p) => String(p || '').split('/').filter(Boolean).pop() || '';
+  const hostOf = (u) => {
+    const m = String(u || '').match(/^https?:\/\/([^/?#]+)/i);
+    return m ? m[1] : String(u || '');
+  };
+
+  // 一行摘要：卡片头部右边那行小字。写不出东西就返回空串，不留空位。
+  function cardSub(t, meta) {
+    if (t.denied) return '未执行';
+    if (t.ok === false) return '失败';
+    const card = t.card || 'generic';
+    if (card === 'read' && meta.total) {
+      const a = meta.offset || 1, b = a + (meta.lines || 0) - 1;
+      return a + '–' + b + ' / ' + meta.total + ' 行';
+    }
+    if (card === 'terminal') {
+      if (meta.timed_out) return '超时';
+      if (meta.exit != null) return '退出 ' + meta.exit;
+    }
+    if (card === 'diff') return meta.is_new ? '新建' : '已改';
+    if (card === 'search') {
+      if (meta.truncated) return '已截断';
+      return meta.shape === 'matches' ? (meta.total || 0) + ' 处' : (meta.count || 0) + ' 个';
+    }
+    if (card === 'web') return meta.kind === 'fetch' ? '抓取' : (meta.count || 0) + ' 条';
+    return '';
+  }
+
+  // 卡片主标题 = "它到底动了什么"，不是工具名。用户不关心工具叫 read_file，
+  // 只关心读了哪个文件、跑了哪条命令。
+  function cardTitle(t, meta) {
+    const card = t.card || 'generic';
+    if (card === 'terminal') return meta.command || t.name;
+    if (card === 'diff' || card === 'read') return baseName(meta.path) || t.name;
+    if (card === 'search') return meta.pattern || baseName(meta.path) || t.name;
+    if (card === 'web') return meta.kind === 'fetch' ? hostOf(meta.url) : ('“' + (meta.query || '') + '”');
+    return t.name;
+  }
+
+  function toolCard(t) {
+    const meta = t.meta || {};
+    const card = t.card || 'generic';
+    const box = el('div', 'tool-card' + (t.ok === false ? ' failed' : '') + (t.denied ? ' denied' : ''));
+
+    const head = el('div', 'tool-head');
+    const ic = el('span', 'ic');
+    ic.appendChild(iconNode(t.denied ? 'shield' : (t.ok === false ? 'x' : (CARD_ICON[card] || 'terminal')), 'i'));
+    head.appendChild(ic);
+    head.appendChild(el('span', 'tool-name', cardTitle(t, meta)));
+    const sub = cardSub(t, meta);
+    if (sub) head.appendChild(el('span', 'tool-sub', sub));
+    box.appendChild(head);
+
+    // diff 卡片单独画：并排的"旧/新"两段比一整块 pre 有用得多 ——
+    // 尤其 edit_file 只改一处的时候，用户要确认的是"改的是不是这一处"。
+    if (card === 'diff' && (meta.old || meta.new) && !t.denied) {
+      const d = el('div', 'tool-diff');
+      if (meta.old) {
+        const del = el('pre', 'diff-del', String(meta.old));
+        d.appendChild(del);
+      }
+      if (meta.new) d.appendChild(el('pre', 'diff-add', String(meta.new)));
+      box.appendChild(d);
+      return box;
+    }
+
+    if (t.output) {
+      // 去掉只对模型有用的尾巴。服务端在 output 里写"…（这是第 1–3 行，全文共
+      // 245 行）"和"[退出码 0]"，是为了让模型知道要不要接着翻、命令有没有成功；
+      // 卡片头上已经有"1–3 / 245 行"和"退出 0"了，正文再写一遍是重复。
+      // 只改展示，不动 t.output —— 回放和复制拿到的还是原文。
+      let text = String(t.output);
+      if (card === 'read') text = text.replace(/\n…（这是第 [\s\S]*$/, '');
+      if (card === 'terminal') text = text.replace(/\n\[退出码 -?\d+\]$/, '');
+      const tb = el('pre', 'tool-body');
+      tb.textContent = text.slice(0, 1200);
+      box.appendChild(tb);
+    }
+    return box;
+  }
+
   function messageNode(m) {
     if (m.role === 'user') {
       const wrap = el('div', 'msg user');
@@ -424,21 +519,7 @@
     }
 
     if (m.tools && m.tools.length) {
-      for (const t of m.tools) {
-        const card = el('div', 'tool-card' + (t.ok === false ? ' failed' : ''));
-        const head = el('div', 'tool-head');
-        const ic = el('span', 'ic');
-        ic.appendChild(iconNode(t.ok === false ? 'x' : 'terminal', 'i'));
-        head.appendChild(ic);
-        head.appendChild(el('span', '', '调用工具'));
-        head.appendChild(el('span', 'tool-name', t.name));
-        card.appendChild(head);
-        if (t.output) {
-          const tb = el('div', 'tool-body', t.output.slice(0, 1200));
-          card.appendChild(tb);
-        }
-        col.appendChild(card);
-      }
+      for (const t of m.tools) col.appendChild(toolCard(t));
     }
 
     if (m.meta) {
@@ -1160,6 +1241,8 @@
                 // 后者是跑了但出错。卡片上必须分开，否则用户会去查命令
                 // 本身，而真正该做的是去设置里开权限。
                 last.denied = j.dubhe.denied === true;
+                last.card = j.dubhe.card || 'generic';
+                last.meta = j.dubhe.meta || {};
                 last.ms = performance.now() - (last.t0 || performance.now());
               }
               renderTools();
