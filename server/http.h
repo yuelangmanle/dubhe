@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -140,6 +141,27 @@ public:
     }
 
     bool broken() const { return broken_; }
+
+    // 对端还在不在。
+    //
+    // broken_ 只有"写失败"才会置位。可流式生成里最要命的一种情况是
+    // **用户关掉页面或按了停止**：连接被关掉，我们这边却还没写过任何东西
+    // （比如正卡在等审批），broken_ 一直是 false，于是服务端继续占着全局
+    // 生成锁，后面的请求全排队 —— 表现就是"发了消息没反应"。
+    //
+    // MSG_PEEK + 非阻塞探一次：
+    //   >0     有数据（客户端又发了东西）→ 活着
+    //   ==0    EOF，对端关了写端        → 断了
+    //   <0     EAGAIN/EWOULDBLOCK       → 活着，只是没数据
+    //          其它 errno                → 断了
+    bool peer_gone() const {
+        if (broken_) return true;
+        char b = 0;
+        const ssize_t n = ::recv(fd_, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (n > 0) return false;
+        if (n == 0) return true;
+        return !(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
+    }
 
 private:
     void write_all(const std::string& s) {

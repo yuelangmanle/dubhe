@@ -411,6 +411,36 @@
   function toolCard(t) {
     const meta = t.meta || {};
     const card = t.card || 'generic';
+
+    // 审批卡：这条调用被门禁要求确认，服务端正在等（最多 90 秒）。
+    // 它和普通工具卡的区别是"还没执行"，所以不能显示输出，只能显示
+    // 要做什么 + 两个按钮。
+    if (t.askId) {
+      const wait = t.askPending;
+      const box2 = el('div', 'tool-card ask' +
+        (wait ? '' : (t.askAllow ? ' allowed' : ' denied')));
+      const head = el('div', 'tool-head');
+      const ic = el('span', 'ic');
+      ic.appendChild(iconNode(wait ? 'shield' : (t.askAllow ? 'check' : 'x'), 'i'));
+      head.appendChild(ic);
+      head.appendChild(el('span', 'tool-name', t.name));
+      head.appendChild(el('span', 'tool-sub',
+        wait ? '等待确认' : (t.askAllow ? '已允许' : (t.askTimeout ? '超时未答' : '已拒绝'))));
+      box2.appendChild(head);
+      if (t.askDetail) box2.appendChild(el('div', 'ask-detail', t.askDetail));
+      if (wait) {
+        const acts = el('div', 'ask-acts');
+        const yes = el('button', 'ask-btn yes', '允许');
+        yes.onclick = () => { yes.disabled = true; no.disabled = true; approve(t.askId, true); };
+        const no = el('button', 'ask-btn', '拒绝');
+        no.onclick = () => { yes.disabled = true; no.disabled = true; approve(t.askId, false); };
+        acts.appendChild(yes);
+        acts.appendChild(no);
+        box2.appendChild(acts);
+      }
+      return box2;
+    }
+
     const box = el('div', 'tool-card' + (t.ok === false ? ' failed' : '') + (t.denied ? ' denied' : ''));
 
     const head = el('div', 'tool-head');
@@ -436,11 +466,39 @@
     }
 
     if (t.output) {
+      // 联网搜索结果单独画成来源列表：一堆 "[1] 标题 / 缩进 URL / 摘要" 的
+      // 纯文本在卡片里既占地方又点不了，而这类结果的价值恰恰在于"能点开核一下"。
+      // 只有服务端给了结构化 results 才走这条路，老对话里存的是纯文本，仍然走下面。
+      const hits = card === 'web' && meta.kind === 'search' ? meta.results : null;
+      if (Array.isArray(hits) && hits.length) {
+        const list = el('div', 'web-list');
+        hits.forEach((h, i) => {
+          const row = el('div', 'web-item');
+          const a = document.createElement('a');
+          a.className = 'web-title';
+          a.href = h.u || '#';
+          a.target = '_blank';
+          a.rel = 'noreferrer noopener';
+          a.textContent = h.t || h.u || '(无标题)';
+          row.appendChild(el('span', 'web-idx', String(i + 1)));
+          const mid = el('div', 'web-mid');
+          mid.appendChild(a);
+          if (h.u) mid.appendChild(el('div', 'web-host', hostOf(h.u)));
+          if (h.s) mid.appendChild(el('div', 'web-snip', String(h.s).slice(0, 160)));
+          row.appendChild(mid);
+          list.appendChild(row);
+        });
+        box.appendChild(list);
+        return box;
+      }
       // 去掉只对模型有用的尾巴。服务端在 output 里写"…（这是第 1–3 行，全文共
       // 245 行）"和"[退出码 0]"，是为了让模型知道要不要接着翻、命令有没有成功；
       // 卡片头上已经有"1–3 / 245 行"和"退出 0"了，正文再写一遍是重复。
       // 只改展示，不动 t.output —— 回放和复制拿到的还是原文。
-      let text = String(t.output);
+      //
+      // 被拒的那条整个换成 note：output 里写的是"不要重试同一个调用，也不要
+      // 声称它成功了"这类**对模型说的话**，摆在卡片上就是程序在跟用户讲黑话。
+      let text = t.denied && meta.note ? String(meta.note) : String(t.output);
       if (card === 'read') text = text.replace(/\n…（这是第 [\s\S]*$/, '');
       if (card === 'terminal') text = text.replace(/\n\[退出码 -?\d+\]$/, '');
       const tb = el('pre', 'tool-body');
@@ -448,6 +506,34 @@
       box.appendChild(tb);
     }
     return box;
+  }
+
+  // 把"允许/拒绝"送回服务端。服务端那条 chat 请求正在等这个答案。
+  // 送不到（网络断、服务重启）时不要静默：用户会以为点了没反应，
+  // 实际上是 90 秒后按拒绝处理 —— 那也得让他知道。
+  async function approve(id, allow) {
+    try {
+      await vpost('/api/approve', { id, allow });
+      log(allow ? '已允许这次操作' : '已拒绝这次操作');
+    } catch (e) {
+      log('审批没送到：' + e.message + '（90 秒后会自动按拒绝处理）', 'err');
+    }
+  }
+
+  // 同一条消息第二次、第三次画出来时不要再放"升起"动画。
+  //
+  // .msg 上挂着 animation: rise .62s —— 那是给"新消息出现"用的。可工具结果
+  // 一到、审批卡一变，整个气泡都会被 messageNode 重画一次，动画跟着重放：
+  // 长回答 + 两次工具调用 = 屏幕上闪三下，而且每次重画都会把滚动位置顶一下。
+  // 用户说的"生成时界面闪烁"有一半就是它。
+  //
+  // 用 WeakSet 而不是在消息对象上打标记：state.convs 整个被 JSON 序列化进
+  // localStorage，多一个字段就多存一份垃圾。
+  const drawn = new WeakSet();
+  function markDrawn(node, m) {
+    if (drawn.has(m)) node.classList.add('no-rise');
+    else drawn.add(m);
+    return node;
   }
 
   function messageNode(m) {
@@ -475,7 +561,7 @@
       }
       if (m.content) b.appendChild(document.createTextNode(m.content));
       wrap.appendChild(b);
-      return wrap;
+      return markDrawn(wrap, m);
     }
 
     // 助手消息：头像 + 内容列。头像不是装饰 —— 它让"谁在说话"不用读文字就分得清。
@@ -557,7 +643,7 @@
       acts.appendChild(globBtn);
       col.appendChild(acts);
     }
-    return wrap;
+    return markDrawn(wrap, m);
   }
 
   function renderMessages() {
@@ -1370,6 +1456,28 @@
       body.appendChild(tailEl);
       let lastHead = null;
 
+      // 整块重绘气泡。工具结果和审批卡到达时都走这里。
+      //
+      // 抽成函数是因为它要改四个外层 let（node / body / headEl / tailEl）
+      // 和一个 lastHead。原来这段是内联在 tool_result 分支里的，加审批卡
+      // 时又要抄一遍 —— 抄漏一处的症状是"后面的增量写进了已经不在 DOM
+      // 里的旧节点"，界面上看着像卡住，控制台一句错都不报。
+      const reswap = () => {
+        const fresh = messageNode(ai);
+        node.replaceWith(fresh);
+        node = fresh;
+        body = node.querySelector('.body');
+        body.classList.add('typing');
+        headEl = null;
+        tailEl = null;
+        body.appendChild((headEl = document.createElement('div')));
+        body.appendChild((tailEl = document.createElement('div')));
+        headEl.className = 'md-head';
+        tailEl.className = 'md-tail';
+        lastHead = null;
+        paint();
+      };
+
       const paintNow = () => {
         const raw = (ai.content || '').trim();
         const visible = stripToolCalls(raw);
@@ -1418,6 +1526,37 @@
               ai.tools.push({ name: j.dubhe.name, args: j.dubhe.arguments, ok: true, t0: performance.now() });
               log('Tool call: ' + j.dubhe.name);
               renderTools();
+            } else if (j.dubhe.type === 'tool_ask') {
+              // 需要用户点头的调用。卡片上两个按钮，点完 POST /api/approve。
+              // 服务端在等（最多 90 秒），所以这张卡必须显眼、必须可点。
+              //
+              // 服务端先发 tool_call 再发 tool_ask，所以这里要**合并到上一条**
+              // 而不是新增一条 —— 否则界面上会出现两张卡：一张空的 write_file，
+              // 一张审批卡，看起来像调用了两次。
+              const last = ai.tools[ai.tools.length - 1];
+              const patch = {
+                askId: j.dubhe.id, askDetail: j.dubhe.detail,
+                askPending: true, ok: true,
+              };
+              if (last && last.name === j.dubhe.name && !last.output && !last.askId) {
+                Object.assign(last, patch);
+              } else {
+                ai.tools.push(Object.assign({ name: j.dubhe.name, t0: performance.now() }, patch));
+              }
+              log('需要确认：' + (j.dubhe.detail || j.dubhe.name));
+              renderTools();
+              reswap();
+              scrollBottom();
+            } else if (j.dubhe.type === 'tool_ask_done') {
+              const t = ai.tools.find((x) => x.askId === j.dubhe.id);
+              if (t) {
+                t.askPending = false;
+                t.askAllow = j.dubhe.allow === true;
+                t.askTimeout = j.dubhe.timeout === true;
+              }
+              renderTools();
+              reswap();
+              scrollBottom();
             } else if (j.dubhe.type === 'tool_result') {
               const last = ai.tools[ai.tools.length - 1];
               if (last) {
@@ -1430,26 +1569,12 @@
                 last.card = j.dubhe.card || 'generic';
                 last.meta = j.dubhe.meta || {};
                 last.ms = performance.now() - (last.t0 || performance.now());
+                // 审批过的那条：结果一到就换成普通卡片。留着 askId 会一直
+                // 画审批卡（"已允许"），而用户此刻想看的是"到底写进去了什么"。
+                if (last.askId) { delete last.askId; last.askPending = false; }
               }
               renderTools();
-              // 重绘以显示工具卡片。
-              //
-              // 注意这两行必须改的是外层 let：工具结果一到，整个气泡换成
-              // 带卡片的新节点，后面所有增量都得写进新节点的 .body。
-              const fresh = messageNode(ai);
-              node.replaceWith(fresh);
-              node = fresh;
-              body = node.querySelector('.body');
-              body.classList.add('typing');
-              // 新 body 是空节点：把增量渲染用的两段重新挂上，并强制下一次
-              // paint 重绘 head（lastHead 置 null 而不是 ''）。
-              headEl = null; tailEl = null;
-              body.appendChild((headEl = document.createElement('div')));
-              body.appendChild((tailEl = document.createElement('div')));
-              headEl.className = 'md-head';
-              tailEl.className = 'md-tail';
-              lastHead = null;
-              paint();
+              reswap();
             }
             continue;
           }
@@ -1523,7 +1648,10 @@
         body.classList.remove('typing');
       }
       saveConvs();
-      scrollBottom(true);
+      // 收尾不强制回底。用户生成到一半往上滑去读前面的内容，这时候把他
+      // 拽回底部，等于"我看了半天的那段又没了"—— stick.on 为真时它照样
+      // 会贴底，为假说明是他自己选择停在上面的。
+      scrollBottom();
       renderTools();
       renderMeters(state.server);
       refreshState();

@@ -37,11 +37,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -83,6 +85,18 @@ struct AppState {
     // 绑成项目文件夹时预期的语义。要放开就在设置里打开。
     bool allow_write_outside = false;
     int  shell_timeout_ms = 20000;
+    // ---- 逐次审批
+    //
+    // 工具循环里遇到 gate() 的 Ask，要停下来等用户点"允许/拒绝"。
+    //
+    // 这里**必须**用独立的互斥量，不能借用 g.mu：整条 chat 请求从头到尾
+    // 压在 g.mu 上（请求级 workspace 就是靠这个串行化），等待期间如果还
+    // 需要 g.mu，/api/approve 永远拿不到锁 —— 表现是点"允许"毫无反应，
+    // 一直等到超时。这个坑不写下来下次一定还会踩。
+    std::mutex ask_mu;
+    std::condition_variable ask_cv;
+    std::map<std::string, int> ask_result;   // id → 1 允许 / 2 拒绝
+    std::atomic<long long> ask_seq{0};
     std::mutex mu;
     std::atomic<bool> busy{false};
     long long total_requests = 0;
@@ -862,7 +876,18 @@ std::string html_to_text(const std::string& html) {
 
 // DuckDuckGo 的 HTML 端点。选它是因为**不需要 API Key** —— 一个本地
 // 单用户工具没理由为了搜一次就要求用户去注册。
-std::string web_search_text(const std::string& q, int n) {
+//
+// 结果同时给两份：拼成文本给模型读，结构化成 WebHit 给界面画。
+// 只给文本的话，前端要自己拿正则去啃"    https://…"这种缩进约定，
+// 哪天文本格式为了模型好读调一下，界面就跟着瞎 —— 而这两件事本来
+// 就不该绑在一起。
+struct WebHit {
+    std::string title;
+    std::string url;
+    std::string snippet;
+};
+
+std::vector<WebHit> web_search_hits(const std::string& q, int n) {
     std::string qs;
     for (unsigned char c : q) {
         if (std::isalnum(c) || c == '-' || c == '_' || c == '.') qs += (char)c;
@@ -873,13 +898,12 @@ std::string web_search_text(const std::string& q, int n) {
     ProcOut po = run_proc("curl -sSL --compressed -m 20 -A 'Mozilla/5.0 (Macintosh)' " +
                               shell_quote(url),
                           g.workspace, 25000, 2 * 1024 * 1024, false);
-    if (po.out.empty()) return "";
+    std::vector<WebHit> hits;
+    if (po.out.empty()) return hits;
 
     // 解析结果块：标题在 class="result__a" 的 <a> 里，摘要在 class="result__snippet"
-    std::string out;
-    int found = 0;
     size_t p = 0;
-    while (found < n) {
+    while ((int)hits.size() < n) {
         const size_t a = po.out.find("result__a", p);
         if (a == std::string::npos) break;
         const size_t gt = po.out.find('>', a);
@@ -914,11 +938,20 @@ std::string web_search_text(const std::string& q, int n) {
                 snip = html_to_text(po.out.substr(sgt + 1, send - sgt - 1));
         }
         if (title.empty()) { p = end; continue; }
-        found++;
-        out += "[" + std::to_string(found) + "] " + title + "\n";
-        if (!href.empty()) out += "    " + href + "\n";
-        if (!snip.empty()) out += "    " + snip + "\n";
+        hits.push_back(WebHit{title, href, snip});
         p = (sa == std::string::npos) ? end : sa + 16;
+    }
+    return hits;
+}
+
+// 给模型读的那一份。编号是必要的：模型要在回答里标"据 [2]"，
+// 没有编号它只能含糊地说"有资料显示"。
+std::string hits_to_text(const std::vector<WebHit>& hits) {
+    std::string out;
+    for (size_t i = 0; i < hits.size(); i++) {
+        out += "[" + std::to_string(i + 1) + "] " + hits[i].title + "\n";
+        if (!hits[i].url.empty()) out += "    " + hits[i].url + "\n";
+        if (!hits[i].snippet.empty()) out += "    " + hits[i].snippet + "\n";
     }
     return out;
 }
@@ -941,6 +974,7 @@ enum class Verdict { Allow, Deny, Ask };
 struct GateOut {
     Verdict v = Verdict::Deny;
     std::string reason;   // 给模型看的，必须能指导它下一步怎么做
+    std::string detail;   // 给用户看的（审批卡片上那一行）
 };
 
 static GateOut gate_deny(const std::string& why) {
@@ -954,6 +988,13 @@ static GateOut gate_ok() {
     o.v = Verdict::Allow;
     return o;
 }
+static GateOut gate_ask(const std::string& why, const std::string& detail) {
+    GateOut o;
+    o.v = Verdict::Ask;
+    o.reason = why;
+    o.detail = detail;
+    return o;
+}
 
 // p 是否落在 root 之下（按路径段比，不是按字符串前缀 —— 否则 /a/bc 会被
 // 判成在 /a/b 里面）。
@@ -963,7 +1004,7 @@ static bool under_root(const std::string& p, const std::string& root) {
     return p.size() == root.size() || p[root.size()] == '/';
 }
 
-GateOut gate(const std::string& name, const json::Value& args) {
+GateOut gate(const std::string& name, const json::Value& args, bool approved = false) {
     // 白名单，不是黑名单：新增工具忘了登记，表现是"这个工具用不了"，
     // 而不是"它绕过了所有权限"。fail-closed 的全部意义就在这里。
     static const char* kKnown[] = {"read_file", "list_dir", "write_file", "edit_file",
@@ -1038,6 +1079,13 @@ GateOut gate(const std::string& name, const json::Value& args) {
                                  "换个范围明确的做法：删目录就写全路径，"
                                  "覆盖文件就用 write_file。");
         }
+        // sudo 不硬拒 —— 用户让装个软件包是正常需求。但也不该静默执行，
+        // 问一次，答案只对这一次有效。
+        if (flat.find("sudo ") != std::string::npos) {
+            if (approved) return gate_ok();
+            return gate_ask("这条命令要用 sudo 提权，需要你确认。",
+                            "sudo：" + args.s("command"));
+        }
     }
     if (name == "grep" && args.s("pattern").empty()) return gate_deny("缺少 pattern 参数");
     if (name == "glob" && args.s("pattern").empty()) return gate_deny("缺少 pattern 参数");
@@ -1057,22 +1105,33 @@ GateOut gate(const std::string& name, const json::Value& args) {
                 // ~/.dubhe 是应用自己的目录（配置、临时落地），写它不算越界
                 if (h && under_root(p, std::string(h) + "/.dubhe")) ok = true;
             }
-            if (!ok)
-                return gate_deny("只能写当前项目文件夹里的文件（" + g.workspace +
-                                 "）。要写别处，先把那个文件夹绑成项目文件夹"
-                                 "（输入框上方的文件夹按钮），或者在设置里打开"
-                                 "「允许写到项目文件夹之外」。");
+            if (!ok) {
+                // 写到项目外：不是直接拒，而是问一次。
+                //
+                // 这是三态里 Ask 唯一的用处 —— 用户可能确实要写 /tmp 下的
+                // 一个脚本，一刀切拒绝会逼他去设置里开全局开关，然后忘掉。
+                // 问一次，答案只对这一次有效。
+                if (approved) return gate_ok();
+                return gate_ask(
+                    "这次操作需要用户确认：要写到项目文件夹之外。",
+                    "写到项目文件夹之外\n" + p);
+            }
         }
     }
     return gate_ok();
 }
 
-ToolResult run_tool(const std::string& name, const json::Value& args) {
+ToolResult run_tool(const std::string& name, const json::Value& args, bool approved = false) {
     ToolResult r;
-    const GateOut gt = gate(name, args);
-    if (gt.v == Verdict::Deny) {
+    const GateOut gt = gate(name, args, approved);
+    if (gt.v == Verdict::Deny || gt.v == Verdict::Ask) {
+        // Ask 走到这里说明调用方没做审批（比如 /api/tools/run 手测）。
+        // 按拒绝处理 —— 绝不能在没人应答的情况下放行。
         r.denied = true;
-        r.output = gt.reason;
+        r.output = gt.v == Verdict::Ask ? ("需要确认后才能执行：" + gt.reason) : gt.reason;
+        // note 是给卡片看的。output 是给模型看的，里面常带"换个范围明确的做法"
+        // 这类指导语 —— 原样摆在卡片上，用户会觉得程序在对他讲黑话。
+        r.meta.set("note", json::Value::make_str(gt.reason));
         return r;
     }
     if (name == "read_file") {
@@ -1286,20 +1345,28 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
     }
     if (name == "web_search") {
         const std::string q = args.s("query");
-        r.output = web_search_text(q, (int)args.n("n", 6));
-        r.ok = !r.output.empty();
-        if (!r.ok) r.output = "搜索没有返回结果（可能被限流，或本机无法访问外网）";
+        const std::vector<WebHit> hits = web_search_hits(q, (int)args.n("n", 6));
+        r.ok = !hits.empty();
+        if (!r.ok) {
+            r.output = "搜索没有返回结果（可能被限流，或本机无法访问外网）";
+        } else {
+            r.output = hits_to_text(hits);
+        }
         r.card = "web";
         r.meta.set("kind", json::Value::make_str("search"));
         r.meta.set("query", json::Value::make_str(q));
-        int hits = 0;
-        // 数"以 [ 开头的行"。早先用 find("\n[") 数，第一条正好在位置 0，
-        // 于是 3 条结果永远报成 2 条 —— 卡片上的数字比实际少一个。
-        for (size_t i = 0; i < r.output.size(); i++) {
-            if (r.output[i] != '[') continue;
-            if (i == 0 || r.output[i - 1] == '\n') hits++;
+        r.meta.set("count", json::Value::make_num((double)hits.size()));
+        // 结构化的一份给界面画可点的来源列表。只给文本的话，前端得按
+        // "    https://…" 这种缩进约定去啃，格式一调界面就跟着坏。
+        json::Value arr = json::Value::make_arr();
+        for (const WebHit& h : hits) {
+            json::Value o = json::Value::make_obj();
+            o.set("t", json::Value::make_str(h.title));
+            o.set("u", json::Value::make_str(h.url));
+            o.set("s", json::Value::make_str(h.snippet.substr(0, 240)));
+            arr.arr.push_back(o);
         }
-        r.meta.set("count", json::Value::make_num(hits));
+        r.meta.set("results", arr);
         return r;
     }
     if (name == "shell") {
@@ -1907,13 +1974,24 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
             // 自己上一轮"没有思考块"，会以为格式错了，接着把推理写出来。
             if (g_think_style && content.rfind("<think>", 0) != 0) content = "<think></think>" + content;
             p += "<|im_start|>assistant\n" + content + "<|im_end|>\n";
-        } else if (role == "tool") {
+        } else if (role == "tool" || role == "tool_denied") {
             // 光把结果摆上去，小模型会以为"我还没调用"，于是再要一次同样的工具，
             // 循环永远不收敛。明确说一句"已经执行完了，直接用结果回答"，
             // 这一句能把大部分原地打转掐掉。
-            p += "<|im_start|>user\n" + g_tool_open + content + g_tool_close +
-                 "\n工具已经执行完毕，上面就是返回结果。"
-                 "请直接基于这个结果回答，不要再调用同一个工具。<|im_end|>\n";
+            //
+            // 但被拒绝的那次**没有执行**，不能这么说。原来说了，模型就
+            // 顺着"已执行"编出"已写入成功" —— 用户看到一条成功消息，
+            // 磁盘上什么都没有，这比报错严重得多。
+            if (role == "tool_denied") {
+                p += "<|im_start|>user\n" + g_tool_open + content + g_tool_close +
+                     "\n这次工具没有执行，用户拒绝了。不要重试同一个调用，"
+                     "也不要假装它成功了。直接告诉用户「这一步被拒绝、没有执行」，"
+                     "然后问他想怎么继续。<|im_end|>\n";
+            } else {
+                p += "<|im_start|>user\n" + g_tool_open + content + g_tool_close +
+                     "\n工具已经执行完毕，上面就是返回结果。"
+                     "请直接基于这个结果回答，不要再调用同一个工具。<|im_end|>\n";
+            }
         }
     }
     if (!has_system && with_tools) {
@@ -2223,6 +2301,21 @@ struct StreamCtx {
     // 这一轮真正生成的 token 序列，用来给前缀缓存接尾巴
     std::vector<int32_t> gtoks;
 };
+
+// 引擎每吐一个 token 问一次"还要不要继续"。
+//
+// 客户端关页面 / 按停止之后，继续生成纯属浪费：它占着 g.mu（整条请求的
+// 串行锁），后面的请求全排队。实测一次 90 秒的审批等待被一个已经关掉的
+// 标签页占着，新请求 40 秒收不到一个字节 —— 用户看到的就是"卡死"。
+//
+// 注意 ud 是 dubhe_generate 里那个**共用的** void*，也就是 StreamCtx*，
+// 不是 http::Conn*。当初直接把它当 Conn* 用，读到的 fd 是垃圾值，
+// peer_gone() 一律返回"断了"，于是每个请求都立刻 finish_reason=stop、
+// 0 个 token —— 现象是"模型突然一个字都不说了"，报错日志一条都没有。
+static int conn_gone_cb(void* ud) {
+    auto* x = (StreamCtx*)ud;
+    return (x && x->c && x->c->peer_gone()) ? 1 : 0;
+}
 
 // 返回 s 末尾"不完整的多字节序列"占几个字节；0 表示末尾是干净的。
 //
@@ -3167,6 +3260,35 @@ int main(int argc, char** argv) {
         c.send(200, "application/json", json::dump(o));
     });
 
+    // ---- 逐次审批的应答口
+    //
+    // 只碰 ask_mu，绝不碰 g.mu —— 等待中的那条 chat 请求正压在 g.mu 上，
+    // 这里要是也去抢 g.mu，就成了"用户点了允许、服务端却在等自己"。
+    srv.post("/api/approve", [](const http::Request& req, http::Conn& c) {
+        if (!is_local(req)) {
+            c.send(403, "application/json", "{\"error\":\"审批只允许本机操作\"}");
+            return;
+        }
+        json::Value body;
+        if (!json::parse(req.body, &body)) {
+            c.send(400, "application/json", "{\"error\":\"JSON 解析失败\"}");
+            return;
+        }
+        const std::string id = body.s("id");
+        if (id.empty()) {
+            c.send(400, "application/json", "{\"error\":\"缺少 id\"}");
+            return;
+        }
+        const bool allow = body.flag("allow", false);
+        {
+            std::lock_guard<std::mutex> lk(g.ask_mu);
+            g.ask_result[id] = allow ? 1 : 2;
+        }
+        g.ask_cv.notify_all();
+        c.send(200, "application/json",
+               std::string("{\"ok\":true,\"allow\":") + (allow ? "true" : "false") + "}");
+    });
+
     srv.get("/api/tools", [](const http::Request& req, http::Conn& c) {
         if (!is_local(req) && !authorized(req)) {
             c.send(401, "application/json", "{\"error\":\"未授权\"}");
@@ -3670,9 +3792,15 @@ int main(int argc, char** argv) {
                 ctx.no_suppress = !with_tools;
 
                 dubhe_stats s{};
-                dubhe_generate(g.engine, cur.data(), (int32_t)cur.size(), &sp, on_piece, nullptr,
-                               &ctx, &s);
+                dubhe_generate(g.engine, cur.data(), (int32_t)cur.size(), &sp, on_piece,
+                               conn_gone_cb, &ctx, &s);
                 flush_pending(&ctx);
+
+                // 客户端走了就别再往下走：不要跑工具（可能是个写文件/shell），
+                // 也不要再开下一轮生成。这一步省下的不只是算力 —— 工具是有
+                // 副作用的，为一个已经关掉的页面去改文件，用户下次打开会
+                // 看到一个自己没批准过的改动。
+                if (c.peer_gone()) break;
 
                 st.n_generated += s.n_generated;
                 st.decode_tps = s.decode_tps;
@@ -3737,7 +3865,81 @@ int main(int argc, char** argv) {
                               json_escape(tname) + ",\"arguments\":" + json::dump(targs) +
                               "}}\n\n");
 
-                ToolResult tr = run_tool(tname, targs);
+                // 需要用户点头的调用：发一张审批卡，然后在这里等。
+                //
+                // 等待有上限（90 秒）。超时按拒绝处理 —— 宁可让模型收到
+                // "用户没回应"，也不能让一条没人确认的 sudo 在后台跑起来。
+                bool approved = false;
+                const GateOut gt = gate(tname, targs, false);
+                if (gt.v == Verdict::Ask) {
+                    {
+                        const std::string aid = "ask" + std::to_string(++g.ask_seq);
+                        json::Value d = json::Value::make_obj();
+                        d.set("type", json::Value::make_str("tool_ask"));
+                        d.set("id", json::Value::make_str(aid));
+                        d.set("name", json::Value::make_str(tname));
+                        d.set("detail", json::Value::make_str(gt.detail));
+                        json::Value ev = json::Value::make_obj();
+                        ev.set("dubhe", d);
+                        c.write_chunk("data: " + json::dump(ev) + "\n\n");
+
+                        std::unique_lock<std::mutex> lk(g.ask_mu);
+                        const auto deadline = std::chrono::steady_clock::now() +
+                                              std::chrono::seconds(90);
+                        // 一次 wait_until(90s) 是错的：用户在这 90 秒里关掉页面，
+                        // 这条请求仍然压在 g.mu 上，后面所有请求陪着等。切成 1 秒
+                        // 一片，每片顺便看一眼连接还在不在。
+                        bool answered = false;
+                        while (std::chrono::steady_clock::now() < deadline) {
+                            if (g.ask_cv.wait_for(lk, std::chrono::seconds(1), [&] {
+                                    return g.ask_result.count(aid) > 0;
+                                })) {
+                                answered = true;
+                                break;
+                            }
+                            if (c.peer_gone()) break;
+                        }
+                        int verdict = 0;
+                        if (answered) {
+                            verdict = g.ask_result[aid];
+                            g.ask_result.erase(aid);
+                        } else {
+                            // 没人答（超时或对端走了）：把这条 id 清掉，免得
+                            // ask_result 随着一次次的等待慢慢涨。
+                            g.ask_result.erase(aid);
+                        }
+                        lk.unlock();
+                        approved = (verdict == 1);
+                        // 把"用户怎么答的"也发回去，前端那张卡要变灰。
+                        json::Value d2 = json::Value::make_obj();
+                        d2.set("type", json::Value::make_str("tool_ask_done"));
+                        d2.set("id", json::Value::make_str(aid));
+                        d2.set("allow", json::Value::make_bool(approved));
+                        d2.set("timeout", json::Value::make_bool(!answered));
+                        json::Value ev2 = json::Value::make_obj();
+                        ev2.set("dubhe", d2);
+                        c.write_chunk("data: " + json::dump(ev2) + "\n\n");
+                    }
+                }
+
+                // 等审批的这段时间里用户可能已经把页面关了。这时候再往下跑
+                // 工具就是"替一个不在场的人动文件"，直接收手。
+                if (c.peer_gone()) break;
+
+                ToolResult tr;
+                if (gt.v == Verdict::Ask && !approved) {
+                    // 用户拒绝 / 超时没答。这里必须自己造结果，不能交给
+                    // run_tool —— 它会把 gate 的 Ask 转成一句"需要确认后
+                    // 才能执行"，模型读到的像是"流程还没走完"，于是重试同
+                    // 一个调用。要明确告诉它这条路走不通。
+                    tr.denied = true;
+                    tr.output = "用户没有允许这次操作，所以它没有执行，什么都没有发生。"
+                                "不要重试同一个调用，也不要声称它成功了。"
+                                "直接告诉用户这一步被拒绝、没有执行，然后问他想怎么继续。";
+                    tr.meta.set("note", json::Value::make_str("你拒绝了这一步，它没有执行。"));
+                } else {
+                    tr = run_tool(tname, targs, approved);
+                }
                 {
                     // 事件体走 json::dump 而不是手拼字符串：card/meta 里可能有
                     // 引号、换行、反斜杠（命令本身、diff 的 old/new 都有），
@@ -3802,7 +4004,11 @@ int main(int argc, char** argv) {
                 am.set("content", json::Value::make_str(am_content));
                 msgs2.arr.push_back(am);
                 json::Value tm = json::Value::make_obj();
-                tm.set("role", json::Value::make_str("tool"));
+                // 被拒绝的那一轮用另一个角色名。用 "tool" 的话，
+                // build_tokens 会照常加上"工具已经执行完毕，上面就是返回结果"，
+                // 而这条根本没执行 —— 小模型看到这句会当成"已经拿到了结果"，
+                // 接着编一个"已写入成功"的回答（实测 LFM3-1.7B 就这样）。
+                tm.set("role", json::Value::make_str(tr.denied ? "tool_denied" : "tool"));
                 tm.set("content", json::Value::make_str(tr.output));
                 msgs2.arr.push_back(tm);
 

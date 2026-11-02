@@ -680,6 +680,9 @@ body.dropping::after {
  * 后者才像有重量。过冲只有 1.08，多了会晃眼。
  */
 @keyframes rise { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: none; } }
+/* 重画过的消息不放动画。工具结果、审批状态一变，整条气泡都会重建，
+ * 动画跟着重放 —— 一条回答里调两次工具就闪三下。见 app.js 的 markDrawn。 */
+.msg.no-rise { animation: none; }
 
 .msg.user { align-items: flex-end; }
 .msg.user .bubble {
@@ -880,6 +883,33 @@ pre:hover .copy-code { opacity: 1; }
 .tool-card.failed .tool-head .ic { color: var(--red); }
 .tool-card.denied .tool-head .ic { color: var(--amber); }
 
+/* 审批卡。和普通工具卡的区别是"还没执行"，所以底部有按钮。
+ * 用琥珀色描边把视线拉过来 —— 这一条不点，整个回答就停在这里。 */
+.tool-card.ask {
+  border-color: rgba(168, 121, 47, .38);
+  background: rgba(168, 121, 47, .06);
+}
+.tool-card.ask .tool-head .ic { color: var(--amber); }
+.tool-card.ask.allowed { border-color: rgba(78, 138, 107, .34); background: rgba(78, 138, 107, .07); }
+.tool-card.ask.allowed .tool-head .ic { color: var(--green); }
+.tool-card.ask.denied { border-color: var(--glass-line); background: var(--glass-soft); }
+.tool-card.ask.denied .tool-head .ic { color: var(--tertiary); }
+.ask-detail {
+  margin-top: 6px; font-family: var(--mono); font-size: 11.5px;
+  color: var(--text-2); white-space: pre-wrap; word-break: break-all;
+}
+.ask-acts { display: flex; gap: 8px; margin-top: 9px; }
+.ask-btn {
+  height: 27px; padding: 0 13px; border-radius: 8px;
+  border: 1px solid var(--glass-line); background: var(--glass-soft);
+  color: var(--text-2); font-family: inherit; font-size: 12px; cursor: pointer;
+  transition: background .16s var(--ease), color .16s var(--ease);
+}
+.ask-btn:hover { background: var(--fill); color: var(--text); }
+.ask-btn.yes { border-color: rgba(78, 138, 107, .45); color: var(--green); }
+.ask-btn.yes:hover { background: rgba(78, 138, 107, .12); }
+.ask-btn:disabled { opacity: .5; cursor: default; }
+
 /* 卡片头部右侧的一行小字：行数范围、退出码、命中数。
  * 用 tabular-nums，否则 1–9 和 10–99 的数字宽度不一样，切卡片时会抖。 */
 .tool-sub {
@@ -888,6 +918,29 @@ pre:hover .copy-code { opacity: 1; }
 }
 .tool-card.denied .tool-sub { color: var(--amber); }
 .tool-card.failed .tool-sub { color: var(--red); }
+
+/* 联网搜索的来源列表。
+ * 每行是 [序号] 标题（可点）/ 域名 / 摘要。域名单独一行是为了让"这是不是
+ * 官方文档"一眼能判断 —— 摘要里的措辞再像，来源是论坛就还是论坛。 */
+.web-list { margin-top: 7px; display: flex; flex-direction: column; gap: 7px; }
+.web-item { display: flex; gap: 7px; align-items: flex-start; }
+.web-idx {
+  flex: 0 0 auto; min-width: 15px; height: 15px; margin-top: 1px;
+  border-radius: 4px; background: var(--fill); color: var(--tertiary);
+  font-family: var(--mono); font-size: 9.5px; line-height: 15px; text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.web-mid { min-width: 0; flex: 1 1 auto; }
+.web-title {
+  display: block; color: var(--text-2); font-size: 12px; line-height: 1.35;
+  text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.web-title:hover { color: var(--brand-1); text-decoration: underline; }
+.web-host { font-family: var(--mono); font-size: 10px; color: var(--tertiary); margin-top: 1px; }
+.web-snip {
+  font-size: 11px; color: var(--tertiary); line-height: 1.45; margin-top: 2px;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
 
 /* diff 卡片：旧段和新段分开染。不用整块红绿底 —— 大色块会盖掉文字，
  * 只给左边一条竖线和很淡的底色，够区分就行。 */
