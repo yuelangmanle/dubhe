@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -529,11 +530,24 @@ std::vector<KbHit> kb_search(const std::string& q, int topk) {
                   return a.first > b.first;
               });
     if ((int)order.size() > topk) order.resize((size_t)topk);
+    // 按查询长度归一。
+    //
+    // BM25 的原始分**不能跨查询比较**：一个 20 个汉字的问题切出十几个 bigram，
+    // 每个都能撞上几个常见词，加起来自然高；两个字的词只有一两个 bigram，
+    // 就算命中的是决定性术语，分也上不去。实测：
+    //
+    //   "帮我把这段话翻译成英文：今天天气不错"  19.72  ← 和文档毫无关系
+    //   "monorepo"                              11.72  ← 真该命中
+    //   "你好"                                   7.07  ← 不该命中
+    //
+    // 只看分数的话，闲聊排在正经提问前面。除以 sqrt(查询词数) 之后：
+    // 19.72/4.4=4.5、11.72/1=11.7、7.07/1=7.1 —— 顺序才和直觉一致。
+    const double norm = std::sqrt((double)std::max<size_t>(1, uniq.size()));
     for (const auto& [sc, ci] : order) {
         const KbChunk& ch = g_kb_chunks[ci];
         KbHit h;
         h.chunk = ci;
-        h.score = sc;
+        h.score = sc / norm;
         h.path = g_kb_docs[(size_t)ch.doc].path;
         // snippet：以命中词为中心取前后 140 字节
         std::string sn = ch.text;
@@ -564,17 +578,18 @@ void kb_ensure_loaded() {
 
 // 给对话用的上下文块。检索不到就返回空串，调用方据此不加东西。
 //
-// 门槛 8.0（原来 5.0）。BM25 分数随语料规模变，但在这套语料（十几篇文档、
-// 五百多个块）上实测分得很开：
+// 门槛 7.5，用的是**按查询长度归一之后**的分数（见 kb_search 末尾）。
 //
-//   问"进度书里讲了什么"     25.78   ← 该进
-//   问"ADR-0003 决定什么"    19.48   ← 该进
-//   问"monorepo"             12.33   ← 该进
-//   问"你好"                  5.16   ← 不该进（开发书的一条命令示例里
-//                                     正好有一句 -p "你好"）
+// 归一之前这道线是 8.0，而它拦不住真正该拦的东西 —— 一个长问题切出十几个
+// bigram，随便撞几个常见词就能到 19 分：
 //
-// 5.0 那道线正好卡在"你好"下面一点点，等于没拦住。闲聊被拖进三段文档时，
-// 1.7B 会当场被带跑，去复述上下文而不是回答 —— 这就是把它抬到 8.0 的理由。
+//   "帮我把这段话翻译成英文：今天天气不错"  19.72  ← 和文档毫无关系，
+//                                                   1.7B 会照着文档答非所问
+//   "monorepo"                              11.72  ← 真该命中
+//   "你好"                                   7.07  ← 不该命中
+//
+// 归一之后（除以 sqrt(查询词数)）同一批查询变成 4.5 / 11.7 / 7.1，7.5 这道线
+// 才真的分得开"问项目"和"问别的"。
 std::string kb_context_for(const std::string& q, int topk) {
     // 多取一些再挑。
     //
@@ -582,11 +597,11 @@ std::string kb_context_for(const std::string& q, int topk) {
     // "三条全是同一篇"：问 ADR-0003，回来的两条是 ADR-0004 的开头两段，
     // 真正那一篇被挤到看不见。这里改成每篇最多两块，先把不同的文档凑齐。
     const auto hits = kb_search(q, std::max(topk * 3, 8));
-    if (hits.empty() || hits[0].score < 8.0) return "";
+    if (hits.empty() || hits[0].score < 7.5) return "";
     std::vector<const KbHit*> picked;
     std::unordered_map<std::string, int> per_doc;
     for (const auto& h : hits) {
-        if (h.score < 8.0) break;               // 排好序的，后面的只会更低
+        if (h.score < 7.5) break;               // 排好序的，后面的只会更低
         if (per_doc[h.path] >= 2) continue;
         per_doc[h.path]++;
         picked.push_back(&h);
