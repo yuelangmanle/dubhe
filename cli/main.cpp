@@ -194,6 +194,13 @@ int cmd_inspect(const Args& a) {
     std::printf("FFN 维度    %d\n", mi.n_ff);
     std::printf("词表        %d\n", mi.n_vocab);
     std::printf("训练上下文  %d\n", mi.n_ctx_train);
+    // 实际可用上下文：可能被内存夹过（见 model.cpp 里"上下文 × 内存"那段），
+    // 也可能被 -c 限制。和训练上下文不一样时要说出来，否则用户会以为
+    // "模型支持 262144" 然后困惑为什么聊到一半就报越界。
+    if (mi.n_ctx_limit != mi.n_ctx_train)
+        std::printf("可用上下文  %d  （受内存/参数限制）\n", mi.n_ctx_limit);
+    else
+        std::printf("可用上下文  %d\n", mi.n_ctx_limit);
     std::printf("Chat 模板   %s\n", mi.has_chat_template ? "ChatML" : "无");
     std::printf("计算后端    %s\n", mi.backend);
     std::printf("硬件        %s\n", dubhe_hardware_info());

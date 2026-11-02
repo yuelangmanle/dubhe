@@ -8,6 +8,7 @@
 #include "internal.h"
 #include "metal.h"
 #include "parallel.h"
+#include "sysinfo.h"
 
 #include <algorithm>
 #include <cmath>
@@ -138,6 +139,51 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
     // 先给一个够用的窗口，不够时按 2 倍增长，上限 = 用户/训练上下文。
     n_ctx_ = (n_ctx > 0) ? std::min(n_ctx, cfg_.n_ctx_train) : std::min(cfg_.n_ctx_train, 4096);
     kv_cap_ = std::min(n_ctx_, 1024);
+
+    // ------------------------------------------------------- 上下文 × 内存
+    //
+    // n_ctx 不能只看 GGUF 说多少、用户要多少，还要看内存装不装得下。
+    // KV 的开销是 `n_layer × n_ctx × kv_dim × 2(k,v) × 每元素字节数`，
+    // **与模型大小无关，只与层数和 KV 头数有关** —— 所以"小模型"照样能撑爆：
+    //
+    //   LFM3-1.7B（24 层 / 4 个 KV 头 / head_dim 128）
+    //     每 1k 上下文 96 KB（按 CPU 的 f32 算）
+    //     训练上下文 262144 → 25.8 GB，24 GB 的机器直接装不下
+    //
+    // 为什么在**启动时**夹，而不是等第一次长 prompt 触发 grow_kv：
+    // 后者的症状是生成到一半报 "KV cache 扩容失败"，用户看到的是
+    // "聊到第 N 轮就崩"，根本联系不到上下文长度。而且 macOS 的交换会让
+    // 分配"成功"然后整机卡死，比直接失败更糟。
+    //
+    // 两条约束取更紧的那条：
+    //   ① KV 自己不超过总内存的 45%（统一内存，GPU 分配和系统抢同一块）
+    //   ② 权重 + KV 不超过总内存的 85%
+    {
+        const size_t kv_dim = (size_t)cfg_.n_head_kv * (size_t)cfg_.head_dim;
+        // 按 f32 算（CPU 路径就是 f32），GPU 的 f16 只会更省 —— 取大的不会误伤
+        const uint64_t per_ctx = (uint64_t)cfg_.n_layer * kv_dim * 2u * sizeof(float);
+        const uint64_t ram = total_ram_bytes();
+        if (ram > 0 && per_ctx > 0) {
+            uint64_t kv_budget = (uint64_t)((double)ram * 0.45);
+            const uint64_t weights = (uint64_t)file_.file_size();
+            const uint64_t cap85 = (uint64_t)((double)ram * 0.85);
+            if (weights < cap85 && cap85 - weights < kv_budget) kv_budget = cap85 - weights;
+
+            const uint64_t fit = kv_budget / per_ctx;
+            if (fit < (uint64_t)n_ctx_) {
+                int64_t c = (int64_t)fit / 256 * 256;
+                if (c < 1024) c = 1024;
+                if (c < n_ctx_) {
+                    std::fprintf(stderr,
+                                 "[dubhe] 上下文 %d → %d：每 1k 上下文要 %.1f MB KV，"
+                                 "这台机器的内存只装得下这么多\n",
+                                 n_ctx_, (int)c, (double)per_ctx * 1024.0 / 1048576.0);
+                    n_ctx_ = (int)c;
+                    kv_cap_ = std::min(n_ctx_, 1024);
+                }
+            }
+        }
+    }
 
     if (!tok_.init(file_, err)) return false;
 
@@ -274,6 +320,55 @@ bool Model::enable_gpu(std::string* err) {
         char b[256];
         std::snprintf(b, sizeof(b), "Metal · %s（校验误差 %.1e）", metal::device_name(), worst);
         gpu_note_ = b;
+    }
+
+    // ---------------------------------------------------------- 覆盖度体检
+    //
+    // 逐张量问一句"GPU 能不能算"，把不能算的按格式汇总报出来。
+    //
+    // 这条检查是被 Q5_K 那次坑出来的：当时 Q5_K 在四张内核表里都没有登记，
+    // `kind_of()` 返回 -1、`supports()` 直接 false —— 模型**能跑、结果也对**，
+    // 只是每一层都有一半权重在 CPU 上单线程算，prefill 27.8 tok/s。
+    // 从外面看只是"这个格式慢"，完全看不出是个覆盖洞；等哪天真去查，
+    // 又要从头把四张表逐行对一遍。
+    //
+    // 所以：**加载时就把"谁在 CPU 上"说出来**。判据只看格式与行宽
+    // （`supports()` 里的两条），不看 `kGpuMinMac` —— 小张量走 CPU 是
+    // 刻意为之，不该混进来报警。
+    {
+        std::map<uint32_t, std::pair<int, uint64_t>> miss;   // 类型 → (张量数, 字节)
+        uint64_t total = 0;
+        for (const TensorInfo& t : file_.tensors()) {
+            const int64_t n_in = t.ne[0];
+            if (n_in <= 0) continue;
+            int64_t n_out = 1;
+            for (int d = 1; d < t.n_dims; d++) n_out *= t.ne[d];
+            const uint64_t bytes = (uint64_t)type_row_bytes(t.type, n_in) * (uint64_t)n_out;
+            total += bytes;
+            if (n_out * n_in < kGpuMinMac) continue;         // 小张量，本来就该走 CPU
+            if (!metal::supports(t.type, (int)n_in)) {
+                auto& e = miss[t.type];
+                e.first += 1;
+                e.second += bytes;
+            }
+        }
+        if (!miss.empty()) {
+            std::string line;
+            uint64_t lost = 0;
+            for (auto& kv : miss) {
+                char b[128];
+                std::snprintf(b, sizeof(b), "%s%s %d 个张量 / %.0f MB",
+                              line.empty() ? "" : "、", type_name(kv.first),
+                              kv.second.first, (double)kv.second.second / 1048576.0);
+                line += b;
+                lost += kv.second.second;
+            }
+            const double pct = total ? 100.0 * (double)lost / (double)total : 0.0;
+            std::fprintf(stderr,
+                         "[dubhe] ⚠ GPU 覆盖不全：%s 没有可用内核，将回退 CPU\n"
+                         "[dubhe]   占模型 %.0f%%，这些张量的 matvec 会慢一个数量级\n",
+                         line.c_str(), pct);
+        }
     }
 
     // LFM3 还没有整层融合内核。逐算子的 matvec 照样走 GPU（占前向时间的 99%），
