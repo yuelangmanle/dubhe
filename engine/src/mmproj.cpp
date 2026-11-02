@@ -239,6 +239,34 @@ bool MmProj::pack_pixels2(const uint8_t* rgb0, const uint8_t* rgb1, int w, int h
 bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string* err) const {
     if (!loaded_) { if (err) *err = "mmproj 未加载"; return false; }
     const auto& c = cfg_;
+
+    // ---- DUBHE_VIT_TRACE=1：分阶段计时
+    //
+    // 塔的耗时分布已经猜错过两次（先猜"反量化流量"，再猜"cache 未命中"），
+    // 所以这次先量再说。RAII 计数器的好处是中途 return 也不会漏。
+    struct Phase {
+        bool on = std::getenv("DUBHE_VIT_TRACE") != nullptr;
+        int64_t t0 = on ? now_ns() : 0;
+        int64_t* acc;
+        explicit Phase(int64_t* a) : acc(a) {}
+        ~Phase() { if (on) *acc += now_ns() - t0; }
+    };
+    int64_t T_patch = 0, T_rope = 0, T_attn = 0, T_conv = 0, T_ffn = 0, T_proj = 0;
+    struct PhaseDump {
+        bool on = std::getenv("DUBHE_VIT_TRACE") != nullptr;
+        const int64_t *p, *r, *a, *cv, *f, *pj;
+        PhaseDump(const int64_t* pp, const int64_t* rr, const int64_t* aa,
+                  const int64_t* cc, const int64_t* ff, const int64_t* jj)
+            : p(pp), r(rr), a(aa), cv(cc), f(ff), pj(jj) {}
+        ~PhaseDump() {
+            if (!on) return;
+            std::fprintf(stderr,
+                         "[vit] patchify %.0f / rope %.0f / attn %.0f / conv %.0f / "
+                         "ffn %.0f / proj %.0f ms\n",
+                         *p / 1e6, *r / 1e6, *a / 1e6, *cv / 1e6, *f / 1e6, *pj / 1e6);
+        }
+    } dump(&T_patch, &T_rope, &T_attn, &T_conv, &T_ffn, &T_proj);
+
     const int M = c.merge;
     if (gh % M || gw % M) { if (err) *err = "patch 网格必须是 merge 的倍数"; return false; }
 
@@ -289,6 +317,7 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
     // 所有 patch 一起做一次 matmul，不要逐 patch 调 matvec —— 后者每次都要起
     // 8 个线程，256 个 patch 就是 4096 次线程创建，实测占了 70% 的墙钟时间。
     {
+        Phase _t(&T_patch);
         const int64_t slice = (int64_t)3 * P * P;
         const int64_t pw = patch_w[0].n / D;   // 每行宽度 = 一个时间片的元素数
         const int64_t pstride = c.patch_dim();   // 一个 patch 的总长度（两个时间片）
@@ -316,24 +345,27 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
     // 展平后元素值仍是 by*M+dy（patch 下标）。用 block 号会让整张图被当成缩小
     // 一倍的网格 —— 不报错、不 NaN，只是模型对空间位置的感知整体错位。
     const int nf = HD / 4;
-    std::vector<float> invf((size_t)nf);
-    for (int i = 0; i < nf; i++)
-        invf[(size_t)i] = 1.0f / std::pow(c.rope_theta, (float)(2 * i) / (float)(HD / 2));
     std::vector<float> cosb((size_t)(N * HD)), sinb((size_t)(N * HD));
-    for (int64_t n = 0; n < N; n++) {
-        int by, bx, sub;
-        coords(n, &by, &bx, &sub);
-        float* cb = cosb.data() + n * HD;
-        float* sb = sinb.data() + n * HD;
-        for (int i = 0; i < nf; i++) {
-            const float ah = (float)(by * M + sub / M) * invf[(size_t)i];
-            const float aw = (float)(bx * M + sub % M) * invf[(size_t)i];
-            const float ch = std::cos(ah), sh = std::sin(ah);
-            const float cw = std::cos(aw), sw = std::sin(aw);
-            cb[i] = ch;          cb[nf + i] = cw;
-            cb[2 * nf + i] = ch; cb[3 * nf + i] = cw;
-            sb[i] = sh;          sb[nf + i] = sw;
-            sb[2 * nf + i] = sh; sb[3 * nf + i] = sw;
+    {
+        Phase _t(&T_rope);
+        std::vector<float> invf((size_t)nf);
+        for (int i = 0; i < nf; i++)
+            invf[(size_t)i] = 1.0f / std::pow(c.rope_theta, (float)(2 * i) / (float)(HD / 2));
+        for (int64_t n = 0; n < N; n++) {
+            int by, bx, sub;
+            coords(n, &by, &bx, &sub);
+            float* cb = cosb.data() + n * HD;
+            float* sb = sinb.data() + n * HD;
+            for (int i = 0; i < nf; i++) {
+                const float ah = (float)(by * M + sub / M) * invf[(size_t)i];
+                const float aw = (float)(bx * M + sub % M) * invf[(size_t)i];
+                const float ch = std::cos(ah), sh = std::sin(ah);
+                const float cw = std::cos(aw), sw = std::sin(aw);
+                cb[i] = ch;          cb[nf + i] = cw;
+                cb[2 * nf + i] = ch; cb[3 * nf + i] = cw;
+                sb[i] = sh;          sb[nf + i] = sw;
+                sb[2 * nf + i] = sh; sb[3 * nf + i] = sw;
+            }
         }
     }
 
@@ -350,6 +382,7 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
         for (int64_t n = 0; n < N; n++) rmsnorm(xn.data() + n * D, D, wbuf.data(), c.norm_eps);
 
         if (c.is_attn[(size_t)li]) {
+            Phase _t(&T_attn);
             wqn.clear(); wkn.clear();
             if (!deq_all(L.q_norm, wqn, err) || !deq_all(L.k_norm, wkn, err)) return false;
 
@@ -381,12 +414,29 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
                 }
             }
 
-            // 双向 GQA。N 能到几千，这是视觉塔的主要开销，所以做两件事：
+            // 双向 GQA。N 能到几千，这是视觉塔的主要开销，所以做三件事：
             //  1) 把 K/V 转成 [kvh][j][HD] —— 原来按 j 跨 kdim 跳读，每次跨 512
             //     个 float，cache 基本全废；
-            //  2) 按 head 并行，每个线程用自己的 softmax 暂存。
+            //  2) 按 head 并行，每个线程用自己的 softmax 暂存；
+            //  3) **按 query 分块**（见下面的 i0 循环）。
+            //
+            // 第 3 条是这一轮加的，也是最大的一条。原来的循环是 i 在外、j 在内：
+            // 每算一行分数都要把整个 kb 流一遍（N=3840 时 983 KB，已经超过
+            // M 系列的单核 L2 有效容量），于是 N 行就是 N 遍全量重读 ——
+            // 16 个头 × 7 层 × 3840 行 × 983 KB ≈ **424 GB** 的流量，
+            // 而真正算的只有 105 GFLOP。实测这 4 秒里绝大部分是在等内存。
+            //
+            // 改成 i 分块之后，kb / vb 每块只读一次，流量除以 IB：
+            // 3840/32 = 120 遍 × 2 MB ≈ 236 MB/头/层，整体 26 GB，16 倍之差。
+            //
+            // **数值完全不变**：每个 (i,j) 还是同一个 dot_f32、同一个累加顺序；
+            // 缩放 inv 也在同一步乘进去。所以改完可以拿 vlprobe 直接对拍，
+            // 期望逐位一致（不是"误差在阈值内"）。
             const float scale = 1.0f / std::sqrt((float)HD);
             const int group = H / KV;
+            // 分数暂存上限 512 KB：块越大复用越好，但太大会把 L2 挤掉。
+            const int64_t IB = std::max<int64_t>(
+                1, std::min<int64_t>(32, (int64_t)(131072 / std::max<int64_t>(1, N))));
             for (int kvh = 0; kvh < KV; kvh++)
                 for (int64_t j = 0; j < N; j++) {
                     std::memcpy(kt.data() + ((size_t)kvh * N + j) * HD,
@@ -395,33 +445,53 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
                                 v.data() + j * kdim + kvh * HD, sizeof(float) * HD);
                 }
             auto head_body = [&](int h0, int h1) {
-                std::vector<float> sc((size_t)N);
+                std::vector<float> sc((size_t)IB * (size_t)N);
                 for (int hh = h0; hh < h1; hh++) {
                     const int kvh = hh / group;
                     const float* kb = kt.data() + (size_t)kvh * N * HD;
                     const float* vb = vt.data() + (size_t)kvh * N * HD;
-                    for (int64_t i = 0; i < N; i++) {
-                        const float* qi = q.data() + i * qdim + hh * HD;
-                        float mx = -1e30f;
+                    for (int64_t i0 = 0; i0 < N; i0 += IB) {
+                        const int64_t ib = std::min<int64_t>(IB, N - i0);
+                        // 1) 分数：kb 的每一行读一次，和 ib 个 q 各点一次
                         for (int64_t j = 0; j < N; j++) {
-                            const float s = dot_f32(qi, kb + j * HD, HD) * scale;
-                            sc[(size_t)j] = s;
-                            if (s > mx) mx = s;
+                            const float* kj = kb + j * HD;
+                            for (int64_t r = 0; r < ib; r++) {
+                                const float* qi = q.data() + (i0 + r) * qdim + hh * HD;
+                                sc[(size_t)r * (size_t)N + (size_t)j] = dot_f32(qi, kj, HD) * scale;
+                            }
                         }
-                        float sum = 0.0f;
+                        // 2) softmax：逐行，和原来完全同序
+                        for (int64_t r = 0; r < ib; r++) {
+                            float* row = sc.data() + (size_t)r * (size_t)N;
+                            float mx = -1e30f;
+                            for (int64_t j = 0; j < N; j++)
+                                if (row[j] > mx) mx = row[j];
+                            float sum = 0.0f;
+                            for (int64_t j = 0; j < N; j++) {
+                                const float e = std::exp(row[j] - mx);
+                                row[j] = e;
+                                sum += e;
+                            }
+                            const float inv = 1.0f / sum;
+                            for (int64_t j = 0; j < N; j++) row[j] *= inv;
+                        }
+                        // 3) PV：vb 的每一行读一次，累加到 ib 个输出行
+                        for (int64_t r = 0; r < ib; r++) {
+                            float* oi = o.data() + (i0 + r) * qdim + hh * HD;
+                            for (int d = 0; d < HD; d++) oi[d] = 0.0f;
+                        }
                         for (int64_t j = 0; j < N; j++) {
-                            const float e = std::exp(sc[(size_t)j] - mx);
-                            sc[(size_t)j] = e;
-                            sum += e;
+                            const float* vj = vb + j * HD;
+                            for (int64_t r = 0; r < ib; r++) {
+                                const float w = sc[(size_t)r * (size_t)N + (size_t)j];
+                                if (w != 0.0f)
+                                    saxpy(o.data() + (i0 + r) * qdim + hh * HD, vj, w, HD);
+                            }
                         }
-                        const float inv = 1.0f / sum;
-                        float* oi = o.data() + i * qdim + hh * HD;
-                        for (int d = 0; d < HD; d++) oi[d] = 0.0f;
-                        for (int64_t j = 0; j < N; j++)
-                            saxpy(oi, vb + j * HD, sc[(size_t)j] * inv, HD);
                     }
                 }
             };
+
             if (H >= kThreads) {
                 std::vector<std::thread> th;
                 const int hc = (H + kThreads - 1) / kThreads;
@@ -436,6 +506,7 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
             matmul_qt(L.o, qdim, D, o.data(), N, y.data());
         } else {
             // 门控 2D 深度卷积
+            Phase _t(&T_conv);
             wc.clear();
             if (!deq_all(L.conv_spatial, wc, err)) return false;   // 每层只有 9×1024，随便反量化
 
@@ -499,6 +570,7 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
         for (int64_t i = 0; i < N * D; i++) x[(size_t)i] += y[(size_t)i];
 
         // ---------------- sandwich 第二段：x += ffn(norm2(x))
+        Phase _tffn(&T_ffn);
         xn.assign(x.begin(), x.end());
         if (!deq_all(L.ln2, wbuf, err)) return false;
         for (int64_t n = 0; n < N; n++) rmsnorm(xn.data() + n * D, D, wbuf.data(), c.norm_eps);
@@ -514,6 +586,7 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
 
     // ---- 投影器：LayerNorm → 每 merge² 个 token 拼起来 → Linear → GELU → Linear
     {
+        Phase _t(&T_proj);
         std::vector<float> nw, nb, b0, b2;
         if (!deq_all(mm_norm_w, nw, err) || !deq_all(mm_norm_b, nb, err) ||
             !deq_all(mm0_b, b0, err) || !deq_all(mm2_b, b2, err)) return false;
