@@ -89,6 +89,21 @@ bool fwd_token(const float* x0, int pos, float* logits, std::string* err);
 // prefill 批处理：x0 是 [nrow][n_embd] 已反量化的 embedding，pos0 是首行位置。
 // 只有最后一行需要 logits，其余行的 out_w 被省掉。
 bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* err);
+// 同上，但整段落到 KV 缓冲的 slab0 号槽位（连续批处理时每条序列一块）。
+// 位置 pos0..pos0+nrow-1 都相对于 slab0 起算，注意力只看本槽位内的内容。
+bool fwd_batch_at(const float* x0, int nrow, int pos0, uint64_t slab0, uint64_t cslot,
+                  float* logits, std::string* err);
+// 多序列批量前向：nrow 行分属 nrow 个**独立序列**（连续批处理用）。
+//   rpos[r]  第 r 行在自己序列里的位置
+//   rslab[r] 该序列在本层 KV 缓冲里的起始槽位（单位是位置，不是字节）
+//   rslot[r] 该序列的 ShortConv 历史槽位；传 nullptr 时按 r 编号
+// logits 必须按 [nrow][n_vocab] 给出。
+//
+// 和 fwd_batch 的区别只有一处：位置相关的小算子（RoPE / v 写入 / 注意力 /
+// 卷积状态）按行各派发一次，权重 matvec 仍然整批一次 —— 摊薄的是权重读取，
+// 那才是解码的全部成本。
+bool fwd_multi(const float* x0, int nrow, const int* rpos, const uint64_t* rslab,
+               const uint64_t* rslot, float* logits, std::string* err);
 // 批大小上限（与着色器 BMAX 一致）
 int fwd_batch_max();
 // 清零 LFM3 的 ShortConv 历史缓冲（新序列开始时调用）

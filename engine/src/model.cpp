@@ -916,20 +916,27 @@ int Model::batch_size() const {
 // prefill 批处理。GPU 可用时一次提交算完 n 个 token；否则退化成 n 次
 // 单 token 前向（结果一致，只是慢——CPU 侧还没有批量内核）。
 bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* logits,
-                          std::string* err) {
+                          std::string* err, uint64_t slab0, uint64_t cslot) {
     if (!loaded_) { if (err) *err = "模型未加载"; return false; }
     if (n <= 0 || !tokens) { if (err) *err = "空批"; return false; }
-    if (n == 1) return forward(tokens[0], pos0, logits, err);
+    if (n == 1 && slab0 == 0 && cslot == 0) return forward(tokens[0], pos0, logits, err);
 
     if (!gpu_fused_) {
+        // CPU 路径和 forward() 都只认"整条序列从 0 开始"，没有槽位概念。
+        if (slab0 != 0 || cslot != 0) { if (err) *err = "槽位 prefill 需要 GPU 后端"; return false; }
         for (int i = 0; i < n; i++) {
             if (!forward(tokens[i], pos0 + i, logits, err)) return false;
         }
         return true;
     }
 
-    if (pos0 + n > n_ctx_) { if (err) *err = "上下文已满"; return false; }
-    if (pos0 + n > kv_cap_ && !grow_kv(pos0 + n)) { if (err) *err = "KV cache 扩容失败"; return false; }
+    // 槽位 prefill：整段落在 slab0 之后，容量要按 slab0 + pos0 + n 算，
+    // 只按 pos0 + n 算会让第 2 条以后的序列直接越界。
+    if ((int64_t)slab0 + pos0 + n > n_ctx_) { if (err) *err = "上下文已满"; return false; }
+    if ((int64_t)slab0 + pos0 + n > kv_cap_ &&
+        !grow_kv((int)(slab0 + pos0 + n))) {
+        if (err) *err = "KV cache 扩容失败"; return false;
+    }
 
     const int n_embd = cfg_.n_embd;
     xbatch_.resize((size_t)n * (size_t)n_embd);
@@ -949,7 +956,10 @@ bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* log
         }
     }
 
-    if (!metal::fwd_batch(xbatch_.data(), n, pos0, logits, err)) {
+    const bool ok = (slab0 == 0 && cslot == 0)
+        ? metal::fwd_batch(xbatch_.data(), n, pos0, logits, err)
+        : metal::fwd_batch_at(xbatch_.data(), n, pos0, slab0, cslot, logits, err);
+    if (!ok) {
         gpu_active_ = false;
         if (err && err->empty()) *err = "GPU 批处理前向失败";
         return false;
@@ -957,9 +967,46 @@ bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* log
     // 记录 KV 里现在装着什么，供下一次请求判断能不能跳过 prefill。
     // pos0 不等于 kv_len_ 说明这不是顺序追加（调用方自己动过位置），
     // 缓存就此作废 —— 宁可下次多 prefill 一遍，也不能拿错位的 KV 出字。
-    if (pos0 != kv_len_) kv_toks_.clear();
+    // slab0 != 0 时 KV 不在 0 号槽位，同样不能当成"从 0 开始的前缀"。
+    if (slab0 != 0 || pos0 != kv_len_) kv_toks_.clear();
     kv_toks_.insert(kv_toks_.end(), tokens, tokens + n);
     kv_len_ = pos0 + n;
+    return true;
+}
+
+bool Model::forward_multi(const int32_t* tokens, int nrow, const int32_t* rpos,
+                          const uint64_t* rslab, const uint64_t* rslot,
+                          float* logits, std::string* err) {
+    if (!loaded_) { if (err) *err = "模型未加载"; return false; }
+    if (nrow <= 0 || !tokens || !rpos || !rslab) { if (err) *err = "空批"; return false; }
+    if (!gpu_fused_) { if (err) *err = "多序列前向需要 GPU 后端"; return false; }
+
+    // KV 容量按**整块**算：rslab[r] + rpos[r] 必须落在 kv_cap_ 之内。
+    int need = 0;
+    for (int r = 0; r < nrow; r++) {
+        const int64_t hi = (int64_t)rslab[r] + (int64_t)rpos[r] + 1;
+        if (hi > n_ctx_) { if (err) *err = "上下文已满"; return false; }
+        need = std::max(need, (int)hi);
+    }
+    if (need > kv_cap_ && !grow_kv(need)) { if (err) *err = "KV cache 扩容失败"; return false; }
+
+    const int n_embd = cfg_.n_embd;
+    xbatch_.resize((size_t)nrow * (size_t)n_embd);
+    for (int r = 0; r < nrow; r++) {
+        const void* row = (const char*)file_.tensor_data(tok_embd_) +
+                          (size_t)tokens[r] * type_row_bytes(tok_embd_.type, n_embd);
+        dequant_row(tok_embd_.type, row, xbatch_.data() + (size_t)r * n_embd, n_embd);
+    }
+
+    if (!metal::fwd_multi(xbatch_.data(), nrow, rpos, rslab, rslot, logits, err)) {
+        gpu_active_ = false;
+        if (err && err->empty()) *err = "GPU 多序列前向失败";
+        return false;
+    }
+    // 一次前向里混了多条序列，KV 不再是"某一个 prompt 的连续前缀"，
+    // 前缀缓存的前提没了 —— 直接作废，宁可下次多 prefill 一遍。
+    kv_toks_.clear();
+    kv_len_ = 0;
     return true;
 }
 

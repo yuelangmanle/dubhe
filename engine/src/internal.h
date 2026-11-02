@@ -313,7 +313,20 @@ public:
     bool forward(int32_t token, int32_t pos, float* logits, std::string* err);
     // 批量前向（prefill）：tokens[0..n) 连续喂入，pos0 是首 token 的位置。
     // 只有最后一个 token 的 logits 有效。n==1 时等价于 forward()。
-    bool forward_batch(const int32_t* tokens, int n, int32_t pos0, float* logits, std::string* err);
+    // slab0 != 0 时整段落到 KV 缓冲的 slab0 号槽位（连续批处理时每条序列一块），
+    // cslot 是该序列的 ShortConv 历史槽位。
+    bool forward_batch(const int32_t* tokens, int n, int32_t pos0, float* logits,
+                       std::string* err, uint64_t slab0 = 0, uint64_t cslot = 0);
+
+    // 多序列批量前向（连续批处理）。第 r 行属于独立序列 r：
+    //   rpos[r]  该行在自己序列里的位置
+    //   rslab[r] 该序列在本层 KV 缓冲里的起始槽位（单位是位置）
+    //   rslot[r] 该序列的 ShortConv 历史槽位
+    // logits 必须是 [nrow][n_vocab]。调用后前缀缓存作废 —— 一次前向里
+    // 混了多条序列，kv_toks_ 那种"一整段 KV 属于同一个 prompt"的前提没了。
+    bool forward_multi(const int32_t* tokens, int nrow, const int32_t* rpos,
+                       const uint64_t* rslab, const uint64_t* rslot,
+                       float* logits, std::string* err);
 
     // 多模态：把序列里 [at, at+n) 这些**绝对位置**的 token 嵌入换成外部特征
     // （视觉塔 / 音频塔的输出）。调用方保证 embeds 活到生成结束。

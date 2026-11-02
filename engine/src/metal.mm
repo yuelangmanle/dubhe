@@ -494,8 +494,11 @@ bool fwd_init(const Spec& s, std::string* err) {
     g_bgate   = make_buf(B * n_ff * 4);
     g_bup     = make_buf(B * n_ff * 4);
     g_bffn    = make_buf(B * n_ff * 4);
-    g_blogits = make_buf(n_vocab * 4);
-    g_bfinal  = make_buf(n_embd * 4);
+    // logits 按 B 行分配：批量模式下每一行都要出 logits（B 个序列各取各的
+    // 下一个 token），单序列解码仍然只用第 0 行。B×n_vocab×4 在 32×128000
+    // 时是 16 MB，相对 1 GB 权重可以忽略。
+    g_blogits = make_buf(B * n_vocab * 4);
+    g_bfinal  = make_buf(B * n_embd * 4);
     g_bxt     = make_buf(B * (size_t)(s.n_ff > s.n_embd ? s.n_ff : s.n_embd) * 4);
     g_bpart   = make_buf(B * (size_t)kAttnSplits * (size_t)s.n_head * ((size_t)s.hd + 2) * 4);
     g_bkc     = make_buf(kvb);
@@ -507,7 +510,8 @@ bool fwd_init(const Spec& s, std::string* err) {
     g_bconv    = make_buf(B * 3 * n_embd * 4);
     g_bconvh   = make_buf(B * n_embd * 4);
     g_bconvy   = make_buf(B * n_embd * 4);
-    g_bconvst  = make_buf(nconv * (lcache > 1 ? lcache - 1 : 1) * n_embd * 4);
+    // 卷积滚动状态按 B 份分配：批量模式下每个序列有自己的历史，混用会串台。
+    g_bconvst  = make_buf(B * nconv * (lcache > 1 ? lcache - 1 : 1) * n_embd * 4);
     g_bgateatt = make_buf(B * (size_t)s.n_head * 4);
 
     if (!g_bx || !g_bxb || !g_bq || !g_bk || !g_bv || !g_batt || !g_bgate || !g_bup ||
@@ -557,16 +561,42 @@ bool fwd_grow_kv(int new_cap, std::string* err) {
 }
 
 // x0: [nrow][n_embd] 已反量化的 embedding；pos0: 首行在序列中的位置。
-bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* err) {
+//
+// rpos/rslab/rslot 非空时进入**多序列模式**：第 r 行属于一个独立的序列，
+// 有自己的位置（rpos[r]）、自己的 KV 起始槽位（rslab[r]）、自己的 ShortConv
+// 历史（rslot[r]）。这时 logits 要按 [nrow][n_vocab] 给出。
+//
+// 为什么只按行拆「位置相关」的算子、而不是把整个内核改成吃数组：
+// 权重 matvec 是唯一值得摊薄的东西（一次读 1.02 GB 权重产出 nrow 个 token），
+// 而 RoPE / v 写入 / 注意力都是每行几微秒的小算子。把它们按行各派发一次，
+// 用的是现成内核 + 缓冲偏移，**一个着色器都不用改**，单序列路径完全不受影响。
+static bool fwd_impl(const float* x0, int nrow, int pos0, uint64_t slab0, uint64_t cslot,
+                     const int* rpos, const uint64_t* rslab, const uint64_t* rslot,
+                     float* logits, std::string* err) {
     if (!g_fwd_ready) { if (err) *err = "GPU 前向未初始化"; return false; }
     if (nrow <= 0 || nrow > kBatchMax) { if (err) *err = "批大小越界"; return false; }
-    if (pos0 + nrow > g_spec.kv_cap) { if (err) *err = "KV cache 越界"; return false; }
+    const bool multi = (rpos != nullptr && rslab != nullptr);
+    if (multi) {
+        for (int r = 0; r < nrow; r++)
+            if (rpos[r] < 0 || (int64_t)rslab[r] + rpos[r] + 1 > (int64_t)g_spec.kv_cap) {
+                if (err) *err = "KV cache 越界";
+                return false;
+            }
+    } else if ((int64_t)slab0 + pos0 + nrow > (int64_t)g_spec.kv_cap) {
+        if (err) *err = "KV cache 越界";
+        return false;
+    }
 
     const int n_embd = g_spec.n_embd, n_ff = g_spec.n_ff;
     const int n_head = g_spec.n_head, n_kvh = g_spec.n_head_kv, hd = g_spec.hd;
     const int kv_dim = n_kvh * hd;
     const int q_dim = n_head * hd;
     const size_t kv_row = (size_t)g_spec.kv_cap * (size_t)kv_dim;
+
+    // 逐行取值。单序列时退化成原来的 pos0 + row / 槽位 0，代码路径完全一样。
+    const auto row_pos  = [&](int r) -> int      { return multi ? rpos[r] : pos0 + r; };
+    const auto row_slab = [&](int r) -> uint64_t { return multi ? rslab[r] : slab0; };
+    const auto row_slot = [&](int r) -> uint64_t { return (rslot && multi) ? rslot[r] : cslot; };
 
     std::memcpy([g_bx contents], x0, sizeof(float) * (size_t)n_embd * (size_t)nrow);
 
@@ -818,12 +848,15 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
     // ShortConv 的卷积 + 历史滚动。
     // 一行一个 dispatch，多行时按行序连续派发——同一 command buffer 内的
     // compute dispatch 顺序执行，所以 state 能逐行正确递推。
-    auto conv_step = [&](uint64_t slot_off, uint64_t kwoff, int rows) {
+    // hbase 是这一批行在 g_bconvh / g_bconvy 里的起始字节偏移。
+    // 多序列模式下每行各派发一次（rows=1、hbase=r*n_embd*4），因为每行的
+    // 卷积滚动状态槽位不同；单序列时整批一次派发，和原来一致。
+    auto conv_step_at = [&](uint64_t slot_off, uint64_t kwoff, uint64_t hbase, int rows) {
         if (skip_ew) return;
         const uint32_t n = (uint32_t)n_embd;
         const uint32_t K = (uint32_t)g_spec.conv_l_cache;
         for (int r = 0; r < rows; r++) {
-            const uint64_t hoff = (uint64_t)r * (uint64_t)n_embd * sizeof(float);
+            const uint64_t hoff = hbase + (uint64_t)r * (uint64_t)n_embd * sizeof(float);
             const uint64_t yoff = hoff;
             [en setComputePipelineState:g_fpipe[F_CONV]];
             [en setBuffer:g_bconvh offset:0 atIndex:0];
@@ -850,11 +883,13 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
+    auto conv_step = [&](uint64_t slot_off, uint64_t kwoff, int rows) {
+        conv_step_at(slot_off, kwoff, 0, rows);
+    };
 
     for (int l = 0; l < g_spec.n_layer; l++) {
         const LayerSpec& L = g_spec.layers[(size_t)l];
         const uint64_t coff = (uint64_t)l * kv_row * 2u;                 // fp16
-        const uint64_t kpos = coff + (uint64_t)pos0 * (uint64_t)kv_dim * 2u;
 
         rmsnorm(g_bx, L.off[metal::S_ATTN_NORM], g_bxb, nrow);
 
@@ -869,9 +904,21 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
             const uint64_t rowstride = (uint64_t)3 * n_embd * 4;
             mul(g_bconvh, g_bconv, 0, rowstride,
                 g_bconv, (uint64_t)2 * n_embd * 4, rowstride, n_embd);
-            conv_step((uint64_t)L.conv_slot * (uint64_t)(g_spec.conv_l_cache - 1) *
-                          (uint64_t)n_embd * 4,
-                      L.ex_off[metal::X_CONV_K], nrow);
+            // 卷积状态槽位：单序列是 [conv_slot][K-1][n_embd]，
+            // 多序列是 [conv_slot][B][K-1][n_embd] —— 每个序列一份历史。
+            {
+                const uint64_t st = (uint64_t)(g_spec.conv_l_cache > 1 ? g_spec.conv_l_cache - 1 : 1) *
+                                    (uint64_t)n_embd * 4u;
+                if (multi) {
+                    for (int r = 0; r < nrow; r++)
+                        conv_step_at(((uint64_t)L.conv_slot * (uint64_t)kBatchMax + row_slot(r)) * st,
+                                     L.ex_off[metal::X_CONV_K],
+                                     (uint64_t)r * (uint64_t)n_embd * 4u, 1);
+                } else {
+                    conv_step(((uint64_t)L.conv_slot * (uint64_t)kBatchMax + row_slot(0)) * st,
+                              L.ex_off[metal::X_CONV_K], nrow);
+                }
+            }
             mul(g_bconvy, g_bconvy, 0, (uint64_t)n_embd * 4,
                 g_bconv, (uint64_t)n_embd * 4, rowstride, n_embd);
             gemm(L.ex_type[metal::X_CONV_OUT], g_bconvy, g_bxb,
@@ -894,40 +941,56 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
                 headnorm(g_bk, L.ex_off[metal::X_KNORM], n_kvh, nrow);
 
             // RoPE：q 就地，k 旋转后直接落到 cache 的 pos 槽
+            //
+            // 多序列模式下每行各派发一次：内核用的是标量 pos0 和标量 koff，
+            // 行号从 gid.y 取。所以把 q/k 的缓冲按行平移、把 koff 换成该行
+            // 序列的槽位、pos0 换成该行的位置，网格的 y 维压到 1 —— 内核
+            // 一个字节都不用改。q_dim/kv_dim 都是 2048 字节的倍数，
+            // setBuffer 的 256 字节对齐自然满足。
             {
                 uint32_t a = (uint32_t)n_head, b = (uint32_t)n_kvh, c = (uint32_t)hd;
-                uint32_t p0 = (uint32_t)pos0;
                 float th = L.rope_theta_l;
                 uint32_t ang = (L.rope_angles_l > 0 && L.rope_angles_l < hd / 2)
                                    ? (uint32_t)L.rope_angles_l : (uint32_t)(hd / 2);
-                [en setComputePipelineState:g_fpipe[F_ROPE]];
-                [en setBuffer:g_bq offset:0 atIndex:0];
-                [en setBuffer:g_bk offset:0 atIndex:1];
-                [en setBuffer:g_bkc offset:0 atIndex:2];
-                [en setBytes:&kpos length:8 atIndex:3];
+                const uint32_t tot = (a + b) * (c / 2);
+                const int npass = multi ? nrow : 1;
+                for (int r = 0; r < npass; r++) {
+                    uint32_t p0 = (uint32_t)row_pos(r);
+                    uint64_t ko = coff + (uint64_t)(row_slab(r) + (uint64_t)row_pos(r)) *
+                                             (uint64_t)kv_dim * 2u;
+                    [en setComputePipelineState:g_fpipe[F_ROPE]];
+                    [en setBuffer:g_bq offset:(NSUInteger)((size_t)r * (size_t)q_dim * 4) atIndex:0];
+                    [en setBuffer:g_bk offset:(NSUInteger)((size_t)r * (size_t)kv_dim * 4) atIndex:1];
+                    [en setBuffer:g_bkc offset:0 atIndex:2];
+                    [en setBytes:&ko length:8 atIndex:3];
                 [en setBytes:&a length:4 atIndex:4];
                 [en setBytes:&b length:4 atIndex:5];
                 [en setBytes:&c length:4 atIndex:6];
                 [en setBytes:&p0 length:4 atIndex:7];
                 [en setBytes:&th length:4 atIndex:8];
                 [en setBytes:&ang length:4 atIndex:9];
-                const uint32_t tot = (a + b) * (c / 2);
-                [en dispatchThreads:MTLSizeMake(tot, (NSUInteger)nrow, 1)
-              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [en dispatchThreads:MTLSizeMake(tot, (NSUInteger)(multi ? 1 : nrow), 1)
+                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                }
             }
 
             // v → cache（fp16，所以用 k_copy_h 而不是 k_copy）
             {
                 uint32_t n = (uint32_t)kv_dim;
                 uint64_t zero = 0;
-                [en setComputePipelineState:g_fpipe[F_COPY_H]];
-                [en setBuffer:g_bvc offset:0 atIndex:0];
-                [en setBytes:&kpos length:8 atIndex:1];
-                [en setBuffer:g_bv offset:0 atIndex:2];
-                [en setBytes:&zero length:8 atIndex:3];
-                [en setBytes:&n length:4 atIndex:4];
-                [en dispatchThreads:MTLSizeMake((NSUInteger)kv_dim, (NSUInteger)nrow, 1)
-              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                const int npass = multi ? nrow : 1;
+                for (int r = 0; r < npass; r++) {
+                    uint64_t vo = coff + (uint64_t)(row_slab(r) + (uint64_t)row_pos(r)) *
+                                             (uint64_t)kv_dim * 2u;
+                    [en setComputePipelineState:g_fpipe[F_COPY_H]];
+                    [en setBuffer:g_bvc offset:0 atIndex:0];
+                    [en setBytes:&vo length:8 atIndex:1];
+                    [en setBuffer:g_bv offset:(NSUInteger)((size_t)r * (size_t)kv_dim * 4) atIndex:2];
+                    [en setBytes:&zero length:8 atIndex:3];
+                    [en setBytes:&n length:4 atIndex:4];
+                    [en dispatchThreads:MTLSizeMake((NSUInteger)kv_dim, (NSUInteger)(multi ? 1 : nrow), 1)
+                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                }
             }
 
             // 注意力（行 r 的可见长度 = pos0 + r + 1）
@@ -943,8 +1006,13 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
                 // 滑窗层：每行只能看最近 n_swa 个位置
                 uint32_t win = 0;
                 if (L.kind == G_ATTN_SWA && g_spec.n_swa > 0) win = (uint32_t)g_spec.n_swa;
-                const int nlen_max = std::min(pos0 + nrow,
-                                              win > 0 ? (int)win : (pos0 + nrow));
+                // 多序列模式下各行位置不同，切段数按**最长的那一行**定。
+                int nlen_max = pos0 + nrow;
+                if (multi) {
+                    nlen_max = 1;
+                    for (int r = 0; r < nrow; r++) nlen_max = std::max(nlen_max, row_pos(r) + 1);
+                }
+                nlen_max = std::min(nlen_max, win > 0 ? (int)win : nlen_max);
                 // 切几段（split-K）。
                 //
                 // 这里的分母决定了短上下文时的并行度：一个 threadgroup 只
@@ -970,52 +1038,73 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
 
                 if (skip_attk) {
                     // 诊断开关：跳过注意力本体（保留 RoPE 与 v 写入）
-                } else if (nsp == 1) {
-                    // 短上下文：融合版一步到位，省掉 partial 缓冲与 combine
-                    [en setComputePipelineState:g_fpipe[F_ATTN]];
-                    [en setBuffer:g_bq offset:0 atIndex:0];
-                    [en setBuffer:g_bkc offset:0 atIndex:1];
-                    [en setBuffer:g_bvc offset:0 atIndex:2];
-                    [en setBuffer:g_batt offset:0 atIndex:3];
-                    [en setBytes:&coff length:8 atIndex:4];
-                    [en setBytes:&a length:4 atIndex:5];
-                    [en setBytes:&b length:4 atIndex:6];
-                    [en setBytes:&c length:4 atIndex:7];
-                    [en setBytes:&nlen0 length:4 atIndex:8];
-                    [en setBytes:&kvd length:4 atIndex:9];
-                    [en setBytes:&sc length:4 atIndex:10];
-                    [en setBytes:&win length:4 atIndex:11];
-                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
-                                                         (NSUInteger)nrow, 1)
-                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 } else {
-                    [en setComputePipelineState:g_fpipe[F_ATTN_SPLIT]];
-                    [en setBuffer:g_bq offset:0 atIndex:0];
-                    [en setBuffer:g_bkc offset:0 atIndex:1];
-                    [en setBuffer:g_bvc offset:0 atIndex:2];
-                    [en setBuffer:g_bpart offset:0 atIndex:3];
-                    [en setBytes:&coff length:8 atIndex:4];
-                    [en setBytes:&a length:4 atIndex:5];
-                    [en setBytes:&b length:4 atIndex:6];
-                    [en setBytes:&c length:4 atIndex:7];
-                    [en setBytes:&nlen0 length:4 atIndex:8];
-                    [en setBytes:&kvd length:4 atIndex:9];
-                    [en setBytes:&sc length:4 atIndex:10];
-                    [en setBytes:&nsp length:4 atIndex:11];
-                    [en setBytes:&win length:4 atIndex:12];
-                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
-                                                         (NSUInteger)nrow, (NSUInteger)nsp)
-                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    // 多序列模式：每行各派发一次。行号在内核里取 tgid.y，
+                    // 所以把 y 压到 1、把 q/out 按行平移、把 coff 换成该行
+                    // 序列的槽位、nlen0 换成该行的位置即可。
+                    //
+                    // partial 缓冲的行距固定按 kAttnSplits 算（而不是运行时的
+                    // nsp）：kAttnSplits*n_head*(hd+2)*4 在 hd=128 时是 532480
+                    // 字节 = 256 的整数倍，正好满足 setBuffer 的对齐要求，而
+                    // 按 nsp 算会在 nsp=3 这类奇数上踩到非对齐。
+                    const size_t part_row = (size_t)kAttnSplits * (size_t)n_head *
+                                            ((size_t)hd + 2u) * 4u;
+                    const int npass = multi ? nrow : 1;
+                    for (int r = 0; r < npass; r++) {
+                        const uint64_t co = coff + (uint64_t)row_slab(r) * (uint64_t)kv_dim * 2u;
+                        uint32_t nl = multi ? (uint32_t)(row_pos(r) + 1) : nlen0;
+                        const NSUInteger qo = (NSUInteger)((size_t)r * (size_t)q_dim * 4);
+                        const NSUInteger ao = (NSUInteger)((size_t)r * (size_t)q_dim * 4);
+                        const NSUInteger po = (NSUInteger)((size_t)r * part_row);
+                        if (nsp == 1) {
+                            // 短上下文：融合版一步到位，省掉 partial 缓冲与 combine
+                            [en setComputePipelineState:g_fpipe[F_ATTN]];
+                            [en setBuffer:g_bq offset:qo atIndex:0];
+                            [en setBuffer:g_bkc offset:0 atIndex:1];
+                            [en setBuffer:g_bvc offset:0 atIndex:2];
+                            [en setBuffer:g_batt offset:ao atIndex:3];
+                            [en setBytes:&co length:8 atIndex:4];
+                            [en setBytes:&a length:4 atIndex:5];
+                            [en setBytes:&b length:4 atIndex:6];
+                            [en setBytes:&c length:4 atIndex:7];
+                            [en setBytes:&nl length:4 atIndex:8];
+                            [en setBytes:&kvd length:4 atIndex:9];
+                            [en setBytes:&sc length:4 atIndex:10];
+                            [en setBytes:&win length:4 atIndex:11];
+                            [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
+                                                                 (NSUInteger)(multi ? 1 : nrow), 1)
+                                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        } else {
+                            [en setComputePipelineState:g_fpipe[F_ATTN_SPLIT]];
+                            [en setBuffer:g_bq offset:qo atIndex:0];
+                            [en setBuffer:g_bkc offset:0 atIndex:1];
+                            [en setBuffer:g_bvc offset:0 atIndex:2];
+                            [en setBuffer:g_bpart offset:po atIndex:3];
+                            [en setBytes:&co length:8 atIndex:4];
+                            [en setBytes:&a length:4 atIndex:5];
+                            [en setBytes:&b length:4 atIndex:6];
+                            [en setBytes:&c length:4 atIndex:7];
+                            [en setBytes:&nl length:4 atIndex:8];
+                            [en setBytes:&kvd length:4 atIndex:9];
+                            [en setBytes:&sc length:4 atIndex:10];
+                            [en setBytes:&nsp length:4 atIndex:11];
+                            [en setBytes:&win length:4 atIndex:12];
+                            [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
+                                                                 (NSUInteger)(multi ? 1 : nrow),
+                                                                 (NSUInteger)nsp)
+                                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
-                    [en setComputePipelineState:g_fpipe[F_ATTN_COMB]];
-                    [en setBuffer:g_bpart offset:0 atIndex:0];
-                    [en setBuffer:g_batt offset:0 atIndex:1];
-                    [en setBytes:&a length:4 atIndex:2];
-                    [en setBytes:&c length:4 atIndex:3];
-                    [en setBytes:&nsp length:4 atIndex:4];
-                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
-                                                         (NSUInteger)nrow, 1)
-                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                            [en setComputePipelineState:g_fpipe[F_ATTN_COMB]];
+                            [en setBuffer:g_bpart offset:po atIndex:0];
+                            [en setBuffer:g_batt offset:ao atIndex:1];
+                            [en setBytes:&a length:4 atIndex:2];
+                            [en setBytes:&c length:4 atIndex:3];
+                            [en setBytes:&nsp length:4 atIndex:4];
+                            [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
+                                                                 (NSUInteger)(multi ? 1 : nrow), 1)
+                                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        }
+                    }
                 }
             }
 
@@ -1050,9 +1139,15 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         add(g_bx, g_bxb);
     }
 
-    // 只有最后一行需要 logits：先把这一行搬到 xb 的第 0 行，再 norm + out_w。
-    // 省掉 nrow-1 次 out_w —— 它是全模型最大的单个矩阵乘（占权重流量 36%）。
-    {
+    // 单序列/prefill：只有最后一行需要 logits。先把这一行搬到 xb 的第 0 行，
+    // 再 norm + out_w，省掉 nrow-1 次 out_w —— 它是全模型最大的单个矩阵乘
+    // （占权重流量 21%）。
+    //
+    // 多序列：每一行都要 logits（B 个序列各取各的下一个 token），所以
+    // 老老实实对 nrow 行做 out_w。这正是批处理赚的那一笔：权重读一遍，
+    // 出 B 份 logits。
+    const int nlm = multi ? nrow : 1;
+    if (!multi) {
         uint32_t n = (uint32_t)n_embd;
         uint64_t doff = 0;
         uint64_t soff = (uint64_t)(nrow - 1) * (uint64_t)n_embd * sizeof(float);
@@ -1064,10 +1159,13 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         [en setBytes:&n length:4 atIndex:4];
         [en dispatchThreads:MTLSizeMake((NSUInteger)n_embd, 1, 1)
       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        rmsnorm(g_bxb, g_spec.off_out_norm, g_bfinal, 1);
+    } else {
+        rmsnorm(g_bx, g_spec.off_out_norm, g_bfinal, nrow);
     }
-    rmsnorm(g_bxb, g_spec.off_out_norm, g_bfinal, 1);
     if (!skip_lmh)
-        gemm(g_spec.type_out_w, g_bfinal, g_blogits, g_spec.off_out_w, g_spec.n_vocab, n_embd, 1);
+        gemm(g_spec.type_out_w, g_bfinal, g_blogits, g_spec.off_out_w,
+             g_spec.n_vocab, n_embd, nlm);
 
     [en endEncoding];
     const auto t_enc1 = std::chrono::steady_clock::now();
@@ -1107,8 +1205,24 @@ bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* 
         g_fwd_ready = false;
         return false;
     }
-    std::memcpy(logits, [g_blogits contents], sizeof(float) * (size_t)g_spec.n_vocab);
+    std::memcpy(logits, [g_blogits contents],
+                sizeof(float) * (size_t)g_spec.n_vocab * (size_t)nlm);
     return true;
+}
+
+bool fwd_batch(const float* x0, int nrow, int pos0, float* logits, std::string* err) {
+    return fwd_impl(x0, nrow, pos0, 0, 0, nullptr, nullptr, nullptr, logits, err);
+}
+
+bool fwd_batch_at(const float* x0, int nrow, int pos0, uint64_t slab0, uint64_t cslot,
+                  float* logits, std::string* err) {
+    return fwd_impl(x0, nrow, pos0, slab0, cslot, nullptr, nullptr, nullptr, logits, err);
+}
+
+bool fwd_multi(const float* x0, int nrow, const int* rpos, const uint64_t* rslab,
+               const uint64_t* rslot, float* logits, std::string* err) {
+    if (!rpos || !rslab) { if (err) *err = "多序列前向缺少 rpos/rslab"; return false; }
+    return fwd_impl(x0, nrow, 0, 0, 0, rpos, rslab, rslot, logits, err);
 }
 
 bool fwd_token(const float* x0, int pos, float* logits, std::string* err) {
@@ -1127,8 +1241,12 @@ bool fwd_copy_x(float* dst, int n) {
 void fwd_reset_conv() {
     if (!g_fwd_ready || !g_bconvst || g_spec.n_conv <= 0) return;
     const size_t lcache = (size_t)std::max(1, g_spec.conv_l_cache);
-    const size_t bytes = (size_t)g_spec.n_conv * (lcache > 1 ? lcache - 1 : 1) *
-                         (size_t)g_spec.n_embd * sizeof(float);
+    // 必须清**整块**缓冲：多序列模式下槽位下标是 conv_slot*kBatchMax + 序列号，
+    // 会落到 n_conv*(lcache-1)*n_embd 之外。只清前一段的话，被复用的槽位里
+    // 留着上一条序列的卷积历史，输出看着通顺但内容串台 —— 融合校验能抓到，
+    // 但它报的是"rel=0.66"，看不出根因在这儿。
+    const size_t bytes = (size_t)kBatchMax * (size_t)g_spec.n_conv *
+                         (lcache > 1 ? lcache - 1 : 1) * (size_t)g_spec.n_embd * sizeof(float);
     std::memset([g_bconvst contents], 0, bytes);
 }
 

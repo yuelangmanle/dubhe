@@ -167,6 +167,14 @@ $(BUILD)/vlprobe: $(ENGINE_OBJS) $(BUILD)/tools/vlprobe.o
 	$(CXX) $^ -o $@ $(LDFLAGS)
 	@echo "✓ $@"
 
+# 多序列批处理对拍（连续批处理的正确性 + 吞吐）
+$(BUILD)/batchcheck: $(ENGINE_OBJS) $(BUILD)/tools/batchcheck.o
+	$(CXX) $^ -o $@ $(LDFLAGS)
+	@echo "✓ $@"
+
+batchcheck: $(BUILD)/batchcheck
+	./$(BUILD)/batchcheck $(MODEL) 3 8
+
 $(BUILD)/audprobe: $(ENGINE_OBJS) $(BUILD)/tools/audprobe.o
 	$(CXX) $^ -o $@ $(LDFLAGS)
 	@echo "✓ $@"

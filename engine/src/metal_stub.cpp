@@ -32,6 +32,15 @@ bool fwd_batch(const float*, int, int, float*, std::string* err) {
     if (err) *err = "Metal 不可用";
     return false;
 }
+bool fwd_multi(const float*, int, const int*, const uint64_t*, const uint64_t*,
+               float*, std::string* err) {
+    if (err) *err = "Metal 不可用";
+    return false;
+}
+bool fwd_batch_at(const float*, int, int, uint64_t, uint64_t, float*, std::string* err) {
+    if (err) *err = "Metal 不可用";
+    return false;
+}
 int fwd_batch_max() { return 1; }
 void fwd_reset_conv() {}
 bool fwd_copy_x(float*, int) { return false; }
