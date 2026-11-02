@@ -1858,6 +1858,19 @@
       }
       openSheet('选择文件夹', (body) => {
         body.appendChild(el('div', 'desc', '当前：' + d.path));
+        // 两个动作按钮放在列表**上面**。
+        //
+        // 原来放在列表下面，目录一多就被推到折叠线以外 —— 看得见的只有
+        // 右上角那个"完成"，而它只是关闭。用户点了"完成"以为选好了，
+        // 实际什么都没变，回来发现项目文件夹还是旧的。
+        const acts = el('div', 'dirpick-acts');
+        const use = el('button', 'vbtn', '用这个文件夹');
+        use.onclick = () => { closeSheet(); onPick(d.path); };
+        acts.appendChild(use);
+        const dflt = el('button', 'vbtn ghost', '用默认目录');
+        dflt.onclick = () => { closeSheet(); onPick(null); };
+        acts.appendChild(dflt);
+        body.appendChild(acts);
         const card = el('div', 'vcard');
         const mk = (label, onClick, iconName) => {
           const r = el('div', 'vrow tap');
@@ -1873,14 +1886,6 @@
         mk('上一级', () => { cur = d.parent; render(); }, 'arrow-up');
         d.items.filter((i) => i.dir).forEach((i) => mk(i.name + '/', () => { cur = i.path; render(); }));
         body.appendChild(card);
-        const use = el('button', 'vbtn', '用这个文件夹');
-        use.style.marginTop = '12px';
-        use.onclick = () => { closeSheet(); onPick(d.path); };
-        body.appendChild(use);
-        const dflt = el('button', 'vbtn ghost', '用默认目录');
-        dflt.style.marginTop = '8px';
-        dflt.onclick = () => { closeSheet(); onPick(null); };
-        body.appendChild(dflt);
       });
     };
     render();
@@ -1942,7 +1947,11 @@
       // 读域和写域分开。读可以看整个家目录（模型权重就在 ~/.dubhe 下），
       // 但写默认只落在当前项目文件夹里 —— 这是 Codex / DeepSeek Harness 的
       // workspace-write 语义，也是把文件夹绑成项目之后最符合直觉的边界。
-      toggle(body, '写到项目外', '打开后允许写到项目文件夹以外的位置（默认只写项目内）。',
+      //
+      // 关着不等于"写不了"：越界的那一次会在对话里弹审批卡，用户点允许
+      // 才写。所以这里的开关是"要不要每次都问"，不是"允不允许"—— 说明
+      // 文字必须这么写，否则用户会以为关掉之后模型彻底写不了外面。
+      toggle(body, '写到项目外', '关着时，越界的写入会先问你一次（允许只对那一次有效）；打开后不再问。',
         () => srv().write_outside === true, (v) => setPerm('write_outside', v));
       toggle(body, '联网', '允许 web_search 搜索、fetch_url 抓网页。',
         () => !!srv().net, (v) => setPerm('net', v));

@@ -954,6 +954,10 @@ pre:hover .copy-code { opacity: 1; }
  * 用 tertiary 而不是 amber —— 它不是警告，是交代。 */
 .tool-note { margin-top: 6px; font-size: 10.5px; color: var(--tertiary); line-height: 1.4; }
 
+/* 选文件夹的两个动作。放在列表上面，目录再长也不会被推到折叠线以外。 */
+.dirpick-acts { display: flex; gap: 8px; margin: 10px 0 12px; }
+.dirpick-acts .vbtn { margin: 0; flex: 0 0 auto; }
+
 /* diff 卡片：旧段和新段分开染。不用整块红绿底 —— 大色块会盖掉文字，
  * 只给左边一条竖线和很淡的底色，够区分就行。 */
 .tool-diff { margin-top: 7px; display: grid; gap: 2px; }
