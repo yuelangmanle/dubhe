@@ -3338,6 +3338,10 @@ int main(int argc, char** argv) {
         const bool allow = body.flag("allow", false);
         {
             std::lock_guard<std::mutex> lk(g.ask_mu);
+            // 没人认领的授权会一直留在这张表里（chat 那条路等完就删，但
+            // /api/tools/run 拿到 id 之后可能再也不来第二次）。id 是单调
+            // 递增的 ask<N>，std::map 按字典序排，超了就从最小的删起。
+            while (g.ask_result.size() > 64) g.ask_result.erase(g.ask_result.begin());
             g.ask_result[id] = allow ? 1 : 2;
         }
         g.ask_cv.notify_all();
@@ -3388,7 +3392,48 @@ int main(int argc, char** argv) {
         // 路径与权限一律交给 gate()。这里原来还有一段自己的 path_allowed 检查，
         // 结果是同一个越界路径在两条路上返回两种错误形状 —— 模型看到的和手测
         // 看到的不是一回事，排查时最容易把人带偏。
-        const ToolResult r = run_tool(name, args);
+        //
+        // 门禁说"要问一次"的时候，这个接口不能只说一句"需要确认后才能执行"
+        // 就收摊：调用方（curl、脚本、第三方客户端）没有任何地方能点"允许"，
+        // 这条路走到一半就断了。给它一个能接上的闭环：
+        //   1) 本次**不执行**，返回 need_approval + ask.id
+        //   2) POST /api/approve {id, allow:true}
+        //   3) 带 "approve":"<id>" 再调一次，这一次真的执行
+        // 一次授权只对一次调用有效 —— 消费掉就删，不给"批准一次、反复用"。
+        bool approved = false;
+        {
+            const GateOut gt = gate(name, args, false);
+            if (gt.v == Verdict::Ask) {
+                const json::Value* av = body.get("approve");
+                const std::string aid =
+                    (av && av->type == json::Value::STR) ? av->str : std::string();
+                if (!aid.empty()) {
+                    std::lock_guard<std::mutex> lk(g.ask_mu);
+                    auto it = g.ask_result.find(aid);
+                    if (it != g.ask_result.end()) {
+                        approved = (it->second == 1);
+                        g.ask_result.erase(it);
+                    }
+                }
+                if (!approved) {
+                    const std::string nid = "ask" + std::to_string(++g.ask_seq);
+                    json::Value ask = json::Value::make_obj();
+                    ask.set("id", json::Value::make_str(nid));
+                    ask.set("name", json::Value::make_str(name));
+                    ask.set("detail", json::Value::make_str(gt.detail));
+                    ask.set("reason", json::Value::make_str(gt.reason));
+                    json::Value o = json::Value::make_obj();
+                    o.set("ok", json::Value::make_bool(false));
+                    o.set("need_approval", json::Value::make_bool(true));
+                    o.set("ask", ask);
+                    o.set("output", json::Value::make_str(
+                        "这次调用需要用户确认，还没有执行。确认后带上 approve 再调一次。"));
+                    c.send(200, "application/json", json::dump(o));
+                    return;
+                }
+            }
+        }
+        const ToolResult r = run_tool(name, args, approved);
         json::Value o = json::Value::make_obj();
         o.set("ok", json::Value::make_bool(r.ok));
         o.set("denied", json::Value::make_bool(r.denied));
