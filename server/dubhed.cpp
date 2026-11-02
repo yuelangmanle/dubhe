@@ -3778,7 +3778,7 @@ int main(int argc, char** argv) {
             return;
         }
         const bool stream = body.flag("stream", false);
-        const bool with_tools = body.get("tools") != nullptr || body.flag("dubhe_tools", false);
+        bool with_tools = body.get("tools") != nullptr || body.flag("dubhe_tools", false);
 
         // ---- 串行化：整条请求（含多模态编码和工具两轮）放进同一把锁
         //
@@ -3946,6 +3946,10 @@ int main(int argc, char** argv) {
             std::vector<int32_t> cur = toks;
             std::string last_sig;      // 上一次执行的工具签名，用来发现原地打转
             const char* finish = "stop";
+            // 每一轮都从 msgs 出发重新拼（工具结果追加到副本上），所以它必须
+            // 活到下一轮 —— 轮次用完时要用"上一轮那份含工具结果的对话"去开
+            // 最后一个回答轮。
+            json::Value msgs2 = *msgs;
             // 这一轮喂进去的是哪段 prompt（前缀缓存的代号）。生成完要拿它
             // 把"新吐出来的字和 token"接到缓存尾巴上。
             uint64_t pcid = g_pcache.current_id();
@@ -4015,9 +4019,34 @@ int main(int argc, char** argv) {
                     break;
                 }
                 if (rounds >= max_rounds) {
-                    // 到顶了模型还在要工具。把原始 JSON 摆给用户没有意义 ——
-                    // 他看不懂，也做不了什么，只能以为程序坏了。说清楚发生了什么，
-                    // 已经拿到的工具结果还留在上面的卡片里。
+                    // 轮次用完了，模型还在要工具。
+                    //
+                    // 直接说一句"已达上限"最省事，但用户拿到的是**没有结论**
+                    // 的回答：目录列了、文件读了，就是不告诉你结果。实测
+                    // "先列 docs 再读 README 前五行"正好两轮用光，最后吐出一段
+                    // 裸 <tool_call>，用户什么也没得到。
+                    //
+                    // 所以再开一轮**不带工具说明**的生成：把上一轮那份含工具
+                    // 结果的对话原样摆回去，末尾补一句"工具次数用完了，直接用
+                    // 上面的结果回答"。这一轮的 prompt 前缀和上一轮完全一致，
+                    // 只是尾巴多了一句，KV 前缀缓存还能接上，代价很小。
+                    json::Value fin = msgs2;
+                    json::Value note = json::Value::make_obj();
+                    note.set("role", json::Value::make_str("user"));
+                    note.set("content", json::Value::make_str(
+                        "工具调用次数已经用完。不要再调用任何工具，"
+                        "直接用上面拿到的结果回答问题；拿不到的部分就说没拿到。"));
+                    fin.arr.push_back(note);
+                    std::vector<int32_t> t3;
+                    std::string e3;
+                    if (build_tokens(g.engine, fin, chatml, false, force_raw, &t3, &mcache, &e3) &&
+                        !t3.empty()) {
+                        cur = std::move(t3);
+                        with_tools = false;   // 下一轮不再找 tool_call，也不再抑制
+                        pcid = g_pcache.current_id();
+                        continue;
+                    }
+                    // 连这一步都拼不出来（上下文放不下），只能如实说停在哪。
                     emit_delta(&ctx, "（模型反复请求调用工具 " + tname + "，已达 " +
                                          std::to_string(max_rounds) +
                                          " 轮上限，已停止。可以换个问法再试。）");
@@ -4147,7 +4176,7 @@ int main(int argc, char** argv) {
                 json::Value call = json::Value::make_obj();
                 call.set("name", json::Value::make_str(tname));
                 call.set("arguments", targs);
-                json::Value msgs2 = *msgs;
+                msgs2 = *msgs;
                 json::Value am = json::Value::make_obj();
                 am.set("role", json::Value::make_str("assistant"));
                 std::string call_text;
