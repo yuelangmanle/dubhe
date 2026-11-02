@@ -142,6 +142,13 @@ public:
 
     bool broken() const { return broken_; }
 
+    // 响应头是不是已经发出去了。
+    //
+    // 排队等锁时我们会**先**发 SSE 头（否则客户端在排队期间一个字节都收不到，
+    // 界面上和卡死一样）。此后任何提前失败都不能再走 send() —— 它看到
+    // sent_header_ 就直接返回，客户端拿到一条空流，比报错更难查。
+    bool header_sent() const { return sent_header_; }
+
     // 对端还在不在。
     //
     // broken_ 只有"写失败"才会置位。可流式生成里最要命的一种情况是

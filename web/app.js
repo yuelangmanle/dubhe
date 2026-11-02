@@ -742,13 +742,22 @@
       }
       col.appendChild(st);
     } else if (m.streaming) {
-      st.appendChild(el('span', '', '生成中…'));
+      // 排队和生成是两件事：引擎一次只答一个，第二个请求在服务端等锁。
+      // 两种情况都不出字，但用户该知道"在等别人"还是"在算我的"。
+      st.appendChild(el('span', '', m.queued ? '排队中…' : '生成中…'));
       col.appendChild(st);
     }
 
     const body = el('div', 'body');
     body.innerHTML = bodyHtml(m.content, m.tools && m.tools.length);
     col.appendChild(body);
+
+    // 服务端在流里报的错。不显示出来的话，这一轮就是一个永远转着
+    // "生成中…"、一个字都没有的空气泡 —— 比报错难查得多。
+    if (m.errText) {
+      const e = el('div', 'fake-tool', '⚠️ ' + m.errText);
+      col.insertBefore(e, body);
+    }
 
     // 模型编造工具结果。
     //
@@ -956,12 +965,21 @@
   // 拿它当标签等于说这个模型是 Q6_K，和实际主体差两档。
   // 顶栏胶囊和右栏模型信息共用这一个函数，两处不能各写一套。
   function quantLabel(s) {
-    const qm = /(IQ\d[_A-Z0-9]*|Q\d[_A-Z0-9]*|BF16|F16|F32)/.exec((s && s.model_id) || '');
+    const mid = (s && s.model_id) || '';
+    // 先认量化档，再认"未量化"。
+    //
+    // 未量化的写法大小写不定：LFM3 那份叫 -F16，HuggingFace 官方的 qwen 叫
+    // -fp16（而且 "FP16" 里没有连续的 "F16"，是 F、P、1、6）。所以这两类
+    // 分开匹配：量化档保持大小写敏感（带 i 会让 "qwen2.5" 里的 q2 被当成
+    // 量化标记），未量化的那一组忽略大小写。
+    const qm = /(IQ\d[_A-Z0-9]*|Q\d[_A-Z0-9]*)/.exec(mid);
     if (qm) return qm[1];
+    const uq = /(BF16|FP16|F16|FP32|F32)/i.exec(mid);
+    if (uq) return uq[1].toUpperCase();
     // model_id 里没有量化标记时退回 quant 串：跳过 F32/F16 这类"未量化"的边角层，
     // 取第一个真正的量化块。全都未量化才显示 F32。
     const parts = (((s && s.info && s.info.quant) || '')).split('+').filter(Boolean);
-    return parts.find((x) => !/^(F32|F16|BF16)$/.test(x)) || parts[0] || '';
+    return parts.find((x) => !/^(F32|F16|FP32|FP16|BF16)$/.test(x)) || parts[0] || '';
   }
 
   function renderHead(s) {
@@ -1699,6 +1717,21 @@
               ai.tools.push({ name: j.dubhe.name, args: j.dubhe.arguments, ok: true, t0: performance.now() });
               log('Tool call: ' + j.dubhe.name);
               renderTools();
+            } else if (j.dubhe.type === 'queued') {
+              // 引擎一次只答一个，第二个请求在服务端排队。排队时它一个字节都
+              // 还没发，界面和"卡死"长得一模一样 —— 所以服务端会先推这个事件，
+              // 这里把状态行改成"排队中"，让用户知道是等别人，不是坏了。
+              ai.queued = true;
+              log('引擎正在回答另一个请求，已排队');
+              reswap();
+            } else if (j.dubhe.type === 'error') {
+              // 服务端在流里报的错。原来前端只认 tool_* 三种事件，这类消息
+              // 直接被丢掉 —— 表现是气泡永远"生成中…"，正文一个字都没有。
+              ai.errText = j.dubhe.message || '生成失败';
+              log('生成失败：' + ai.errText, 'err');
+              reswap();
+            } else if (j.dubhe.type === 'note') {
+              log(j.dubhe.message || '');
             } else if (j.dubhe.type === 'tool_ask') {
               // 需要用户点头的调用。卡片上两个按钮，点完 POST /api/approve。
               // 服务端在等（最多 90 秒），所以这张卡必须显眼、必须可点。
@@ -1758,6 +1791,9 @@
               state.gen.ttft = (tFirst - t0) / 1000;
               log('First token in ' + state.gen.ttft.toFixed(2) + ' s');
             }
+            // 排到队了：把状态行从"排队中"换回"生成中"。只在这一帧重画一次，
+            // 不能每来一个 token 都 reswap —— 那等于把整块 DOM 每秒重建几十次。
+            if (ai.queued) { ai.queued = false; reswap(); }
             ai.content += delta.content;
             paint();
             // 生成中每 12 帧刷一次仪表，别让 DOM 写操作拖慢解码
@@ -1785,6 +1821,7 @@
       state.streaming = false;
       state.abort = null;
       ai.streaming = false;
+      delete ai.queued;   // 状态行用的临时标记，不该跟着会话存下去
       setSendEnabled(true);
       const total = (performance.now() - t0) / 1000;
       const tokens = (ai.meta && ai.meta.tokens) || state.gen.tokens || 0;
@@ -1812,7 +1849,9 @@
       body = node.querySelector('.body');
       body.classList.remove('typing');
       // "已完成 · 0 tokens"的空气泡比报错更让人困惑：真空了就直说。
-      if (!String(ai.content || '').trim() && !(ai.tools && ai.tools.length)) {
+      // 已经有 errText 的时候不要盖掉 —— 那才是真正的原因，"模型直接收尾了"
+      // 会把用户引到错误的方向。
+      if (!String(ai.content || '').trim() && !(ai.tools && ai.tools.length) && !ai.errText) {
         ai.content = '（这一轮没有任何输出。可能是上下文放不下，或者模型直接收尾了，换个问法再试。）';
         const nn = messageNode(ai);
         node.replaceWith(nn);

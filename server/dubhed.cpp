@@ -48,6 +48,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -2638,13 +2639,18 @@ void scan_models(const std::string& dir, std::vector<ModelEntry>* out, int depth
 
 // 从文件名猜量化类型。顺序要紧：长的先匹配，"Q4_K_M" 必须排在 "Q4_0" 前面，
 // 否则 Q4_K_M 会被识别成 Q4_0。
+//
+// FP16 / FP32 也要排在 F16 / F32 前面：HuggingFace 官方仓库的文件名是
+// "qwen2.5-0.5b-instruct-fp16.gguf"，而 "FP16" 里并不含连续的 "F16"
+// （是 F、P、1、6），只认 F16 的话这份文件会被判成"未知格式"。
 std::string guess_quant(const std::string& n) {
     std::string u = n;
     for (auto& c : u) c = (char)std::toupper((unsigned char)c);
     static const char* kQ[] = {"IQ4_XS", "IQ4_NL", "IQ3_M",  "IQ2_XS", "IQ2_M", "Q8_K",
                                "Q8_0",   "Q6_K",   "Q5_K_M", "Q5_K_S", "Q5_1",  "Q5_0",
                                "Q4_K_M", "Q4_K_S", "Q4_1",   "Q4_0",   "Q3_K_L", "Q3_K_M",
-                               "Q3_K_S", "Q2_K",   "BF16",   "F16",    "F32"};
+                               "Q3_K_S", "Q2_K",   "BF16",   "FP16",   "FP32",   "F16",
+                               "F32"};
     for (const char* q : kQ)
         if (u.find(q) != std::string::npos) return q;
     return "";
@@ -3775,12 +3781,58 @@ int main(int argc, char** argv) {
         std::unique_lock<std::mutex> gen_lk(g.mu, std::defer_lock);
         if (!gen_lk.try_lock()) {
             std::fprintf(stderr, "[dubhed] 生成中，请求排队等待…\n");
-            gen_lk.lock();
+            // 排队期间不能一声不吭。
+            //
+            // 本地单机场景下"等一下再答"比"直接失败"符合直觉，但排队时客户端
+            // 收到的第一个字节还没有 —— 界面上和"卡死"完全一样，用户会以为
+            // 坏了，去点停止、刷新、甚至重启服务。所以先把 SSE 头发出去，再发
+            // 一个 queued 事件，界面就有话可说。
+            if (stream) {
+                c.begin_stream();
+                c.write_chunk("data: {\"dubhe\":{\"type\":\"queued\"}}\n\n");
+            }
+            // 分片等锁，而不是 lock() 一次等到底：
+            //   1) 每片看一眼对端还在不在 —— 排队时关掉页面的人，不该在轮到
+            //      它之后还让引擎跑一遍没人看的结果；
+            //   2) 每 5 秒发一个 SSE 注释心跳，免得中间的代理或浏览器把这条
+            //      一直没数据的连接掐掉。
+            auto last_ping = std::chrono::steady_clock::now();
+            for (;;) {
+                if (gen_lk.try_lock()) break;
+                if (c.peer_gone()) {
+                    std::fprintf(stderr, "[dubhed] 排队中客户端已断开，放弃\n");
+                    c.end_stream();
+                    return;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (stream && now - last_ping > std::chrono::seconds(5)) {
+                    last_ping = now;
+                    c.write_chunk(": keep-alive\n\n");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            }
         }
         g.busy = true;
         struct BusyGuard {
             ~BusyGuard() { g.busy = false; }
         } busy_guard;
+
+        // 提前失败的统一出口。
+        //
+        // 排队那条路上头已经发出去了（见上），此时 c.send(400) 会因为
+        // sent_header_ 直接返回，客户端拿到一条空流 —— 比报错还难查。
+        auto fail = [&](const std::string& msg) {
+            if (c.header_sent()) {
+                c.write_chunk("data: {\"dubhe\":{\"type\":\"error\",\"message\":" +
+                              json_escape(msg) + "}}\n\n");
+                c.write_chunk("data: [DONE]\n\n");
+                c.end_stream();
+            } else {
+                c.send(400, "application/json",
+                       "{\"error\":{\"message\":" + json_escape(msg) +
+                           ",\"type\":\"invalid_request_error\"}}");
+            }
+        };
 
         // 请求级工作目录。
         //
@@ -3826,9 +3878,7 @@ int main(int argc, char** argv) {
         std::string berr;
         const bool force_raw = body.flag("dubhe_raw", false);
         if (!build_tokens(g.engine, *msgs, chatml, with_tools, force_raw, &toks, &mcache, &berr)) {
-            c.send(400, "application/json",
-                   "{\"error\":{\"message\":" + json_escape(berr) +
-                       ",\"type\":\"invalid_request_error\"}}");
+            fail(berr);
             return;
         }
         const int32_t n = (int32_t)toks.size();
@@ -3838,12 +3888,9 @@ int main(int argc, char** argv) {
         dubhe_model_info lim{};
         dubhe_model_info_get(g.engine, &lim);
         if (lim.n_ctx_limit > 0 && n >= lim.n_ctx_limit) {
-            c.send(400, "application/json",
-                   "{\"error\":{\"message\":" +
-                       json_escape("输入太长：" + std::to_string(n) + " tokens，超过当前上下文上限 " +
-                                   std::to_string(lim.n_ctx_limit) +
-                                   "。请缩短问题、清空历史，或换一个上下文更长的模型。") +
-                       ",\"type\":\"invalid_request_error\"}}");
+            fail("输入太长：" + std::to_string(n) + " tokens，超过当前上下文上限 " +
+                 std::to_string(lim.n_ctx_limit) +
+                 "。请缩短问题、清空历史，或换一个上下文更长的模型。");
             return;
         }
 
