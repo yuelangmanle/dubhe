@@ -50,12 +50,21 @@ STAT_RE = re.compile(
 
 
 def run_dubhe(spec: str, prompt: str, n: int) -> dict:
-    """spec = 标签=二进制路径[:模型路径]"""
+    """spec = 标签=二进制路径[:模型路径[:K=V,K2=V2]]
+
+    第四段是给这一边单独设的环境变量。同二进制、不同开关的对比（比如
+    DUBHE_ATTN_WRAP 这类诊断开关）就靠它，不然只能改代码编两份。
+    """
     label, _, rest = spec.partition("=")
-    binary, _, model = rest.partition(":")
+    binary, _, tail = rest.partition(":")
+    model, _, envstr = tail.partition(":")
+    env = dict(os.environ)
+    for kv in filter(None, envstr.split(",")):
+        k, _, v = kv.partition("=")
+        env[k.strip()] = v.strip()
     cmd = [str(Path(binary).expanduser()), "run", "-m", str(Path(model).expanduser()),
            "-p", prompt, "--raw", "-n", str(n), "--temp", "0", "--stats"]
-    p = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    p = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
     out = p.stdout + p.stderr
     m = STAT_RE.search(out)
     if not m:

@@ -580,6 +580,20 @@ bool fwd_grow_kv(int new_cap, std::string* err) {
     return true;
 }
 
+// 诊断开关：DUBHE_ATTN_WRAP=N 让注意力把回看的 KV 位置按位与回绕到 N 个槽位。
+// 指令数、访存次数、dispatch 形状全部不变，只有工作集从几十 MB 缩到几 KB。
+// 用来回答一个决定路线的问题：长上下文 decode 是被**带宽**卡住，还是被
+// **指令数**卡住？前者值得做 Q8 KV，后者只能上 MMA。结果错误，只用于计时。
+static const uint32_t g_attn_wrap = []() -> uint32_t {
+    const char* s = getenv("DUBHE_ATTN_WRAP");
+    if (!s) return 0u;
+    const int v = atoi(s);
+    if (v <= 0) return 0u;
+    uint32_t n = 1;
+    while (n < (uint32_t)v) n <<= 1;
+    return n - 1;                       // 传 mask：内核里用 t & kvwrap
+}();
+
 // x0: [nrow][n_embd] 已反量化的 embedding；pos0: 首行在序列中的位置。
 //
 // rpos/rslab/rslot 非空时进入**多序列模式**：第 r 行属于一个独立的序列，
@@ -1091,6 +1105,8 @@ static bool fwd_impl(const float* x0, int nrow, int pos0, uint64_t slab0, uint64
                             [en setBytes:&kvd length:4 atIndex:9];
                             [en setBytes:&sc length:4 atIndex:10];
                             [en setBytes:&win length:4 atIndex:11];
+                            uint32_t wrapv = g_attn_wrap;
+                            [en setBytes:&wrapv length:4 atIndex:12];
                             [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
                                                                  (NSUInteger)(multi ? 1 : nrow), 1)
                                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -1109,6 +1125,8 @@ static bool fwd_impl(const float* x0, int nrow, int pos0, uint64_t slab0, uint64
                             [en setBytes:&sc length:4 atIndex:10];
                             [en setBytes:&nsp length:4 atIndex:11];
                             [en setBytes:&win length:4 atIndex:12];
+                            uint32_t wrapv = g_attn_wrap;
+                            [en setBytes:&wrapv length:4 atIndex:13];
                             [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_head + 3) / 4),
                                                                  (NSUInteger)(multi ? 1 : nrow),
                                                                  (NSUInteger)nsp)

@@ -980,6 +980,15 @@
 
       <div class="live" id="liveBadge"><i></i><span>未连接</span></div>
 
+      <!-- 项目文件夹：本对话的工具以它为根。点一下可以换。
+           做成常驻可见的小胶囊而不是藏进设置，是因为"模型读的到底是
+           哪个目录"这件事必须一眼可见 —— 否则它读到别的项目的文件，
+           用户只会觉得模型在胡说。 -->
+      <button id="cwdChip" class="cwd-chip" title="本对话的项目文件夹">
+        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-folder"/></svg>
+        <span id="cwdName">未绑定</span>
+      </button>
+
       <div class="chat-actions">
         <button id="toggleInspector" class="icon-btn" title="运行状态" aria-label="运行状态">
           <svg class="i" viewBox="0 0 24 24"><use href="#i-split"/></svg>

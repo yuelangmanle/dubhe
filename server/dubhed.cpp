@@ -24,11 +24,14 @@
 
 #include <ifaddrs.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -59,7 +62,22 @@ struct AppState {
     std::string lan_url;      // 局域网可访问的 base url
     std::string mmproj_path;  // 视觉/语音塔；空表示不支持多模态
     std::string tmp_dir;      // 多模态请求的落地目录
-    bool allow_shell = false;
+    // ---- 权限位
+    //
+    // 这几项以前只有"启动参数决定、之后就定死"这一种形态。用户想开终端
+    // 就得重启进程、还得记住 --allow-shell 这个只有源码里才知道的名字 ——
+    // 实际上等于没有权限设置。现在它们可以在运行期从 UI 改，改完立刻生效。
+    //
+    // 默认值改了：shell / net 默认**开**。理由是这是个本机单用户工具，
+    // "模型说我没有执行命令的权限、而界面上又找不到地方能开"是用户实际
+    // 报上来的问题；真正的风险由 sandbox 兜（写盘只允许落在工作区与 /tmp，
+    // 命令有超时和输出上限）。要收紧就在设置里关掉，或者启动时用
+    // --no-shell / --no-net 强制关。
+    bool allow_shell = true;    // 执行 shell 命令
+    bool allow_write = true;    // 写文件 / 改文件
+    bool allow_net = true;      // 联网（web_search / fetch_url）
+    bool sandbox = true;        // shell 用 seatbelt 限制写盘范围
+    int  shell_timeout_ms = 20000;
     std::mutex mu;
     std::atomic<bool> busy{false};
     long long total_requests = 0;
@@ -551,6 +569,342 @@ struct ToolResult {
     std::string output;
 };
 
+// ---------------------------------------------------------------- 进程执行
+//
+// 为什么不用 popen：popen 没有超时、没有 cwd、拿不到退出码，而且命令是交给
+// /bin/sh 在**当前进程的会话**里跑的 —— 模型写一个 `sleep 600` 就把整个
+// 请求挂死，写一个 `rm -rf` 就直接删用户文件，中间没有任何一道闸。
+//
+// 这里改成 fork + setpgid + 非阻塞读 + 截止时间：超时整组 kill，输出超过
+// 上限就截断并标注。进程组是关键 —— 只 kill 子进程的话，`sh -c "a | b"`
+// 里被管道拉起来的 b 会活下来，继续往管道里写，读端永远等不到 EOF。
+
+std::string home_dir() {
+    const char* h = getenv("HOME");
+    return h ? std::string(h) : std::string("/");
+}
+
+// 单引号包裹：shell 里单引号内没有任何元字符，唯一要处理的是单引号本身。
+// 模型生成的命令里出现 `$(...)`、反引号、分号的概率很高，直接拼进去就是
+// 命令注入 —— 这里的调用方本来就打算执行任意命令，但**不该**在执行前
+// 被意外展开一次（比如命令里带 $PATH 会被服务端的环境替换掉）。
+std::string shell_quote(const std::string& s) {
+    std::string o = "'";
+    for (char c : s) {
+        if (c == '\'') o += "'\\''";
+        else o += c;
+    }
+    o += "'";
+    return o;
+}
+
+
+struct ProcOut {
+    int  exit_code = -1;
+    bool timed_out = false;
+    bool truncated = false;
+    std::string out;
+};
+
+ProcOut run_proc(const std::string& cmd, const std::string& cwd,
+                 int timeout_ms, size_t max_bytes, bool sandbox_writes) {
+    ProcOut r;
+    int fds[2];
+    if (pipe(fds) != 0) { r.out = "无法创建管道"; return r; }
+
+    // 沙箱：只允许写工作区与临时目录。
+    //
+    // sandbox-exec 在 macOS 上早已标记废弃，但它是系统自带的、唯一不需要
+    // 额外安装的写盘隔离手段。deny default 太脆（连 dylib 都读不到），
+    // 所以这里保留全盘可读、只收紧写 —— 对"模型把用户文件改坏"这一类
+    // 事故是有效的，对"模型读到敏感文件"无效。想连读也收紧就自己改 profile。
+    std::string wrapped = cmd;
+    if (sandbox_writes) {
+        char tmpl[] = "/tmp/dubhe-sb-XXXXXX";
+        const int fd = mkstemp(tmpl);
+        if (fd >= 0) {
+            const std::string prof =
+                "(version 1)\n(allow default)\n"
+                "(deny file-write*)\n"
+                "(allow file-write* (subpath \"" + g.workspace + "\"))\n"
+                "(allow file-write* (subpath \"" + (g.tmp_dir.empty() ? "/tmp" : g.tmp_dir) + "\"))\n"
+                "(allow file-write* (subpath \"/private/tmp\"))\n"
+                "(allow file-write* (subpath \"/private/var/folders\"))\n";
+            if (write(fd, prof.data(), prof.size()) == (ssize_t)prof.size()) {
+                close(fd);
+                wrapped = "/usr/bin/sandbox-exec -f " + std::string(tmpl) + " /bin/sh -c " +
+                          shell_quote(cmd);
+            } else {
+                close(fd);
+                unlink(tmpl);
+                wrapped = "/bin/sh -c " + shell_quote(cmd);
+            }
+        } else {
+            wrapped = "/bin/sh -c " + shell_quote(cmd);
+        }
+    } else {
+        wrapped = "/bin/sh -c " + shell_quote(cmd);
+    }
+
+    // 环境变量只留必要的。把服务端进程的全部环境（包括 --api-key、各种
+    // token）交给模型生成的命令，等于把密钥交给一段自己看不懂的文本。
+    // 这些必须在 fork 之前拼好 —— 子进程里不能分配内存（见下面 execve 处）。
+    const std::string home = home_dir();
+    std::vector<std::string> envs = {
+        "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG=en_US.UTF-8",
+        "TERM=dumb",
+        "DUBHE_SANDBOXED=1",
+    };
+    if (!home.empty()) envs.push_back("HOME=" + home);
+    std::vector<char*> sh_argv;
+    sh_argv.push_back(const_cast<char*>("/bin/sh"));
+    sh_argv.push_back(const_cast<char*>("-c"));
+    sh_argv.push_back(const_cast<char*>(wrapped.c_str()));
+    sh_argv.push_back(nullptr);
+    std::vector<char*> envp;
+    envp.reserve(envs.size() + 1);
+    for (auto& e : envs) envp.push_back(const_cast<char*>(e.c_str()));
+    envp.push_back(nullptr);
+
+    const pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); r.out = "fork 失败"; return r; }
+    if (pid == 0) {
+        // 子进程：独立进程组，方便整组回收
+        setpgid(0, 0);
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        dup2(fds[1], STDERR_FILENO);   // 错误也要能看到，否则失败信息全丢
+        close(fds[1]);
+        if (!cwd.empty()) { if (chdir(cwd.c_str()) != 0) { /* 落回继承的 cwd */ } }
+        // 注意：fork 之后**不能**再做堆分配。这是个多线程服务，别的线程
+        // 可能正握着 malloc 的锁，子进程一分配就会永久卡住。所以环境数组
+        // 在 fork 之前就拼好（见上面的 envs/envp）。
+        execve("/bin/sh", sh_argv.data(), envp.data());
+        _exit(127);
+    }
+
+    setpgid(pid, pid);   // 与子进程里的 setpgid 双写，避免竞态
+    close(fds[1]);
+    fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK);
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 20000);
+    char buf[8192];
+    bool eof = false, killed = false;
+    int status = 0;
+    while (true) {
+        while (!eof) {
+            const ssize_t n = read(fds[0], buf, sizeof(buf));
+            if (n > 0) {
+                if (r.out.size() < max_bytes) {
+                    const size_t room = max_bytes - r.out.size();
+                    r.out.append(buf, (size_t)std::min((size_t)n, room));
+                    if ((size_t)n > room) r.truncated = true;
+                } else {
+                    r.truncated = true;
+                }
+                continue;
+            }
+            if (n == 0) { eof = true; break; }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            eof = true;   // EINTR 之类，当作结束
+            break;
+        }
+        const pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w == pid) break;
+        if (!killed && std::chrono::steady_clock::now() > deadline) {
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+            killed = true;
+            r.timed_out = true;
+        }
+        struct timespec ts { 0, 2 * 1000 * 1000 };   // 2ms
+        nanosleep(&ts, nullptr);
+    }
+    // 把管道里剩下的读干净（进程已退出，这里不会阻塞太久）
+    while (true) {
+        const ssize_t n = read(fds[0], buf, sizeof(buf));
+        if (n <= 0) break;
+        if (r.out.size() < max_bytes) {
+            const size_t room = max_bytes - r.out.size();
+            r.out.append(buf, (size_t)std::min((size_t)n, room));
+            if ((size_t)n > room) r.truncated = true;
+        } else { r.truncated = true; }
+    }
+    close(fds[0]);
+    if (WIFEXITED(status)) r.exit_code = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status)) r.exit_code = 128 + WTERMSIG(status);
+    if (sandbox_writes) { /* 临时 profile 由系统回收，/tmp 下的残留无害 */ }
+    return r;
+}
+
+// ---------------------------------------------------------------- HTML → 文本
+//
+// 抓网页给模型看，不能把原始 HTML 直接塞进去：一个普通的新闻页有 200 KB
+// 标签、5 KB 正文，全塞进去既超上下文又全是噪声。这里做最小可用的抽取：
+// 去掉 script/style/注释，块级标签转换行，其余标签删掉，实体还原。
+std::string html_unescape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] != '&') { o += s[i]; continue; }
+        const size_t sc = s.find(';', i);
+        if (sc == std::string::npos || sc - i > 8) { o += s[i]; continue; }
+        const std::string e = s.substr(i + 1, sc - i - 1);
+        if (e == "amp") o += '&';
+        else if (e == "lt") o += '<';
+        else if (e == "gt") o += '>';
+        else if (e == "quot") o += '"';
+        else if (e == "apos" || e == "#39") o += '\'';
+        else if (e == "nbsp") o += ' ';
+        else if (!e.empty() && e[0] == '#') {
+            const long cp = (e.size() > 1 && (e[1] == 'x' || e[1] == 'X'))
+                                ? strtol(e.c_str() + 2, nullptr, 16)
+                                : strtol(e.c_str() + 1, nullptr, 10);
+            // UTF-8 编码一个码点
+            if (cp > 0 && cp < 0x80) o += (char)cp;
+            else if (cp >= 0x80 && cp < 0x800) {
+                o += (char)(0xC0 | (cp >> 6));
+                o += (char)(0x80 | (cp & 0x3F));
+            } else if (cp >= 0x800 && cp < 0x10000) {
+                o += (char)(0xE0 | (cp >> 12));
+                o += (char)(0x80 | ((cp >> 6) & 0x3F));
+                o += (char)(0x80 | (cp & 0x3F));
+            } else if (cp >= 0x10000 && cp < 0x110000) {
+                o += (char)(0xF0 | (cp >> 18));
+                o += (char)(0x80 | ((cp >> 12) & 0x3F));
+                o += (char)(0x80 | ((cp >> 6) & 0x3F));
+                o += (char)(0x80 | (cp & 0x3F));
+            } else o += '?';
+        } else { o += s[i]; continue; }
+        i = sc;
+    }
+    return o;
+}
+
+std::string html_to_text(const std::string& html) {
+    std::string s = html;
+    // 丢掉不可能含正文的整段
+    auto drop_block = [&](const char* open, const char* close) {
+        for (;;) {
+            const size_t a = s.find(open);
+            if (a == std::string::npos) break;
+            const size_t b = s.find(close, a);
+            if (b == std::string::npos) { s.erase(a); break; }
+            s.erase(a, b + std::strlen(close) - a);
+        }
+    };
+    drop_block("<script", "</script>");
+    drop_block("<style", "</style>");
+    drop_block("<!--", "-->");
+    drop_block("<svg", "</svg>");
+
+    std::string o;
+    o.reserve(s.size() / 2);
+    bool in_tag = false;
+    for (size_t i = 0; i < s.size(); i++) {
+        const char c = s[i];
+        if (in_tag) {
+            if (c == '>') in_tag = false;
+            continue;
+        }
+        if (c == '<') {
+            // 块级标签留一个换行，否则整页会挤成一行
+            const char* blocks[] = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "section", "article"};
+            for (const char* b : blocks) {
+                const size_t n = std::strlen(b);
+                if (s.compare(i + 1, n, b) == 0) { o += '\n'; break; }
+            }
+            in_tag = true;
+            continue;
+        }
+        o += c;
+    }
+    o = html_unescape(o);
+    // 折叠空白：连续空格/空行压掉，保留段落
+    std::string t;
+    t.reserve(o.size());
+    int nl = 0;
+    for (size_t i = 0; i < o.size(); i++) {
+        const char c = o[i];
+        if (c == '\n') {
+            if (++nl <= 2) t += '\n';
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\r') {
+            if (!t.empty() && t.back() != ' ' && t.back() != '\n') t += ' ';
+            continue;
+        }
+        nl = 0;
+        t += c;
+    }
+    return t;
+}
+
+// DuckDuckGo 的 HTML 端点。选它是因为**不需要 API Key** —— 一个本地
+// 单用户工具没理由为了搜一次就要求用户去注册。
+std::string web_search_text(const std::string& q, int n) {
+    std::string qs;
+    for (unsigned char c : q) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.') qs += (char)c;
+        else if (c == ' ') qs += '+';
+        else { char b[8]; std::snprintf(b, sizeof(b), "%%%02X", c); qs += b; }
+    }
+    const std::string url = "https://html.duckduckgo.com/html/?q=" + qs;
+    ProcOut po = run_proc("curl -sSL --compressed -m 20 -A 'Mozilla/5.0 (Macintosh)' " +
+                              shell_quote(url),
+                          g.workspace, 25000, 2 * 1024 * 1024, false);
+    if (po.out.empty()) return "";
+
+    // 解析结果块：标题在 class="result__a" 的 <a> 里，摘要在 class="result__snippet"
+    std::string out;
+    int found = 0;
+    size_t p = 0;
+    while (found < n) {
+        const size_t a = po.out.find("result__a", p);
+        if (a == std::string::npos) break;
+        const size_t gt = po.out.find('>', a);
+        const size_t end = po.out.find("</a>", gt);
+        if (gt == std::string::npos || end == std::string::npos) break;
+        std::string title = html_to_text(po.out.substr(gt + 1, end - gt - 1));
+        // 真实地址藏在 href 的 uddg= 参数里。
+        // 必须**向后**找 href，并且限定在这个 <a> 标签的 '>' 之前：
+        // DuckDuckGo 的属性顺序是 class 在前、href 在后，用 rfind 往前找
+        // 会拿到上一条结果的链接（实测第二条结果的 URL 就是第一条的）。
+        std::string href;
+        const size_t hs = po.out.find("href=\"", a);
+        if (hs != std::string::npos && hs < gt) {
+            const size_t he = po.out.find('"', hs + 6);
+            if (he != std::string::npos) {
+                std::string raw = po.out.substr(hs + 6, he - hs - 6);
+                const size_t u = raw.find("uddg=");
+                if (u != std::string::npos) {
+                    std::string enc = raw.substr(u + 5);
+                    const size_t amp = enc.find('&');
+                    if (amp != std::string::npos) enc.resize(amp);
+                    href = http::Request::url_decode(enc);
+                } else href = raw;
+            }
+        }
+        std::string snip;
+        const size_t sa = po.out.find("result__snippet", end);
+        if (sa != std::string::npos) {
+            const size_t sgt = po.out.find('>', sa);
+            const size_t send = po.out.find("</a>", sgt);
+            if (sgt != std::string::npos && send != std::string::npos)
+                snip = html_to_text(po.out.substr(sgt + 1, send - sgt - 1));
+        }
+        if (title.empty()) { p = end; continue; }
+        found++;
+        out += "[" + std::to_string(found) + "] " + title + "\n";
+        if (!href.empty()) out += "    " + href + "\n";
+        if (!snip.empty()) out += "    " + snip + "\n";
+        p = (sa == std::string::npos) ? end : sa + 16;
+    }
+    return out;
+}
+
 ToolResult run_tool(const std::string& name, const json::Value& args) {
     ToolResult r;
     if (name == "read_file") {
@@ -608,39 +962,176 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         return r;
     }
     if (name == "list_dir") {
-        std::string p = args.s("path", g.workspace);
-        std::string cmd = "ls -la \"" + p + "\" 2>&1 | head -80";
-        FILE* fp = popen(cmd.c_str(), "r");
-        if (!fp) { r.output = "无法执行"; return r; }
-        char buf[4096];
-        while (fgets(buf, sizeof(buf), fp)) r.output += buf;
-        pclose(fp);
+        // 不再 shell 出去调 ls：一是没开 shell 权限时它就不该依赖 shell，
+        // 二是 `ls -la "路径"` 里路径带双引号、反引号就能注入。
+        std::string p = path_abs(args.s("path", g.workspace));
+        if (!path_allowed(p)) { r.output = "路径不在允许范围内: " + p; return r; }
+        DIR* d = opendir(p.c_str());
+        if (!d) { r.output = "无法打开目录: " + p; return r; }
+        std::vector<std::string> dirs, files;
+        struct dirent* e;
+        while ((e = readdir(d)) != nullptr) {
+            const std::string n = e->d_name;
+            if (n == "." || n == "..") continue;
+            struct stat st {};
+            if (stat(path_join(p, n).c_str(), &st) != 0) continue;
+            char line[1024];
+            if (S_ISDIR(st.st_mode)) {
+                std::snprintf(line, sizeof(line), "%s/", n.c_str());
+                dirs.push_back(line);
+            } else {
+                std::snprintf(line, sizeof(line), "%s\t%lld B", n.c_str(), (long long)st.st_size);
+                files.push_back(line);
+            }
+        }
+        closedir(d);
+        std::sort(dirs.begin(), dirs.end());
+        std::sort(files.begin(), files.end());
         r.ok = true;
+        r.output = p + "\n";
+        for (auto& x : dirs) r.output += "  " + x + "\n";
+        for (auto& x : files) r.output += "  " + x + "\n";
+        if (dirs.empty() && files.empty()) r.output += "  （空目录）\n";
         return r;
     }
     if (name == "write_file") {
-        std::string p = args.s("path");
-        std::string c = args.s("content");
-        if (p.empty()) { r.output = "缺少 path 参数"; return r; }
+        if (!g.allow_write) { r.output = "写文件权限已关闭（设置 → 权限）"; return r; }
+        const std::string raw = args.s("path");
+        const std::string c = args.s("content");
+        if (raw.empty()) { r.output = "缺少 path 参数"; return r; }
+        const std::string p = path_abs(raw);
+        if (!path_allowed(p)) { r.output = "路径不在允许范围内: " + p; return r; }
         r.ok = write_file(p, c);
-        r.output = r.ok ? ("已写入 " + std::to_string(c.size()) + " 字节到 " + p) : ("写入失败: " + p);
+        r.output = r.ok ? ("已写入 " + std::to_string(c.size()) + " 字节到 " + p)
+                        : ("写入失败: " + p);
+        return r;
+    }
+    if (name == "edit_file") {
+        // 精确串替换。为什么不是"整文件重写"：小模型重写整文件时会把
+        // 没看过的部分凭记忆补一遍，改一个函数顺手删掉另外三个。
+        if (!g.allow_write) { r.output = "写文件权限已关闭（设置 → 权限）"; return r; }
+        const std::string raw = args.s("path");
+        const std::string old_s = args.s("old");
+        const std::string new_s = args.s("new");
+        if (raw.empty() || old_s.empty()) { r.output = "缺少 path 或 old 参数"; return r; }
+        const std::string p = path_abs(raw);
+        if (!path_allowed(p)) { r.output = "路径不在允许范围内: " + p; return r; }
+        std::string body = read_file(p, 4 * 1024 * 1024);
+        if (body.empty()) { r.output = "读不到文件: " + p; return r; }
+        size_t at = body.find(old_s);
+        if (at == std::string::npos) {
+            r.output = "文件里找不到这段原文。请先用 read_file 确认当前内容（注意缩进和空格）。";
+            return r;
+        }
+        const size_t second = body.find(old_s, at + old_s.size());
+        if (second != std::string::npos) {
+            r.output = "这段原文在文件里出现了不止一次，替换位置有歧义。"
+                       "请多带几行上下文让它唯一。";
+            return r;
+        }
+        body.replace(at, old_s.size(), new_s);
+        r.ok = write_file(p, body);
+        r.output = r.ok ? ("已替换 1 处，文件现在是 " + std::to_string(body.size()) + " 字节")
+                        : ("写入失败: " + p);
+        return r;
+    }
+    if (name == "grep") {
+        // 递归文本搜索。用 /usr/bin/grep 而不是自己写：它已经处理了二进制
+        // 检测、编码、正则方言，自己写只会更慢更错。
+        const std::string pat = args.s("pattern");
+        if (pat.empty()) { r.output = "缺少 pattern 参数"; return r; }
+        std::string base = path_abs(args.s("path", g.workspace));
+        if (!path_allowed(base)) { r.output = "路径不在允许范围内: " + base; return r; }
+        int limit = (int)args.n("limit", 60);
+        if (limit <= 0) limit = 60;
+        std::string cmd = "grep -rnI --exclude-dir=.git --exclude-dir=node_modules "
+                          "--exclude-dir=build --exclude-dir=.build "
+                          "-m " + std::to_string(limit) + " -e " + shell_quote(pat) + " " +
+                          shell_quote(base) + " 2>&1 | head -" + std::to_string(limit);
+        ProcOut po = run_proc(cmd, g.workspace, 15000, 48 * 1024, false);
+        r.ok = true;
+        r.output = po.out.empty() ? ("没有匹配: " + pat) : po.out;
+        return r;
+    }
+    if (name == "glob") {
+        const std::string pat = args.s("pattern");
+        if (pat.empty()) { r.output = "缺少 pattern 参数"; return r; }
+        std::string base = path_abs(args.s("path", g.workspace));
+        if (!path_allowed(base)) { r.output = "路径不在允许范围内: " + base; return r; }
+        // find -name 只支持 glob，不支持 **。这里把 ** 折成"任意深度"，
+        // 也就是去掉路径前缀里的 **/，剩下的交给 -name。
+        std::string name_pat = pat;
+        const size_t sl = name_pat.find_last_of('/');
+        if (sl != std::string::npos) name_pat = name_pat.substr(sl + 1);
+        std::string cmd = "find " + shell_quote(base) +
+                          " -maxdepth 6 -type f -name " + shell_quote(name_pat) +
+                          " 2>/dev/null | head -200";
+        ProcOut po = run_proc(cmd, g.workspace, 15000, 48 * 1024, false);
+        r.ok = true;
+        r.output = po.out.empty() ? ("没有匹配的文件: " + pat) : po.out;
+        return r;
+    }
+    if (name == "fetch_url") {
+        if (!g.allow_net) { r.output = "联网权限已关闭（设置 → 权限）"; return r; }
+        const std::string url = args.s("url");
+        if (url.empty()) { r.output = "缺少 url 参数"; return r; }
+        if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+            r.output = "只支持 http/https";
+            return r;
+        }
+        // 走系统 curl：本工程不依赖 libcurl，而自己实现 TLS 不现实。
+        // -L 跟随跳转，-m 限时，--compressed 省流量。
+        std::string cmd = "curl -sSL --compressed -m 20 -A 'Mozilla/5.0 (Dubhe)' " +
+                          shell_quote(url);
+        ProcOut po = run_proc(cmd, g.workspace, 25000, 512 * 1024, false);
+        r.ok = po.exit_code == 0;
+        r.output = html_to_text(po.out);
+        if (r.output.empty()) r.output = "抓取失败或内容为空";
+        return r;
+    }
+    if (name == "web_search") {
+        if (!g.allow_net) { r.output = "联网权限已关闭（设置 → 权限）"; return r; }
+        const std::string q = args.s("query");
+        if (q.empty()) { r.output = "缺少 query 参数"; return r; }
+        r.output = web_search_text(q, (int)args.n("n", 6));
+        r.ok = !r.output.empty();
+        if (!r.ok) r.output = "搜索没有返回结果（可能被限流，或本机无法访问外网）";
         return r;
     }
     if (name == "shell") {
-        if (!g.allow_shell) { r.output = "shell 工具未启用（启动时加 --allow-shell）"; return r; }
-        std::string cmd = args.s("command");
-        if (cmd.empty()) { r.output = "缺少 command 参数"; return r; }
-        FILE* fp = popen((cmd + " 2>&1").c_str(), "r");
-        if (!fp) { r.output = "无法执行"; return r; }
-        char buf[4096];
-        std::string out;
-        while (fgets(buf, sizeof(buf), fp)) {
-            out += buf;
-            if (out.size() > 64 * 1024) break;
+        if (!g.allow_shell) {
+            r.output = "shell 工具未启用。在界面「设置 → 权限」里打开「允许执行命令」即可。";
+            return r;
         }
-        pclose(fp);
-        r.ok = true;
-        r.output = out;
+        const std::string cmd = args.s("command");
+        if (cmd.empty()) { r.output = "缺少 command 参数"; return r; }
+        const std::string cwd = args.s("cwd", g.workspace);
+        ProcOut po = run_proc(cmd, cwd.empty() ? g.workspace : cwd,
+                              g.shell_timeout_ms, 96 * 1024, g.sandbox);
+        // seatbelt 在某些环境里套不上（进程本身已经被更外层的沙箱约束，
+        // 例如 App 沙箱或某些 CI 容器），报的是
+        // `sandbox-exec: sandbox_apply: Operation not permitted` + 退出码 71。
+        // 这时候不该让用户看到"命令执行失败"——命令根本没跑。退一步裸跑，
+        // 并在结果里说明"沙箱没生效"，让用户自己决定要不要继续用。
+        bool no_sandbox = false;
+        if (g.sandbox && po.exit_code == 71 && po.out.find("sandbox_apply") != std::string::npos) {
+            po = run_proc(cmd, cwd.empty() ? g.workspace : cwd,
+                          g.shell_timeout_ms, 96 * 1024, false);
+            no_sandbox = true;
+        }
+        r.ok = (po.exit_code == 0) && !po.timed_out;
+        r.output = po.out;
+        if (no_sandbox) {
+            r.output = "[提示] 当前环境不支持 seatbelt 沙箱，这条命令是**未隔离**执行的"
+                       "（写盘限制未生效）。\n" + r.output;
+        }
+        if (po.timed_out) {
+            r.output += "\n[超时] 命令超过 " + std::to_string(g.shell_timeout_ms / 1000) +
+                        " 秒被终止。拆小一点，或者只跑必要的那一步。";
+        }
+        if (po.truncated) r.output += "\n[截断] 输出超过 96 KB，只保留了前面部分。";
+        if (po.out.empty() && r.ok) r.output = "（命令执行成功，没有输出）";
+        else if (!po.out.empty()) r.output += "\n[退出码 " + std::to_string(po.exit_code) + "]";
         return r;
     }
     r.output = "未知工具: " + name;
@@ -693,10 +1184,18 @@ std::string tool_prompt() {
         "- read_file(path, offset, limit): 读取文本文件，默认给前 120 行。\n"
         "  文件很长时先读开头；需要后面的内容再用 offset=121 往下翻。\n"
         "- list_dir(path): 列出目录内容\n"
-        "- write_file(path, content): 写入文件\n"
-        "- shell(command): 执行 shell 命令（可能被禁用）\n"
+        "- grep(pattern, path): 在目录里递归搜索文本，pattern 是正则\n"
+        "- glob(pattern, path): 按文件名找文件，例如 *.md\n"
+        "- write_file(path, content): 写入文件（覆盖）\n"
+        "- edit_file(path, old, new): 把文件里一段原文替换掉。old 必须唯一。\n"
+        "- shell(command, cwd): 执行 shell 命令\n"
+        "- web_search(query, n): 联网搜索\n"
+        "- fetch_url(url): 抓取网页正文\n"
         "不需要工具时直接回答。不要描述你打算怎么做，直接输出工具调用。"
         "不要自己写工具返回块（" + g_tool_open + "），那是系统给你的，不是你输出的。";
+    if (!g.workspace.empty()) {
+        s += "\n当前工作目录是 " + g.workspace + "，相对路径都以它为根。";
+    }
     return s;
 }
 
@@ -1829,8 +2328,13 @@ json::Value tools_json() {
     };
     add("read_file", "读取文本文件，默认前 120 行，可用 offset/limit 分页", "path, offset, limit", true);
     add("list_dir", "列出目录内容", "path", true);
-    add("write_file", "写入文件（覆盖）", "path, content", true);
-    add("shell", "执行 shell 命令", "command", g.allow_shell);
+    add("grep", "在目录里递归搜索文本（正则）", "pattern, path, limit", true);
+    add("glob", "按文件名通配符找文件", "pattern, path", true);
+    add("write_file", "写入文件（覆盖）", "path, content", g.allow_write);
+    add("edit_file", "精确替换文件里的一段原文（只改一处，要求唯一）", "path, old, new", g.allow_write);
+    add("shell", "执行 shell 命令（有超时与写盘沙箱）", "command, cwd", g.allow_shell);
+    add("web_search", "联网搜索", "query, n", g.allow_net);
+    add("fetch_url", "抓取网页并转成纯文本", "url", g.allow_net);
     return arr;
 }
 
@@ -1859,6 +2363,10 @@ int main(int argc, char** argv) {
         else if (a == "-c" || a == "--ctx") ctx = atoi(next().c_str());
         else if (a == "-t" || a == "--threads") threads = atoi(next().c_str());
         else if (a == "--allow-shell") g.allow_shell = true;
+        else if (a == "--no-shell") g.allow_shell = false;
+        else if (a == "--no-net") g.allow_net = false;
+        else if (a == "--no-sandbox") g.sandbox = false;
+        else if (a == "--no-write") g.allow_write = false;
         else if (a == "--model-dir") g.model_dir = next();
         else if (a == "--no-gpu") no_gpu = true;
         else if (a == "--api-key") g.api_key = next();
@@ -2039,6 +2547,10 @@ int main(int argc, char** argv) {
         o.set("loaded", json::Value::make_bool(!g.model_path.empty()));
         o.set("workspace", json::Value::make_str(g.workspace));
         o.set("shell", json::Value::make_bool(g.allow_shell));
+        o.set("write", json::Value::make_bool(g.allow_write));
+        o.set("net", json::Value::make_bool(g.allow_net));
+        o.set("sandbox", json::Value::make_bool(g.sandbox));
+        o.set("shell_timeout_s", json::Value::make_num(g.shell_timeout_ms / 1000.0));
         o.set("api_key", json::Value::make_str(is_local(req) ? g.api_key : ""));
         o.set("lan_url", json::Value::make_str(g.lan_url));
         o.set("auth", json::Value::make_bool(!g.api_key.empty()));
@@ -2300,6 +2812,58 @@ int main(int argc, char** argv) {
     });
 
     // ---- 工具：清单 + 手动执行（给 UI 的调试面板用，不必绕一圈模型）
+    // 运行期权限开关。
+    //
+    // 这些位以前只能由启动参数决定，改了要重启进程 —— 用户实际体验就是
+    // "没有权限设置"：模型说"我没有执行命令的能力"，界面上也找不到任何
+    // 地方能开。现在放进 /api/settings，UI 改完立刻生效，下一次工具调用
+    // 就用新值。
+    //
+    // 只接受本机请求：把 shell 权限开放给局域网里任何一台机器，等于把
+    // 这台 Mac 的终端交出去。
+    srv.post("/api/settings", [](const http::Request& req, http::Conn& c) {
+        if (!is_local(req)) {
+            c.send(403, "application/json", "{\"error\":\"权限设置只允许本机修改\"}");
+            return;
+        }
+        json::Value body;
+        if (!json::parse(req.body, &body)) {
+            c.send(400, "application/json", "{\"error\":\"JSON 解析失败\"}");
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g.mu);
+            if (body.get("shell")) g.allow_shell = body.flag("shell", g.allow_shell);
+            if (body.get("write")) g.allow_write = body.flag("write", g.allow_write);
+            if (body.get("net")) g.allow_net = body.flag("net", g.allow_net);
+            if (body.get("sandbox")) g.sandbox = body.flag("sandbox", g.sandbox);
+            const double t = body.n("shell_timeout_s", 0);
+            if (t >= 1 && t <= 600) g.shell_timeout_ms = (int)(t * 1000);
+            // 工作目录：必须是已存在的目录，且落在白名单根之内
+            const std::string wd = body.s("workspace");
+            if (!wd.empty()) {
+                const std::string full = path_abs(wd);
+                if (!is_dir_p(full)) {
+                    c.send(400, "application/json", "{\"error\":\"目录不存在\"}");
+                    return;
+                }
+                if (!path_allowed(full)) {
+                    c.send(403, "application/json", "{\"error\":\"目录不在允许的范围内\"}");
+                    return;
+                }
+                g.workspace = full;
+            }
+        }
+        json::Value o = json::Value::make_obj();
+        o.set("shell", json::Value::make_bool(g.allow_shell));
+        o.set("write", json::Value::make_bool(g.allow_write));
+        o.set("net", json::Value::make_bool(g.allow_net));
+        o.set("sandbox", json::Value::make_bool(g.sandbox));
+        o.set("shell_timeout_s", json::Value::make_num(g.shell_timeout_ms / 1000.0));
+        o.set("workspace", json::Value::make_str(g.workspace));
+        c.send(200, "application/json", json::dump(o));
+    });
+
     srv.get("/api/tools", [](const http::Request& req, http::Conn& c) {
         if (!is_local(req) && !authorized(req)) {
             c.send(401, "application/json", "{\"error\":\"未授权\"}");
@@ -2308,6 +2872,10 @@ int main(int argc, char** argv) {
         json::Value root = json::Value::make_obj();
         root.set("items", tools_json());
         root.set("workspace", json::Value::make_str(g.workspace));
+        root.set("shell", json::Value::make_bool(g.allow_shell));
+        root.set("write", json::Value::make_bool(g.allow_write));
+        root.set("net", json::Value::make_bool(g.allow_net));
+        root.set("sandbox", json::Value::make_bool(g.sandbox));
         c.send(200, "application/json", json::dump(root));
     });
 
@@ -2600,6 +3168,31 @@ int main(int argc, char** argv) {
         struct BusyGuard {
             ~BusyGuard() { g.busy = false; }
         } busy_guard;
+
+        // 请求级工作目录。
+        //
+        // 前端每个对话可以绑定一个"项目文件夹"，工具的相对路径就以它为根。
+        // 改的是 g.workspace 这个全局量，看起来危险 —— 但整条请求是串行化
+        // 在 g.mu 上的（上面刚拿到锁），同一时刻只可能有一个请求在跑，
+        // 而且用 RAII 恢复，异常路径也不会漏。换成请求上下文对象当然更干净，
+        // 但那要把 workspace 一路传进 run_tool / path_abs 的每个调用点，
+        // 改动面大得多，收益只有"并发时不互相影响"—— 而这里本来就不并发。
+        struct WsScope {
+            std::string old;
+            bool active = false;
+            ~WsScope() { if (active) g.workspace = old; }
+        } ws_scope;
+        {
+            const std::string want = body.s("workspace");
+            if (!want.empty()) {
+                const std::string full = path_abs(want);
+                if (is_dir_p(full) && path_allowed(full) && full != g.workspace) {
+                    ws_scope.old = g.workspace;
+                    ws_scope.active = true;
+                    g.workspace = full;
+                }
+            }
+        }
 
         dubhe_model_info mi{};
         dubhe_model_info_get(g.engine, &mi);

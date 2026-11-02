@@ -2618,6 +2618,7 @@ kernel void k_attn(device const float* q  [[buffer(0)]],
                    constant uint& kv_dim  [[buffer(9)]],
                    constant float& scale  [[buffer(10)]],
                    constant uint& win     [[buffer(11)]],
+                   constant uint& kvwrap  [[buffer(12)]],
                    uint2 tgid [[threadgroup_position_in_grid]],
                    uint lane [[thread_index_in_simdgroup]],
                    uint sg   [[simdgroup_index_in_threadgroup]])
@@ -2645,7 +2646,11 @@ kernel void k_attn(device const float* q  [[buffer(0)]],
     for (int j = 0; j < 4; j++) acc[j] = 0.0f;
 
     for (uint t = t0; t < nlen; t++) {
-        device const half* kk = kb + (ulong)t * kv_dim;
+        // kvwrap 是诊断开关（非 0 时按位与回绕到一小段 KV）：指令数与访存
+        // 次数都不变，只把工作集缩小到能进 cache。用来区分"注意力是被带宽
+        // 卡住"还是"被指令数卡住"——结果错误，只用于计时。
+        const uint tt = kvwrap ? (t & kvwrap) : t;
+        device const half* kk = kb + (ulong)tt * kv_dim;
         float partial = 0.0f;
         for (uint d = lane; d < hd; d += 32u) partial += qh[d] * float(kk[d]);
         const float s = simd_sum(partial) * scale;
@@ -2663,7 +2668,7 @@ kernel void k_attn(device const float* q  [[buffer(0)]],
         }
         l += w;
 
-        device const half* vv = vb + (ulong)t * kv_dim;
+        device const half* vv = vb + (ulong)tt * kv_dim;
         int j = 0;
         for (uint d = lane; d < hd; d += 32u, j++) acc[j] += w * float(vv[d]);
     }
@@ -2688,6 +2693,7 @@ kernel void k_attn_split(device const float* q  [[buffer(0)]],
                          constant float& scale  [[buffer(10)]],
                          constant uint& nsp     [[buffer(11)]],
                          constant uint& win     [[buffer(12)]],
+                         constant uint& kvwrap  [[buffer(13)]],
                          uint3 tgid [[threadgroup_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]],
                          uint sg   [[simdgroup_index_in_threadgroup]])
@@ -2722,7 +2728,8 @@ kernel void k_attn_split(device const float* q  [[buffer(0)]],
         device const half* vb = (device const half*)((device uchar*)vc + coff) + kvh * hd;
 
         for (uint t = k0; t < k1; t++) {
-            device const half* kk = kb + (ulong)t * kv_dim;
+            const uint tt = kvwrap ? (t & kvwrap) : t;
+            device const half* kk = kb + (ulong)tt * kv_dim;
             float partial = 0.0f;
             for (uint d = lane; d < hd; d += 32u) partial += qh[d] * float(kk[d]);
             const float s = simd_sum(partial) * scale;
@@ -2743,7 +2750,7 @@ kernel void k_attn_split(device const float* q  [[buffer(0)]],
             }
             l += w;
 
-            device const half* vv = vb + (ulong)t * kv_dim;
+            device const half* vv = vb + (ulong)tt * kv_dim;
             int j = 0;
             for (uint d = lane; d < hd; d += 32u, j++) acc[j] += w * float(vv[d]);
         }

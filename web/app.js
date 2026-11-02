@@ -72,15 +72,43 @@
   function saveSettings() { localStorage.setItem(SET_KEY, JSON.stringify(settings)); }
 
   function newConv() {
+    // 新对话默认继承上一个对话绑定的项目文件夹 —— 像 Codex 那样"开个新
+    // 会话继续在同一个项目里干活"，而不是每次都要重新选一遍目录。
+    const inherit = state.current && state.current.cwd;
     const c = { id: 'c' + Date.now(), title: '新对话', messages: [], at: Date.now() };
+    if (inherit) c.cwd = inherit;
     state.convs.unshift(c);
     state.current = c;
     saveConvs();
     renderConvList();
     renderMessages();
+    renderCwd();
     $('#convTitle').textContent = '新对话';
     $('#input').focus();
     return c;
+  }
+
+  // ---------------------------------------------------------------- 项目文件夹
+  //
+  // 一个对话 = 一个项目文件夹。工具的相对路径以它为根，服务端每次请求
+  // 单独收（POST body 里的 workspace），所以两个对话可以各自待在各自的
+  // 目录里，不会互相看见对方读的是哪个项目。
+  function renderCwd() {
+    const chip = $('#cwdChip');
+    const name = $('#cwdName');
+    if (!chip || !name) return;
+    const c = state.current;
+    const p = (c && c.cwd) || (state.server && state.server.workspace) || '';
+    if (!p) {
+      name.textContent = '未绑定';
+      chip.classList.add('unbound');
+      chip.title = '本对话还没有绑定项目文件夹';
+      return;
+    }
+    chip.classList.remove('unbound');
+    const seg = p.split('/').filter(Boolean);
+    name.textContent = seg.length ? seg[seg.length - 1] : p;
+    chip.title = (c && c.cwd ? '项目文件夹：' : '默认工作目录：') + p;
   }
 
   // ---------------------------------------------------------------- Markdown
@@ -95,6 +123,27 @@
       .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
       .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>')
       .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  }
+
+  // 代码块外壳。
+  //
+  // 三种语言可以直接跑：html / htm / svg。其余只给复制。
+  // 判断放在这里而不是渲染后扫 DOM：流式渲染时同一个块会被反复重建，
+  // 扫 DOM 的做法要么漏、要么每次都得重挂事件。
+  const RUNNABLE_LANG = { html: 1, htm: 1, svg: 1, xml: 1 };
+  function codeBlockHtml(lang, code) {
+    const raw = (lang || '').trim().toLowerCase();
+    const first = raw.split(/[\s,{]/)[0] || '';
+    const label = first || 'text';
+    const runnable = !!RUNNABLE_LANG[first];
+    return '<div class="codeblock" data-lang="' + label + '">'
+      + '<div class="cb-head"><span class="cb-lang">' + label + '</span>'
+      + '<span class="cb-actions">'
+      + (runnable ? '<button class="cb-btn run" data-run>运行</button>' : '')
+      + '<button class="cb-btn" data-copy>复制</button>'
+      + '</span></div>'
+      // tabindex 让 pre 可聚焦 —— 只有聚焦的元素方向键才滚它自己
+      + '<pre tabindex="0"><code>' + code + '</code></pre></div>';
   }
 
   function renderMarkdown(src) {
@@ -113,7 +162,7 @@
         if (!inCode) { inCode = true; codeLang = line.slice(3).trim(); codeBuf = []; closeList(); }
         else {
           inCode = false;
-          html += `<pre><button class="copy-code" data-copy>复制</button><code>${codeBuf.join('\n')}</code></pre>`;
+          html += codeBlockHtml(codeLang, codeBuf.join('\n'));
         }
         continue;
       }
@@ -142,7 +191,7 @@
       closeList();
       html += `<p>${inline(line)}</p>`;
     }
-    if (inCode && codeBuf.length) html += `<pre><code>${codeBuf.join('\n')}</code></pre>`;
+    if (inCode && codeBuf.length) html += codeBlockHtml(codeLang, codeBuf.join('\n'));
     closeList();
     return html;
   }
@@ -150,6 +199,29 @@
   // 隐藏模型输出的 tool_call 原文
   function stripToolCalls(s) {
     return s.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').replace(/<tool_result>[\s\S]*?<\/tool_result>/g, '').trim();
+  }
+
+  // 流式渲染的"安全切点"：返回一个下标，之前的文本已经定型、不会再变。
+  //
+  // 两个安全位置：空行之后，以及 ``` 围栏闭合之后。切在空行上不会把段落
+  // 劈成两半；切在围栏之后不会把代码块拆开（拆开的话每帧都在重建它，
+  // 代码块内部的滚动位置就保不住）。
+  // 返回 0 表示还没有任何定型内容，整段都算尾巴。
+  function stableCut(s) {
+    const lines = s.split('\n');
+    let off = 0, safe = 0, inFence = false;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      off += line.length + 1;
+      if (/^```/.test(line)) {
+        inFence = !inFence;
+        if (!inFence) safe = off;      // 围栏刚闭合，整块都定型了
+        continue;
+      }
+      if (inFence) continue;
+      if (!line.trim()) safe = off;
+    }
+    return safe;
   }
 
   // 助手正文的 HTML。
@@ -194,6 +266,7 @@
         renderConvList();
         renderMessages();
         renderTools();
+        renderCwd();
         $('#convTitle').textContent = c.title;
         if (window.innerWidth <= 860) closeSidebar();
       };
@@ -306,13 +379,52 @@
       return;
     }
     for (const m of c.messages) box.appendChild(messageNode(m));
-    scrollBottom();
+    scrollBottom(true);
+  }
+
+  // ---------------------------------------------------------------- 滚动跟随
+  //
+  // 规则只有一条：**贴底才跟随**。
+  //
+  // 旧实现每帧都算一次"离底 < 220px 就贴底"，看起来很合理，实际有两个毛病：
+  //   1) 220px 太宽。用户往上滑半屏想重读一段，仍然被判定为"在底部"，
+  //      下一帧就被拽回去 —— 表现就是"滑不上去"。
+  //   2) 判定用的是 scrollTop，而流式输出时 scrollHeight 每帧都在长，
+  //      程序自己滚出来的位置也会被当成用户意图，两边互相打架。
+  // 现在把"要不要跟随"变成一个有状态的开关：用户主动上滑就关掉，滑回底部
+  // 才重新打开。程序滚动期间用一个短标记忽略自己触发的 scroll 事件。
+  const stick = { on: true };
+  let progScroll = false;
+  const STICK_GAP = 72;   // 离底多少像素以内算"在底部"
+
+  function atBottom(box) {
+    return box.scrollHeight - box.scrollTop - box.clientHeight < STICK_GAP;
   }
 
   function scrollBottom(force) {
     const box = $('#messages');
-    const near = box.scrollHeight - box.scrollTop - box.clientHeight < 220;
-    if (force || near) box.scrollTop = box.scrollHeight;
+    if (!box) return;
+    if (force) stick.on = true;
+    if (!stick.on) return;
+    progScroll = true;
+    box.scrollTop = box.scrollHeight;
+    requestAnimationFrame(() => { progScroll = false; });
+  }
+
+  function bindScrollStick() {
+    const box = $('#messages');
+    if (!box || box.dataset.stickBound) return;
+    box.dataset.stickBound = '1';
+    box.addEventListener('scroll', () => {
+      // 自己滚出来的事件不算用户意图，否则跟随开关会被自己关掉
+      if (progScroll) return;
+      stick.on = atBottom(box);
+    }, { passive: true });
+    // 滚轮/触摸立刻表态，不用等 scroll 事件排队 —— 差一帧就会被拽回去
+    box.addEventListener('wheel', (e) => {
+      if (e.deltaY < 0) stick.on = false;
+    }, { passive: true });
+    box.addEventListener('touchstart', () => { progScroll = false; }, { passive: true });
   }
 
   // ---------------------------------------------------------------- 服务端
@@ -336,6 +448,7 @@
       renderModelInfo(s);
       renderMeters(s);
       renderRes(s);
+      renderCwd();
       $('#hwInfo').textContent = s.hardware || '';
       // 只有加载了视觉塔/语音塔才露出对应入口
       const att = $('#btnAttach');
@@ -746,6 +859,9 @@
           top_p: settings.top_p,
           max_tokens: settings.max_tokens,
           dubhe_tools: withTools,
+          // 本对话绑定的项目文件夹。服务端在请求作用域内把它当成工具的根，
+          // 请求结束就恢复 —— 所以两个对话各读各的项目，不会串。
+          workspace: conv.cwd || undefined,
         }),
       });
       if (!resp.ok) throw new Error(await resp.text());
@@ -756,10 +872,52 @@
       let raf = null;
       let genTick = 0;
 
+      // 流式渲染拆成"已定型"和"还在长"两段。
+      //
+      // 旧实现每来一个 token 就把整段 markdown 重新渲染一遍写回 innerHTML。
+      // 三个后果都是用户能直接看到的：
+      //   1) 闪烁 —— 整块 DOM 每 20ms 重建一次，代码块的 hover/过渡全部重来；
+      //   2) 代码块滚不动 —— 重建后 scrollTop 归零，刚滚到的那行立刻弹回顶部；
+      //   3) 选中不了文字 —— 选区随 DOM 一起被丢掉。
+      // 现在按"安全边界"（空行或已闭合的 ``` 围栏）切开：前面那段只在变长时
+      // 重绘一次，后面那段才是每帧都换的。切点绝不会落在代码块中间，所以
+      // 已经闭合的代码块只渲染一次，滚动位置自然保住。
+      // 用 let：工具卡片到达时整个气泡会被换成新节点，这两段要跟着搬过去。
+      let headEl = document.createElement('div');
+      let tailEl = document.createElement('div');
+      headEl.className = 'md-head';
+      tailEl.className = 'md-tail';
+      body.appendChild(headEl);
+      body.appendChild(tailEl);
+      let lastHead = null;
+
+      const paintNow = () => {
+        const raw = (ai.content || '').trim();
+        const visible = stripToolCalls(raw);
+        if (!visible) {
+          // 全被工具调用吃掉了：露原文，别留空气泡
+          if (lastHead !== '') { headEl.innerHTML = ''; lastHead = ''; }
+          tailEl.innerHTML = (!raw || (ai.tools && ai.tools.length)) ? ''
+            : '<div class="raw-note">模型这段输出被识别成工具调用，没有可显示的正文字。原文：</div>'
+              + '<pre class="raw-out">' + escapeHtml(raw.slice(0, 2000)) + '</pre>';
+          return;
+        }
+        const cut = stableCut(visible);
+        const head = cut > 0 ? visible.slice(0, cut) : '';
+        const tail = visible.slice(cut);
+        if (head !== lastHead) { headEl.innerHTML = renderMarkdown(head); lastHead = head; }
+        tailEl.innerHTML = renderMarkdown(tail);
+      };
+
       const paint = () => {
-        body.innerHTML = bodyHtml(ai.content, false) || '<p></p>';
+        // DOM 写操作全部收进 rAF：一个 token 一次布局，而不是一个 SSE
+        // 分片一次。原来 innerHTML 写在 rAF 外面，等于每片都强制同步布局。
         if (raf) return;
-        raf = requestAnimationFrame(() => { raf = null; scrollBottom(); });
+        raf = requestAnimationFrame(() => {
+          raf = null;
+          paintNow();
+          scrollBottom();
+        });
       };
 
       while (true) {
@@ -798,6 +956,15 @@
               node = fresh;
               body = node.querySelector('.body');
               body.classList.add('typing');
+              // 新 body 是空节点：把增量渲染用的两段重新挂上，并强制下一次
+              // paint 重绘 head（lastHead 置 null 而不是 ''）。
+              headEl = null; tailEl = null;
+              body.appendChild((headEl = document.createElement('div')));
+              body.appendChild((tailEl = document.createElement('div')));
+              headEl.className = 'md-head';
+              tailEl.className = 'md-tail';
+              lastHead = null;
+              paint();
             }
             continue;
           }
@@ -975,6 +1142,72 @@
     return wrap;
   }
 
+  // ---------------------------------------------------------------- 权限
+  //
+  // 服务端把权限做成了运行期可改的位（POST /api/settings），这里负责把它
+  // 变成开关。改完立刻生效 —— 不需要重启进程，也不需要记住启动参数。
+  async function setPerm(key, val) {
+    try {
+      const r = await vpost('/api/settings', { [key]: val });
+      state.server = Object.assign({}, state.server || {}, r);
+      const shown = typeof val === 'boolean' ? (val ? '开' : '关') : val;
+      log('权限已更新：' + key + ' = ' + shown);
+      renderMeters(state.server);
+    } catch (e) {
+      log('权限更新失败：' + e.message, 'err');
+    }
+  }
+
+  function shortPath(p) {
+    const home = (state.server && state.server.home) || '';
+    let s = String(p || '');
+    if (home && s.startsWith(home)) s = '~' + s.slice(home.length);
+    if (s.length <= 42) return s;
+    return s.slice(0, 18) + '…' + s.slice(-21);
+  }
+
+  // 目录选择器。复用 /api/files，所以看到的目录树和「文件」视图完全一致，
+  // 不会出现"设置里能选、文件视图里看不到"这种两套边界的问题。
+  async function pickDir(start, onPick) {
+    let cur = start || '.';
+    const render = async () => {
+      let d;
+      try {
+        d = await vapi('/api/files?path=' + encodeURIComponent(cur));
+      } catch (e) {
+        log('读目录失败：' + e.message, 'err');
+        return;
+      }
+      openSheet('选择文件夹', (body) => {
+        body.appendChild(el('div', 'desc', '当前：' + d.path));
+        const card = el('div', 'vcard');
+        const mk = (label, onClick, iconName) => {
+          const r = el('div', 'vrow tap');
+          const ic = el('div', 'vico');
+          ic.appendChild(iconNode(iconName || 'folder'));
+          r.appendChild(ic);
+          const m = el('div', 'vmain');
+          m.appendChild(el('div', 'vname', label));
+          r.appendChild(m);
+          r.onclick = onClick;
+          card.appendChild(r);
+        };
+        mk('上一级', () => { cur = d.parent; render(); }, 'arrow-up');
+        d.items.filter((i) => i.dir).forEach((i) => mk(i.name + '/', () => { cur = i.path; render(); }));
+        body.appendChild(card);
+        const use = el('button', 'vbtn', '用这个文件夹');
+        use.style.marginTop = '12px';
+        use.onclick = () => { closeSheet(); onPick(d.path); };
+        body.appendChild(use);
+        const dflt = el('button', 'vbtn ghost', '用默认目录');
+        dflt.style.marginTop = '8px';
+        dflt.onclick = () => { closeSheet(); onPick(null); };
+        body.appendChild(dflt);
+      });
+    };
+    render();
+  }
+
   function openSettings() {
     openSheet('设置', (body) => {
       body.appendChild(el('div', 'group-title', '模型'));
@@ -1015,9 +1248,52 @@
 
       body.appendChild(el('div', 'group-title', '工具'));
       toggle(body, '启用工具调用', '允许模型读取文件、列目录、执行命令', () => settings.tools, (v) => { settings.tools = v; state.tools = v; localStorage.setItem(TOOLS_TOUCHED, '1'); saveSettings(); });
-      if (state.server) {
-        row(body, '服务端 Shell', state.server.shell ? '已启用' : '未启用（启动加 --allow-shell）', el('span', 'value', state.server.shell ? '开' : '关'));
-      }
+
+      // ---- 权限
+      //
+      // 这一段以前是一行只读文字"服务端 Shell：未启用（启动加 --allow-shell）"。
+      // 用户看到的是"模型说它没有执行命令的能力"，而界面上唯一能做的
+      // 事情是重启进程加一个只有源码里才知道的参数。现在改成开关，
+      // 直接打 /api/settings，下一次工具调用就生效。
+      body.appendChild(el('div', 'group-title', '权限'));
+      const srv = () => state.server || {};
+      toggle(body, '执行命令', '允许模型运行 shell 命令。有超时和输出上限。',
+        () => !!srv().shell, (v) => setPerm('shell', v));
+      toggle(body, '写文件', '允许 write_file / edit_file 改动磁盘上的文件。',
+        () => srv().write !== false, (v) => setPerm('write', v));
+      toggle(body, '联网', '允许 web_search 搜索、fetch_url 抓网页。',
+        () => !!srv().net, (v) => setPerm('net', v));
+      toggle(body, '命令沙箱', '命令只能写工作区与 /tmp。关掉就是完全放开。',
+        () => srv().sandbox !== false, (v) => setPerm('sandbox', v));
+
+      // 命令超时：给几档就够，没必要拉滑块
+      const tmo = el('div', 'seg');
+      [10, 20, 60, 180].forEach((sec) => {
+        const b = el('button', 'seg-item' + ((srv().shell_timeout_s || 20) === sec ? ' on' : ''), sec + 's');
+        b.onclick = async () => {
+          await setPerm('shell_timeout_s', sec);
+          tmo.querySelectorAll('.seg-item').forEach((x) => x.classList.remove('on'));
+          b.classList.add('on');
+        };
+        tmo.appendChild(b);
+      });
+      row(body, '命令超时', '超过这个时间整组进程会被杀掉', tmo);
+
+      // 工作目录 = 工具眼里的"根"。相对路径全部相对它解析。
+      const wd = el('div');
+      wd.style.display = 'flex';
+      wd.style.alignItems = 'center';
+      wd.style.gap = '8px';
+      const wdPath = el('span', 'value', shortPath(srv().workspace || '—'));
+      wdPath.title = srv().workspace || '';
+      const wdBtn = el('button', 'vbtn ghost', '选择…');
+      wdBtn.onclick = () => pickDir(srv().workspace || '~', (p) => {
+        // 全局工作目录不接受 null（那会让服务端失去一个合法的根）
+        if (p) setPerm('workspace', p);
+      });
+      wd.appendChild(wdPath);
+      wd.appendChild(wdBtn);
+      row(body, '工作目录', '模型读写文件和执行命令的根目录', wd);
 
       body.appendChild(el('div', 'group-title', '系统提示词'));
       const ta = el('textarea', 'field');
@@ -1282,6 +1558,78 @@
     b.appendChild(el('b', null, title));
     if (desc) b.appendChild(document.createTextNode(desc));
     return b;
+  }
+
+  // ---------------------------------------------------------------- 代码预览
+  //
+  // 模型吐出来的 HTML 片段直接就能看，不用"复制 → 存文件 → 打开"。
+  //
+  // 沙箱是硬约束：sandbox 只给 allow-scripts，**不给** allow-same-origin。
+  // 少了这一条，预览页和主站同源，模型随手写个 fetch('/api/load') 就能
+  // 操作本机引擎、读 localStorage 里的对话。给 allow-scripts 而不给
+  // same-origin，iframe 拿到的是不透明源，脚本照跑，但碰不到我们。
+  let pv = null;
+  function ensurePreview() {
+    if (pv) return pv;
+    const mask = el('div', 'pv-mask');
+    const panel = el('div', 'pv-panel');
+    const head = el('div', 'pv-head');
+    head.appendChild(el('span', 'pv-title', '运行预览'));
+    head.appendChild(el('span', 'pv-hint', '沙箱内运行 · 不联网、不碰本站数据'));
+    const acts = el('div', 'cb-actions');
+    const btnNew = el('button', 'cb-btn', '新窗口');
+    const btnClose = el('button', 'cb-btn', '关闭');
+    acts.appendChild(btnNew);
+    acts.appendChild(btnClose);
+    head.appendChild(acts);
+    const frame = document.createElement('iframe');
+    frame.setAttribute('sandbox', 'allow-scripts allow-modals allow-forms allow-popups');
+    frame.setAttribute('referrerpolicy', 'no-referrer');
+    frame.setAttribute('title', '预览');
+    panel.appendChild(head);
+    panel.appendChild(frame);
+    document.body.appendChild(mask);
+    document.body.appendChild(panel);
+    mask.style.display = 'none';
+    panel.style.display = 'none';
+    const close = () => {
+      mask.style.display = 'none';
+      panel.style.display = 'none';
+      frame.srcdoc = '';
+    };
+    btnClose.onclick = close;
+    mask.onclick = close;
+    btnNew.onclick = () => {
+      const w = window.open('', '_blank');
+      if (!w) return;
+      w.document.open();
+      w.document.write(frame.srcdoc || '');
+      w.document.close();
+    };
+    pv = { mask, panel, frame, close };
+    return pv;
+  }
+
+  function openPreview(code, lang) {
+    const p = ensurePreview();
+    p.frame.srcdoc = wrapPreviewDoc(code, lang);
+    p.mask.style.display = '';
+    p.panel.style.display = '';
+  }
+
+  // SVG 直接扔进 iframe 会被当成 HTML 解析，得包一层；纯 HTML 片段缺
+  // <meta charset> 时中文会乱码（srcdoc 继承的是父页编码，但不保证）。
+  function wrapPreviewDoc(code, lang) {
+    const l = String(lang || '').toLowerCase();
+    if (l === 'svg' || /^\s*<svg[\s>]/i.test(code)) {
+      return '<!doctype html><meta charset="utf-8">'
+        + '<style>html,body{margin:0;height:100%;display:grid;place-items:center;background:#fff}'
+        + 'svg{max-width:96vw;max-height:96vh}</style>' + code;
+    }
+    if (/<html[\s>]/i.test(code)) return code;
+    return '<!doctype html><meta charset="utf-8">'
+      + '<style>body{margin:0;font:15px/1.6 -apple-system,system-ui,sans-serif;padding:18px}</style>'
+      + code;
   }
 
   // ---------------------------------------------------------------- 模型
@@ -1802,9 +2150,29 @@
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
     });
     // 软键盘弹起会压缩视口，把最新一条消息顶出去。等键盘落定再回到底部。
-    $('#input').addEventListener('focus', () => setTimeout(() => scrollBottom(true), 340));
+    // 手机上软键盘弹出会改视口高度，底部可能被顶出屏幕。但这里不能强制
+    // 贴底：用户正往上翻看历史时点一下输入框，就被拽回最新一条，
+    // 会让人以为"输入框一点就丢失阅读位置"。只在本来就贴底时才补一下。
+    $('#input').addEventListener('focus', () => setTimeout(() => scrollBottom(false), 340));
     if (window.visualViewport) {
-      window.visualViewport.addEventListener('resize', () => scrollBottom(true));
+      // 同理，键盘收起/弹出时不强制回底，只跟随
+      window.visualViewport.addEventListener('resize', () => scrollBottom(false));
+    }
+    bindScrollStick();
+
+    const cwdChip = $('#cwdChip');
+    if (cwdChip) {
+      cwdChip.onclick = () => {
+        if (!state.current) newConv();
+        const cur = state.current.cwd || (state.server && state.server.workspace) || '~';
+        pickDir(cur, (p) => {
+          if (p) state.current.cwd = p;
+          else delete state.current.cwd;
+          saveConvs();
+          renderCwd();
+          log(p ? '项目文件夹 → ' + p : '项目文件夹已解绑，跟随默认目录');
+        });
+      };
     }
 
     $('#send').onclick = () => {
@@ -1899,9 +2267,20 @@
     if (vback) vback.onclick = closeView;
 
     document.addEventListener('click', (e) => {
+      // 先判"运行"：它和"复制"在同一行，两者的 closest 都会命中自己那颗按钮，
+      // 顺序反了会把点击当成复制处理掉。
+      const run = e.target.closest('[data-run]');
+      if (run) {
+        const box = run.closest('.codeblock');
+        const code = box && box.querySelector('code');
+        if (code) openPreview(code.textContent, box.dataset.lang);
+        return;
+      }
       const btn = e.target.closest('[data-copy]');
       if (btn) {
-        const code = btn.parentNode.querySelector('code');
+        const box = btn.closest('.codeblock') || btn.parentNode;
+        const code = box.querySelector('code');
+        if (!code) return;
         navigator.clipboard.writeText(code.textContent);
         btn.textContent = '已复制';
         setTimeout(() => (btn.textContent = '复制'), 1200);
@@ -1909,7 +2288,10 @@
     });
 
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') { closeSheet(); closeSidebar(); if (state.view) closeView(); }
+      if (e.key === 'Escape') {
+        if (pv && pv.panel.style.display !== 'none') { pv.close(); return; }
+        closeSheet(); closeSidebar(); if (state.view) closeView();
+      }
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
         e.preventDefault();
         const si = $('#searchInput');
