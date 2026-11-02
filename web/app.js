@@ -2335,6 +2335,17 @@
       return;
     }
     const card = el('div', 'vcard');
+    // 速度预估。
+    //
+    // 解码是**带宽瓶颈**：每出一个 token 就要把整个权重读一遍，所以
+    //   tok/s ≈ 内存带宽 ÷ 每 token 要读的字节数（≈ 模型文件大小）
+    // 与其写死一个数字，不如拿"当前已加载模型的实测 tok/s × 体积比"外推 ——
+    // 换台机器、换个内存带宽，这个比例关系仍然成立。
+    //
+    // 这件事值得摆在界面上，是因为"十几 tok/s 太慢"这个观感有一半来自
+    // 选错了量化档：F16 是 3.5 GB，Q4_K_M 是 1.1 GB，同一台机器差三倍。
+    const anchor = d.items.find((x) => x.loaded && x.bytes);
+    const anchorTps = (state.server && state.server.decode_tps) || 0;
     d.items.forEach((m) => {
       const row = el('div', 'vrow' + (m.loaded ? ' on' : ''));
       const ico = el('div', 'vico');
@@ -2360,6 +2371,10 @@
       if (m.params) bits.push((m.params / 1e9).toFixed(1) + 'B');
       bits.push(fmtBytes(m.bytes));
       bits.push(fmtAgo(m.mtime));
+      if (!m.mlx && anchor && anchorTps > 0 && m.bytes) {
+        bits.push(m.loaded ? '实测 ' + anchorTps.toFixed(0) + ' tok/s'
+                           : '≈' + Math.round(anchorTps * anchor.bytes / m.bytes) + ' tok/s');
+      }
       main.appendChild(el('div', 'vmeta', bits.join(' · ')));
       if (m.note) main.appendChild(el('div', 'vnote', m.note));
       row.appendChild(main);
@@ -2397,6 +2412,9 @@
     body.appendChild(card);
     body.appendChild(el('div', 'vnote',
       '切换模型会先卸载当前权重再加载新的，通常 1~2 秒。加载失败会自动装回原来的模型，不会把服务变成没有模型的状态。'));
+    body.appendChild(el('div', 'vnote',
+      '速度是按"内存带宽 ÷ 模型体积"估的，拿当前模型的实测值外推 —— 同一台机器上，'
+      + 'F16 的体积是 Q4_K_M 的三倍，速度也就只有三分之一。觉得慢先换小量化档，换内核没用。'));
   }
 
   // ---------------------------------------------------------------- 工具

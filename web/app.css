@@ -778,7 +778,16 @@ body.dropping::after {
    */
   overflow: auto;
   max-height: min(56vh, 520px);
-  overscroll-behavior: contain;
+  /* 到头的滚动要能"接力"给外面，不能 contain。
+   *
+   * 这里原来是 contain，理由是"别让滚轮一滚就带着整个对话流跑"。但那句话
+   * 是给"代码块还不是滚动容器"的时候写的 —— 现在它有 max-height、自己就是
+   * 滚动容器了，contain 只剩一个副作用：光标停在代码块上往上滑，滑到块顶
+   * 就卡住，页面纹丝不动，得先把鼠标挪出去才能继续。用户的说法是"光标在
+   * 代码块里面滑不动"。
+   *
+   * 默认的 auto 就是接力：块里没得滚了，滚动交给父级。 */
+  overscroll-behavior: auto;
 }
 /* 键盘可达：pre 能聚焦，方向键/PageUp/PageDown 才滚的是代码块本身。
  * 焦点环用内阴影，不改变布局。 */
