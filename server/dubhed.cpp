@@ -2367,7 +2367,44 @@ struct ModelEntry {
     long long bytes = 0;
     long long mtime = 0;
     std::string mmproj;   // 同目录配套的塔；空表示纯文本
+    bool mlx = false;     // 苹果 MLX 格式（目录 + safetensors），本引擎跑不了
 };
+
+// 一个目录是不是 MLX 模型：看有没有 *.safetensors。
+// MLX 的模型是**目录**，不是单个文件，所以按文件扫的代码永远看不到它。
+bool has_safetensors(const std::string& dir) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return false;
+    bool found = false;
+    while (dirent* e = readdir(d)) {
+        const std::string n = e->d_name;
+        // ".safetensors" 是 12 个字符（点 + 11 个字母）。写成 11 会永远匹配
+        // 不上，表现就是"MLX 模型一个都看不见" —— 而代码看着完全正常。
+        if (n.size() > 12 && n.compare(n.size() - 12, 12, ".safetensors") == 0) {
+            found = true;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+// 目录里权重文件的总字节。只统计顶层，不递归 —— MLX 的分片就在顶层。
+long long weights_bytes(const std::string& dir) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return 0;
+    long long total = 0;
+    while (dirent* e = readdir(d)) {
+        const std::string n = e->d_name;
+        const bool w = (n.size() > 12 && n.compare(n.size() - 12, 12, ".safetensors") == 0) ||
+                       (n.size() > 4 && n.compare(n.size() - 4, 4, ".bin") == 0);
+        if (!w) continue;
+        struct stat st {};
+        if (stat(path_join(dir, n).c_str(), &st) == 0) total += (long long)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
 
 void scan_models(const std::string& dir, std::vector<ModelEntry>* out, int depth) {
     if (depth > 3 || out->size() >= 400) return;
@@ -2380,6 +2417,21 @@ void scan_models(const std::string& dir, std::vector<ModelEntry>* out, int depth
         struct stat st {};
         if (stat(full.c_str(), &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
+            // MLX 模型是一个目录。这里把它当成一条清单项收下，然后不再往里翻 ——
+            // 里面的 safetensors 分片不是"可以点开加载的东西"。
+            // 为什么要列出来而不是继续装作没有：用户把 MLX 模型放进模型目录，
+            // 打开清单找不到它，第一反应是"这软件不支持苹果格式"，而真实情况
+            // 是"不支持，但至少该让你看见它在哪、为什么用不了"。
+            if (has_safetensors(full)) {
+                ModelEntry m;
+                m.path = full;
+                m.name = n;
+                m.bytes = weights_bytes(full);
+                m.mtime = (long long)st.st_mtime;
+                m.mlx = true;
+                out->push_back(std::move(m));
+                continue;
+            }
             scan_models(full, out, depth + 1);
         } else if (n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0) {
             // mmproj 是塔，不是模型。以前它会被当成可选模型列出来，点一下就
@@ -2815,7 +2867,7 @@ int main(int argc, char** argv) {
         json::Value root = json::Value::make_obj();
         root.set("dir", json::Value::make_str(g.model_dir));
         root.set("current", json::Value::make_str(g.model_path));
-        for (auto& m : ms) m.mmproj = find_sibling_mmproj(m.path);
+        for (auto& m : ms) if (!m.mlx) m.mmproj = find_sibling_mmproj(m.path);
         json::Value arr = json::Value::make_arr();
         for (const auto& m : ms) {
             json::Value o = json::Value::make_obj();
@@ -2823,13 +2875,25 @@ int main(int argc, char** argv) {
             o.set("name", json::Value::make_str(m.name));
             o.set("bytes", json::Value::make_num((double)m.bytes));
             o.set("mtime", json::Value::make_num((double)m.mtime));
-            o.set("quant", json::Value::make_str(guess_quant(m.name)));
-            o.set("params", json::Value::make_num(guess_params(m.name)));
+            // MLX 条目不猜量化也不猜参数量：目录名是 "lfm3-mlx-4bit"，
+            // guess_params 会把 "4bit" 里的 4 当成 4B，界面上就出现一个
+            // "4.0B · 928 MB" 的自相矛盾条目（4B 的 4bit 模型不可能只有 928 MB）。
+            o.set("quant", json::Value::make_str(m.mlx ? "" : guess_quant(m.name)));
+            o.set("params", json::Value::make_num(m.mlx ? 0 : guess_params(m.name)));
             o.set("loaded", json::Value::make_bool(m.path == g.model_path));
             // 有配套塔就能看图/听音。这里只报"有没有塔"和塔的路径，
             // 不报具体是视觉还是语音 —— 那要读塔的 GGUF 头，而几十个模型
             // 逐个读头是几百毫秒。真正的 caps 在 /api/state 里，加载后自然知道。
             o.set("mmproj", json::Value::make_str(m.mmproj));
+            // MLX 条目只报"看得见、用不了"，不假装能加载。loadable=false
+            // 的项前端会画成灰的并给一句原因，而不是让用户点下去等一个报错。
+            o.set("mlx", json::Value::make_bool(m.mlx));
+            o.set("loadable", json::Value::make_bool(!m.mlx));
+            if (m.mlx) {
+                o.set("note", json::Value::make_str(
+                    "MLX 格式（safetensors 目录），当前引擎只加载 GGUF。"
+                    "想跑它需要 MLX 运行时，这里只把它列出来免得你以为丢了。"));
+            }
             arr.arr.push_back(o);
         }
         root.set("items", arr);
@@ -2852,6 +2916,15 @@ int main(int argc, char** argv) {
             return;
         }
         const std::string full = path_abs(p);
+        // MLX 是目录 + safetensors，引擎只认 GGUF。在这里挡下来并说清楚，
+        // 否则会走到 dubhe_load_model，报一句"magic 不是 GGUF"，用户完全
+        // 看不懂那是什么意思。
+        if (is_dir_p(full)) {
+            c.send(400, "application/json",
+                   "{\"error\":\"这是目录形式的模型（MLX / safetensors），"
+                   "当前引擎只加载 GGUF 单文件。\"}");
+            return;
+        }
         if (!path_allowed(full) || !is_file_p(full)) {
             c.send(400, "application/json", "{\"error\":\"路径不允许或文件不存在\"}");
             return;

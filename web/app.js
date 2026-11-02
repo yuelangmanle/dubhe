@@ -2202,6 +2202,9 @@
       // 已加载的也要标：它同时是"当前"和"多模态"，两个标签不冲突。
       if (m.mmproj) nm.appendChild(el('span', 'vtag', '多模态'));
       if (isMm) nm.appendChild(el('span', 'vtag', '多模态塔'));
+      // MLX 条目：列出来但明说不能加载。装作没有的代价是用户以为
+      // "这软件不支持苹果格式"，而实际上原因和出路都在 note 里。
+      if (m.mlx) nm.appendChild(el('span', 'vtag', 'MLX'));
       main.appendChild(nm);
       const bits = [];
       if (m.quant) bits.push(m.quant);
@@ -2209,8 +2212,11 @@
       bits.push(fmtBytes(m.bytes));
       bits.push(fmtAgo(m.mtime));
       main.appendChild(el('div', 'vmeta', bits.join(' · ')));
+      if (m.note) main.appendChild(el('div', 'vnote', m.note));
       row.appendChild(main);
-      if (!m.loaded && !isMm) {
+      if (m.mlx) {
+        row.classList.add('off');
+      } else if (!m.loaded && !isMm) {
         const b = el('button', 'vbtn', '加载');
         b.onclick = async () => {
           b.disabled = true;

@@ -1752,6 +1752,16 @@ body[data-glass="off"] .edge::before { display: none; }
 .vrow.tap { cursor: pointer; }
 .vrow.tap:hover { background: var(--fill); }
 .vrow.on { background: var(--brand-grad-soft); }
+/* 不能加载的条目（MLX）：压暗但仍然可读 —— 目的是"让你看见它在哪、
+ * 为什么用不了"，不是藏起来。 */
+.vrow.off { opacity: .74; }
+.vrow.off .vico { color: var(--tertiary); }
+/* 行内说明：不要 .vnote 那套卡片外观（那是整块提示用的），
+ * 这里只是名字下面一行小字。 */
+.vrow .vnote {
+  margin: 3px 0 0; padding: 0; border: 0; background: none;
+  font-size: 11px; line-height: 1.5; color: var(--tertiary);
+}
 .vrow .vico {
   width: 26px; height: 26px; flex: 0 0 auto;
   display: grid; place-items: center;
