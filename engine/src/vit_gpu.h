@@ -31,6 +31,18 @@ void vit_bind(const void* base, size_t size);
 bool vit_gemm_gpu(const void* wdata, uint32_t type, int64_t n_in, int64_t n_out,
                   const float* X, int64_t n_tok, float* Y, int64_t x_stride);
 
+// 双向 GQA 注意力：O = softmax(Q·Kᵀ·scale)·V，**无因果掩码**，fp32 进 fp32 出。
+//   Q : [N][H*HD]      K/V : [N][KV*HD]      O : [N][H*HD]
+// 返回 false 表示这一档不可用（非 Apple / DUBHE_VIT_CPU=1 / 形状不支持），
+// 调用方落回 CPU 版。
+//
+// 为什么值得单独写：`DUBHE_VIT_TRACE=1` 量出视觉塔 5.9 s 里 **4.3 s 是这一项**
+// （73%），而 CPU 侧已经贴着 NEON 的算力天花板（211 GFLOP / 4.3 s ≈ 49~99
+// GFLOP/s，4 个性能核峰值约 112 GFLOP/s）。按 query 分块把理论内存流量从
+// 424 GB 压到 26 GB，墙钟一点没动 —— 这个负结果证明再调循环没用，只能换硬件。
+bool vit_attn_gpu(const float* Q, const float* K, const float* V, int64_t N,
+                  int H, int KV, int HD, float* O);
+
 // 释放 Metal 资源（模型卸载时调）
 void vit_gpu_release();
 

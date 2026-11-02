@@ -434,6 +434,13 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
             // 期望逐位一致（不是"误差在阈值内"）。
             const float scale = 1.0f / std::sqrt((float)HD);
             const int group = H / KV;
+
+            // 先试 GPU：整段双向注意力一层一次算完。
+            // 失败（非 Apple / DUBHE_VIT_CPU=1 / head_dim 不在 32/64/128 里）
+            // 就落回下面的 CPU 版，两条路输出必须一致 —— 用 vlprobe --dump
+            // 对拍，期望差异在 1e-6 量级（在线 softmax 与两趟 softmax 的
+            // 累加顺序不同，不是逐位相等，这点和分块那版不一样）。
+            if (!vit_attn_gpu(q.data(), k.data(), v.data(), N, H, KV, HD, o.data())) {
             // 分数暂存上限 512 KB：块越大复用越好，但太大会把 L2 挤掉。
             const int64_t IB = std::max<int64_t>(
                 1, std::min<int64_t>(32, (int64_t)(131072 / std::max<int64_t>(1, N))));
@@ -503,6 +510,7 @@ bool MmProj::encode(const float* pixels, int gh, int gw, float* out, std::string
             } else {
                 head_body(0, H);
             }
+            }  // if (!vit_attn_gpu(...)) —— CPU 兜底结束
             matmul_qt(L.o, qdim, D, o.data(), N, y.data());
         } else {
             // 门控 2D 深度卷积

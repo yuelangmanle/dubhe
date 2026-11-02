@@ -9,6 +9,8 @@ namespace dubhe {
 void vit_bind(const void*, size_t) {}
 bool vit_gemm_gpu(const void*, uint32_t, int64_t, int64_t,
                   const float*, int64_t, float*, int64_t) { return false; }
+bool vit_attn_gpu(const float*, const float*, const float*, int64_t,
+                  int, int, int, float*) { return false; }
 void vit_gpu_release() {}
 bool vit_gpu_active() { return false; }
 
