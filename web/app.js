@@ -66,8 +66,65 @@
   state.tools = settings.tools;
 
   // ---------------------------------------------------------------- 存储
+  //
+  // localStorage 只有 5 MB 左右，写满时 setItem 抛 QuotaExceededError。
+  // 这里原来的 catch 是空的 —— 于是"对话突然不再保存"，重启后丢一片，
+  // 界面上一个字都不提示。工具结果动辄 8 KB（read_file 的正文、diff 的
+  // old/new），一次会话几十条就上千 KB，这个上限不是理论上的。
+  //
+  // 两道处理：
+  //   1) 存之前把只对"看"有用的东西截短：工具 output 留 1500 字（回放时
+  //      卡片照样画得出来，meta 里的 path/command/diff 全部保留），
+  //      搜索结果的摘要不留。
+  //   2) 还是写不进去，就从最老的对话开始丢（绝不丢当前打开的那条），
+  //      丢到能写进去为止，并且明确告诉用户丢了哪一条 —— 静默丢数据
+  //      是所有处理方式里最坏的一种。
+  const TOOL_OUT_KEEP = 1500;
+
+  function slimTool(t) {
+    const o = { name: t.name, ok: t.ok, card: t.card };
+    if (t.ms) o.ms = Math.round(t.ms);
+    if (t.denied) o.denied = 1;
+    if (t.output) {
+      const s = String(t.output);
+      o.output = s.slice(0, TOOL_OUT_KEEP);
+      if (s.length > TOOL_OUT_KEEP) o.trunc = 1;
+    }
+    if (t.meta) {
+      const m = Object.assign({}, t.meta);
+      if (Array.isArray(m.results)) m.results = m.results.map((r) => ({ t: r.t, u: r.u }));
+      o.meta = m;
+    }
+    return o;
+  }
+
+  function slimConv(c) {
+    const out = Object.assign({}, c);
+    out.messages = (c.messages || []).map((m) => {
+      if (!m.tools || !m.tools.length) return m;
+      const mm = Object.assign({}, m);
+      mm.tools = m.tools.map(slimTool);
+      return mm;
+    });
+    return out;
+  }
+
   function saveConvs() {
-    try { localStorage.setItem(STORE_KEY, JSON.stringify(state.convs)); } catch (e) {}
+    for (let guard = 0; guard < 24; guard++) {
+      try {
+        localStorage.setItem(STORE_KEY, JSON.stringify(state.convs.map(slimConv)));
+        return;
+      } catch (e) {
+        const idx = state.convs.findIndex((c) => c !== state.current);
+        if (idx < 0) {
+          log('对话没能保存到本地：存储空间不足', 'err');
+          return;
+        }
+        const gone = state.convs.splice(idx, 1)[0];
+        log('本地存储满了，已丢弃最早的对话「' + (gone.title || gone.id) + '」', 'err');
+      }
+    }
+    log('对话没能保存到本地：存储空间不足', 'err');
   }
   function loadConvs() {
     try { state.convs = JSON.parse(localStorage.getItem(STORE_KEY) || '[]'); } catch (e) { state.convs = []; }
@@ -504,6 +561,14 @@
       const tb = el('pre', 'tool-body');
       tb.textContent = text.slice(0, 1200);
       box.appendChild(tb);
+      // 存盘时工具输出被截过（见 saveConvs）。回放时要说清楚，否则用户会
+      // 以为工具当时只返回了这么多 —— 那等于替他改动记忆。
+      // 这句必须挂在 pre **外面**：pre 里的正文自己就截到 1200 字，写进
+      // text 末尾等于写进了看不见的地方。
+      if (t.trunc) {
+        box.appendChild(el('div', 'tool-note',
+          '本地只留了前 ' + TOOL_OUT_KEEP + ' 字，完整结果只在那次请求里'));
+      }
     }
     return box;
   }
