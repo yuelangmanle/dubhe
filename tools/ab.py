@@ -86,6 +86,10 @@ def main() -> int:
     ap.add_argument("--mlx", action="append", default=[], metavar="LABEL=DIR")
     ap.add_argument("--mlx-python", default=os.path.expanduser("~/.dubhe/venv-mlx/bin/python"))
     ap.add_argument("--prompt", default="long", choices=sorted(PROMPTS))
+    # 内置那三条提示词只有几十个 token，量不出**二次项**（长上下文注意力）。
+    # 想测长上下文就自己给一个文件 —— 文件里放一段真实长度的材料，
+    # 长度按 token 算不是按字节算，中文一个字常常就是一个 token。
+    ap.add_argument("--prompt-file", default="", help="用文件内容当提示词（覆盖 --prompt）")
     ap.add_argument("-n", "--tokens", type=int, default=32)
     ap.add_argument("-p", "--rounds", type=int, default=5)
     args = ap.parse_args()
@@ -93,7 +97,8 @@ def main() -> int:
     if not args.dubhe and not args.mlx:
         ap.error("至少要给一个 --dubhe 或 --mlx")
 
-    prompt = PROMPTS[args.prompt]
+    prompt = (Path(args.prompt_file).expanduser().read_text()
+              if args.prompt_file else PROMPTS[args.prompt])
     cases = [("dubhe", s) for s in args.dubhe] + [("mlx", s) for s in args.mlx]
     hist: dict[str, list[dict]] = {}
 
