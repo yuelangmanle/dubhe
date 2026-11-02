@@ -28,6 +28,7 @@
   --blue-press: #4A6555;
   --green: #4E8A6B;
   --red: #C4553F;              /* 陶土红，不用荧光红 */
+  --amber: #A8792F;            /* 琥珀：被拦下 / 需要注意，但不是错误 */
   --mint: #8FBFA8;
 
   /* ---- 底色：暖纸白，不是纯白。纯白会显得廉价 */
@@ -1135,6 +1136,10 @@ pre:hover .copy-code { opacity: 1; }
   white-space: nowrap; display: flex; align-items: center; gap: 4px;
 }
 .tool-row.fail .ti { color: var(--red); }
+/* 被门禁拦下 ≠ 执行失败。用琥珀而不是红：红是"出错了，去查命令"，
+ * 琥珀是"没让它跑，去开权限"。两种颜色对应两种完全不同的下一步动作。 */
+.tool-row.denied .ti { color: var(--amber); }
+.tool-row.denied .td { color: var(--amber); }
 .tool-empty { font-size: 11px; color: var(--tertiary); padding: 3px 0; }
 
 /* 系统日志：深色块。整个界面里唯一的深底，

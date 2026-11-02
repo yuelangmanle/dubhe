@@ -77,6 +77,11 @@ struct AppState {
     bool allow_write = true;    // 写文件 / 改文件
     bool allow_net = true;      // 联网（web_search / fetch_url）
     bool sandbox = true;        // shell 用 seatbelt 限制写盘范围
+    // 写域默认只到当前项目文件夹。读可以看整个家目录（模型权重就在
+    // ~/.dubhe 下，读不到等于残废），但"能读"和"能改"不该是同一个范围 ——
+    // 这是 DeepSeek Harness 的 workspace-write 默认值，也是用户把文件夹
+    // 绑成项目文件夹时预期的语义。要放开就在设置里打开。
+    bool allow_write_outside = false;
     int  shell_timeout_ms = 20000;
     std::mutex mu;
     std::atomic<bool> busy{false};
@@ -567,6 +572,9 @@ std::string guess_mime(const std::string& p) {
 struct ToolResult {
     bool ok = false;
     std::string output;
+    // 被门禁挡下来（不是工具执行失败）。前端据此把卡片画成"未执行"，
+    // 而不是把一句权限提示渲染成命令输出。
+    bool denied = false;
 };
 
 // ---------------------------------------------------------------- 进程执行
@@ -905,11 +913,125 @@ std::string web_search_text(const std::string& q, int n) {
     return out;
 }
 
+// ---------------------------------------------------------------- 工具门禁
+//
+// 策略集中在这一个函数里，不散落在每个工具内部。
+//
+// 这条是从 DeepSeek Harness 的 `tools/pre-execute` 抄的。它官方文档里有一句
+// 话正好戳中 Dubhe 原来的做法：「尽量不要把部署策略内建到工具中」。而我们
+// 之前是反例 —— allow_write 的判断在 write_file 和 edit_file 里各写一遍，
+// allow_net 在 fetch_url 和 web_search 里各写一遍，加一个新工具就多一个
+// 漏判点，而漏判的表现是"权限没生效"，不是报错，没人会发现。
+//
+// 三态而不是布尔：现在只会用到 Allow / Deny，但 Ask 的位置先留出来。将来
+// 前端要做"这条命令要跑，确认吗"的时候（DSH 的 Web UI 就是这么做的），
+// 只需要在 run_tool 里加一个分支，不用再改一遍九个工具。
+enum class Verdict { Allow, Deny, Ask };
+
+struct GateOut {
+    Verdict v = Verdict::Deny;
+    std::string reason;   // 给模型看的，必须能指导它下一步怎么做
+};
+
+static GateOut gate_deny(const std::string& why) {
+    GateOut o;
+    o.v = Verdict::Deny;
+    o.reason = why;
+    return o;
+}
+static GateOut gate_ok() {
+    GateOut o;
+    o.v = Verdict::Allow;
+    return o;
+}
+
+// p 是否落在 root 之下（按路径段比，不是按字符串前缀 —— 否则 /a/bc 会被
+// 判成在 /a/b 里面）。
+static bool under_root(const std::string& p, const std::string& root) {
+    if (root.empty() || p.size() < root.size()) return false;
+    if (p.compare(0, root.size(), root) != 0) return false;
+    return p.size() == root.size() || p[root.size()] == '/';
+}
+
+GateOut gate(const std::string& name, const json::Value& args) {
+    // 白名单，不是黑名单：新增工具忘了登记，表现是"这个工具用不了"，
+    // 而不是"它绕过了所有权限"。fail-closed 的全部意义就在这里。
+    static const char* kKnown[] = {"read_file", "list_dir", "write_file", "edit_file",
+                                   "grep",      "glob",     "fetch_url",  "web_search",
+                                   "shell"};
+    bool known = false;
+    for (const char* k : kKnown) {
+        if (name == k) {
+            known = true;
+            break;
+        }
+    }
+    if (!known) return gate_deny("未知工具: " + name);
+
+    const bool is_write = (name == "write_file" || name == "edit_file");
+    const bool has_path = (name == "read_file" || name == "list_dir" || name == "write_file" ||
+                           name == "edit_file" || name == "grep" || name == "glob");
+    // 只有这三个工具"没有 path 就没法干活"。grep/glob/list_dir 的 path 可省
+    // （默认工作区），shell 和联网工具根本不看 path —— 早先这里写成
+    // "除了 grep/glob/list_dir 都要 path"，结果 shell 被自己的门禁挡了。
+    const bool path_required = (name == "read_file" || name == "write_file" ||
+                                name == "edit_file");
+
+    // ---- 权限位
+    if (is_write && !g.allow_write)
+        return gate_deny("写文件权限已关闭（设置 → 权限 → 允许写文件）");
+    if (name == "shell" && !g.allow_shell)
+        return gate_deny("shell 工具未启用。在界面「设置 → 权限」里打开「允许执行命令」即可。");
+    if ((name == "fetch_url" || name == "web_search") && !g.allow_net)
+        return gate_deny("联网权限已关闭（设置 → 权限 → 允许联网）");
+
+    // ---- 必填键
+    //
+    // 放在门禁里而不是各工具里：工具自己判的话，模型只会看到一句
+    // "缺少 path 参数"，不知道该怎么办。这里统一说清楚缺哪个键。
+    if (path_required && args.s("path").empty()) return gate_deny("缺少 path 参数");
+    if (name == "shell" && args.s("command").empty()) return gate_deny("缺少 command 参数");
+    if (name == "grep" && args.s("pattern").empty()) return gate_deny("缺少 pattern 参数");
+    if (name == "glob" && args.s("pattern").empty()) return gate_deny("缺少 pattern 参数");
+    if (name == "fetch_url" && args.s("url").empty()) return gate_deny("缺少 url 参数");
+    if (name == "web_search" && args.s("query").empty()) return gate_deny("缺少 query 参数");
+    if (name == "edit_file" && args.s("old").empty()) return gate_deny("缺少 old 参数");
+
+    // ---- 路径域
+    if (has_path) {
+        const std::string p = path_abs(args.s("path", g.workspace));
+        if (p.find("..") != std::string::npos) return gate_deny("路径里不能有 ..");
+        if (!path_allowed(p)) return gate_deny("路径不在允许范围内: " + p);
+        if (is_write && !g.allow_write_outside) {
+            bool ok = under_root(p, g.workspace);
+            if (!ok) {
+                const char* h = getenv("HOME");
+                // ~/.dubhe 是应用自己的目录（配置、临时落地），写它不算越界
+                if (h && under_root(p, std::string(h) + "/.dubhe")) ok = true;
+            }
+            if (!ok)
+                return gate_deny("只能写当前项目文件夹里的文件（" + g.workspace +
+                                 "）。要写别处，先把那个文件夹绑成项目文件夹"
+                                 "（输入框上方的文件夹按钮），或者在设置里打开"
+                                 "「允许写到项目文件夹之外」。");
+        }
+    }
+    return gate_ok();
+}
+
 ToolResult run_tool(const std::string& name, const json::Value& args) {
     ToolResult r;
+    const GateOut gt = gate(name, args);
+    if (gt.v == Verdict::Deny) {
+        r.denied = true;
+        r.output = gt.reason;
+        return r;
+    }
     if (name == "read_file") {
-        std::string p = args.s("path");
-        if (p.empty()) { r.output = "缺少 path 参数"; return r; }
+        // 相对路径按项目文件夹解析。以前这里直接用原始字符串交给 read_file()，
+        // 于是 "a.txt" 会相对**服务进程的 cwd** 去找 —— 一旦用户把项目文件夹
+        // 绑到别处，模型读到的就是另一个同名文件，而且不会报错。
+        const std::string p = path_abs(args.s("path"));
         const std::string content = read_file(p);
         if (content.empty()) { r.output = "文件为空或无法读取: " + p; return r; }
 
@@ -965,7 +1087,6 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         // 不再 shell 出去调 ls：一是没开 shell 权限时它就不该依赖 shell，
         // 二是 `ls -la "路径"` 里路径带双引号、反引号就能注入。
         std::string p = path_abs(args.s("path", g.workspace));
-        if (!path_allowed(p)) { r.output = "路径不在允许范围内: " + p; return r; }
         DIR* d = opendir(p.c_str());
         if (!d) { r.output = "无法打开目录: " + p; return r; }
         std::vector<std::string> dirs, files;
@@ -995,12 +1116,8 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         return r;
     }
     if (name == "write_file") {
-        if (!g.allow_write) { r.output = "写文件权限已关闭（设置 → 权限）"; return r; }
-        const std::string raw = args.s("path");
         const std::string c = args.s("content");
-        if (raw.empty()) { r.output = "缺少 path 参数"; return r; }
-        const std::string p = path_abs(raw);
-        if (!path_allowed(p)) { r.output = "路径不在允许范围内: " + p; return r; }
+        const std::string p = path_abs(args.s("path"));
         r.ok = write_file(p, c);
         r.output = r.ok ? ("已写入 " + std::to_string(c.size()) + " 字节到 " + p)
                         : ("写入失败: " + p);
@@ -1009,13 +1126,9 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
     if (name == "edit_file") {
         // 精确串替换。为什么不是"整文件重写"：小模型重写整文件时会把
         // 没看过的部分凭记忆补一遍，改一个函数顺手删掉另外三个。
-        if (!g.allow_write) { r.output = "写文件权限已关闭（设置 → 权限）"; return r; }
-        const std::string raw = args.s("path");
         const std::string old_s = args.s("old");
         const std::string new_s = args.s("new");
-        if (raw.empty() || old_s.empty()) { r.output = "缺少 path 或 old 参数"; return r; }
-        const std::string p = path_abs(raw);
-        if (!path_allowed(p)) { r.output = "路径不在允许范围内: " + p; return r; }
+        const std::string p = path_abs(args.s("path"));
         std::string body = read_file(p, 4 * 1024 * 1024);
         if (body.empty()) { r.output = "读不到文件: " + p; return r; }
         size_t at = body.find(old_s);
@@ -1039,9 +1152,7 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         // 递归文本搜索。用 /usr/bin/grep 而不是自己写：它已经处理了二进制
         // 检测、编码、正则方言，自己写只会更慢更错。
         const std::string pat = args.s("pattern");
-        if (pat.empty()) { r.output = "缺少 pattern 参数"; return r; }
         std::string base = path_abs(args.s("path", g.workspace));
-        if (!path_allowed(base)) { r.output = "路径不在允许范围内: " + base; return r; }
         int limit = (int)args.n("limit", 60);
         if (limit <= 0) limit = 60;
         std::string cmd = "grep -rnI --exclude-dir=.git --exclude-dir=node_modules "
@@ -1055,9 +1166,7 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
     }
     if (name == "glob") {
         const std::string pat = args.s("pattern");
-        if (pat.empty()) { r.output = "缺少 pattern 参数"; return r; }
         std::string base = path_abs(args.s("path", g.workspace));
-        if (!path_allowed(base)) { r.output = "路径不在允许范围内: " + base; return r; }
         // find -name 只支持 glob，不支持 **。这里把 ** 折成"任意深度"，
         // 也就是去掉路径前缀里的 **/，剩下的交给 -name。
         std::string name_pat = pat;
@@ -1072,9 +1181,7 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         return r;
     }
     if (name == "fetch_url") {
-        if (!g.allow_net) { r.output = "联网权限已关闭（设置 → 权限）"; return r; }
         const std::string url = args.s("url");
-        if (url.empty()) { r.output = "缺少 url 参数"; return r; }
         if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
             r.output = "只支持 http/https";
             return r;
@@ -1090,21 +1197,14 @@ ToolResult run_tool(const std::string& name, const json::Value& args) {
         return r;
     }
     if (name == "web_search") {
-        if (!g.allow_net) { r.output = "联网权限已关闭（设置 → 权限）"; return r; }
         const std::string q = args.s("query");
-        if (q.empty()) { r.output = "缺少 query 参数"; return r; }
         r.output = web_search_text(q, (int)args.n("n", 6));
         r.ok = !r.output.empty();
         if (!r.ok) r.output = "搜索没有返回结果（可能被限流，或本机无法访问外网）";
         return r;
     }
     if (name == "shell") {
-        if (!g.allow_shell) {
-            r.output = "shell 工具未启用。在界面「设置 → 权限」里打开「允许执行命令」即可。";
-            return r;
-        }
         const std::string cmd = args.s("command");
-        if (cmd.empty()) { r.output = "缺少 command 参数"; return r; }
         const std::string cwd = args.s("cwd", g.workspace);
         ProcOut po = run_proc(cmd, cwd.empty() ? g.workspace : cwd,
                               g.shell_timeout_ms, 96 * 1024, g.sandbox);
@@ -2560,6 +2660,7 @@ int main(int argc, char** argv) {
         o.set("write", json::Value::make_bool(g.allow_write));
         o.set("net", json::Value::make_bool(g.allow_net));
         o.set("sandbox", json::Value::make_bool(g.sandbox));
+        o.set("write_outside", json::Value::make_bool(g.allow_write_outside));
         o.set("shell_timeout_s", json::Value::make_num(g.shell_timeout_ms / 1000.0));
         o.set("api_key", json::Value::make_str(is_local(req) ? g.api_key : ""));
         o.set("lan_url", json::Value::make_str(g.lan_url));
@@ -2847,6 +2948,8 @@ int main(int argc, char** argv) {
             if (body.get("write")) g.allow_write = body.flag("write", g.allow_write);
             if (body.get("net")) g.allow_net = body.flag("net", g.allow_net);
             if (body.get("sandbox")) g.sandbox = body.flag("sandbox", g.sandbox);
+            if (body.get("write_outside"))
+                g.allow_write_outside = body.flag("write_outside", g.allow_write_outside);
             const double t = body.n("shell_timeout_s", 0);
             if (t >= 1 && t <= 600) g.shell_timeout_ms = (int)(t * 1000);
             // 工作目录：必须是已存在的目录，且落在白名单根之内
@@ -2869,6 +2972,7 @@ int main(int argc, char** argv) {
         o.set("write", json::Value::make_bool(g.allow_write));
         o.set("net", json::Value::make_bool(g.allow_net));
         o.set("sandbox", json::Value::make_bool(g.sandbox));
+        o.set("write_outside", json::Value::make_bool(g.allow_write_outside));
         o.set("shell_timeout_s", json::Value::make_num(g.shell_timeout_ms / 1000.0));
         o.set("workspace", json::Value::make_str(g.workspace));
         c.send(200, "application/json", json::dump(o));
@@ -2909,20 +3013,13 @@ int main(int argc, char** argv) {
         const json::Value* a = body.get("arguments");
         if (a && a->type == json::Value::OBJ) args = *a;
         else args = body;
-        // 文件类工具走路径白名单，和 UI 的文件视图同一套边界
-        for (const char* k : {"path", "content"}) {
-            const std::string v = args.s(k);
-            if (!v.empty() && std::strcmp(k, "path") == 0) {
-                const std::string full = path_abs(v);
-                if (!path_allowed(full)) {
-                    c.send(403, "application/json", "{\"error\":\"路径不在允许的范围内\"}");
-                    return;
-                }
-            }
-        }
+        // 路径与权限一律交给 gate()。这里原来还有一段自己的 path_allowed 检查，
+        // 结果是同一个越界路径在两条路上返回两种错误形状 —— 模型看到的和手测
+        // 看到的不是一回事，排查时最容易把人带偏。
         const ToolResult r = run_tool(name, args);
         json::Value o = json::Value::make_obj();
         o.set("ok", json::Value::make_bool(r.ok));
+        o.set("denied", json::Value::make_bool(r.denied));
         o.set("output", json::Value::make_str(r.output));
         c.send(200, "application/json", json::dump(o));
     });
@@ -3451,7 +3548,8 @@ int main(int argc, char** argv) {
 
                 ToolResult tr = run_tool(tname, targs);
                 c.write_chunk("data: {\"dubhe\":{\"type\":\"tool_result\",\"ok\":" +
-                              std::string(tr.ok ? "true" : "false") + ",\"output\":" +
+                              std::string(tr.ok ? "true" : "false") + ",\"denied\":" +
+                              std::string(tr.denied ? "true" : "false") + ",\"output\":" +
                               json_escape(tr.output.substr(0, 8000)) + "}}\n\n");
                 rounds++;
 

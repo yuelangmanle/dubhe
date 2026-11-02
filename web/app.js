@@ -785,13 +785,15 @@
       return;
     }
     for (const t of tools.slice(-8)) {
-      const row = el('div', 'tool-row' + (t.ok === false ? ' fail' : ''));
+      const row = el('div', 'tool-row' + (t.ok === false ? ' fail' : '') + (t.denied ? ' denied' : ''));
       const ti = el('span', 'ti');
-      ti.appendChild(iconNode(t.ok === false ? 'x' : 'terminal', 'i'));
+      ti.appendChild(iconNode(t.denied ? 'shield' : (t.ok === false ? 'x' : 'terminal'), 'i'));
       row.appendChild(ti);
       row.appendChild(el('span', 'tn', t.name));
       const td = el('span', 'td');
-      if (t.ok === false) {
+      if (t.denied) {
+        td.appendChild(el('span', '', '未执行'));
+      } else if (t.ok === false) {
         td.appendChild(el('span', '', '失败'));
       } else {
         td.appendChild(iconNode('check', 'i'));
@@ -1154,6 +1156,10 @@
               if (last) {
                 last.output = j.dubhe.output;
                 last.ok = j.dubhe.ok;
+                // denied 和「执行失败」是两件事：前者是门禁没让它跑，
+                // 后者是跑了但出错。卡片上必须分开，否则用户会去查命令
+                // 本身，而真正该做的是去设置里开权限。
+                last.denied = j.dubhe.denied === true;
                 last.ms = performance.now() - (last.t0 || performance.now());
               }
               renderTools();
@@ -1471,6 +1477,11 @@
         () => !!srv().shell, (v) => setPerm('shell', v));
       toggle(body, '写文件', '允许 write_file / edit_file 改动磁盘上的文件。',
         () => srv().write !== false, (v) => setPerm('write', v));
+      // 读域和写域分开。读可以看整个家目录（模型权重就在 ~/.dubhe 下），
+      // 但写默认只落在当前项目文件夹里 —— 这是 Codex / DeepSeek Harness 的
+      // workspace-write 语义，也是把文件夹绑成项目之后最符合直觉的边界。
+      toggle(body, '写到项目外', '打开后允许写到项目文件夹以外的位置（默认只写项目内）。',
+        () => srv().write_outside === true, (v) => setPerm('write_outside', v));
       toggle(body, '联网', '允许 web_search 搜索、fetch_url 抓网页。',
         () => !!srv().net, (v) => setPerm('net', v));
       toggle(body, '命令沙箱', '命令只能写工作区与 /tmp。关掉就是完全放开。',
