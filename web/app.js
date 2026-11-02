@@ -465,6 +465,97 @@
     return t.name;
   }
 
+  // ---------------------------------------------------------------- 引用联动
+  //
+  // 模型回答联网内容时会写 [1] [2]，卡片上也有编号 1..6 的来源 —— 但两边原来
+  // 谁也不认谁：正文里的 [2] 只是一段普通文字，用户得自己数到卡片第二行再点。
+  // 这里把 [n] 换成指向第 n 条来源的链接，点开的同时把卡片里那一行闪一下，
+  // "这句话是从哪来的"一步就能落地。
+  //
+  // 只在这条消息**真的带了结构化搜索结果**时才做。别的时候 [1] 可能是
+  // Markdown 脚注、是数组下标、是正则里的字符类 —— 一律不能动。
+
+  // 一条消息里可能搜了两次，两套编号都从 1 开始，混起来必然错位。
+  // 取最后一次搜索：回答里引的几乎总是最后那次的结果。
+  function citeTableOf(tools) {
+    const list = tools || [];
+    for (let i = list.length - 1; i >= 0; i--) {
+      const t = list[i];
+      if (t.card !== 'web' || !t.meta || t.meta.kind !== 'search') continue;
+      const hits = t.meta.results;
+      if (Array.isArray(hits) && hits.length) return hits;
+    }
+    return null;
+  }
+
+  // 这些容器里的 [1] 一定不是引用：代码、链接文字、内联代码。
+  const CITE_SKIP = { PRE: 1, CODE: 1, A: 1, SCRIPT: 1, STYLE: 1 };
+
+  // 点到 [2]：把卡片里第 2 条来源滚进视野并闪一下。
+  // 用 closest('.msg') 而不是闭包里存节点：消息重绘（reswap）之后旧节点已经
+  // 不在文档里了，闭包存的那份会把高亮闪在一个看不见的地方。
+  function flashCite(a, i) {
+    const msg = a.closest ? a.closest('.msg') : null;
+    if (!msg) return;
+    const row = msg.querySelectorAll('.cite-table .web-item')[i];
+    if (!row) return;
+    row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    row.classList.remove('flash');
+    void row.offsetWidth;   // 强制回流，否则连点两次第二次不会重放动画
+    row.classList.add('flash');
+    clearTimeout(row._ft);
+    row._ft = setTimeout(() => row.classList.remove('flash'), 1400);
+  }
+
+  function linkCites(root, hits) {
+    if (!root || !hits || !hits.length) return;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(n) {
+        if (!n.nodeValue || n.nodeValue.indexOf('[') < 0) return NodeFilter.FILTER_SKIP;
+        if (CITE_SKIP[n.parentNode && n.parentNode.nodeName]) return NodeFilter.FILTER_SKIP;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const texts = [];
+    while (walker.nextNode()) texts.push(walker.currentNode);
+
+    for (const node of texts) {
+      const s = node.nodeValue;
+      // [1] / [1][3] / [1, 3] / [1，3]。中文逗号也得认 —— 模型写中文回答时
+      // 经常用全角，只认半角会让一半引用点不动。
+      const re = /\[(\d{1,2}(?:\s*[,，]\s*\d{1,2})*)\]/g;
+      let m, last = 0, frag = null;
+      while ((m = re.exec(s))) {
+        const nums = m[1].split(/[,，]/).map((x) => parseInt(x, 10));
+        // 有一个越界就整段不动。拆一半的结果是"[1, 99]"变成"[1, 99" ——
+        // 比不处理更难看，而且会让用户以为模型引了个不存在的来源。
+        if (nums.some((n) => !(n >= 1 && n <= hits.length))) continue;
+        if (!frag) frag = document.createDocumentFragment();
+        frag.appendChild(document.createTextNode(s.slice(last, m.index)));
+        nums.forEach((n, k) => {
+          if (k) {
+            const sepCh = (m[1].match(/[,，]/) || [','])[0];
+            frag.appendChild(document.createTextNode(sepCh === '，' ? '，' : ', '));
+          }
+          const h = hits[n - 1];
+          const a = document.createElement('a');
+          a.className = 'cite';
+          a.href = h.u || '#';
+          a.target = '_blank';
+          a.rel = 'noreferrer noopener';
+          a.textContent = '[' + n + ']';
+          a.title = (h.t || h.u || '') + (h.u ? '\n' + h.u : '');
+          a.onclick = () => flashCite(a, n - 1);
+          frag.appendChild(a);
+        });
+        last = m.index + m[0].length;
+      }
+      if (!last) continue;
+      frag.appendChild(document.createTextNode(s.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    }
+  }
+
   function toolCard(t) {
     const meta = t.meta || {};
     const card = t.card || 'generic';
@@ -673,7 +764,19 @@
     }
 
     if (m.tools && m.tools.length) {
-      for (const t of m.tools) col.appendChild(toolCard(t));
+      // 引用联动得先定"编号的出处"：把选中的那张来源卡标出来（.cite-table），
+      // 点正文里的 [2] 才知道该闪哪一行。
+      const tbl = citeTableOf(m.tools);
+      let tblNode = null;
+      for (const t of m.tools) {
+        const cardNode = toolCard(t);
+        if (tbl && t.meta && t.meta.results === tbl) tblNode = cardNode;
+        col.appendChild(cardNode);
+      }
+      if (tbl) {
+        if (tblNode) tblNode.classList.add('cite-table');
+        linkCites(body, tbl);
+      }
     }
 
     if (m.meta) {
@@ -1559,6 +1662,11 @@
         const tail = visible.slice(cut);
         if (head !== lastHead) { headEl.innerHTML = renderMarkdown(head); lastHead = head; }
         tailEl.innerHTML = renderMarkdown(tail);
+        // 流式期间也要补引用：来源卡是先到的（tool_result），文字是后到的，
+        // 所以每一帧画完都得重新扫一遍 —— 新吐出来的那几个 [n] 上一帧还不存在。
+        // 没有搜索卡片的消息在这里直接返回，不产生任何额外开销。
+        const tbl = citeTableOf(ai.tools);
+        if (tbl) { linkCites(headEl, tbl); linkCites(tailEl, tbl); }
       };
 
       const paint = () => {

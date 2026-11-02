@@ -950,6 +950,26 @@ pre:hover .copy-code { opacity: 1; }
   font-size: 11px; color: var(--tertiary); line-height: 1.45; margin-top: 2px;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
+/* 正文里的引用编号 [1]。
+ * 做成"淡底小方块 + 品牌色数字"，而不是普通下划线链接：它夹在中文句子中间，
+ * 下划线会把行距顶开，方块不会。inline-block 是为了让 padding 真正生效 ——
+ * 纯 inline 的左右 padding 会盖住相邻的字。 */
+.body .cite {
+  display: inline-block; margin: 0 1px; padding: 0 3px; border-radius: 4px;
+  background: var(--fill); color: var(--brand-2);
+  font-family: var(--mono); font-size: .86em; line-height: 1.55;
+  text-decoration: none; vertical-align: baseline;
+  transition: background .16s var(--ease), color .16s var(--ease);
+}
+.body .cite:hover { background: var(--brand-grad-soft); color: var(--brand-1); }
+
+/* 点到 [2] 时卡片里第 2 条来源闪一下：位置对了，眼睛就不用再数一遍。 */
+.web-item.flash { animation: hit-flash 1.3s var(--ease); border-radius: 6px; }
+@keyframes hit-flash {
+  0%, 45% { background: rgba(110, 140, 122, .20); box-shadow: 0 0 0 4px rgba(110, 140, 122, .16); }
+  100% { background: transparent; box-shadow: 0 0 0 0 transparent; }
+}
+
 /* 卡片底部的一行说明：本地只留了多少字这类"事后"信息。
  * 用 tertiary 而不是 amber —— 它不是警告，是交代。 */
 .tool-note { margin-top: 6px; font-size: 10.5px; color: var(--tertiary); line-height: 1.4; }

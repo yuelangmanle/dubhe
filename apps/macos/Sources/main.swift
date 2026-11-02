@@ -803,6 +803,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         NSWorkspace.shared.open(url)
         decisionHandler(.cancel)
     }
+
+    // target="_blank" 的链接走这里：联网来源的标题、正文里的引用编号 [1]。
+    //
+    // 不实现这个代理方法，WebKit 拿到"新窗口"请求就直接丢掉 —— 点上去一点
+    // 反应都没有，控制台也不报错。而这两类链接的价值恰恰在于"能点开核一下"。
+    // 处理方式和上面一致：外部链接交给系统浏览器，WebView 自己不留。
+    func webView(_ webView: WKWebView,
+                 createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction,
+                 windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if let url = navigationAction.request.url { NSWorkspace.shared.open(url) }
+        return nil
+    }
 }
 
 // ---------------------------------------------------------------- 入口
