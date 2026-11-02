@@ -742,9 +742,9 @@
       }
       col.appendChild(st);
     } else if (m.streaming) {
-      // 排队和生成是两件事：引擎一次只答一个，第二个请求在服务端等锁。
-      // 两种情况都不出字，但用户该知道"在等别人"还是"在算我的"。
-      st.appendChild(el('span', '', m.queued ? '排队中…' : '生成中…'));
+      // 排队、预填充、生成是三件不同的事，都不出字，但用户该知道自己在等什么。
+      st.appendChild(el('span', '', m.queued ? '排队中…'
+        : (m.noteText || '生成中…')));
       col.appendChild(st);
     }
 
@@ -1731,7 +1731,11 @@
               log('生成失败：' + ai.errText, 'err');
               reswap();
             } else if (j.dubhe.type === 'note') {
+              // 服务端的"交代"，比如"输入 5 万 token，正在预填充"。还没出字
+              // 的时候把它顶到状态行上 —— 大输入预填充要一分钟，只写日志
+              // 等于没说。
               log(j.dubhe.message || '');
+              if (!ai.content) { ai.noteText = j.dubhe.message || ''; reswap(); }
             } else if (j.dubhe.type === 'tool_ask') {
               // 需要用户点头的调用。卡片上两个按钮，点完 POST /api/approve。
               // 服务端在等（最多 90 秒），所以这张卡必须显眼、必须可点。
@@ -1791,9 +1795,13 @@
               state.gen.ttft = (tFirst - t0) / 1000;
               log('First token in ' + state.gen.ttft.toFixed(2) + ' s');
             }
-            // 排到队了：把状态行从"排队中"换回"生成中"。只在这一帧重画一次，
+            // 排到队了 / 预填充完了：状态行换回"生成中"。只在这一帧重画一次，
             // 不能每来一个 token 都 reswap —— 那等于把整块 DOM 每秒重建几十次。
-            if (ai.queued) { ai.queued = false; reswap(); }
+            if (ai.queued || ai.noteText) {
+              ai.queued = false;
+              delete ai.noteText;
+              reswap();
+            }
             ai.content += delta.content;
             paint();
             // 生成中每 12 帧刷一次仪表，别让 DOM 写操作拖慢解码
@@ -1821,7 +1829,8 @@
       state.streaming = false;
       state.abort = null;
       ai.streaming = false;
-      delete ai.queued;   // 状态行用的临时标记，不该跟着会话存下去
+      delete ai.queued;    // 状态行用的临时标记，不该跟着会话存下去
+      delete ai.noteText;
       setSendEnabled(true);
       const total = (performance.now() - t0) / 1000;
       const tokens = (ai.meta && ai.meta.tokens) || state.gen.tokens || 0;
@@ -2047,7 +2056,10 @@
         const kv = (k, v) => { const d = el('div', 'kv'); d.appendChild(el('span', 'k', k)); d.appendChild(el('span', 'v', v)); box.appendChild(d); };
         kv('架构', i.arch);
         kv('参数量', (i.params / 1e9).toFixed(2) + ' B');
-        kv('量化', i.quant);
+        // 量化这一行用 quantLabel 而不是原始 quant 串：后者是逐层拼起来的
+        // （"F32+F16"），看着像"这个模型一半是 F32"，其实只是几个边角层
+        // 没量化。顶栏胶囊用的就是这个函数，两处必须一致。
+        kv('量化', quantLabel(state.server));
         kv('层数 / 维度', `${i.n_layer} / ${i.n_embd}`);
         kv('词表', String(i.n_vocab));
         // 三个数分清楚：n_ctx 是这次能用的，n_ctx_ceiling 是这台机器装得下的，
@@ -2589,6 +2601,12 @@
       main.appendChild(nm);
       const bits = [];
       if (m.quant) bits.push(m.quant);
+      // MLX 目录名里的位宽（lfm3-mlx-4bit）没有走 guess_quant，补一下 ——
+      // 一行 "MLX · 0.9 GB" 看不出是 4bit 还是 8bit，而这两个速度差一倍。
+      else if (m.mlx) {
+        const q = /(\d+)\s*bit/i.exec(m.name || '');
+        if (q) bits.push(q[1] + 'bit');
+      }
       if (m.params) bits.push((m.params / 1e9).toFixed(1) + 'B');
       bits.push(fmtBytes(m.bytes));
       bits.push(fmtAgo(m.mtime));

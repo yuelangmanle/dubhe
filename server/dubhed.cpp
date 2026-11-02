@@ -3933,6 +3933,19 @@ int main(int argc, char** argv) {
         const std::string id = now_id();
         long long created = (long long)time(nullptr);
 
+        // 大输入先报一声。
+        //
+        // 预填充是**一个字节都不吐**的一段：5 万 token 在 1.7B 上大约要一分钟，
+        // 这段时间界面上只有"生成中…"，用户以为卡死，去点停止、刷新。
+        // 这里先把 SSE 头和一个 note 发出去，界面就有话可说。
+        if (stream && n > 8000) {
+            c.begin_stream();   // 幂等：已经发过头就直接返回
+            c.write_chunk("data: {\"dubhe\":{\"type\":\"note\",\"message\":" +
+                          json_escape("输入约 " + std::to_string(n) +
+                                      " tokens，正在做预填充，要等一会儿") +
+                          "}}\n\n");
+        }
+
         if (stream) {
             c.begin_stream();
 
