@@ -476,6 +476,31 @@ std::vector<KbHit> kb_search(const std::string& q, int topk) {
     }
     std::vector<std::pair<double, int>> order;
     order.reserve(score.size());
+    // 文件名加成。
+    //
+    // 用户问"ADR-0003 决定的是什么"，期望的是那个文件本身；而 BM25 只看
+    // 块的正文 —— "0003" 根本不在正文里，于是检索回来的是 ADR **模板**
+    // 那几篇（正文里到处是 ADR 这个词）。实测就是这样：问 ADR-0003，
+    // 命中 docs/adr/README.md，1.7B 拿着模板照猫画虎编了一份"ADR-0.003"。
+    //
+    // 文件名短、信息密度高，命中它比命中正文更能说明"就是这篇"。所以给
+    // "查询词出现在文件名里"加一份固定分。6.0 是按"一条明显相关的命中
+    // 在几百个块上通常 10 分以上"估的：够把对的推上来，又不至于让文件名
+    // 里的一个泛词（readme）压过正文里真正的多处命中。
+    std::unordered_map<int, double> doc_bonus;
+    auto bonus_of = [&](int di) {
+        auto it = doc_bonus.find(di);
+        if (it != doc_bonus.end()) return it->second;
+        double add = 0;
+        const auto nt = kb_tokenize(path_base(g_kb_docs[(size_t)di].path));
+        for (const auto& t : uniq) {
+            if (t.size() < 2) continue;
+            if (std::find(nt.begin(), nt.end(), t) != nt.end()) add += 6.0;
+        }
+        doc_bonus.emplace(di, add);
+        return add;
+    };
+    for (auto& kv : score) kv.second += bonus_of(g_kb_chunks[(size_t)kv.first].doc);
     for (const auto& kv : score) order.emplace_back(kv.second, kv.first);
     std::sort(order.begin(), order.end(),
               [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
@@ -517,12 +542,35 @@ void kb_ensure_loaded() {
 
 // 给对话用的上下文块。检索不到就返回空串，调用方据此不加东西。
 //
-// 门槛 5.0：BM25 分数随语料规模变，但"明显相关"的命中在几百个块上
-// 通常 10 以上，而闲聊撞到的词只有 1~3。不设门槛的话每句"你好"都会
-// 拖进三段文档 —— 1.7B 这种小模型会当场被带跑，去复述上下文而不是回答。
+// 门槛 8.0（原来 5.0）。BM25 分数随语料规模变，但在这套语料（十几篇文档、
+// 五百多个块）上实测分得很开：
+//
+//   问"进度书里讲了什么"     25.78   ← 该进
+//   问"ADR-0003 决定什么"    19.48   ← 该进
+//   问"monorepo"             12.33   ← 该进
+//   问"你好"                  5.16   ← 不该进（开发书的一条命令示例里
+//                                     正好有一句 -p "你好"）
+//
+// 5.0 那道线正好卡在"你好"下面一点点，等于没拦住。闲聊被拖进三段文档时，
+// 1.7B 会当场被带跑，去复述上下文而不是回答 —— 这就是把它抬到 8.0 的理由。
 std::string kb_context_for(const std::string& q, int topk) {
-    const auto hits = kb_search(q, topk);
-    if (hits.empty() || hits[0].score < 5.0) return "";
+    // 多取一些再挑。
+    //
+    // 同一篇文档常常有两三个块一起命中，直接把 top3 塞进去就会变成
+    // "三条全是同一篇"：问 ADR-0003，回来的两条是 ADR-0004 的开头两段，
+    // 真正那一篇被挤到看不见。这里改成每篇最多两块，先把不同的文档凑齐。
+    const auto hits = kb_search(q, std::max(topk * 3, 8));
+    if (hits.empty() || hits[0].score < 8.0) return "";
+    std::vector<const KbHit*> picked;
+    std::unordered_map<std::string, int> per_doc;
+    for (const auto& h : hits) {
+        if (h.score < 8.0) break;               // 排好序的，后面的只会更低
+        if (per_doc[h.path] >= 2) continue;
+        per_doc[h.path]++;
+        picked.push_back(&h);
+        if ((int)picked.size() >= topk) break;
+    }
+    if (picked.empty()) return "";
     // 措辞很重要。原来写的是"回答时优先依据它们"，结果 1.7B 会把资料当圣旨：
     // 问"今天天气怎么样"，它去复述文档里那句"今天天气很好，我们一起"的
     // 测试样例 —— 检索没错（那句话确实在库里），错在没给它"这跟我无关"
@@ -530,9 +578,9 @@ std::string kb_context_for(const std::string& q, int topk) {
     std::string s = "\n\n以下是从本地知识库检索到的片段，可能相关，也可能不相关。\n"
                     "只有确实能回答用户问题时才引用；不相关就忽略，不要复述，"
                     "也不要说「资料里提到」。\n";
-    for (size_t i = 0; i < hits.size(); i++) {
-        s += "\n[" + std::to_string(i + 1) + "] " + path_base(hits[i].path) + "\n";
-        s += hits[i].snippet + "\n";
+    for (size_t i = 0; i < picked.size(); i++) {
+        s += "\n[" + std::to_string(i + 1) + "] " + path_base(picked[i]->path) + "\n";
+        s += picked[i]->snippet + "\n";
     }
     return s;
 }
@@ -2160,10 +2208,14 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
                 std::string ctx;
                 {
                     std::lock_guard<std::mutex> lk(g_kb_mu);
-                    if (!g_kb_docs.empty()) {
-                        kb_ensure_loaded();
-                        ctx = kb_context_for(last_user, 3);
-                    }
+                    // 先 ensure 再判空。原来的顺序反了：g_kb_docs 在进程刚起来
+                    // 时是空的，而"判空"挡在 ensure 前面 —— 于是第一次对话
+                    // 一定注入不了；更糟的是只要没人点开"知识库"那一页，
+                    // g_kb_docs 就永远是空的，RAG 从头到尾一次都不生效。
+                    // 实测：重启后直接问，prompt 里没有知识库片段；先访问一次
+                    // /api/kb 再问，片段就出现了。
+                    kb_ensure_loaded();
+                    if (!g_kb_docs.empty()) ctx = kb_context_for(last_user, 3);
                 }
                 if (!ctx.empty()) {
                     // kb_context_for 以两个换行开头，去掉后拼在问题前面
