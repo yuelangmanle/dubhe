@@ -46,6 +46,7 @@
     abort: null,    // 生成中的 AbortController，用于"停止"
     view: null,     // 当前打开的功能视图（null = 对话）
     fsPath: '',     // 文件视图当前目录
+    memory: [],     // 记忆条目（见 loadMemory）
   };
 
   const settings = Object.assign(
@@ -70,6 +71,83 @@
     if (!Array.isArray(state.convs)) state.convs = [];
   }
   function saveSettings() { localStorage.setItem(SET_KEY, JSON.stringify(settings)); }
+
+  // ---------------------------------------------------------------- 记忆
+  //
+  // 两个作用域：
+  //   conv:<id> —— 只属于这一个对话。默认作用域，写进来的东西不会跑到别的
+  //                对话里去（"不同对话会串记忆"这条问题的正面解法）。
+  //   global    —— 显式选择才写，所有对话共享。
+  //
+  // 为什么存在浏览器而不是服务端：对话本身就只存在这里（localStorage），
+  // 记忆是对话的附属物，放到服务端反而会出现"对话删了、记忆还在"的错位。
+  const MEM_KEY = 'dubhe.memory.v1';
+  function loadMemory() {
+    try {
+      const a = JSON.parse(localStorage.getItem(MEM_KEY) || '[]');
+      return Array.isArray(a) ? a : [];
+    } catch (e) { return []; }
+  }
+  function saveMemory() {
+    try { localStorage.setItem(MEM_KEY, JSON.stringify(state.memory)); } catch (e) {}
+  }
+  function convScope() {
+    return 'conv:' + (state.current ? state.current.id : 'none');
+  }
+  function addMemory(text, scope) {
+    // 存之前把 markdown 的强调标记去掉：记忆是纯文本背景，留着 ** 和 ```
+    // 只会让模型在回答里也学着加，界面上看着也脏。
+    const t = String(text || '')
+      .replace(/\*\*|__|`{1,3}/g, '')
+      .replace(/^\s*[-*+]\s+/gm, '')
+      .replace(/^#+\s+/gm, '')
+      .trim();
+    if (!t) return null;
+    const m = { id: 'm' + Date.now() + Math.random().toString(36).slice(2, 6), scope, text: t, at: Date.now() };
+    state.memory.unshift(m);
+    if (state.memory.length > 500) state.memory.length = 500;
+    saveMemory();
+    return m;
+  }
+  // 本对话能看到的记忆：自己的 + 全局的
+  function memoryForConv(conv) {
+    const sc = 'conv:' + (conv ? conv.id : 'none');
+    return state.memory.filter((m) => m.scope === sc || m.scope === 'global');
+  }
+
+  // ---------------------------------------------------------------- 上下文压缩
+  //
+  // 触发条件是"消息条数"，不是"token 数"：前端拿不到准确 token 数，
+  // 而按条数触发的好处是行为可预测、不需要额外请求。每条消息的长短差异
+  // 由 KEEP_RECENT 和摘要本身的长度上限兜住。
+  const COMPRESS_AT = 16;   // 未折叠的消息超过这个数就压
+  const KEEP_RECENT = 8;    // 无论如何保留最近这么多条原文
+
+  async function maybeCompress(conv) {
+    const folded = conv.folded || 0;
+    const total = conv.messages.length;
+    if (total - folded <= COMPRESS_AT) return;
+    const end = total - KEEP_RECENT;
+    if (end <= folded) return;
+    const slice = conv.messages.slice(folded, end)
+      .filter((m) => m.content && (m.role === 'user' || m.role === 'assistant'))
+      .map((m) => ({ role: m.role, content: m.content }));
+    if (slice.length < 4) return;
+    log('上下文压缩中（' + slice.length + ' 条）…');
+    try {
+      const r = await vpost('/api/summarize', { messages: slice });
+      const sum = (r && r.summary ? String(r.summary) : '').trim();
+      if (!sum) { log('压缩没拿到摘要，本轮按原样发', 'err'); return; }
+      conv.summary = (conv.summary ? conv.summary + '\n' : '') + sum;
+      conv.folded = end;
+      saveConvs();
+      log('已压缩 ' + slice.length + ' 条 → 摘要 ' + sum.length + ' 字');
+      renderMessages();
+    } catch (e) {
+      // 压缩失败不该挡住这一轮对话：原样发出去，下次再试
+      log('压缩失败：' + e.message, 'err');
+    }
+  }
 
   function newConv() {
     // 新对话默认继承上一个对话绑定的项目文件夹 —— 像 Codex 那样"开个新
@@ -286,8 +364,11 @@
           im.alt = m.att.name;
           b.appendChild(im);
         } else {
-          const kind = m.att.kind === 'audio' ? 'audio'
-            : (m.att.kind === 'video' ? 'video' : (m.att.kind === 'image' ? 'image' : 'file'));
+          // 图标名必须是 index.html 里真实存在的 <symbol>：这里原来写的是
+          // 'audio' / 'video' / 'file'，而 symbol 集里只有 msg-audio /
+          // msg-video / msg-file —— 于是附件卡片永远是一个空方块。
+          const kind = m.att.kind === 'audio' ? 'msg-audio'
+            : (m.att.kind === 'video' ? 'msg-video' : 'msg-file');
           const f = el('div', 'mfile');
           f.appendChild(iconNode(kind, 'i mfile-i'));
           f.appendChild(el('span', '', m.att.name));
@@ -366,6 +447,32 @@
       if (m.meta.tokens) meta.appendChild(el('span', '', m.meta.tokens + ' tokens'));
       col.appendChild(meta);
     }
+
+    // 助手消息的操作行：只放真正会用到的那一两个。
+    // 「记住」把这条回答的要点写进本对话的记忆，下次请求自动带上 ——
+    // 这是记忆系统唯一需要用户动手的地方，所以放在消息上而不是设置里。
+    if (!m.streaming && (m.content || '').trim()) {
+      const acts = el('div', 'msg-acts');
+      const memBtn = el('button', 'act-btn', '记住');
+      memBtn.title = '把这条回答存进本对话的记忆';
+      memBtn.onclick = () => {
+        const pick = String(m.content).trim().slice(0, 300);
+        addMemory(pick, convScope());
+        memBtn.textContent = '已记住';
+        memBtn.disabled = true;
+      };
+      acts.appendChild(memBtn);
+      const globBtn = el('button', 'act-btn', '记住（全局）');
+      globBtn.title = '存进全局记忆，所有对话都能看到';
+      globBtn.onclick = () => {
+        const pick = String(m.content).trim().slice(0, 300);
+        addMemory(pick, 'global');
+        globBtn.textContent = '已记住';
+        globBtn.disabled = true;
+      };
+      acts.appendChild(globBtn);
+      col.appendChild(acts);
+    }
     return wrap;
   }
 
@@ -379,7 +486,27 @@
       return;
     }
     for (const m of c.messages) box.appendChild(messageNode(m));
+    if (c.summary && c.folded) box.insertBefore(compressNote(c), box.firstChild);
     scrollBottom(true);
+  }
+
+  // 折叠提示：告诉用户"前面那段已经被压缩了"，并且摘要随时可以点开看。
+  // 不做成折叠掉就消失 —— 用户翻历史时会以为消息丢了。
+  function compressNote(c) {
+    const wrap = el('div', 'compress-note');
+    const head = el('div', 'cn-head');
+    head.appendChild(iconNode('scissors', 'i'));
+    head.appendChild(el('b', null, '已压缩 ' + (c.folded || 0) + ' 条早期消息'));
+    const toggle = el('button', 'act-btn', '看摘要');
+    head.appendChild(toggle);
+    wrap.appendChild(head);
+    const bodyEl = el('div', 'cn-body hidden', c.summary || '');
+    wrap.appendChild(bodyEl);
+    toggle.onclick = () => {
+      const hidden = bodyEl.classList.toggle('hidden');
+      toggle.textContent = hidden ? '看摘要' : '收起';
+    };
+    return wrap;
   }
 
   // ---------------------------------------------------------------- 滚动跟随
@@ -695,7 +822,47 @@
     inp.click();
   }
 
+  // 文本/代码类扩展名。为什么要专门列一张表：File.type 在桌面 App 和
+  // 部分 WebView 里经常是空串（尤其是 .md / .py / .go 这些系统没有注册
+  // 关联的类型），只看 mime 会把它们一律当成二进制。
+  const TEXT_EXT = new Set([
+    'txt', 'md', 'markdown', 'json', 'jsonl', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf',
+    'csv', 'tsv', 'log', 'xml', 'html', 'htm', 'css', 'scss', 'js', 'mjs', 'cjs', 'ts',
+    'tsx', 'jsx', 'vue', 'svelte', 'py', 'rb', 'go', 'rs', 'c', 'h', 'cc', 'cpp', 'hpp',
+    'm', 'mm', 'swift', 'kt', 'java', 'sh', 'zsh', 'bash', 'sql', 'proto', 'gradle',
+    'cmake', 'mk', 'dockerfile', 'gitignore', 'env', 'patch', 'diff', 'srt', 'vtt',
+  ]);
+
+  function looksText(file) {
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    if (TEXT_EXT.has(ext)) return true;
+    const m = file.type || '';
+    if (m.startsWith('text/')) return true;
+    return ['application/json', 'application/xml', 'application/javascript',
+            'application/x-sh', 'application/x-yaml'].includes(m);
+  }
+
   function readAttachment(file) {
+    // 文本/代码：直接读成字符串塞进上下文。
+    // 原来这里不分类型，非音视频一律当 image 走 data URL —— 拖一个 .md
+    // 进来会变成 image_url，服务端当场拒掉，用户看到的就是"上传不了文件"。
+    if (looksText(file)) {
+      return new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onerror = () => reject(new Error('读取失败'));
+        fr.onload = () => {
+          let t = String(fr.result || '');
+          const CAP = 120 * 1024;
+          if (t.length > CAP) {
+            t = t.slice(0, CAP) + `\n…（文件较大，只截取了前 ${Math.round(CAP / 1024)} KB，` +
+                                 `原文共 ${Math.round(file.size / 1024)} KB）`;
+          }
+          resolve({ kind: 'text', name: file.name, mime: file.type || 'text/plain',
+                    text: t, bytes: file.size });
+        };
+        fr.readAsText(file);
+      });
+    }
     return new Promise((resolve, reject) => {
       const fr = new FileReader();
       fr.onerror = () => reject(new Error('读取失败'));
@@ -706,6 +873,13 @@
         let kind = 'image';
         if (mime.startsWith('audio/') || ['wav', 'mp3', 'm4a', 'flac', 'aiff', 'aif', 'ogg'].includes(ext)) kind = 'audio';
         else if (mime.startsWith('video/') || ['mp4', 'mov', 'webm', 'm4v'].includes(ext)) kind = 'video';
+        else if (!mime.startsWith('image/') && ext !== 'png' && ext !== 'jpg' && ext !== 'jpeg'
+                 && ext !== 'webp' && ext !== 'gif' && ext !== 'bmp') {
+          // 既不是文本、也不是音视频、也不是常见图片 —— 硬发过去只会得到
+          // 一句服务端错误。在这里就拒掉，理由说清楚。
+          reject(new Error('不支持这种文件类型：' + (file.type || ext || '未知')));
+          return;
+        }
         resolve({ kind, name: file.name, mime, fmt: mime.split('/')[1] || 'bin', dataUrl });
       };
       fr.readAsDataURL(file);
@@ -745,10 +919,12 @@
       chip.appendChild(im);
     } else {
       const ph = el('div', 'ph');
-      ph.appendChild(iconNode(a.kind === 'audio' ? 'audio' : 'video', 'i'));
+      ph.appendChild(iconNode(a.kind === 'audio' ? 'msg-audio'
+                             : a.kind === 'text' ? 'msg-file' : 'msg-video', 'i'));
       chip.appendChild(ph);
     }
-    chip.appendChild(el('div', 'an', a.name));
+    chip.appendChild(el('div', 'an', a.kind === 'text' && a.bytes
+      ? a.name + ' · ' + fmtBytes(a.bytes) : a.name));
     const x = el('button', 'ax');
     x.setAttribute('aria-label', '移除附件');
     x.appendChild(iconNode('x', 'i'));
@@ -782,8 +958,23 @@
     if (!state.current) newConv();
     const conv = state.current;
 
+    // 压缩放在最前面：它可能要先跑一次生成（压旧对话），期间不该把
+    // 用户这条消息已经塞进列表里 —— 否则压缩的切片边界会把新消息也算进去。
+    await maybeCompress(conv);
+
+    // 文本/代码附件：内容直接并进这一条 user 消息，不走 image_url。
+    //
+    // 为什么用围栏包起来而不是直接拼：模型需要一眼看出"这是文件内容、
+    // 到哪结束"，否则它会顺着文件最后一行的语气继续往下写。文件名放在
+    // 围栏的语言位上也顺便让界面把它渲染成一个带标题的代码块。
+    let wire = content;
+    if (att && att.kind === 'text') {
+      const head = att.name.replace(/[`\s]/g, '_');
+      wire = '```' + head + '\n' + att.text + '\n```' + (content ? '\n\n' + content : '');
+    }
+
     const userMsg = { role: 'user', content };
-    if (att) userMsg.att = { kind: att.kind, name: att.name, thumb: att.thumb, mime: att.mime };
+    if (att) userMsg.att = { kind: att.kind, name: att.name, thumb: att.thumb, mime: att.mime, bytes: att.bytes };
     conv.messages.push(userMsg);
     if (conv.title === '新对话') {
       const t = content || att.name;
@@ -821,19 +1012,38 @@
     saveConvs();
     renderConvList();
 
-    const msgs = conv.messages
+    // 只发"没被折叠"的那一段 + 摘要。折叠掉的原文还在 conv.messages 里
+    // （界面上照样能往上翻），但不再占上下文 —— 这就是压缩真正省下来的东西。
+    const live = conv.messages.slice(conv.folded || 0);
+    const msgs = live
       .filter((m) => m.role === 'user' || (m.role === 'assistant' && m.content))
       .map((m) => {
-        if (m === userMsg && att) {
+        if (m === userMsg && att && att.kind !== 'text') {
           const parts = [attachmentParts(att)];
           if (content) parts.push({ type: 'text', text: content });
           return { role: 'user', content: parts };
         }
         // 历史消息里的附件只留一行说明：服务端只认最后一条 user 的媒体，
         // 而且占位符没配特征会让模型看到空 token。
-        const c = m.content || '';
+        const c = m === userMsg ? wire : (m.content || '');
         return { role: m.role, content: m.att ? (c ? c + '\n' : '') + `[${m.att.kind}: ${m.att.name}]` : c };
       });
+    // 记忆 → 背景。放在 system 里而不是拼进最后一条 user：拼进 user 会让
+    // 模型把记忆当成"用户刚说的话"，回答时反复复述。
+    const mem = memoryForConv(conv);
+    if (mem.length) {
+      msgs.unshift({
+        role: 'system',
+        content: '以下是用户希望你记住的背景信息（不要逐条复述，只在相关时自然使用）：\n'
+          + mem.map((m, i) => (i + 1) + '. ' + m.text).join('\n'),
+      });
+    }
+    if (conv.summary) {
+      msgs.unshift({
+        role: 'system',
+        content: '以下是本对话更早部分的摘要（原文已折叠，不要假装记得原文细节）：\n' + conv.summary,
+      });
+    }
     if (settings.system) msgs.unshift({ role: 'system', content: settings.system });
 
     const t0 = performance.now();
@@ -1529,7 +1739,70 @@
     agent: { title: 'Agent', render: () => viewAgent() },
     files: { title: '文件', render: () => viewFiles(state.fsPath) },
     kb: { title: '知识库', render: () => viewKb() },
+    memory: { title: '记忆', render: () => viewMemory() },
   };
+
+  // ---------------------------------------------------------------- 记忆视图
+  function viewMemory() {
+    const body = $('#viewBody');
+    body.innerHTML = '';
+    const conv = state.current;
+    const mine = state.memory.filter((m) => m.scope === convScope());
+    const glob = state.memory.filter((m) => m.scope === 'global');
+    setViewHead('记忆', mine.length + ' 条本对话 · ' + glob.length + ' 条全局', [
+      {
+        label: '新建',
+        on: () => {
+          const t = prompt('要记住什么？（只对本对话生效）');
+          if (t) { addMemory(t, convScope()); viewMemory(); }
+        },
+      },
+    ]);
+
+    body.appendChild(el('div', 'desc',
+      '记忆会作为背景信息注入本对话的每一次请求。默认只属于当前对话；'
+      + '标成「全局」的才会出现在所有对话里 —— 这就是对话之间不串记忆的边界。'));
+
+    const section = (title, items, scope) => {
+      const sec = el('div', 'vsec');
+      const head = el('div', 'vsec-head');
+      head.appendChild(el('h3', null, title));
+      head.appendChild(el('span', 'n', items.length + ' 条'));
+      sec.appendChild(head);
+      if (!items.length) {
+        sec.appendChild(vEmpty('还没有记忆', scope === 'global'
+          ? '全局记忆对所有对话可见，适合放"我叫什么、我做什么"这类稳定事实。'
+          : '在对话里点助手消息下的「记住」，或者点右上角「新建」。'));
+        body.appendChild(sec);
+        return;
+      }
+      const card = el('div', 'vcard');
+      items.forEach((m) => {
+        const row = el('div', 'vrow');
+        const ico = el('div', 'vico');
+        ico.appendChild(iconNode('think'));
+        row.appendChild(ico);
+        const main = el('div', 'vmain');
+        main.appendChild(el('div', 'vname', m.text));
+        main.appendChild(el('div', 'vmeta',
+          new Date(m.at).toLocaleString() + (m.scope === 'global' ? ' · 全局' : ' · 本对话')));
+        row.appendChild(main);
+        const del = el('button', 'vbtn ghost', '删除');
+        del.onclick = () => {
+          state.memory = state.memory.filter((x) => x.id !== m.id);
+          saveMemory();
+          viewMemory();
+        };
+        row.appendChild(del);
+        card.appendChild(row);
+      });
+      sec.appendChild(card);
+      body.appendChild(sec);
+    };
+
+    section('本对话', mine, convScope());
+    section('全局', glob, 'global');
+  }
 
   function openView(name) {
     const v = VIEWS[name];
@@ -2249,6 +2522,42 @@
       }
     };
 
+    // 拖文件进窗口。桌面 App 里这条比点按钮更常用 —— 从 Finder 直接拖过来
+    // 比"点附件 → 在面板里翻目录 → 选文件"快得多。
+    let dragDepth = 0;
+    const hasFiles = (e) => !!(e.dataTransfer &&
+      Array.from(e.dataTransfer.types || []).includes('Files'));
+    const takeFile = async (f) => {
+      if (!f) return;
+      if (f.size > 64 * 1024 * 1024) { alert('文件太大，上限 64 MB'); return; }
+      try {
+        const a = await readAttachment(f);
+        if (a.kind === 'image') a.thumb = await makeThumb(a.dataUrl);
+        state.attach = a;
+        renderAttach();
+      } catch (err) {
+        alert('读取文件失败：' + err.message);
+      }
+    };
+    window.addEventListener('dragenter', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dragDepth++;
+      document.body.classList.add('dropping');
+    });
+    window.addEventListener('dragover', (e) => { if (hasFiles(e)) e.preventDefault(); });
+    window.addEventListener('dragleave', (e) => {
+      if (!hasFiles(e)) return;
+      if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dropping'); }
+    });
+    window.addEventListener('drop', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dragDepth = 0;
+      document.body.classList.remove('dropping');
+      takeFile(e.dataTransfer.files && e.dataTransfer.files[0]);
+    });
+
     document.querySelectorAll('.chip').forEach((c) => {
       c.onclick = () => send(c.dataset.p);
     });
@@ -2304,6 +2613,7 @@
   // ---------------------------------------------------------------- 启动
   async function boot() {
     loadConvs();
+    state.memory = loadMemory();
     bind();
     await refreshState();
     if (state.convs.length) {

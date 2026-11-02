@@ -2341,6 +2341,16 @@ json::Value tools_json() {
 
 }  // namespace
 
+// 上下文压缩用的累积回调。放在这里而不是 lambda：dubhe_generate 收的是
+// 裸函数指针，带捕获的 lambda 转不过去。
+struct SumCtx {
+    std::string out;
+};
+static void sum_piece_cb(void* ud, int32_t tok, const char* piece) {
+    auto* x = (SumCtx*)ud;
+    if (piece && *piece) x->out += piece;
+}
+
 // ---------------------------------------------------------------- handlers
 int main(int argc, char** argv) {
     std::string host = "127.0.0.1";
@@ -3104,6 +3114,93 @@ int main(int argc, char** argv) {
         root.set("hits", arr);
         root.set("q", json::Value::make_str(q));
         c.send(200, "application/json", json::dump(root));
+    });
+
+    // 上下文压缩：把一段较早的对话压成要点。
+    //
+    // 为什么放在服务端：只有这里有模型。前端能做的只是"截断"，那等于
+    // 把用户前半小时说过的话直接扔掉；压缩至少把结论留下来。
+    //
+    // 调用方（前端）负责决定"压哪一段"，这里只管"把给的这段压成一段话"。
+    // 这样服务端不需要知道会话结构，也不用持久化任何对话 —— 隐私面上
+    // 更干净：对话始终只存在浏览器里。
+    srv.post("/api/summarize", [](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        if (!json::parse(req.body, &body)) {
+            c.send(400, "application/json", "{\"error\":\"JSON 解析失败\"}");
+            return;
+        }
+        const json::Value* msgs = body.get("messages");
+        if (!msgs || msgs->type != json::Value::ARR || msgs->arr.empty()) {
+            c.send(400, "application/json", "{\"error\":\"缺少 messages\"}");
+            return;
+        }
+        std::string dialog;
+        for (auto& m : msgs->arr) {
+            const std::string role = m.s("role");
+            const std::string ct = m.s("content");
+            if (ct.empty()) continue;
+            dialog += (role == "user" ? "用户：" : "助手：");
+            dialog += ct;
+            dialog += "\n";
+        }
+        if (dialog.empty()) {
+            c.send(400, "application/json", "{\"error\":\"没有可压缩的正文\"}");
+            return;
+        }
+        // 只压最近这一段：太长的输入在 1-2B 模型上既慢又容易中途跑偏
+        const size_t CAP = 20000;
+        if (dialog.size() > CAP) dialog = dialog.substr(dialog.size() - CAP);
+
+        const std::string ask =
+            "把下面这段对话压缩成中文要点，供之后继续对话时参考。要求：\n"
+            "1. 保留事实、数字、结论、用户明确提出的要求和偏好；\n"
+            "2. 删掉寒暄、重复和已经作废的方案；\n"
+            "3. 用短句分条写，不要复述原文，不要加评论；\n"
+            "4. 总长不超过 300 字。\n\n对话记录：\n" + dialog + "\n\n压缩结果：";
+
+        std::unique_lock<std::mutex> lk(g.mu, std::defer_lock);
+        if (!lk.try_lock()) {
+            c.send(409, "application/json", "{\"error\":\"引擎正在生成，稍后再试\"}");
+            return;
+        }
+        dubhe_model_info mi{};
+        dubhe_model_info_get(g.engine, &mi);
+
+        json::Value one = json::Value::make_arr();
+        json::Value m0 = json::Value::make_obj();
+        m0.set("role", json::Value::make_str("user"));
+        m0.set("content", json::Value::make_str(ask));
+        one.arr.push_back(m0);
+
+        MmCache mc;
+        std::vector<int32_t> toks;
+        std::string berr;
+        if (!build_tokens(g.engine, one, mi.has_chat_template != 0, false, false,
+                          &toks, &mc, &berr)) {
+            c.send(500, "application/json", "{\"error\":" + json_escape("分词失败: " + berr) + "}");
+            return;
+        }
+        dubhe_sampling sp{};
+        sp.max_tokens = 420;
+        sp.temperature = 0.2f;
+        sp.top_k = 20;
+        sp.top_p = 0.9f;
+        sp.repeat_penalty = 1.05f;
+        sp.repeat_last_n = 64;
+
+        SumCtx sc;
+        dubhe_stats st{};
+        dubhe_generate(g.engine, toks.data(), (int32_t)toks.size(), &sp, sum_piece_cb,
+                       nullptr, &sc, &st);
+        json::Value o = json::Value::make_obj();
+        o.set("summary", json::Value::make_str(sc.out));
+        o.set("tokens", json::Value::make_num((double)st.n_generated));
+        c.send(200, "application/json", json::dump(o));
     });
 
     srv.get("/v1/models", [](const http::Request& req, http::Conn& c) {

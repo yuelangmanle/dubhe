@@ -634,6 +634,42 @@ body::after {
   .cwd-chip { max-width: 120px; }
 }
 
+/* ================= 拖放提示 ================= */
+body.dropping::after {
+  content: "松手即可作为附件发送";
+  position: fixed; inset: 14px; z-index: 95; pointer-events: none;
+  display: grid; place-items: center;
+  border: 2px dashed var(--brand-2); border-radius: 18px;
+  background: color-mix(in srgb, var(--brand-1) 8%, transparent);
+  color: var(--brand-1); font-size: 14px; font-weight: 600;
+  -webkit-backdrop-filter: blur(2px); backdrop-filter: blur(2px);
+}
+
+/* ================= 消息操作行 / 压缩提示 ================= */
+.msg-acts { display: flex; gap: 8px; margin-top: 8px; opacity: 0; transition: opacity .16s; }
+.msg:hover .msg-acts, .msg-acts:focus-within { opacity: 1; }
+.act-btn {
+  border: 1px solid var(--glass-line); background: var(--glass-soft);
+  color: var(--secondary); font-size: 11.5px; padding: 3px 9px;
+  border-radius: 7px; cursor: pointer; transition: color .15s, background .15s;
+}
+.act-btn:hover { color: var(--text); background: var(--fill-strong); }
+.act-btn:disabled { opacity: .55; cursor: default; }
+
+.compress-note {
+  max-width: 760px; margin: 0 auto 18px; padding: 9px 12px;
+  border: 1px dashed var(--glass-line); border-radius: 12px;
+  background: var(--glass-soft); font-size: 12px; color: var(--secondary);
+}
+.cn-head { display: flex; align-items: center; gap: 8px; }
+.cn-head .i { width: 13px; height: 13px; color: var(--brand-1); }
+.cn-head b { font-weight: 600; color: var(--text-2); }
+.cn-head .act-btn { margin-left: auto; }
+.cn-body {
+  margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--glass-line);
+  white-space: pre-wrap; line-height: 1.6; max-height: 260px; overflow: auto;
+}
+
 /* ================= 消息 ================= */
 .msg {
   max-width: 760px; margin: 0 auto 22px; display: flex; flex-direction: column;

@@ -149,7 +149,7 @@ private func dbg(_ s: String) {
 
 // ---------------------------------------------------------------- 主界面
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
-                         WKNavigationDelegate, WKScriptMessageHandler {
+                         WKNavigationDelegate, WKScriptMessageHandler, WKUIDelegate {
     private var window: NSWindow!
     private var webView: WKWebView!
     private var engine: Process?
@@ -366,6 +366,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         webView = WKWebView(frame: rect, configuration: cfg)
         webView.autoresizingMask = [.width, .height]
         webView.navigationDelegate = self
+        // 文件选择必须挂 uiDelegate。
+        //
+        // WKWebView **默认不会**弹文件选择框：页面里的 <input type="file">
+        // 点了以后什么都不会发生，而且不报错、不打日志。这就是"界面上传不了
+        // 文件/图片"的根因 —— 网页在浏览器里正常，塞进 WKWebView 就哑了。
+        // 要让它工作，必须实现 runOpenPanelWith 并用 NSOpenPanel 自己弹。
+        webView.uiDelegate = self
         // 窗口标题跟着页面的 <title> 走，这样切到"模型"页时标题栏也跟着变，
         // Dock 的悬停提示也一样。WKWebView.title 是 KVO 可观察的，不用额外请求。
         titleObserver = webView.observe(\.title, options: [.new]) { [weak self] wv, _ in
@@ -705,6 +712,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             dbg("autorestart in \(secs)s")
             DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
                 self?.restartEngine()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ 文件选择
+    //
+    // 页面里点「文件」/「图像」会走到这里。WKOpenPanelParameters 只暴露
+    // allowsMultipleSelection / allowsDirectories，读不到 accept 属性 ——
+    // 所以这里不做类型过滤，选错了类型由网页侧再校验（readAttachment
+    // 会按 mime 判断，给不支持的格式会明确报出来）。
+    func webView(_ webView: WKWebView,
+                 runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping ([URL]?) -> Void) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.treatsFilePackagesAsDirectories = true
+        panel.message = "选择要发送给模型的文件"
+        panel.prompt = "选择"
+        // 用 sheet 而不是 begin：不挡住窗口，取消也不会留下悬空的面板
+        if let w = window {
+            panel.beginSheetModal(for: w) { resp in
+                completionHandler(resp == .OK ? panel.urls : nil)
+            }
+        } else {
+            panel.begin { resp in
+                completionHandler(resp == .OK ? panel.urls : nil)
             }
         }
     }
