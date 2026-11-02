@@ -47,6 +47,7 @@ macOS 宿主。许可：闭源（Proprietary，见根目录 LICENSE）。
 | 错误页可重试 | 转圈页出按钮，JS → 原生只认 `retry` / `openLog` 两个字符串 | 一个转不完的圈不是错误提示 |
 | 重启引擎 | 菜单 ⌘⇧R，走和冷启动同一条路 | 换模型/卡住时不用退出重开 |
 | 窗口标题同步 | KVO `WKWebView.title` | 实测变成「Dubhe · 天枢」 |
+| 拖 gguf 到 Dock 图标 | `CFBundleDocumentTypes` 声明 + `application(_:open:)` | 换个模型不用先进界面 |
 
 ## 构建
 
@@ -104,11 +105,10 @@ build/Dubhe.app/Contents/Resources/AppIcon.icns
 
 ## 待做
 
-- 拖拽文件到窗口：现在靠 Web UI 自己的 `<input type=file>`，拖进输入框能用，
-  但"拖到 Dock 图标上"这条路径还没接（`application(_:open:)` 收到路径后没有
-  地方转交给界面）。
 - 生成完成的通知：窗口不在前台时没有任何提示。WKWebView 的 Web Notification
   需要自己实现 delegate，工作量比看起来大，先记着。
 - 公证：`build.sh` 现在只做 ad-hoc 签名。对外分发要换 Developer ID 并 `notarytool`。
 - 引擎崩溃后的自动重试：现在只给"重试"按钮，不会自己拉起来。做的话要限次数，
   否则一个必崩的模型会变成重启风暴。
+- 拖文件到窗口里（而不是 Dock 图标）：现在靠 Web UI 自己的 `<input type=file>`，
+  拖进输入框能用，拖到窗口空白处没反应。

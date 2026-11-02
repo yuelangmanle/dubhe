@@ -164,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var stateTimer: DispatchSourceTimer?
     private var usedRememberedModel = false
     private var logInitialized = false
+    private var pendingModelURL: URL?
 
     // 上次在界面里加载过的模型。存路径而不是名字：同名模型可能在两个目录里。
     private static let lastModelKey = "lastModelPath"
@@ -177,12 +178,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        dbg("launch pid \(getpid()) bundle \(Bundle.main.bundleIdentifier ?? "?")")
         // 第二次双击时不要再起一份引擎：macOS 一般会把已经开着的那个激活，
         // 但从终端直接跑二进制、或者两份不同路径的拷贝，都会真的起两个
         // 引擎（各占一个端口、各吃一份内存）。这里主动退让。
         let others = NSRunningApplication
             .runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.dubhe.desktop")
             .filter { $0.processIdentifier != getpid() }
+        dbg("other instances: \(others.map { $0.processIdentifier })")
         if let other = others.first {
             other.activate()
             dbg("another instance running (pid \(other.processIdentifier)), bowing out")
@@ -192,6 +195,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         installSignalHandlers()
         buildMenu()
         buildWindow()
+        // 由"打开 .gguf"触发启动时，第一个要加载的就是它，别再先用
+        // 记住的那个起一遍再重启。
+        if let u = pendingModelURL {
+            UserDefaults.standard.set(u.path, forKey: Self.lastModelKey)
+            pendingModelURL = nil
+        }
         startEngine()
     }
 
@@ -214,6 +223,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     // 关窗口 = 退出（这是一个单窗口工具，不是文档型 App）
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+
+    // 把 .gguf 拖到 Dock 图标上（或在 Finder 里"打开方式 → Dubhe"）。
+    // 拖进来的文件直接当"这次要加载的模型"，走重启引擎那条路。
+    func application(_ sender: NSApplication, open urls: [URL]) {
+        guard let gguf = urls.first(where: { $0.pathExtension.lowercased() == "gguf" }) else { return }
+        dbg("open file \(gguf.path)")
+        // 如果是"用这个文件启动"的场景，窗口还没建好，先记下来，
+        // 等 applicationDidFinishLaunching 里再决定用哪个模型起引擎。
+        if webView == nil {
+            pendingModelURL = gguf
+            return
+        }
+        UserDefaults.standard.set(gguf.path, forKey: Self.lastModelKey)
+        usedRememberedModel = false
+        restartEngine()
+    }
 
     func applicationWillTerminate(_ note: Notification) {
         shuttingDown = true
