@@ -82,7 +82,7 @@ TOOL_OBJS   := $(BUILD)/tools/selftest.o $(BUILD)/tools/ggufdump.o
 
 MODEL ?= $(HOME)/.dubhe/models/qwen2.5-0.5b-instruct/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
-.PHONY: all clean tools run inspect bench serve check gpu optest shader-check mm2 engine membw mvbench
+.PHONY: all clean tools run inspect bench serve check gpu optest shader-check mm2 engine membw mvbench app app-run dmg
 
 all: $(BIN) $(SRV) tools
 
@@ -151,6 +151,18 @@ bench: $(BIN)
 
 serve: $(SRV)
 	./$(SRV) -m $(MODEL) --port 7777
+
+# macOS 桌面外壳：出一份 build/Dubhe.app（引擎 + web/ 都打进包里）
+app: all
+	./apps/macos/build.sh
+
+# 出完直接打开
+app-run: all
+	./apps/macos/build.sh --run
+
+# 分发用：额外打一个 DMG
+dmg: all
+	./apps/macos/build.sh --dmg
 
 # 一条命令自检（ADR-0007 要求）：GPU 与 CPU 两条路径都跑一遍
 check: all
