@@ -489,6 +489,16 @@ std::vector<KbHit> kb_search(const std::string& q, int topk) {
     // 在几百个块上通常 10 分以上"估的：够把对的推上来，又不至于让文件名
     // 里的一个泛词（readme）压过正文里真正的多处命中。
     std::unordered_map<int, double> doc_bonus;
+    // 查询里的纯数字词（0003 / 2119）。这类词只在**文件名**里出现，正文里
+    // 一个都没有 —— 见下面"编号命中"的注释。
+    std::vector<std::string> nums;
+    for (const auto& t : uniq) {
+        if (t.size() < 2) continue;
+        bool digits = true;
+        for (char ch : t)
+            if (!std::isdigit((unsigned char)ch)) { digits = false; break; }
+        if (digits) nums.push_back(t);
+    }
     auto bonus_of = [&](int di) {
         auto it = doc_bonus.find(di);
         if (it != doc_bonus.end()) return it->second;
@@ -497,6 +507,17 @@ std::vector<KbHit> kb_search(const std::string& q, int topk) {
         for (const auto& t : uniq) {
             if (t.size() < 2) continue;
             if (std::find(nt.begin(), nt.end(), t) != nt.end()) add += 6.0;
+        }
+        // 编号命中。
+        //
+        // 文件名加成是"每个命中词 +6"，可 ADR 系列每一篇的文件名里都有 "adr"：
+        // 问 ADR-0003 时，ADR-0003.md 拿 12 分，ADR-0004.md 也拿 6 分 —— 中间
+        // 这 6 分差距常常小于正文 BM25 的波动，于是排第一的还是错的那篇。
+        // 数字部分才是真正的区分点：文件名里带 0003 的那一篇就是用户要的那一篇。
+        // +40 是"压过一切正文分差"的量级（这套语料正文分在 5~26 之间），
+        // 而且只有"文件名里真的有这个编号"时才触发，普通提问一分都不受影响。
+        for (const auto& num : nums) {
+            if (std::find(nt.begin(), nt.end(), num) != nt.end()) { add += 40.0; break; }
         }
         doc_bonus.emplace(di, add);
         return add;
