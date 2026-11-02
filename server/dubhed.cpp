@@ -1638,18 +1638,28 @@ json::Value flatten_messages(const json::Value& messages, std::vector<MediaPart>
                     if (err) *err = "一次请求只支持一个媒体（图像 / 视频 / 音频）";
                     return json::Value::make_obj();
                 }
-                std::string url, b64, fmt;
+                std::string url, fmt;
                 if (const json::Value* iu = part.get("image_url")) url = iu->s("url");
                 if (const json::Value* vu = part.get("video_url")) {
                     url = vu->s("url");
                     if (url.empty()) url = vu->s("path");
                 }
                 if (const json::Value* ia = part.get("input_audio")) {
-                    b64 = ia->s("data");
+                    // 两种写法都得认：
+                    //   data 是**完整 data URL**（前端就是发这个）
+                    //   data 是**裸 base64**（OpenAI 官方的形状，format 另给）
+                    // 早先这里只处理第二种，于是前端发来的音频一律报
+                    // "缺少 input_audio 数据" —— 界面上录完音点发送，得到的是
+                    // 一句 400，看起来像"语音功能没做"。
+                    const std::string d = ia->s("data");
                     fmt = ia->s("format");
-                    if (!b64.empty() && b64.rfind("data:", 0) != 0)
+                    if (d.rfind("data:", 0) == 0) url = d;
+                    else if (!d.empty())
                         url = "data:audio/" + (fmt.empty() ? std::string("wav") : fmt) +
-                              ";base64," + b64;
+                              ";base64," + d;
+                    if (url.empty()) {
+                        if (const json::Value* p = ia->get("path")) url = p->str;
+                    }
                 }
                 if (url.empty()) { if (err) *err = std::string("缺少 ") + type + " 数据"; return json::Value::make_obj(); }
 

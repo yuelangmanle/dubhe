@@ -991,6 +991,13 @@ pre:hover .copy-code { opacity: 1; }
 .cbtn.dim, .cbtn:disabled { color: var(--tertiary); cursor: default; }
 .cbtn.dim:hover { background: none; color: var(--tertiary); }
 
+/* 录音中：麦克风变红 + 呼吸。不加文字提示是因为工具栏宽度有限，
+ * 而"红点 + 呼吸"这件事所有录音软件都是这么表达的，不用教。 */
+.cbtn.rec { color: var(--red); background: rgba(196, 85, 63, .10); }
+.cbtn.rec:hover { color: var(--red); background: rgba(196, 85, 63, .16); }
+.cbtn.rec .i { animation: recpulse 1.1s ease-in-out infinite; }
+@keyframes recpulse { 50% { opacity: .35; } }
+
 .cmode {
   display: inline-flex; align-items: center; gap: 4px;
   height: 29px; padding: 0 8px; border-radius: 8px;

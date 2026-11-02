@@ -39,6 +39,9 @@
     // 普通对话被污染的成本远大于偶尔能自动读个文件的收益。
     // 要用就走 Agent 视图（单次开启），或者在设置里显式打开。
     tools: false,
+    // 联网搜索：只在本次会话有效。打开后每个问题前面会加一句"先搜再答"，
+    // 并临时打开工具（否则模型没有 web_search 可用，开关等于摆设）。
+    web: false,
     attach: null,   // 待发送的图片/音频/视频（一次只允许一个）
     logs: [],       // 右栏系统日志：只记真实事件，不编
     gen: null,      // 本轮生成统计 { tokens, tps, total, ttft }
@@ -670,6 +673,14 @@
       if (mi) {
         mi.disabled = !s.mm_audio;
         mi.classList.toggle('dim', !s.mm_audio);
+        mi.title = s.mm_audio ? '语音输入（点一下开始，再点结束）' : '当前模型没有语音塔';
+      }
+      const bw = $('#btnWeb');
+      if (bw) {
+        bw.disabled = !s.net;
+        bw.classList.toggle('dim', !s.net);
+        bw.title = s.net ? '联网搜索（先搜再答）' : '联网权限已关闭（设置 → 权限）';
+        if (!s.net && state.web) { state.web = false; bw.classList.remove('on'); }
       }
       if (first) {
         log(s.loaded ? 'Model loaded successfully.' : 'No model loaded.', s.loaded ? '' : 'err');
@@ -1025,6 +1036,144 @@
     return { type: 'input_audio', input_audio: { data: a.dataUrl, format: a.fmt } };
   }
 
+  // ---------------------------------------------------------------- 语音输入
+  //
+  // 录成 16 kHz 单声道 WAV，而不是拿 MediaRecorder 直接录一段 webm/opus。
+  // 服务端解码走 AVFoundation 的 AVAudioFile（engine/src/audiofile.mm），它认
+  // wav / mp3 / m4a / flac / aiff / caf，**不认 webm** —— 而 Chromium 系
+  // 的 MediaRecorder 默认就给 webm。发过去只会得到一句解码失败，用户看到的
+  // 就是"语音输入用不了"。
+  //
+  // 自己取 PCM 再写 44 字节 WAV 头是二十行的事，换来的是不依赖浏览器的编码器
+  // 选什么。采样率也自己降到 16 kHz：语音塔的 mel 就是按 16 kHz 算的，
+  // 交给 AVFoundation 去重采样只是多一次误差。
+  const rec = { on: false, ctx: null, stream: null, proc: null, chunks: [], t0: 0, timer: 0 };
+
+  function downsampleTo(buf, from, to) {
+    if (to >= from) return buf;
+    const ratio = from / to;
+    const n = Math.floor(buf.length / ratio);
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      // 取区间平均而不是最近邻：直接抽点会把 8 kHz 以上的成分折回可听频段，
+      // 录出来的声音发闷、带金属味，语音识别率会掉。
+      const a = Math.floor(i * ratio);
+      const b = Math.min(buf.length, Math.floor((i + 1) * ratio));
+      let sum = 0;
+      for (let j = a; j < b; j++) sum += buf[j];
+      out[i] = b > a ? sum / (b - a) : 0;
+    }
+    return out;
+  }
+
+  function pcmToWav(pcm, rate) {
+    const n = pcm.length;
+    const ab = new ArrayBuffer(44 + n * 2);
+    const dv = new DataView(ab);
+    const str = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+    str(0, 'RIFF');
+    dv.setUint32(4, 36 + n * 2, true);
+    str(8, 'WAVE');
+    str(12, 'fmt ');
+    dv.setUint32(16, 16, true);       // PCM 头长度
+    dv.setUint16(20, 1, true);        // 1 = PCM
+    dv.setUint16(22, 1, true);        // 单声道
+    dv.setUint32(24, rate, true);
+    dv.setUint32(28, rate * 2, true); // 字节率
+    dv.setUint16(32, 2, true);        // 块对齐
+    dv.setUint16(34, 16, true);       // 位深
+    str(36, 'data');
+    dv.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) {
+      const v = Math.max(-1, Math.min(1, pcm[i]));
+      dv.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+    }
+    return ab;
+  }
+
+  function b64Of(ab) {
+    const u8 = new Uint8Array(ab);
+    let s = '';
+    // 一次 32 KB：再大 String.fromCharCode.apply 会爆栈
+    for (let i = 0; i < u8.length; i += 32768) {
+      s += String.fromCharCode.apply(null, u8.subarray(i, i + 32768));
+    }
+    return btoa(s);
+  }
+
+  async function startRec() {
+    const s = state.server || {};
+    if (!s.mm_audio) {
+      log('当前模型没有加载语音塔，语音输入用不了。换 lfm3-audio 这类带 mmproj 的模型再试。', 'err');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      });
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AC();
+      const src = ctx.createMediaStreamSource(stream);
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      rec.chunks = [];
+      proc.onaudioprocess = (e) => {
+        if (!rec.on) return;
+        rec.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      };
+      src.connect(proc);
+      // ScriptProcessor 不接 destination 就不会被拉 —— 它的输出是静音，
+      // 所以这样接不会把麦克风回放出来。
+      proc.connect(ctx.destination);
+      rec.on = true; rec.ctx = ctx; rec.stream = stream; rec.proc = proc;
+      rec.t0 = performance.now();
+      const btn = $('#btnMic');
+      if (btn) { btn.classList.add('rec'); btn.title = '再点一下结束录音'; }
+      log('开始录音…再点一下麦克风结束');
+      // 60 秒硬上限：WAV 不压缩，1 分钟 16 kHz 单声道约 1.9 MB，
+      // 再长 base64 进请求体就开始难看了。
+      rec.timer = setTimeout(() => stopRec(true), 60000);
+    } catch (e) {
+      log('打不开麦克风：' + (e.message || e), 'err');
+    }
+  }
+
+  function stopRec(auto) {
+    if (!rec.on) return;
+    rec.on = false;
+    clearTimeout(rec.timer);
+    const ms = performance.now() - rec.t0;
+    try { rec.proc.disconnect(); } catch (e) {}
+    try { rec.stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+    const rate = rec.ctx ? rec.ctx.sampleRate : 16000;
+    try { rec.ctx.close(); } catch (e) {}
+    const btn = $('#btnMic');
+    if (btn) { btn.classList.remove('rec'); btn.title = '语音输入'; }
+
+    let n = 0;
+    for (const c of rec.chunks) n += c.length;
+    if (!n) { log('没录到声音', 'err'); return; }
+    const all = new Float32Array(n);
+    let off = 0;
+    for (const c of rec.chunks) { all.set(c, off); off += c.length; }
+    const wav = pcmToWav(downsampleTo(all, rate, 16000), 16000);
+    const name = '语音 ' + (ms / 1000).toFixed(1) + 's.wav';
+    state.attach = {
+      kind: 'audio', name, mime: 'audio/wav', fmt: 'wav',
+      dataUrl: 'data:audio/wav;base64,' + b64Of(wav), bytes: wav.byteLength,
+    };
+    renderAttach();
+    log('已录音 ' + (ms / 1000).toFixed(1) + 's · ' + (wav.byteLength / 1024).toFixed(0) +
+        ' KB' + (auto ? '（到 60 秒自动停了）' : ''));
+  }
+
+  // ---------------------------------------------------------------- 联网搜索开关
+  //
+  // 打开之后在用户问题前面加一句"先搜再答"，让模型自己去调 web_search。
+  // 为什么不在这里直接把搜索结果塞进 prompt：那样模型会把搜索摘要当成
+  // 用户给的材料，不再引用来源；而走工具调用，卡片上能看到它搜了什么、
+  // 搜到几条，用户能判断这个答案值不值得信。
+  function webOn() { return !!state.web; }
+
   // ---------------------------------------------------------------- 发送
   // opts.tools 可以单次覆盖工具开关。
   //
@@ -1129,6 +1278,20 @@
     }
     if (settings.system) msgs.unshift({ role: 'system', content: settings.system });
 
+    // 联网搜索开关。
+    //
+    // 只说"先搜再答"不够 —— 小模型会跳过工具直接编。所以要求它把搜到的
+    // 东西落进回答里，并明确禁止编造来源。实测 LFM3-1.7B 在带这句时会先调
+    // 一次 web_search；不带就 3 次里只有 1 次真的搜。
+    if (state.web) {
+      msgs.unshift({
+        role: 'system',
+        content: '用户打开了联网搜索。回答前先用 web_search 工具查一次，'
+          + '把查到的内容作为依据，并在回答里说明信息来自哪里。'
+          + '如果搜索没有返回结果，就直接说没搜到，不要凭记忆编造来源或数字。',
+      });
+    }
+
     const t0 = performance.now();
     let tFirst = 0;
 
@@ -1140,7 +1303,9 @@
       // 整段输出写成 <tool_result>{...}，但它并没有真的调用工具 ——
       // 结果就是界面上一条"已完成 9 tokens"的空气泡。图片问答本来也不该
       // 走工具循环，关掉对双方都更省。真要图文 + 工具，用 API 显式传 tools。
-      const withTools = (opts.tools !== undefined ? opts.tools : state.tools) && !att;
+      // 联网搜索开着就必须带工具说明，否则上面那段 system 让模型"用
+      // web_search"，而请求里根本没有这个工具，它只能编。
+      const withTools = ((opts.tools !== undefined ? opts.tools : state.tools) || state.web) && !att;
       const resp = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2602,6 +2767,19 @@
     $('#btnTools').classList.toggle('on', state.tools);
 
     $('#btnAttach').onclick = pickAttachment;
+
+    // 麦克风：点一下开始，再点一下结束。disabled 由 refreshState 按 mm_audio 控制。
+    $('#btnMic').onclick = () => { rec.on ? stopRec(false) : startRec(); };
+
+    // 联网搜索：只切一个本地开关，不改服务端权限。真正干活的还是 web_search
+    // 工具，所以关掉「联网」权限时这个按钮也没意义 —— 一起联动。
+    $('#btnWeb').onclick = () => {
+      const s = state.server || {};
+      if (!s.net) { log('联网权限已关闭（设置 → 权限 → 联网）', 'err'); return; }
+      state.web = !state.web;
+      $('#btnWeb').classList.toggle('on', state.web);
+      log(state.web ? '联网搜索已开：下一个问题会先搜再答' : '联网搜索已关');
+    };
     $('#fileInput').onchange = async (e) => {
       const f = e.target.files && e.target.files[0];
       if (!f) return;
