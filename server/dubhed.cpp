@@ -1465,7 +1465,11 @@ std::string tool_prompt() {
         "- web_search(query, n): 联网搜索\n"
         "- fetch_url(url): 抓取网页正文\n"
         "不需要工具时直接回答。不要描述你打算怎么做，直接输出工具调用。"
-        "不要自己写工具返回块（" + g_tool_open + "），那是系统给你的，不是你输出的。";
+        "不要自己写工具返回块（" + g_tool_open + "），那是系统给你的，不是你输出的。"
+        // 实测 1.7B 会把"我知道工作目录是什么"讲成"我执行了 pwd，返回…"。
+        // 工作目录确实在下面那句里给了它，所以它没编内容，只是把"知道"
+        // 说成了"做过"。用户看到的是"它跑了命令"，而界面上一条工具卡都没有。
+        "没有真的调用过工具时，不要说\"我已经执行了\"，只说你知道什么。";
     if (!g.workspace.empty()) {
         s += "\n当前工作目录是 " + g.workspace + "，相对路径都以它为根。";
     }
@@ -3319,9 +3323,14 @@ int main(int argc, char** argv) {
             c.send(400, "application/json", "{\"error\":\"缺少 name\"}");
             return;
         }
-        // arguments 允许是对象，也允许直接平铺在顶层（方便 curl 手测）
+        // arguments 允许是对象，也允许直接平铺在顶层（方便 curl 手测）。
+        //
+        // 顺带认一下 "args"：内部事件（tool_call）里这个字段叫 args，
+        // 照着手写一遍 curl 就是 args，然后拿到一句"缺少 path 参数" ——
+        // 明明传了 path，看起来像门禁坏了，实际是名字没对上。
         json::Value args = json::Value::make_obj();
         const json::Value* a = body.get("arguments");
+        if (!a) a = body.get("args");
         if (a && a->type == json::Value::OBJ) args = *a;
         else args = body;
         // 路径与权限一律交给 gate()。这里原来还有一段自己的 path_allowed 检查，
