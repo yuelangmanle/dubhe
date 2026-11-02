@@ -8,6 +8,8 @@
     <string>Dubhe</string>
     <key>CFBundleExecutable</key>
     <string>Dubhe</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.dubhe.desktop</string>
     <key>CFBundlePackageType</key>

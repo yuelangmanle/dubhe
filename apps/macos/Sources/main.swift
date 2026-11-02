@@ -74,6 +74,60 @@ private func resolveWebRoot() -> String? {
     return candidates.first { fm.fileExists(atPath: $0 + "/index.html") }
 }
 
+// ---------------------------------------------------------------- 日志
+//
+// 引擎的 stderr 以前整份丢给 /dev/null。这样 Console 里干净，但外壳出问题
+// （白屏、引擎起不来）时就没有任何地方可查。现在落到
+// ~/Library/Logs/Dubhe/engine.log：每次启动重写，超过 8 MB 时留一份 .1。
+private func engineLogURL() -> URL {
+    let base = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library")
+    let dir = base.appendingPathComponent("Logs/Dubhe", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("engine.log")
+}
+
+// ---------------------------------------------------------------- 进程
+//
+// libproc 没有 Swift overlay，这里直接绑 C 符号。只为了两件事：
+//   proc_pidpath  → 判断某个 pid 是不是"我们自己那份 dubhed"
+//   proc_listpids → 遍历所有 pid
+// 用 kill(pid, 0) + 路径比对，而不是记 pid 文件：pid 会被系统复用，
+// 路径不会。
+@_silgen_name("proc_listpids")
+private func c_proc_listpids(_ type: UInt32, _ typeinfo: UInt32,
+                             _ buffer: UnsafeMutableRawPointer?, _ size: Int32) -> Int32
+@_silgen_name("proc_pidpath")
+private func c_proc_pidpath(_ pid: Int32, _ buffer: UnsafeMutableRawPointer?, _ size: UInt32) -> Int32
+
+private let PROC_ALL_PIDS: UInt32 = 1
+
+private func executablePath(of pid: pid_t) -> String? {
+    var buf = [CChar](repeating: 0, count: 4096)
+    let n = c_proc_pidpath(pid, &buf, UInt32(buf.count))
+    guard n > 0 else { return nil }
+    return String(cString: buf)
+}
+
+// 上一次被 SIGKILL 强杀时，dubhed 会留下来（信号接不到）。它占着端口和
+// 几个 G 的统一内存，还会让下一次启动以为自己"端口被占"。这里在启动时
+// 扫一遍：凡是可执行文件路径等于我们自己那份 dubhed 的进程，全部清掉。
+private func killStaleEngines(bundleEnginePath: String) -> Int {
+    let stride = MemoryLayout<pid_t>.size
+    var pids = [pid_t](repeating: 0, count: 8192)
+    let bytes = c_proc_listpids(PROC_ALL_PIDS, 0, &pids, Int32(pids.count * stride))
+    guard bytes > 0 else { return 0 }
+    var killed = 0
+    for i in 0..<(Int(bytes) / stride) {
+        let pid = pids[i]
+        if pid <= 0 || pid == getpid() { continue }
+        guard executablePath(of: pid) == bundleEnginePath else { continue }
+        kill(pid, SIGKILL)
+        killed += 1
+    }
+    return killed
+}
+
 // ---------------------------------------------------------------- 调试日志
 //
 // 外壳平时不该往任何地方写日志，但"双击之后一直转圈"这种问题在 Console 里
@@ -104,8 +158,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var uiLoaded = false
     private var shuttingDown = false
     private var signalSources: [DispatchSourceSignal] = []
+    private var logHandle: FileHandle?
+    private var titleObserver: NSKeyValueObservation?
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        // 第二次双击时不要再起一份引擎：macOS 一般会把已经开着的那个激活，
+        // 但从终端直接跑二进制、或者两份不同路径的拷贝，都会真的起两个
+        // 引擎（各占一个端口、各吃一份内存）。这里主动退让。
+        let others = NSRunningApplication
+            .runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.dubhe.desktop")
+            .filter { $0.processIdentifier != getpid() }
+        if let other = others.first {
+            other.activate()
+            dbg("another instance running (pid \(other.processIdentifier)), bowing out")
+            exit(0)
+        }
+
         installSignalHandlers()
         buildMenu()
         buildWindow()
@@ -156,6 +224,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                         action: #selector(NSApplication.hideOtherApplications(_:)),
                         keyEquivalent: "h").keyEquivalentModifierMask = [.command, .option]
         appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "打开引擎日志", action: #selector(openEngineLog), keyEquivalent: "")
+        appMenu.addItem(withTitle: "在 Finder 中显示日志", action: #selector(revealEngineLog),
+                        keyEquivalent: "")
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 Dubhe",
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
@@ -201,6 +273,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     @objc private func zoomOut() { webView.pageZoom = max(0.5, webView.pageZoom - 0.1) }
     @objc private func zoomReset() { webView.pageZoom = 1.0 }
 
+    @objc private func openEngineLog() {
+        let url = engineLogURL()
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func revealEngineLog() {
+        NSWorkspace.shared.activateFileViewerSelecting([engineLogURL()])
+    }
+
     private func buildWindow() {
         let rect = NSRect(x: 0, y: 0, width: 1100, height: 760)
         window = NSWindow(contentRect: rect,
@@ -218,6 +302,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         webView = WKWebView(frame: rect, configuration: cfg)
         webView.autoresizingMask = [.width, .height]
         webView.navigationDelegate = self
+        // 窗口标题跟着页面的 <title> 走，这样切到"模型"页时标题栏也跟着变，
+        // Dock 的悬停提示也一样。WKWebView.title 是 KVO 可观察的，不用额外请求。
+        titleObserver = webView.observe(\.title, options: [.new]) { [weak self] wv, _ in
+            guard let self, self.uiLoaded else { return }
+            let t = (wv.title?.isEmpty == false) ? wv.title! : "Dubhe"
+            dbg("title -> \(t)")
+            self.window.title = t
+        }
         window.contentView = webView
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -253,6 +345,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             showSplash("找不到 dubhed —— 用 DUBHE_BIN 指一下路径，或者先 make all")
             return
         }
+
+        // 清掉上一次被强杀留下的引擎（SIGKILL 接不到，只能下次启动补）。
+        // 只清"可执行文件路径就是包里这份"的进程，不会误伤用户自己开的
+        // dubhed（那通常是开发时从 build/dubhed 起的）。
+        let stale = killStaleEngines(bundleEnginePath: bin)
+        if stale > 0 {
+            dbg("killed \(stale) stale engine(s)")
+            usleep(200_000)                 // 等端口真的释放
+        }
+
         var p: UInt16 = 7777
         while p < 7800 && !portIsFree(p) { p += 1 }
         port = p
@@ -271,11 +373,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: bin)
         proc.arguments = args
-        // 引擎的日志走 stderr。不接管道的话会跟着 App 一起进 Console，
-        // 接上就没人读、写满 64 KB 后引擎会阻塞 —— 所以直接丢给 /dev/null，
-        // 真要调试就 DUBHE_BIN 指向一个包装脚本。
-        proc.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
-        proc.standardError = FileHandle(forWritingAtPath: "/dev/null")
+        // 引擎的日志走 stderr。不能给管道：没人读的话写满 64 KB 引擎就阻塞；
+        // 也不能丢 /dev/null：白屏的时候没有地方可查。落文件，每次启动重写。
+        let logURL = engineLogURL()
+        if let old = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+           let size = old[.size] as? Int, size > 8 << 20 {
+            let prev = logURL.deletingPathExtension().appendingPathExtension("log.1")
+            try? FileManager.default.removeItem(at: prev)
+            try? FileManager.default.moveItem(at: logURL, to: prev)
+        }
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        let fh = FileHandle(forWritingAtPath: logURL.path)
+        logHandle = fh
+        proc.standardOutput = fh ?? FileHandle(forWritingAtPath: "/dev/null")
+        proc.standardError = fh ?? FileHandle(forWritingAtPath: "/dev/null")
         proc.terminationHandler = { [weak self] pr in
             DispatchQueue.main.async {
                 guard let self, !self.shuttingDown, self.engine === pr else { return }
@@ -405,7 +516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     // ------------------------------------------------------------ 导航
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         dbg("didFinish \(webView.url?.absoluteString ?? "?")")
-        window.title = "Dubhe"
+        if let t = webView.title, !t.isEmpty { window.title = t }
         window.makeFirstResponder(webView)
         maybeSnapshot()
     }

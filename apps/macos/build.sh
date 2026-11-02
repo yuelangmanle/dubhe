@@ -58,6 +58,26 @@ cp build/dubhed "$APP/Contents/Resources/dubhed"
 # web/ 只有 1700 行前端，整份拷进去；--exclude 掉以后可能出现的 node_modules
 rsync -a --exclude 'node_modules' --exclude '*.map' web/ "$APP/Contents/Resources/web/"
 
+# ---------------------------------------------------------------- 图标
+# 1024 的源图已经是 macOS 那套圆角 + 留边的样式，直接切各档尺寸即可。
+# iconset 的档位是固定的（16/32/128/256/512 各一档 1x 一档 2x），少一档
+# iconutil 会报错。
+ICON_SRC=assets/branding/app-icon-1024.png
+if [ -f "$ICON_SRC" ] && command -v iconutil >/dev/null 2>&1; then
+  SET=$(mktemp -d)/Dubhe.iconset
+  mkdir -p "$SET"
+  for s in 16 32 128 256 512; do
+    sips -z $s $s "$ICON_SRC" --out "$SET/icon_${s}x${s}.png" >/dev/null 2>&1
+    sips -z $((s*2)) $((s*2)) "$ICON_SRC" --out "$SET/icon_${s}x${s}@2x.png" >/dev/null 2>&1
+  done
+  iconutil -c icns "$SET" -o "$APP/Contents/Resources/AppIcon.icns" 2>/dev/null \
+    && echo "   图标 $(du -h "$APP/Contents/Resources/AppIcon.icns" | cut -f1)" \
+    || echo "   图标生成失败（不影响运行，会显示系统默认图标）"
+  rm -rf "$(dirname "$SET")"
+else
+  echo "   跳过图标（缺 $ICON_SRC 或 iconutil）"
+fi
+
 # PkgInfo 不是必需的，但有些老工具靠它认类型
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
