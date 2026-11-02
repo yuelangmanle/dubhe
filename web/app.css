@@ -1473,6 +1473,10 @@ input[type=range]::-webkit-slider-thumb {
 }
 .switch input:checked + span { background: var(--brand-grad); }
 .switch input:checked + span::after { transform: translateX(20px); }
+/* 置灰：这一项当前不可能生效（例如本机 sandbox-exec 套不上）。
+ * 不给 cursor:pointer —— 鼠标形状是"能不能点"的第一信号。 */
+.switch.off span { opacity: .45; cursor: not-allowed; }
+.switch.off span::after { box-shadow: none; }
 
 textarea.field, input.field {
   width: 100%; border: 1px solid var(--glass-line); border-radius: var(--r-s);

@@ -1940,12 +1940,22 @@
     row(parent, label, desc, wrap);
   }
 
-  function toggle(parent, label, desc, get, set) {
+  function toggle(parent, label, desc, get, set, dis) {
     const sw = el('label', 'switch');
     const cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.checked = get();
     cb.onchange = () => set(cb.checked);
+    // dis：这一项当前**不可能**生效，别让它看起来能拨。
+    //
+    // 命令沙箱就是这种情况：本机 sandbox-exec 套不上时，开关拨到 ON 也没用，
+    // 刷新一下又弹回 OFF —— 用户会以为"开关坏了"，反复点。直接置灰更诚实。
+    if (dis) {
+      cb.disabled = true;
+      cb.checked = false;
+      sw.classList.add('off');
+      sw.title = '本机不支持，无法开启';
+    }
     sw.appendChild(cb);
     sw.appendChild(el('span'));
     row(parent, label, desc, sw);
@@ -2125,11 +2135,12 @@
         () => srv().write_outside === true, (v) => setPerm('write_outside', v));
       toggle(body, '联网', '允许 web_search 搜索、fetch_url 抓网页。',
         () => !!srv().net, (v) => setPerm('net', v));
+      const sbOff = srv().sandbox_cfg && srv().sandbox === false;
       toggle(body, '命令沙箱', '命令只能写工作区与 /tmp。关掉就是完全放开。',
-        () => srv().sandbox !== false, (v) => setPerm('sandbox', v));
+        () => srv().sandbox !== false, (v) => setPerm('sandbox', v), sbOff);
       // 开关"开着但不生效"是最坏的一种状态：用户以为有隔离，其实命令在裸跑。
       // 服务端把配置值和实际探测结果分成两个字段，这里把差异说出来。
-      if (srv().sandbox_cfg && srv().sandbox === false) {
+      if (sbOff) {
         const warn = el('div', 'perm-warn',
           '本机的 sandbox-exec 套不上（外层已有沙箱或系统限制），命令是未隔离执行的。' +
           '写盘限制目前不生效 —— 模型自己的 write_file 仍然只写项目内。');
