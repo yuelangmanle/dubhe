@@ -59,12 +59,18 @@ prefill 的两个数是「短提示 / 904 token 长文」。MLX 的 495 是 601 
 | 后端 | 上下文 | decode | prefill |
 | --- | ---: | ---: | ---: |
 | CPU · NEON | 短 | 4.4 tok/s | 3.9 tok/s |
-| **Metal GPU** | 短 | **15.0 tok/s** | **85 tok/s** |
-| Metal GPU | 681 | 13.4 tok/s | 71 tok/s |
-| Metal GPU | 2111 | 10.9 tok/s | 80 tok/s |
+| **Metal GPU** | 短 | **15.0 tok/s** | **113 tok/s**（稳定态） |
+| Metal GPU | 681 | 13.4 tok/s | 71 tok/s（含冷启动） |
+| Metal GPU | 2111 | 10.9 tok/s | 80 tok/s（含冷启动） |
+
+prefill 的稳定态是每 32 token 一叠 282 ms = 2.03 TFLOP/s，达到 M4 上
+8×8×8 fp32 MMA 峰值的 75%，已经没有多少余量。681 token 的墙钟之所以是
+9.6 秒，是因为第一叠要付约 3.6 秒把 5.44 GB 权重从盘上读进来（mmap
+按需缺页，约 1.5 GB/s）—— 这是 I/O，不是内核。
 
 可用的上下文是 **176 896 token**（8 层 fp16 KV，占 5.8 GB）。KV 容量不是写死的：
-启动时按 `recommendedMaxWorkingSetSize` 减去权重算，装不下才收紧。
+启动时按 `recommendedMaxWorkingSetSize` 减去权重算，装不下才收紧；
+`DUBHE_KV_CAP=32768` 可以手动压小（省内存的诊断/调优口子）。
 
 数值一致性：GPU 与 CPU 逐层残差流的 RMS 差 < 0.6%（f16 KV + 量化舍入），
 681 token 提示下贪心输出与逐 token 路径**逐字一致**。

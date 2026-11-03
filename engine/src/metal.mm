@@ -1470,6 +1470,12 @@ bool q35_init(const Q35Spec& s, std::string* err) {
     }
     if (cap < 4096) cap = 4096;
     if (cap > s.kv_cap) cap = s.kv_cap;
+    // 诊断/省内存开关：DUBHE_KV_CAP=32768 只保留 1 GB KV，把余量让给
+    // 系统的文件页缓存（冷启动时 5.44 GB 权重是从磁盘读的）。
+    if (const char* e = std::getenv("DUBHE_KV_CAP")) {
+        const int v = std::atoi(e);
+        if (v >= 4096 && v < cap) cap = v;
+    }
     g_q35.kv_cap = cap;
 
     const size_t kvb = (size_t)s.n_kv_layer * (size_t)cap * (size_t)kv_dim * 2;
