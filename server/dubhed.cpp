@@ -3840,9 +3840,27 @@ int main(int argc, char** argv) {
         dubhe_stats st{};
         dubhe_generate(g.engine, toks.data(), (int32_t)toks.size(), &sp, sum_piece_cb,
                        nullptr, &sc, &st);
+
+        // 摘要短得离谱时，补一段原文摘录兜底。
+        //
+        // 1-2B 模型经常把"压缩成要点"理解成"说一句总结"：实测 20 条历史压出来
+        // 17 个字 —— 而这 17 个字要顶替掉前面十几轮对话。这种压缩比截断更糟：
+        // 截断至少留着原文，压缩是把原文**删了**换一行字。
+        //
+        // 所以加一道下限：输入够长、输出却短到不可能是有效摘要时，把对话开头
+        // 原样附在后面。宁可摘要里混着原文，也不能让上下文凭空少掉一大块。
+        std::string out = sc.out;
+        if (dialog.size() > 600 && out.size() < 80) {
+            size_t cut = std::min<size_t>(dialog.size(), 600);
+            cut = utf8_back(dialog, cut);
+            out += "\n（模型给出的摘要过短，附对话开头原文）\n";
+            out += dialog.substr(0, cut);
+            out += "…";
+        }
         json::Value o = json::Value::make_obj();
-        o.set("summary", json::Value::make_str(sc.out));
+        o.set("summary", json::Value::make_str(out));
         o.set("tokens", json::Value::make_num((double)st.n_generated));
+        o.set("fellback", json::Value::make_bool(out.size() != sc.out.size()));
         c.send(200, "application/json", json::dump(o));
     });
 
