@@ -250,6 +250,7 @@ enum LayerKind : uint8_t {
     LK_ATTN_FULL = 0,   // 全局因果注意力
     LK_ATTN_SWA  = 1,   // 滑窗注意力（只看最近 n_swa 个位置）
     LK_CONV      = 2,   // LFM3 的 ShortConv：门控深度可分离因果卷积
+    LK_DELTA     = 3,   // Qwen3.5 的 Gated DeltaNet：固定状态的线性注意力
 };
 
 struct Layer {
@@ -271,6 +272,24 @@ struct Layer {
 
     // ---- ShortConv 子层（仅 LK_CONV）
     TensorInfo conv_in, conv_kernel, conv_out;
+
+    // ---- Gated DeltaNet 子层（仅 LK_DELTA）
+    //
+    //   qkv     : [n_embd, 2*key_dim + value_dim]   q/k 各 16 head，v 32 head
+    //   gate    : [n_embd, value_dim]               输出门（silu 后乘在 norm 上）
+    //   conv1d  : [4, conv_dim]                     深度可分离因果卷积，silu
+    //   dt/a    : [n_v_heads]                       步长偏置与 -A_log.exp()
+    //   beta    : [n_embd, n_v_heads]               sigmoid 后作为 delta 的学习率
+    //   alpha   : [n_embd, n_v_heads]               softplus(dt) 后乘 a 得到衰减
+    //   norm    : [head_v_dim]                      每 head 的 RMSNorm
+    //   out     : [value_dim, n_embd]
+    TensorInfo ssm_qkv, ssm_gate, ssm_conv1d, ssm_dt, ssm_a;
+    TensorInfo ssm_beta, ssm_alpha, ssm_norm, ssm_out;
+
+    // full attention 的 q 投影把 Q 和输出门拼在同一个矩阵里（每 head
+    // 2*head_dim，Q 在前、gate 在后）。Qwen3.5 的 gated attention 用这个布局，
+    // 拆错一半就会把 gate 当成 Q 去做注意力 —— 输出仍然像话，但全是噪声。
+    bool q_gate_fused = false;
 
     // ---- FFN 子层
     TensorInfo ffn_norm, ffn_gate, ffn_up, ffn_down;
@@ -294,9 +313,33 @@ struct ModelConfig {
     // ---- LFM3 专属
     int32_t rope_angles = 0;        // partial RoPE：真正旋转的角度数，0 = 全部
     float   rope_theta_swa = 0.f;   // 滑窗层用另一套 base（1e4 vs 1e6）
+    // partial RoPE 的两种定义，差别在**配对跨度**和**频率分母**：
+    //   false（LFM3）  配对 v[i] / v[i+head_dim/2]，频率分母 head_dim
+    //   true （Qwen3.5）配对 v[i] / v[i+n_rot/2]，  频率分母 n_rot
+    // n_rot == head_dim 时两者等价（Llama/Qwen2 就是这种），所以默认 false
+    // 不会影响老模型。
+    bool    rope_pair_nrot = false;
+    // Qwen3.5 的 MRoPE：rope.dimension_sections 把旋转维度切成 4 段
+    // （9B 是 [11,11,10,0]，共 32 个角度对）。**频率在每段重新从 base 开始**，
+    // 不是连续递增 —— 按连续算会让后 21 对全转错，症状是输出通顺但语义乱。
+    bool    rope_mrope = false;
+    int32_t rope_sections[4] = {0, 0, 0, 0};
     int32_t conv_l_cache = 0;       // ShortConv 的卷积核宽度
     bool    sandwich_norm = false;
     int     n_conv = 0;             // conv 层个数
+
+    // ---- Qwen3.5 专属（Gated DeltaNet）
+    //
+    // 这是"每层不是同一种算子"的第二套架构：32 层里 24 层是线性注意力
+    // （固定状态，KV 不随上下文长），8 层是 gated full attention。
+    // 参数全部从 GGUF 的 qwen35.* 读，不写死 —— 9B / 4B / 27B 共用同一套代码。
+    int32_t ssm_conv_kernel = 0;    // 卷积核宽（4）
+    int32_t ssm_state_size = 0;     // head_k_dim = head_v_dim（128）
+    int32_t ssm_group_count = 0;    // K 头数（16）
+    int32_t ssm_time_step_rank = 0; // V 头数（32）
+    int32_t ssm_inner_size = 0;     // value_dim（4096）
+    int     n_delta = 0;            // delta 层个数
+    std::vector<uint8_t> recurrent_layers;  // 每层 1 = delta，0 = full attn
 };
 
 class Model {
@@ -368,6 +411,7 @@ public:
     bool gpu_active() const { return gpu_active_; }
     const char* gpu_note() const { return gpu_note_.c_str(); }
     bool arch_is_lfm3() const { return cfg_.arch == "lfm3" || cfg_.arch == "lfm2"; }
+    bool arch_is_qwen35() const { return cfg_.arch == "qwen35"; }
 
 private:
     bool load_weights(std::string* err);
@@ -382,6 +426,9 @@ private:
     // LFM3 ShortConv 子层：结果写进 attn_out_
     void shortconv(const Layer& L, int slot, const float* xin);
     void clear_conv_state();
+    // Qwen3.5 Gated DeltaNet 子层：结果写进 attn_out_
+    void delta_net(const Layer& L, int slot, const float* xin);
+    void clear_ssm_state();
 
     GgufFile file_;
     Tokenizer tok_;
@@ -410,8 +457,14 @@ private:
     TensorInfo tok_embd_, out_norm_, out_w_;
     std::vector<Layer> layers_;
 
-    // KV cache: [n_layer][n_ctx][n_head_kv * head_dim]
+    // KV cache: [n_kv_layer][n_ctx][n_head_kv * head_dim]
+    //
+    // n_kv_layer 不一定等于 n_layer：Qwen3.5 只有 8 层 full attention 需要
+    // KV，另外 24 层是固定大小的 DeltaNet 状态。按 32 层分配会白扔 4 倍
+    // 内存（44K 上下文的差距），所以用 kv_slot_ 把层号映射到紧凑槽位。
     std::vector<float> k_cache_, v_cache_;
+    std::vector<int>   kv_slot_;      // 层号 → KV 槽位；-1 表示该层不要 KV
+    int n_kv_layer_ = 0;
     int kv_len_ = 0;
     // 当前 KV 里躺着的 token 序列（长度恒等于 kv_len_）。
     //
@@ -436,6 +489,24 @@ private:
     std::vector<float> conv_state_;    // [n_conv][l_cache-1][n_embd]，环形历史
     std::vector<int>   conv_slot_;     // 层号 → conv_state_ 槽位，-1 表示非 conv
     std::vector<float> ffn_down_out_;  // ffn down 输出，n_embd
+
+    // ---- Qwen3.5 Gated DeltaNet
+    //
+    // 状态是**固定大小**的：每层 32 个 V head，每个 head 一个 128x128 的
+    // 递归矩阵。它不随上下文增长，这是这条架构最值钱的地方 —— 262K 上下文
+    // 的 KV cache 要 8 GB，而这份状态恒为 50 MB。
+    //
+    // 代价是它**不能按位置回退**：和 LFM3 的 conv 状态一样，只能整体 reset。
+    // 所以前缀缓存只认"整段 token 完全一致"，不做最长公共前缀。
+    std::vector<float> ssm_state_;      // [n_delta][n_v_heads][S][S]
+    std::vector<float> ssm_conv_state_; // [n_delta][K-1][conv_dim]
+    std::vector<int>   ssm_slot_;       // 层号 → delta 槽位，-1 表示非 delta
+    std::vector<float> ssm_qkv_;        // [2*kdim + vdim]
+    std::vector<float> ssm_z_;          // [vdim] 输出门
+    std::vector<float> ssm_q_, ssm_k_, ssm_v_, ssm_o_;
+    std::vector<float> ssm_beta_, ssm_alpha_, ssm_gate_buf_;
+    std::vector<float> ssm_conv_out_;   // [conv_dim]
+    std::vector<float> qg_;             // full attn 的 Q+gate 拼接输出
 
     uint64_t n_params_ = 0;
     std::string quant_desc_;

@@ -133,8 +133,54 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
         if (const GgufValue* v = file_.get(p + "rope.partial_rotary_factor")) {
             if (v->f64 > 0.0) cfg_.rope_angles = (int32_t)(v->f64 * cfg_.head_dim) / 2;
         }
+    } else if (arch_is_qwen35()) {
+        // Qwen3.5 把 32 层拆成"24 层 Gated DeltaNet + 8 层 gated attention"。
+        // 两套子层的 head_dim 不一样：delta 是 128（ssm.state_size），
+        // full attention 是 256（attention.key_length）。上面按
+        // n_embd / n_head 算出来的是 256，正好是 full attention 的；
+        // delta 层单独用 ssm_state_size。
+        cfg_.ssm_conv_kernel    = (int32_t)file_.get_u32(p + "ssm.conv_kernel", 4);
+        cfg_.ssm_state_size     = (int32_t)file_.get_u32(p + "ssm.state_size", 128);
+        cfg_.ssm_group_count    = (int32_t)file_.get_u32(p + "ssm.group_count", 16);
+        cfg_.ssm_time_step_rank = (int32_t)file_.get_u32(p + "ssm.time_step_rank", 32);
+        cfg_.ssm_inner_size     = (int32_t)file_.get_u32(p + "ssm.inner_size", cfg_.n_embd);
+        cfg_.head_dim           = (int32_t)file_.get_u32(p + "attention.key_length", cfg_.head_dim);
+
+        // rope.dimension_count 是**真正旋转的维数**（64），不是 head_dim（256）。
+        // 这是 zero-tail partial RoPE，但频率分母是 n_rot 而不是 head_dim ——
+        // 和 LFM3 的定义相反。配对跨度也不同：这里前 32 维和后 32 维配对，
+        // LFM3 是前 128 维和后 128 维配对。用一个开关分开，别让 9B 的
+        // q/k 转错维度（症状是输出通顺但答非所问）。
+        const int32_t n_rot = (int32_t)file_.get_u32(p + "rope.dimension_count", cfg_.head_dim);
+        cfg_.n_rot = n_rot > 0 ? n_rot : cfg_.head_dim;
+        cfg_.rope_angles = cfg_.n_rot / 2;
+        cfg_.rope_pair_nrot = true;
+        if (const auto* sec = file_.get_arr_i32(p + "rope.dimension_sections")) {
+            if (sec->size() >= 4) {
+                for (int k = 0; k < 4; k++) cfg_.rope_sections[k] = (*sec)[(size_t)k];
+                cfg_.rope_mrope = (cfg_.rope_sections[0] + cfg_.rope_sections[1] +
+                                   cfg_.rope_sections[2] + cfg_.rope_sections[3]) > 0;
+            }
+        }
+
+        if (const auto* rec = file_.get_arr_u8(p + "attention.recurrent_layers")) {
+            cfg_.recurrent_layers.assign(rec->begin(), rec->end());
+        } else {
+            // 老 GGUF 可能没有这张表，按 full_attention_interval 推。
+            const int32_t iv = (int32_t)file_.get_u32(p + "full_attention_interval", 4);
+            cfg_.recurrent_layers.resize((size_t)cfg_.n_layer, 0);
+            for (int i = 0; i < cfg_.n_layer; i++)
+                cfg_.recurrent_layers[(size_t)i] = ((i + 1) % iv != 0) ? 1 : 0;
+        }
+        cfg_.recurrent_layers.resize((size_t)cfg_.n_layer, 0);
+        cfg_.n_delta = 0;
+        for (uint8_t b : cfg_.recurrent_layers) cfg_.n_delta += b ? 1 : 0;
     }
     cfg_.n_ctx_train = std::max(cfg_.n_ctx_train, 512);
+    // 只有 full attention 层需要 KV。Qwen3.5 的 24 层 DeltaNet 是固定状态，
+    // 把它们也算进 KV 会白扔 4 倍内存 —— 44K 和 176K 上下文的差别。
+    n_kv_layer_ = cfg_.n_layer - cfg_.n_delta;
+    if (n_kv_layer_ <= 0) n_kv_layer_ = cfg_.n_layer;
     // KV cache 不预分配满上下文（262144 × 24 层 = 25.8 GB，纯浪费）。
     // 先给一个够用的窗口，不够时按 2 倍增长，上限 = 下面算出来的天花板。
     //
@@ -167,7 +213,7 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
     {
         const size_t kv_dim = (size_t)cfg_.n_head_kv * (size_t)cfg_.head_dim;
         // 按 f32 算（CPU 路径就是 f32），GPU 的 f16 只会更省 —— 取大的不会误伤
-        const uint64_t per_ctx = (uint64_t)cfg_.n_layer * kv_dim * 2u * sizeof(float);
+        const uint64_t per_ctx = (uint64_t)n_kv_layer_ * kv_dim * 2u * sizeof(float);
         const uint64_t ram = total_ram_bytes();
         if (ram > 0 && per_ctx > 0) {
             uint64_t kv_budget = (uint64_t)((double)ram * 0.45);
@@ -212,10 +258,17 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
         }
     }
 
-    // KV cache（可增长）
+    // KV cache（可增长）。只给需要 KV 的层分配槽位。
     const size_t kv_dim = (size_t)cfg_.n_head_kv * cfg_.head_dim;
-    k_cache_.assign((size_t)cfg_.n_layer * kv_cap_ * kv_dim, 0.f);
-    v_cache_.assign((size_t)cfg_.n_layer * kv_cap_ * kv_dim, 0.f);
+    kv_slot_.assign((size_t)cfg_.n_layer, -1);
+    {
+        int slot = 0;
+        for (int i = 0; i < cfg_.n_layer; i++) {
+            if (layers_[(size_t)i].kind != LK_DELTA) kv_slot_[(size_t)i] = slot++;
+        }
+    }
+    k_cache_.assign((size_t)n_kv_layer_ * kv_cap_ * kv_dim, 0.f);
+    v_cache_.assign((size_t)n_kv_layer_ * kv_cap_ * kv_dim, 0.f);
     kv_len_ = 0;
     kv_toks_.clear();
 
@@ -240,6 +293,41 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
         conv_state_.assign((size_t)cfg_.n_conv * (cfg_.conv_l_cache - 1) * cfg_.n_embd, 0.f);
     }
 
+    // ---- Qwen3.5 Gated DeltaNet 的固定状态
+    //
+    // 每层 32 个 V head，每个 head 维护一个 128×128 的递归矩阵，f32 下是
+    // 32×128×128×4 = 2 MB/层，24 层共 50 MB。它**不随上下文增长** ——
+    // 262K 上下文的 KV cache 要 8 GB，这份状态恒为 50 MB，这是这条架构
+    // 在 24 GB 机器上能跑到 128K 的原因。
+    if (cfg_.n_delta > 0) {
+        const int S   = cfg_.ssm_state_size;
+        const int nv  = cfg_.ssm_time_step_rank;
+        const int kdim = cfg_.ssm_group_count * cfg_.ssm_state_size;
+        const int vdim = cfg_.ssm_inner_size;
+        const int cdim = 2 * kdim + vdim;
+        ssm_slot_.assign((size_t)cfg_.n_layer, -1);
+        int slot = 0;
+        for (int i = 0; i < cfg_.n_layer; i++) {
+            if (layers_[(size_t)i].kind == LK_DELTA) ssm_slot_[(size_t)i] = slot++;
+        }
+        ssm_state_.assign((size_t)cfg_.n_delta * (size_t)nv * (size_t)S * (size_t)S, 0.f);
+        ssm_conv_state_.assign((size_t)cfg_.n_delta * (size_t)(cfg_.ssm_conv_kernel - 1) *
+                                   (size_t)cdim, 0.f);
+        ssm_qkv_.assign((size_t)cdim, 0.f);
+        ssm_conv_out_.assign((size_t)cdim, 0.f);
+        ssm_q_.assign((size_t)kdim, 0.f);
+        ssm_k_.assign((size_t)kdim, 0.f);
+        ssm_v_.assign((size_t)vdim, 0.f);
+        ssm_o_.assign((size_t)vdim, 0.f);
+        ssm_z_.assign((size_t)vdim, 0.f);
+        ssm_beta_.assign((size_t)nv, 0.f);
+        ssm_alpha_.assign((size_t)nv, 0.f);
+        ssm_gate_buf_.assign((size_t)nv, 0.f);
+    }
+    if (arch_is_qwen35()) {
+        qg_.assign((size_t)2 * cfg_.n_head * cfg_.head_dim, 0.f);
+    }
+
     loaded_ = true;
     gpu_active_ = false;
     gpu_fused_ = false;
@@ -254,6 +342,14 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
 // 用真实权重跑一遍 GPU vs CPU 基准，误差超阈值就整体退回 CPU。
 bool Model::enable_gpu(std::string* err) {
     gpu_active_ = false;
+    // Qwen3.5 还没有 Metal 内核：整层融合的 spec 只认识 conv / 滑窗 / 全注意力
+    // 三种层，DeltaNet 会被错当成 full attention 去跑，结果是"能出字但全错"。
+    // 在补上 Metal 之前，宁可明确走 CPU，也不做一半的加速。
+    if (arch_is_qwen35()) {
+        gpu_note_ = "Qwen3.5 暂用 CPU 路径（Gated DeltaNet 尚无 Metal 内核）";
+        if (err) *err = gpu_note_;
+        return false;
+    }
     if (!metal::available()) {
         gpu_note_ = "无 Metal 设备";
         if (err) *err = gpu_note_;
@@ -692,6 +788,12 @@ bool Model::load_weights(std::string* err) {
             } else if (const auto* swp = file_.get_arr_u8(cfg_.arch + ".attention.sliding_window_pattern")) {
                 if (i < (int)swp->size() && (*swp)[(size_t)i]) L.kind = LK_ATTN_SWA;
             }
+        } else if (arch_is_qwen35()) {
+            // recurrent_layers 是逐层的 bool 表：1 = Gated DeltaNet，0 = full attention。
+            // 不按 "每 4 层一个" 硬编码 —— 9B 是 3:1，27B 是另一个比例，
+            // 表里怎么写就怎么走。
+            if (i < (int)cfg_.recurrent_layers.size() && cfg_.recurrent_layers[(size_t)i])
+                L.kind = LK_DELTA;
         }
 
         // 每层实际旋转的角度数。HF 的 config.json 里 rope_parameters 是
@@ -701,7 +803,11 @@ bool Model::load_weights(std::string* err) {
         L.rope_angles_l = (L.kind == LK_ATTN_SWA) ? (cfg_.head_dim / 2)
                                                   : cfg_.rope_angles;
 
-        L.ffn_norm    = need(b + "ffn_norm.weight");
+        // Qwen3.5 没有独立的 ffn_norm：它把 post_attention_norm 放在 FFN 之前
+        // （残差加完之后才归一化），语义上是"FFN 的输入 norm"，不是 LFM3 的
+        // sandwich norm。这里直接指过去，前向里就不用再分叉。
+        L.ffn_norm    = arch_is_qwen35() ? need(b + "post_attention_norm.weight")
+                                         : need(b + "ffn_norm.weight");
         L.ffn_gate    = need(b + "ffn_gate.weight");
         L.ffn_up      = need(b + "ffn_up.weight");
         L.ffn_down    = need(b + "ffn_down.weight");
@@ -713,8 +819,26 @@ bool Model::load_weights(std::string* err) {
             L.conv_in     = need(b + "shortconv.in_proj.weight");
             L.conv_kernel = need(b + "shortconv.conv.weight");
             L.conv_out    = need(b + "shortconv.out_proj.weight");
+        } else if (L.kind == LK_DELTA) {
+            // Gated DeltaNet 子层。张量名和 llama.cpp 的 GGUF 约定一致：
+            // qkv 把 q/k/v 拼成一个矩阵（q/k 各 16 头 ×128，v 32 头 ×128），
+            // attn_gate 是输出门，ssm_* 是线性注意力自己的参数。
+            L.attn_norm   = need(b + "attn_norm.weight");
+            L.ssm_qkv     = need(b + "attn_qkv.weight");
+            L.ssm_gate    = need(b + "attn_gate.weight");
+            L.ssm_conv1d  = need(b + "ssm_conv1d.weight");
+            L.ssm_dt      = need(b + "ssm_dt.bias");
+            L.ssm_a       = need(b + "ssm_a");
+            L.ssm_beta    = need(b + "ssm_beta.weight");
+            L.ssm_alpha   = need(b + "ssm_alpha.weight");
+            L.ssm_norm    = need(b + "ssm_norm.weight");
+            L.ssm_out     = need(b + "ssm_out.weight");
         } else {
             L.attn_norm   = need(b + "attn_norm.weight");
+            // Qwen3.5 的 gated attention 把 Q 和输出门拼在同一个投影里
+            // （每 head 2*head_dim，前半 Q、后半 gate）。标记一下，
+            // 前向里按 2 倍宽度取，拆错就会把 gate 当成 Q。
+            if (arch_is_qwen35()) L.q_gate_fused = true;
             L.attn_q      = need(b + "attn_q.weight");
             L.attn_k      = need(b + "attn_k.weight");
             L.attn_v      = need(b + "attn_v.weight");
@@ -738,13 +862,21 @@ bool Model::load_weights(std::string* err) {
         }
 
         // sandwich norm：子层输出先归一化再加残差
-        if (const TensorInfo* t = file_.find_tensor(b + "post_attention_norm.weight")) {
-            L.post_attn_norm = *t; L.has_sandwich = true;
-            count(*t);
-        }
-        if (const TensorInfo* t = file_.find_tensor(b + "post_ffw_norm.weight")) {
-            L.post_ffn_norm = *t;
-            count(*t);
+        //
+        // Qwen3.5 也有 post_attention_norm，但它的语义完全不同：那是**残差
+        // 之后、FFN 之前**的输入 norm（已经绑给 ffn_norm 了），不是 LFM3 的
+        // "子层输出先归一化"。如果这里也置 has_sandwich，FFN 输出会去乘一个
+        // 根本没绑定的 post_ffw_norm（offset 0 → 读到别的张量的量化字节），
+        // 表现为第一层就炸到 1e38。
+        if (!arch_is_qwen35()) {
+            if (const TensorInfo* t = file_.find_tensor(b + "post_attention_norm.weight")) {
+                L.post_attn_norm = *t; L.has_sandwich = true;
+                count(*t);
+            }
+            if (const TensorInfo* t = file_.find_tensor(b + "post_ffw_norm.weight")) {
+                L.post_ffn_norm = *t;
+                count(*t);
+            }
         }
 
         if (err && !err->empty()) return false;
@@ -768,7 +900,8 @@ bool Model::load_weights(std::string* err) {
         for (int i = 0; i < cfg_.n_layer; i++) {
             const Layer& L = layers_[(size_t)i];
             const char* k = L.kind == LK_CONV ? "conv  "
-                          : L.kind == LK_ATTN_SWA ? "swa   " : "full  ";
+                          : L.kind == LK_ATTN_SWA ? "swa   "
+                          : L.kind == LK_DELTA ? "delta " : "full  ";
             if (L.kind == LK_CONV) {
                 std::fprintf(stderr, "[dubhe]   %2d %s\n", i, k);
             } else {
@@ -803,6 +936,8 @@ void Model::unload() {
     layers_.clear();
     k_cache_.clear();
     v_cache_.clear();
+    kv_slot_.clear();
+    n_kv_layer_ = 0;
     kv_toks_.clear();
     kv_len_ = 0;
     x_.clear();
@@ -821,7 +956,22 @@ void Model::unload() {
     conv_state_.clear();
     conv_slot_.clear();
     ffn_down_out_.clear();
+    ssm_state_.clear();
+    ssm_conv_state_.clear();
+    ssm_slot_.clear();
+    ssm_qkv_.clear();
+    ssm_z_.clear();
+    ssm_q_.clear();
+    ssm_k_.clear();
+    ssm_v_.clear();
+    ssm_o_.clear();
+    ssm_beta_.clear();
+    ssm_alpha_.clear();
+    ssm_gate_buf_.clear();
+    ssm_conv_out_.clear();
+    qg_.clear();
     cfg_.n_conv = 0;
+    cfg_.n_delta = 0;
     file_.close();
 }
 
@@ -829,6 +979,9 @@ void Model::reset_kv() {
     kv_len_ = 0;
     kv_toks_.clear();
     clear_conv_state();
+    // DeltaNet 的状态和 ShortConv 一样是"滚动"的，没法按位置回退，
+    // 换 prompt 只能整体清零。
+    clear_ssm_state();
     if (gpu_fused_) metal::fwd_reset_conv();
 }
 
@@ -863,9 +1016,9 @@ bool Model::grow_kv(int need) {
     const size_t old_row = (size_t)kv_cap_ * kv_dim;
     const size_t new_row = (size_t)cap * kv_dim;
 
-    std::vector<float> nk((size_t)cfg_.n_layer * new_row, 0.f);
-    std::vector<float> nv((size_t)cfg_.n_layer * new_row, 0.f);
-    for (int l = 0; l < cfg_.n_layer; l++) {
+    std::vector<float> nk((size_t)n_kv_layer_ * new_row, 0.f);
+    std::vector<float> nv((size_t)n_kv_layer_ * new_row, 0.f);
+    for (int l = 0; l < n_kv_layer_; l++) {
         std::memcpy(nk.data() + (size_t)l * new_row, k_cache_.data() + (size_t)l * old_row,
                     sizeof(float) * old_row);
         std::memcpy(nv.data() + (size_t)l * new_row, v_cache_.data() + (size_t)l * old_row,
@@ -990,19 +1143,175 @@ void Model::shortconv(const Layer& L, int slot, const float* xin) {
     matvec(attn_out_.data(), y, L.conv_out, n, n);
 }
 
+// Qwen3.5 的 Gated DeltaNet 子层。
+//
+// 和注意力最本质的区别：它没有 KV cache，只有一个**固定大小**的递归状态。
+// 每层 32 个 V head，每个 head 一个 128×128 矩阵；来一个 token 就把状态
+// 衰减一次、用 (v - Sᵀk) 修正一次，再读出 Sᵀq。上下文再长，状态也不涨。
+//
+// 张量布局（和 llama.cpp 的 GGUF 约定一致）：
+//   qkv = wqkv·x  →  [q: 16×128 | k: 16×128 | v: 32×128]
+//   z   = wgate·x →  [32×128]           输出门，silu 后乘在 norm 上
+//   beta  = sigmoid(wbeta·x + 0)         每 V head 一个标量学习率
+//   alpha = softplus(walpha·x + dt) * a  每 V head 一个衰减（a 为负）
+//
+// 状态按 M[j][i] = S[i][j] 存（转置），这样每行是连续的，delta 与读出都能
+// 顺序扫 —— 和 ggml 的实现保持同一布局，对拍时不用再转一次。
+void Model::delta_net(const Layer& L, int slot, const float* xin) {
+    const int n    = cfg_.n_embd;
+    const int K    = cfg_.ssm_conv_kernel;
+    const int S    = cfg_.ssm_state_size;
+    const int nk   = cfg_.ssm_group_count;   // K/V 头数（16）
+    const int nv   = cfg_.ssm_time_step_rank; // V 头数（32）
+    const int kdim = nk * S;
+    const int vdim = cfg_.ssm_inner_size;
+    const int cdim = 2 * kdim + vdim;
+
+    if (K < 1 || S <= 0 || nv <= 0 || ssm_state_.empty()) return;
+
+    // 1) 四个投影一次算完
+    matvec(ssm_qkv_.data(),   xin, L.ssm_qkv,   cdim, n);
+    matvec(ssm_z_.data(),     xin, L.ssm_gate,  vdim, n);
+    matvec(ssm_beta_.data(),  xin, L.ssm_beta,  nv,   n);
+    matvec(ssm_alpha_.data(), xin, L.ssm_alpha, nv,   n);
+
+    const float* dtb = (const float*)file_.tensor_data(L.ssm_dt);
+    const float* av  = (const float*)file_.tensor_data(L.ssm_a);
+    for (int h = 0; h < nv; h++) {
+        ssm_beta_[(size_t)h] = 1.f / (1.f + std::exp(-ssm_beta_[(size_t)h]));
+        const float x = ssm_alpha_[(size_t)h] + dtb[h];
+        // softplus 在 x>20 之后等于 x（exp 会溢出，但结果本来就一样）
+        const float sp = x > 20.f ? x : std::log1p(std::exp(x));
+        ssm_alpha_[(size_t)h] = sp * av[h];   // 负数 → exp 后 <1，起衰减作用
+    }
+    auto dbg = [&](const char* tag, const float* p, int n) {
+        if (!std::getenv("DUBHE_DEBUG_NAN")) return;
+        static int calls = 0;
+        if (++calls > 80) return;   // 只看前几个 token
+        float mx = 0.f; int bad = 0;
+        for (int i = 0; i < n; i++) {
+            if (!std::isfinite(p[i])) bad++;
+            else mx = std::max(mx, std::fabs(p[i]));
+        }
+        std::fprintf(stderr, "[dbg]   delta %-8s max=%.4g bad=%d\n", tag, mx, bad);
+    };
+    dbg("qkv", ssm_qkv_.data(), cdim);
+    dbg("z", ssm_z_.data(), vdim);
+    dbg("beta", ssm_beta_.data(), nv);
+    dbg("alpha", ssm_alpha_.data(), nv);
+
+    // 2) depthwise 因果卷积 + silu。历史缓冲存最近 K-1 个 qkv，最旧在前。
+    float* st = ssm_conv_state_.data() + (size_t)slot * (size_t)(K - 1) * (size_t)cdim;
+    const float* W = (const float*)file_.tensor_data(L.ssm_conv1d);
+    for (int c = 0; c < cdim; c++) {
+        const float* wc = W + (size_t)c * K;
+        float acc = 0.f;
+        for (int k = 0; k < K - 1; k++) acc += wc[k] * st[(size_t)k * cdim + c];
+        acc += wc[K - 1] * ssm_qkv_[(size_t)c];
+        ssm_conv_out_[(size_t)c] = acc / (1.f + std::exp(-acc));
+    }
+    if (K > 1) {
+        if (K > 2) std::memmove(st, st + cdim, sizeof(float) * (size_t)(K - 2) * cdim);
+        std::memcpy(st + (size_t)(K - 2) * cdim, ssm_qkv_.data(), sizeof(float) * cdim);
+    }
+
+    // 3) 拆 q/k/v，q/k 做 per-head L2 norm（不是 RMSNorm：没有可学习权重）
+    const float* qc = ssm_conv_out_.data();
+    const float* kc = qc + kdim;
+    const float* vc = kc + kdim;
+    auto l2norm = [&](const float* src, float* dst, int heads) {
+        for (int h = 0; h < heads; h++) {
+            const float* s = src + (size_t)h * S;
+            float ss = 0.f;
+            for (int i = 0; i < S; i++) ss += s[i] * s[i];
+            const float r = 1.f / std::sqrt(ss + cfg_.rms_eps);
+            float* d = dst + (size_t)h * S;
+            for (int i = 0; i < S; i++) d[i] = s[i] * r;
+        }
+    };
+    l2norm(qc, ssm_q_.data(), nk);
+    l2norm(kc, ssm_k_.data(), nk);
+    std::memcpy(ssm_v_.data(), vc, sizeof(float) * (size_t)vdim);
+    dbg("conv", ssm_conv_out_.data(), cdim);
+
+    // 4) delta rule。q/k 只有 16 个 head，v 有 32 个：第 h 个 v head 用
+    //    第 h%16 个 k/q head（ggml_repeat_4d 的语义）。
+    const float scale = 1.f / std::sqrt((float)S);
+    float* M = ssm_state_.data() + (size_t)slot * (size_t)nv * S * S;
+    for (int h = 0; h < nv; h++) {
+        const int kh = h % nk;
+        const float* q = ssm_q_.data() + (size_t)kh * S;
+        const float* k = ssm_k_.data() + (size_t)kh * S;
+        const float* v = ssm_v_.data() + (size_t)h * S;
+        float* m = M + (size_t)h * S * S;
+        const float g = std::exp(ssm_alpha_[(size_t)h]);
+        const float beta = ssm_beta_[(size_t)h];
+
+        // 衰减整行：M[j][i] *= exp(g_h)
+        for (int j = 0; j < S; j++) {
+            float* row = m + (size_t)j * S;
+            for (int i = 0; i < S; i++) row[i] *= g;
+        }
+        // delta[j] = (v[j] - <M[j], k>) * beta;  M[j] += delta[j] * k
+        // 读出 <M[j], q> 用的是**更新后**的状态（顺序和 ggml 一致）。
+        for (int j = 0; j < S; j++) {
+            float* row = m + (size_t)j * S;
+            float sk = 0.f;
+            for (int i = 0; i < S; i++) sk += row[i] * k[i];
+            const float d = (v[j] - sk) * beta;
+            for (int i = 0; i < S; i++) row[i] += d * k[i];
+            float sq = 0.f;
+            for (int i = 0; i < S; i++) sq += row[i] * q[i];
+            ssm_o_[(size_t)h * S + j] = sq * scale;
+        }
+    }
+
+    // 5) gated RMSNorm：每 head 归一化后乘 silu(z)
+    dbg("attn", ssm_o_.data(), vdim);
+    rmsnorm_heads(ssm_o_.data(), L.ssm_norm, S, nv);
+    for (int i = 0; i < vdim; i++) {
+        const float z = ssm_z_[(size_t)i];
+        ssm_o_[(size_t)i] *= z / (1.f + std::exp(-z));
+    }
+    dbg("gated", ssm_o_.data(), vdim);
+
+    // 6) 输出投影
+    matvec(attn_out_.data(), ssm_o_.data(), L.ssm_out, n, vdim);
+    dbg("out", attn_out_.data(), n);
+}
+
+void Model::clear_ssm_state() {
+    std::fill(ssm_state_.begin(), ssm_state_.end(), 0.f);
+    std::fill(ssm_conv_state_.begin(), ssm_conv_state_.end(), 0.f);
+}
+
 void Model::rope(float* q, float* k, int n_head, int n_head_kv, int head_dim, int pos,
                  float theta, int angles) const {
-    const int half = head_dim / 2;
-    // partial RoPE：只转前 angles 个角度，后面的 cos=1/sin=0 等价于恒等，
-    // 直接跳过更省。LFM3 的 full_attention 只转 32/64，sliding_attention 转满。
-    // 频率分母恒为 head_dim（不是 2*angles）——这是 zero-tail 布局的定义：
-    // 被旋转的前缀仍然用完整 head_dim 的频率级数。
+    // partial RoPE 有两套定义（见 ModelConfig::rope_pair_nrot）：
+    //   LFM3   配对跨度 head_dim/2、频率分母 head_dim（zero-tail 的原义）
+    //   Qwen3.5 配对跨度 n_rot/2、  频率分母 n_rot
+    // 老模型 n_rot == head_dim，两条路完全等价。
+    const int half  = cfg_.rope_pair_nrot ? (cfg_.n_rot / 2) : (head_dim / 2);
+    const int denom = cfg_.rope_pair_nrot ? cfg_.n_rot : head_dim;
     if (angles <= 0 || angles > half) angles = half;
     for (int h = 0; h < n_head + n_head_kv; h++) {
         float* v = (h < n_head) ? (q + (size_t)h * head_dim)
                                 : (k + (size_t)(h - n_head) * head_dim);
         for (int i = 0; i < angles; i++) {
-            const float freq = 1.f / std::pow(theta, (float)(2 * i) / (float)head_dim);
+            // MRoPE：频率**按 section 重置**。9B 的 [11,11,10,0] 意味着
+            // 第 0-10 对用 base^(0..10·2/64)，第 11-21 对又从 base^0 开始。
+            // 文本输入下三个 section 的位置相同，所以只是频率重复，不需要
+            // 真的维护三套位置 —— 但重不重置差别很大，不能省。
+            int j = i;
+            if (cfg_.rope_mrope) {
+                int base = 0;
+                for (int k = 0; k < 4; k++) {
+                    const int n = cfg_.rope_sections[k];
+                    if (i < base + n) { j = i - base; break; }
+                    base += n;
+                }
+            }
+            const float freq = 1.f / std::pow(theta, (float)(2 * j) / (float)denom);
             const float a = pos * freq;
             const float c = std::cos(a), s = std::sin(a);
             const float x0 = v[i], x1 = v[i + half];
@@ -1172,13 +1481,28 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
     for (int l = 0; l < cfg_.n_layer; l++) {
         const Layer& L = layers_[l];
 
-        // ---- 子层 1：ShortConv 或 注意力
+        // ---- 子层 1：ShortConv / DeltaNet / 注意力
         if (L.kind == LK_CONV) {
             rmsnorm(xb_.data(), x_.data(), L.attn_norm, n_embd);
             shortconv(L, conv_slot_[(size_t)l], xb_.data());
+        } else if (L.kind == LK_DELTA) {
+            rmsnorm(xb_.data(), x_.data(), L.attn_norm, n_embd);
+            delta_net(L, ssm_slot_[(size_t)l], xb_.data());
         } else {
             rmsnorm(xb_.data(), x_.data(), L.attn_norm, n_embd);
-            matvec(q_.data(), xb_.data(), L.attn_q, n_head * hd, n_embd);
+            if (L.q_gate_fused) {
+                // Qwen3.5 的 Q 投影把 [Q | gate] 按 head 交错存：每个 head
+                // 占 2*hd，前 hd 是 Q、后 hd 是门。按 2 倍宽度取再拆开。
+                matvec(qg_.data(), xb_.data(), L.attn_q, 2 * n_head * hd, n_embd);
+                for (int h = 0; h < n_head; h++) {
+                    std::memcpy(q_.data() + (size_t)h * hd,
+                                qg_.data() + (size_t)h * 2 * hd, sizeof(float) * hd);
+                    std::memcpy(gate_.data() + (size_t)h * hd,
+                                qg_.data() + (size_t)h * 2 * hd + hd, sizeof(float) * hd);
+                }
+            } else {
+                matvec(q_.data(), xb_.data(), L.attn_q, n_head * hd, n_embd);
+            }
             matvec(k_.data(), xb_.data(), L.attn_k, kv_dim, n_embd);
             matvec(v_.data(), xb_.data(), L.attn_v, kv_dim, n_embd);
 
@@ -1205,8 +1529,8 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
                                     ? cfg_.rope_theta_swa : cfg_.rope_theta;
             rope(q_.data(), k_.data(), n_head, n_kv, hd, pos, theta, L.rope_angles_l);
 
-            float* kc = k_cache_.data() + (size_t)l * kv_cap_ * kv_dim;
-            float* vc = v_cache_.data() + (size_t)l * kv_cap_ * kv_dim;
+            float* kc = k_cache_.data() + (size_t)kv_slot_[(size_t)l] * kv_cap_ * kv_dim;
+            float* vc = v_cache_.data() + (size_t)kv_slot_[(size_t)l] * kv_cap_ * kv_dim;
             std::memcpy(kc + (size_t)pos * kv_dim, k_.data(), sizeof(float) * kv_dim);
             std::memcpy(vc + (size_t)pos * kv_dim, v_.data(), sizeof(float) * kv_dim);
 
@@ -1230,6 +1554,15 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
                     for (int d = 0; d < hd; d++) o[d] *= s;
                 }
             }
+            // Qwen3.5：门是**逐维**的（每 head head_dim 个），不是逐 head 标量。
+            // 乘错粒度不会报错，只会让每个 head 的输出被一个常数缩放 ——
+            // 表现为"能说人话但答非所问"。
+            if (L.q_gate_fused) {
+                for (int i = 0; i < n_head * hd; i++) {
+                    const float g = gate_[(size_t)i];
+                    attn_out_[(size_t)i] *= 1.f / (1.f + std::exp(-g));
+                }
+            }
 
             // 3) attention 输出投影
             matvec(xb2_.data(), attn_out_.data(), L.attn_output, n_embd, n_embd);
@@ -1239,17 +1572,65 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
         // sandwich norm：子层输出先归一化再加残差（LFM3）
         if (L.has_sandwich) rmsnorm(attn_out_.data(), attn_out_.data(), L.post_attn_norm, n_embd);
         for (int i = 0; i < n_embd; i++) x_[i] += attn_out_[i];
+        if (std::getenv("DUBHE_DEBUG_NAN") && l == 0) {
+            float mx = 0.f; int bad = 0;
+            for (int i = 0; i < n_embd; i++) {
+                if (!std::isfinite(x_[(size_t)i])) bad++;
+                else mx = std::max(mx, std::fabs(x_[(size_t)i]));
+            }
+            std::fprintf(stderr, "[dbg] L00 post-attn max=%.4g bad=%d\n", mx, bad);
+        }
 
         // ---- 子层 2：FFN（SwiGLU）
         rmsnorm(xb_.data(), x_.data(), L.ffn_norm, n_embd);
         matvec(gate_.data(), xb_.data(), L.ffn_gate, cfg_.n_ff, n_embd);
         matvec(up_.data(), xb_.data(), L.ffn_up, cfg_.n_ff, n_embd);
+        if (std::getenv("DUBHE_DEBUG_NAN") && l == 0) {
+            auto mm = [](const float* p, int n, float* mx, int* bad) {
+                *mx = 0.f; *bad = 0;
+                for (int i = 0; i < n; i++) {
+                    if (!std::isfinite(p[i])) (*bad)++;
+                    else *mx = std::max(*mx, std::fabs(p[i]));
+                }
+            };
+            float m1, m2; int b1, b2;
+            mm(xb_.data(), n_embd, &m1, &b1);
+            mm(gate_.data(), cfg_.n_ff, &m2, &b2);
+            std::fprintf(stderr, "[dbg] L00 ffn-norm max=%.4g bad=%d gate max=%.4g bad=%d\n",
+                         m1, b1, m2, b2);
+        }
         for (int i = 0; i < cfg_.n_ff; i++) ffn_out_[i] = silu(gate_[i]) * up_[i];
         {
             float* dst = ffn_down_out_.data();
             matvec(dst, ffn_out_.data(), L.ffn_down, n_embd, cfg_.n_ff);
+            if (std::getenv("DUBHE_DEBUG_NAN") && l == 0) {
+                auto mm = [](const float* p, int n, float* mx, int* bad) {
+                    *mx = 0.f; *bad = 0;
+                    for (int i = 0; i < n; i++) {
+                        if (!std::isfinite(p[i])) (*bad)++;
+                        else *mx = std::max(*mx, std::fabs(p[i]));
+                    }
+                };
+                float m1, m2; int b1, b2;
+                mm(ffn_out_.data(), cfg_.n_ff, &m1, &b1);
+                mm(dst, n_embd, &m2, &b2);
+                std::fprintf(stderr, "[dbg] L00 ffn-out max=%.4g bad=%d down max=%.4g bad=%d\n",
+                             m1, b1, m2, b2);
+            }
             if (L.has_sandwich) rmsnorm(dst, dst, L.post_ffn_norm, n_embd);
             for (int i = 0; i < n_embd; i++) x_[i] += dst[i];
+        }
+        if (std::getenv("DUBHE_DEBUG_NAN")) {
+            double ss = 0.0;
+            float mx = 0.f;
+            int nbad = 0;
+            for (int i = 0; i < n_embd; i++) {
+                const float v = x_[(size_t)i];
+                if (!std::isfinite(v)) nbad++;
+                else { ss += (double)v * v; mx = std::max(mx, std::fabs(v)); }
+            }
+            std::fprintf(stderr, "[dbg] L%02d kind=%d rms=%.4f max=%.3f bad=%d\n",
+                         l, (int)L.kind, std::sqrt(ss / n_embd), mx, nbad);
         }
     }
 
