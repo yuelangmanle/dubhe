@@ -6,6 +6,63 @@
 
 ---
 
+## [0.20.0] · 2026-11-03 · Qwen3.5 架构：Gated DeltaNet 跑通
+
+第一个**混合线性注意力**架构进引擎。MiMo-V2.6-Distill-Qwen-9B（Q4_K_M，
+5.84 GB）现在能跑出正确的中文、英文和代码。这是 2026 年本地模型的主流
+形态 —— 32 层里 24 层没有 KV cache。
+
+### 新增
+
+- **`qwen35` 架构支持**：32 层 = 8 × (3 × Gated DeltaNet + FFN) + 1 ×
+  (gated attention + FFN)。层类型从 GGUF 的 `attention.recurrent_layers`
+  逐层读，不按 "每 4 层一个" 硬编码。
+- **DeltaNet 子层**（`LK_DELTA`）：
+  - `attn_qkv` 一次出 q/k/v（q/k 各 16 head ×128，v 32 head ×128），
+    `attn_gate` 是输出门，`ssm_*` 是线性注意力自己的参数
+  - depthwise 因果卷积（kernel 4）+ silu，历史 3 个 token
+  - q/k 做 per-head **L2 norm**（不是 RMSNorm，没有可学习权重）
+  - delta rule 严格对齐 ggml：状态按 `M[j][i] = S[i][j]` 转置存储，
+    按列乘 `exp(alpha)` 衰减，`delta = (v - M·k) * beta`，先修正再读出，
+    输出乘 `1/sqrt(128)`；q/k 的 16 个 head 按 `h % 16` 映射到 32 个 v head
+  - 输出做 gated RMSNorm：`rmsnorm(o, ssm_norm) * silu(z)`
+- **MRoPE**：`rope.dimension_sections = [11,11,10,0]`，频率在每段**重新
+  从 base 开始**，不是连续 32 对。文本输入下三段位置相同，所以只是频率
+  重复，但重不重置差别很大。
+- **KV 只给 full attention 层分配**：8 层需要 KV，24 层是固定状态。
+  上下文上限从 44032 提到 **176896**（每 1K 上下文 64 MB）。
+
+### 修复
+
+- **第一层就炸到 1e38**：Qwen3.5 也有 `post_attention_norm.weight`，
+  被误判成 LFM3 的 sandwich norm，FFN 输出去乘了一个根本没绑定的
+  `post_ffw_norm`（offset 0，读到别的张量的量化字节）。qwen35 的
+  `post_attention_norm` 语义是"残差之后、FFN 之前"的输入 norm。
+- **层结构表把 DeltaNet 显示成 `full`**：`LK_DELTA` 落到了字符串三元
+  表达式的 else 分支，看起来像一个纯 Transformer，掩盖了 delta 层从未
+  启用的事实。
+
+### 基准
+
+M4 / 24 GB，MiMo-V2.6-Distill-Qwen-9B Q4_K_M（5.84 GB）：
+
+| 路径 | prefill | decode |
+| --- | ---: | ---: |
+| 纯 CPU（当前） | 1.9–3.9 tok/s | **4.4 tok/s** |
+
+CPU 的瓶颈是权重读取（5.4 GB/token ÷ 约 26 GB/s），不是 delta rule 的
+计算。要可用必须上 Metal：同样的带宽账在 84 GB/s 下是约 15 tok/s。
+
+### 已知限制
+
+- **没有 Metal 内核**：`enable_gpu` 对 qwen35 直接返回，整条前向走 CPU。
+  逐算子 `mfvec` 也不划算 —— 每 token 192 次提交+同步，光同步就 38 ms。
+- **Gemma 4 26B-A4B 还没做**：MoE 的专家路由是另一套算子。
+- tokenizer 沿用 Qwen2 的 pre-tokenize 规则（`qwen35` 的 pre 字段没单独
+  实现），实测中英文分词正确，但极端符号序列没验过。
+
+---
+
 ## [0.19.0] · 2026-11-03 · 客户端从"能演示"到"敢日常用"，以及四个静默 bug
 
 这一版的重心不在内核，在**客户端能不能真的拿来干活**。引擎侧只改了三处，
