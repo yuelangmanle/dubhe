@@ -1434,6 +1434,8 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err) {
 
     std::memcpy([g_q35_x contents], x0, sizeof(float) * (size_t)n_embd);
 
+    const bool g_dump = std::getenv("DUBHE_Q35_DUMP") != nullptr;
+
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
 
@@ -1489,6 +1491,24 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err) {
         [en setBytes:&n length:4 atIndex:2];
         [en dispatchThreads:MTLSizeMake((NSUInteger)n_embd, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
+    // 子步骤指纹（要和 CPU 的 [cpu-attn] 对拍）。每调用一次就同步一次，
+    // 只有 DUBHE_Q35_DUMP 打开且落在第 3 层时才走。
+    auto sdump = [&](int l, int pos_, const char* tag, id<MTLBuffer> b, int n) {
+        if (!g_dump || l != 3) return;
+        [en endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        const float* p = (const float*)[b contents];
+        float mx = 0.f;
+        int bad = 0;
+        for (int i = 0; i < n; i++) {
+            if (!std::isfinite(p[i])) bad++;
+            else mx = std::max(mx, std::fabs(p[i]));
+        }
+        std::fprintf(stderr, "[gpu-attn] L%02d %s=%.5f bad=%d\n", l, tag, mx, bad);
+        cb = [g_queue commandBuffer];
+        en = [cb computeCommandEncoder];
     };
 
     for (int l = 0; l < s.n_layer; l++) {
@@ -1617,6 +1637,7 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err) {
                 uint32_t nrot = (uint32_t)(s.rope_angles * 2);
                 uint32_t s0 = (uint32_t)s.rope_sections[0], s1 = (uint32_t)s.rope_sections[1];
                 uint32_t s2 = (uint32_t)s.rope_sections[2], s3 = (uint32_t)s.rope_sections[3];
+                if (std::getenv("DUBHE_NO_MROPE")) s0 = s1 = s2 = s3 = 0;
                 const NSUInteger tot = (NSUInteger)((nh + nkv) * (s.rope_angles));
                 [en setComputePipelineState:g_q35pipe[Q_ROPE]];
                 [en setBuffer:g_q35_q offset:0 atIndex:0];
@@ -1637,6 +1658,7 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err) {
                 [en dispatchThreads:MTLSizeMake(tot, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
+            sdump(l, pos, "q", g_q35_q, q_dim);
             {
                 uint64_t voff = koff, zero = 0;
                 uint32_t n = (uint32_t)kv_dim;
@@ -1672,6 +1694,7 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err) {
                 [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((nh + 3) / 4), 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             }
+            sdump(l, pos, "attn", g_q35_att, q_dim);
             {
                 uint32_t n = (uint32_t)q_dim;
                 [en setComputePipelineState:g_q35pipe[Q_GATEDIM]];
@@ -1681,7 +1704,9 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err) {
                 [en dispatchThreads:MTLSizeMake((NSUInteger)q_dim, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
+            sdump(l, pos, "gated", g_q35_att, q_dim);
             mv(L.ty_o, g_q35_att, g_q35_down, L.off_o, n_embd, q_dim);
+            sdump(l, pos, "oproj", g_q35_down, n_embd);
         }
 
         add(g_q35_x, L.kind == 0 ? g_q35_att : g_q35_down);
@@ -1702,6 +1727,26 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err) {
         }
         mv(L.ty_down, g_q35_ffn2, g_q35_down, L.off_down, n_embd, n_ff);
         add(g_q35_x, g_q35_down);
+
+        // 逐层指纹：和 CPU 的 `[dbg] L%02d ... rms=` 对拍用。每层一次同步，
+        // 只用于定位分叉点，正常路径不走这里。
+        if (g_dump) {
+            [en endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            const float* xp = (const float*)[g_q35_x contents];
+            double ss = 0.0;
+            float mx = 0.f;
+            for (int i = 0; i < n_embd; i++) {
+                const float v = xp[i];
+                ss += (double)v * v;
+                mx = std::max(mx, std::fabs(v));
+            }
+            std::fprintf(stderr, "[gpu] L%02d kind=%d rms=%.4f max=%.3f\n",
+                         l, L.kind, std::sqrt(ss / n_embd), mx);
+            cb = [g_queue commandBuffer];
+            en = [cb computeCommandEncoder];
+        }
     }
 
     rms(g_q35_x, s.off_out_norm, g_q35_xb);

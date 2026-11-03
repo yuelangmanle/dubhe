@@ -33,6 +33,13 @@ using namespace metal;
 // 每个 lane 8 个累加器，加上解码用的临时量，仍在 255 个寄存器内。
 #define BMAX 8
 
+// 注意力内核里每个 lane 的累加器数 = ceil(head_dim / 32)。
+//
+// 这个数必须跟着 head_dim 走：LFM3 是 128（4 个），Qwen3.5 的 full-attention
+// head 是 256（8 个）。写成 4 的时候 hd=256 会让 acc[4..7] 越界写穿栈上的
+// 其它浮点，症状是"q 对、attn 只有一半"——不崩、不报错，只是数值全错。
+#define ATTN_ACC 8
+
 // 解码时一个 simdgroup 同时处理几行。
 //
 // 为什么不是 1：解码是**延迟受限**而不是带宽受限。一行一个 simdgroup 时，
@@ -2642,8 +2649,8 @@ kernel void k_attn(device const float* q  [[buffer(0)]],
     const uint t0 = (win > 0u && nlen > win) ? (nlen - win) : 0u;
 
     float m = -1e30f, l = 0.0f;
-    float acc[4];
-    for (int j = 0; j < 4; j++) acc[j] = 0.0f;
+    float acc[ATTN_ACC];
+    for (int j = 0; j < ATTN_ACC; j++) acc[j] = 0.0f;
 
     for (uint t = t0; t < nlen; t++) {
         // kvwrap 是诊断开关（非 0 时按位与回绕到一小段 KV）：指令数与访存
@@ -2717,8 +2724,8 @@ kernel void k_attn_split(device const float* q  [[buffer(0)]],
     device float* p = part + (((ulong)row * nsp + sp) * n_head + head) * W;
 
     float m = -1e30f, l = 0.0f;
-    float acc[4];
-    for (int j = 0; j < 4; j++) acc[j] = 0.0f;
+    float acc[ATTN_ACC];
+    for (int j = 0; j < ATTN_ACC; j++) acc[j] = 0.0f;
 
     if (k0 < k1) {
         const uint mul = n_head / n_kvh;
@@ -2782,8 +2789,8 @@ kernel void k_attn_comb(device const float* part [[buffer(0)]],
     }
 
     float l = 0.0f;
-    float acc[4];
-    for (int j = 0; j < 4; j++) acc[j] = 0.0f;
+    float acc[ATTN_ACC];
+    for (int j = 0; j < ATTN_ACC; j++) acc[j] = 0.0f;
     for (uint s = 0; s < nsp; s++) {
         device const float* p = part + (((ulong)row * nsp + s) * n_head + head) * W;
         const float ls = p[hd + 1u];
@@ -3114,6 +3121,7 @@ kernel void k_gate_mul_dim(device float* x       [[buffer(0)]],
 namespace dubhe_msl {
 
 constexpr int kBmax      = 8;    // 与 MSL 的 BMAX 一致（mm2_* 的 token 摊薄）
+constexpr int kAttnAcc   = 8;    // 与 MSL 的 ATTN_ACC 一致（= ceil(head_dim/32)）
 constexpr int kMmaBm     = 32;   // 与 MSL 的 MMA_BM 一致（mm3_* 的 token 摊薄）
 constexpr int kMmaBn     = 64;   // 与 MSL 的 MMA_BN 一致
 constexpr int kMmaNk     = 32;   // 与 MSL 的 MMA_NK 一致

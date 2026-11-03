@@ -6,6 +6,43 @@
 
 ---
 
+## [0.21.1] · 2026-11-03 · 修掉 acc[4] 越界：GPU 输出终于和 CPU 一致
+
+0.21.0 的 Metal 路径跑得很快，但贪心输出是错的（`The capital of France is`
+→ "located in the region known as" 而不是 "Paris."）。逐层指纹对拍定位到
+第 3 层（第一个 full-attention 层）：**q 完全一致，attn 只有一半**。
+
+### 修复
+
+- **`k_attn` / `k_attn_split` / `k_attn_comb` 的 `float acc[4]` 越界**。
+  每个 lane 的累加器数必须是 `ceil(head_dim / 32)`：LFM3 的 head 是 128
+  → 正好 4 个，所以两年没暴露；Qwen3.5 的 full-attention head 是 **256**
+  → 需要 8 个，`acc[4..7]` 直接写穿栈上相邻的浮点（`m` / `l` / `qh` 指针
+  就在旁边）。后果：每 head 后 128 维的输出是垃圾，softmax 分母被污染，
+  表现为"跑得飞快的胡说八道"。新增 `ATTN_ACC` 宏，两边常量表同步。
+- 这个 bug **不崩、不报错、NaN 计数为 0**，只能靠数值对拍发现。已把对拍
+  固化进代码：`DUBHE_Q35_DUMP=1` 让 GPU 每层同步一次并打印
+  `rms/max`，和 CPU 的 `DUBHE_DEBUG_NAN=1` 逐行对照。
+
+### 新增
+
+- `--no-think`：在 assistant 起始补 `<think></think>`，关掉 Qwen3.5 的
+  思考段。思考段在 9B 上经常写满 200 字才给出答案，短问答场景不需要。
+
+### 基准
+
+M4 / 24 GB，MiMo-V2.6-Distill-Qwen-9B Q4_K_M：
+
+| 路径 | prefill | decode |
+| --- | ---: | ---: |
+| 修复前（0.21.0，输出错误） | 6.7 tok/s | 13.4 tok/s |
+| **修复后（0.21.1）** | 8.0 tok/s | **15.0 tok/s** |
+
+修完反而更快 —— 越界写穿栈时会破坏 `cb`/`en` 附近的局部变量，之前那次
+13.4 tok/s 里有一部分时间花在了错误路径上。
+
+---
+
 ## [0.21.0] · 2026-11-03 · Qwen3.5 上 Metal：4.4 → 13.4 tok/s
 
 DeltaNet 的整层融合落地。32 层编进**一个** command buffer，每 token 只提交

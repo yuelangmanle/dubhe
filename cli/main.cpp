@@ -29,6 +29,7 @@ struct Args {
     int   ctx = 0;
     int   threads = 0;
     bool  no_gpu = false;
+    bool  no_think = false;
     int   concurrency = 1;
 };
 
@@ -63,6 +64,7 @@ void usage() {
         "      --raw              不加 chat 模板，直接续写\n"
         "      --stats            打印性能统计\n"
         "      --no-gpu           禁用 GPU 后端\n"
+        "      --no-think         不进入思考模式（assistant 后补空 <think>）\n"
         "      --concurrency <N>  bench 并发数\n",
         dubhe_version());
 }
@@ -98,6 +100,7 @@ bool parse(int argc, char** argv, Args* a) {
         else if (k == "--stats") a->stats = true;
         else if (k == "--raw") a->raw = true;
         else if (k == "--no-gpu") a->no_gpu = true;
+        else if (k == "--no-think") a->no_think = true;
         else if (k == "-h" || k == "--help") { usage(); return false; }
         else if (!k.empty() && k[0] != '-') {
             // 位置参数：第一个当模型路径，第二个当提示词
@@ -117,12 +120,18 @@ void print_stats(const dubhe_stats& s) {
 }
 
 // ChatML：Qwen 系
-std::string build_chatml(const std::vector<std::pair<std::string, std::string>>& msgs) {
+//
+// no_think：Qwen3.5 / MiMo 的模板里 `enable_thinking=false` 会在 assistant
+// 后面补一个**空的** `<think></think>`，模型于是直接回答，不再先写一段推理。
+// 9B 的 SFT 在贪心思考下经常跑偏（把 1+1 写成 1+2），单轮问答建议关掉。
+std::string build_chatml(const std::vector<std::pair<std::string, std::string>>& msgs,
+                         bool no_think = false) {
     std::string p;
     for (auto& m : msgs) {
         p += "<|im_start|>" + m.first + "\n" + m.second + "<|im_end|>\n";
     }
     p += "<|im_start|>assistant\n";
+    if (no_think) p += "<think></think>";
     return p;
 }
 
@@ -232,7 +241,7 @@ int cmd_run(const Args& a) {
     }
 
     std::string text = a.raw ? a.prompt
-                             : build_chatml({{"user", a.prompt}});
+                             : build_chatml({{"user", a.prompt}}, a.no_think);
 
     int32_t n = dubhe_tokenize(e, text.c_str(), 1, nullptr, 0);
     std::vector<int32_t> toks((size_t)n);
@@ -350,7 +359,7 @@ int cmd_chat(const Args& a) {
         if (input == "/clear") { hist.clear(); std::fprintf(stderr, "已清空\n"); continue; }
 
         hist.emplace_back("user", input);
-        std::string prompt = build_chatml(hist);
+        std::string prompt = build_chatml(hist, a.no_think);
 
         int32_t n = dubhe_tokenize(e, prompt.c_str(), 1, nullptr, 0);
         std::vector<int32_t> toks((size_t)n);
@@ -399,7 +408,7 @@ int cmd_bench(const Args& a) {
     dubhe_model_info_get(e, &mi);
 
     const char* prompt = "用三句话解释什么是本地推理引擎。";
-    std::string text = build_chatml({{"user", prompt}});
+    std::string text = build_chatml({{"user", prompt}}, a.no_think);
     int32_t n = dubhe_tokenize(e, text.c_str(), 1, nullptr, 0);
     std::vector<int32_t> toks((size_t)n);
     dubhe_tokenize(e, text.c_str(), 1, toks.data(), n);
