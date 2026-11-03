@@ -87,13 +87,38 @@ inline int cpu_count() {
 #endif
 }
 
+// 总核数（含能效核）。给"这台机器是什么"用，不给线程池用。
+inline int total_cpu_count() {
+#if defined(__APPLE__)
+    int n = 0;
+    size_t len = sizeof(n);
+    if (sysctlbyname("hw.ncpu", &n, &len, nullptr, 0) == 0 && n > 0) return n;
+    return cpu_count();
+#else
+    return cpu_count();
+#endif
+}
+
 // 人读的硬件摘要。Apple 是统一内存，其它平台就是普通内存。
+//
+// Apple 上核数要说清两档：cpu_count() 给的是性能核（线程池只用这些，
+// 见上面的注释），拿它当"这台机器几核"写出来就是错的 —— M4 会被写成
+// "4 核"，而它其实是 4 性能 + 6 能效。摘要里两个都给。
 inline std::string hardware_summary() {
     const std::string brand = cpu_brand();
     const int ncpu = cpu_count();
+    const int ntotal = total_cpu_count();
     const uint64_t mem = total_ram_bytes();
     char buf[640];
-    std::snprintf(buf, sizeof(buf), "%s · %d 核 · %.0f GB %s", brand.c_str(), ncpu,
+#if defined(__APPLE__)
+    if (ntotal > ncpu) {
+        std::snprintf(buf, sizeof(buf), "%s · %d 核（%d 性能 + %d 能效）· %.0f GB 统一内存",
+                      brand.c_str(), ntotal, ncpu, ntotal - ncpu,
+                      (double)mem / (1024.0 * 1024.0 * 1024.0));
+        return std::string(buf);
+    }
+#endif
+    std::snprintf(buf, sizeof(buf), "%s · %d 核 · %.0f GB %s", brand.c_str(), ntotal,
                   (double)mem / (1024.0 * 1024.0 * 1024.0),
 #if defined(__APPLE__)
                   "统一内存"

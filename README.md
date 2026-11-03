@@ -2,7 +2,7 @@
 
 > Apple Silicon MacBook 与 Android 手机上的本地大模型推理引擎。GGUF 原生直读，单路与多路都不掉速。
 
-状态：**v0.19.0** · M0 已交付（引擎 + CLI + HTTP + Web UI 全链路可跑）· **M1 性能收敛**（prefill 追平 MLX，decode 差距来自权重大小）· 客户端（Web + macOS 外壳）已落地 · 闭源 · 私有仓库
+状态：**v0.24.0** · M0 已交付（引擎 + CLI + HTTP + Web UI 全链路可跑）· **M1 性能收敛**（prefill 追平 MLX，decode 贴着带宽墙）· **Qwen3.5 混合架构**（Gated DeltaNet + 176K 上下文，decode 15 tok/s / prefill 113 tok/s）· macOS 客户端（双击即开、拖 gguf 换模型、生成完成通知）已落地 · 闭源 · 私有仓库
 
 ---
 

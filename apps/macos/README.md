@@ -48,6 +48,25 @@ macOS 宿主。许可：闭源（Proprietary，见根目录 LICENSE）。
 | 重启引擎 | 菜单 ⌘⇧R，走和冷启动同一条路 | 换模型/卡住时不用退出重开 |
 | 窗口标题同步 | KVO `WKWebView.title` | 实测变成「Dubhe · 天枢」 |
 | 拖 gguf 到 Dock 图标 | `CFBundleDocumentTypes` 声明 + `application(_:open:)` | 换个模型不用先进界面 |
+| **⌘O 打开模型…** | 文件菜单 + `NSOpenPanel`（默认落到 `~/.dubhe/models`）| Mac 用户找「打开」的第一反应就是 ⌘O |
+| **Dock 右键菜单** | `applicationDockMenu`：打开模型 / 重启引擎 / 看日志 | 不用切回窗口也能救 |
+| **生成完成通知** | 页面 `shellPost` 事件 → `UNUserNotificationCenter` + Dock 跳 + 角标 | 长回答几十秒，切走之后得知道完了没 |
+| **崩溃自愈** | 界面起来之后引擎挂了 → 1/2/3 秒退避重启，第 4 次停手并给重试按钮 | 一次性崩溃不该让用户面对一个死页面 |
+| **非 gguf 文件有话说** | 拖别的文件到 Dock 图标时弹一句"图片/文档请拖进窗口" | 原来是什么都不发生 |
+
+## 通知这条路有个前提
+
+`UNUserNotificationCenter` 要求 App 有**能注册到 LaunchServices 的 bundle**。
+从 Finder / Dock 双击 `.app` 时没问题；直接跑
+`build/Dubhe.app/Contents/MacOS/Dubhe` 这种裸二进制，系统会回
+`Notifications are not allowed for this application`（实测）。
+
+所以通知**不是唯一手段**：真发通知之前先做两件一定生效的事 ——
+Dock 图标跳一下（`requestUserAttention`）+ 挂角标（`dockTile.badgeLabel`），
+切回 App 时清掉。通知只是锦上添花，被系统拒了也不影响"知道它跑完了"。
+
+ad-hoc 签名（`build.sh` 的默认）在部分系统上也会被拒。要稳定发通知得走
+Developer ID + 公证。
 
 ## 构建
 
@@ -80,6 +99,8 @@ build/Dubhe.app/Contents/Resources/AppIcon.icns
 | `DUBHE_SHELL_SNAPSHOT=/tmp/x.png` | 界面加载完存一张快照（不需要屏幕录制权限） |
 | `DUBHE_SHELL_AUTOCLOSE=3` | 界面加载完 3 秒后自关窗口（验收"关窗即退"） |
 | `DUBHE_SHELL_AUTORESTART=3` | 界面加载完 3 秒后重启引擎（验收 ⌘⇧R 那条路） |
+| `DUBHE_SHELL_NOTIFY_TEST=3` | 3 秒后按"生成完成"走一遍通知路径（连角标和 Dock 跳） |
+| `DUBHE_SHELL_EVAL="js"` | 加载完 2 秒后在页面里跑一段 JS，结果写进调试日志（仅 `DUBHE_SHELL_DEBUG=1` 时） |
 
 ## 两个踩过的坑
 
@@ -105,10 +126,11 @@ build/Dubhe.app/Contents/Resources/AppIcon.icns
 
 ## 待做
 
-- 生成完成的通知：窗口不在前台时没有任何提示。WKWebView 的 Web Notification
-  需要自己实现 delegate，工作量比看起来大，先记着。
 - 公证：`build.sh` 现在只做 ad-hoc 签名。对外分发要换 Developer ID 并 `notarytool`。
-- 引擎崩溃后的自动重试：现在只给"重试"按钮，不会自己拉起来。做的话要限次数，
-  否则一个必崩的模型会变成重启风暴。
-- 拖文件到窗口里（而不是 Dock 图标）：现在靠 Web UI 自己的 `<input type=file>`，
-  拖进输入框能用，拖到窗口空白处没反应。
+  这条同时卡着"通知一定发得出来"（见上）。
+- 拖文件到窗口**空白处**：现在网页侧接管了整窗拖放（`window` 上的
+  dragover/drop），图片/文档/音频都能用；`<input type=file>` 也挂了
+  `uiDelegate`。唯一没打通的是"把 .gguf 拖进窗口"——WebKit 自己吃掉了
+  文件拖放，外壳拿不到路径。现在给的是明确提示（去「模型」页或拖 Dock 图标），
+  要真做就得关掉 WebKit 的拖放、由外壳转发，代价是网页侧全部拖放要重写。
+- 生成完成的通知在**没有 bundle 注册**的场景会被系统拒（见上）。

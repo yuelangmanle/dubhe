@@ -26,6 +26,42 @@
 
   const STORE_KEY = 'dubhe.conv.v1';
   const SET_KEY = 'dubhe.settings.v1';
+
+  // ---------------------------------------------------------------- 原生外壳通道
+  //
+  // 桌面版（apps/macos）把这份 UI 塞进 WKWebView，用一条只认几个 type 的
+  // 小通道把"这一轮生成完了"这类事件告诉外壳 —— 外壳据此弹通知、点 Dock。
+  //
+  // 浏览器里 window.webkit 是 undefined，这里静默退化成空操作；
+  // 不要在这里做任何"是不是 App"的分支判断，页面本身要完全一致。
+  const shellPost = (payload) => {
+    try {
+      const h = window.webkit && window.webkit.messageHandlers
+                && window.webkit.messageHandlers.shell;
+      if (h) h.postMessage(payload);
+    } catch (e) { /* 通道不在就当没这回事 */ }
+  };
+
+  // 通知正文不能用原始 markdown：代码块、表格、标题符号在通知里就是一堆乱码。
+  // 去掉围栏块和行内标记，再把空白压平，超过 160 字截断。
+  function shellPostTurnEnd(ai, tokens) {
+    // 0 token 的"完成"不是完成：请求失败、被中断、或者根本没跑起来。
+    // 这也顺带挡住了一种偶发的幽灵消息（页面重载时队列里残留的那一条），
+    // 症状是"一开 App 就弹一条空通知"。
+    if (!tokens) return;
+    let t = String(ai.content || '')
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/`[^`]*`/g, ' ')
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/^\s{0,3}#{1,6}\s*/gm, '')
+      .replace(/[*_~#>|]+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!t) return;
+    if (t.length > 160) t = t.slice(0, 160) + '…';
+    shellPost({ type: 'turnEnd', body: t });
+  }
   // 用户在设置面板里亲手拨过"启用工具调用"的开关。
   // 有这个标记才认存储里的 tools 值；没有就说明那个 true 是旧默认值留下的。
   const TOOLS_TOUCHED = 'dubhe.tools.touched';
@@ -383,7 +419,7 @@
     const list = $('#convList');
     list.innerHTML = '';
     if (!state.convs.length) {
-      list.appendChild(el('div', 'conv-empty', '还没有对话。点上面的 ＋ 开始。'));
+      list.appendChild(el('div', 'conv-empty', '还没有对话。在下方输入框直接提问就会新建一条。'));
       return;
     }
     const q = (state.q || '').trim().toLowerCase();
@@ -993,6 +1029,16 @@
     return parts.find((x) => !/^(F32|F16|FP32|FP16|BF16)$/.test(x)) || parts[0] || '';
   }
 
+  // 顶栏胶囊里已经单独挂了量化标签（Q4_K_M / Q8_0 …），模型名里再带一遍
+  // 就是十来个字符的纯浪费 —— 窄窗口下正是它把名字挤成 "Qwen2..."。
+  // 名字只保留"是什么模型"，"量化成什么样"交给旁边的标签。
+  function shortModelName(id) {
+    const full = String(id || '');
+    const cut = full.replace(
+      /[-_.](?:UD-)?(?:(?:IQ|Q)\d+(?:_[A-Za-z0-9]+)*|F16|F32|BF16|FP16|fp16|f16)$/i, '');
+    return cut || full;
+  }
+
   function renderHead(s) {
     const name = $('#mpName');
     const tags = $('#mpTags');
@@ -1000,7 +1046,8 @@
     if (!name) return;
     tags.innerHTML = '';
     if (s && s.loaded && s.info) {
-      name.textContent = s.model_id || '已加载';
+      name.textContent = shortModelName(s.model_id) || '已加载';
+      name.title = s.model_id || '';
       const i = s.info;
       const bits = [
         (i.params / 1e9).toFixed(2) + 'B',
@@ -1009,11 +1056,11 @@
       ].filter(Boolean);
       for (const t of bits) tags.appendChild(el('span', '', t));
       live.classList.add('on');
-      live.querySelector('span').textContent = '本地运行 · 已加载';
+      live.querySelector('.live-s').textContent = '已加载';
     } else {
       name.textContent = s ? '未加载模型' : '服务未连接';
       live.classList.remove('on');
-      live.querySelector('span').textContent = s ? '空闲' : '未连接';
+      live.querySelector('.live-s').textContent = s ? '空闲' : '未连接';
     }
   }
 
@@ -1030,7 +1077,8 @@
       return;
     }
     const i = s.info;
-    nm.textContent = s.model_id || i.arch;
+    nm.textContent = shortModelName(s.model_id) || i.arch;
+    nm.title = s.model_id || '';
     tg.textContent = '本地';
     tg.className = 'tag';
     const rows = [
@@ -1832,6 +1880,7 @@
     } catch (e) {
       if (e.name === 'AbortError') {
         // 用户主动停止：保留已生成的部分，不报错
+        ai.stopped = true;
         if (!ai.content) ai.content = '（已停止）';
       } else {
         ai.content = (ai.content || '') + `\n\n> ⚠️ 请求失败：${e.message}`;
@@ -1879,6 +1928,10 @@
         body = node.querySelector('.body');
         body.classList.remove('typing');
       }
+      // 桌面版：这一轮真的生成完了，告诉外壳一声（外壳决定要不要弹通知）。
+      // 用户主动停止的不算 —— 那说明他正盯着屏幕。
+      if (!ai.stopped && !ai.errText) shellPostTurnEnd(ai, tokens);
+      delete ai.stopped;          // 只用于刚才那个判断，不该跟着会话存下去
       saveConvs();
       // 收尾不强制回底。用户生成到一半往上滑去读前面的内容，这时候把他
       // 拽回底部，等于"我看了半天的那段又没了"—— stick.on 为真时它照样
@@ -3258,6 +3311,13 @@
       Array.from(e.dataTransfer.types || []).includes('Files'));
     const takeFile = async (f) => {
       if (!f) return;
+      // 模型文件不是附件：把它当图片/文本发过去只会得到一句"不支持这种类型"，
+      // 而用户的意图恰恰是"换这个模型"。往模型页引，比报错有用。
+      if (/\.gguf$/i.test(f.name || '')) {
+        alert('这是模型文件，不是对话附件。\n\n左侧「模型」页可以加载它，'
+              + '或者把 .gguf 直接拖到 Dock 里的 Dubhe 图标上。');
+        return;
+      }
       if (f.size > 64 * 1024 * 1024) { alert('文件太大，上限 64 MB'); return; }
       try {
         await useAttachment(await readAttachment(f));

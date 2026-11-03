@@ -15,6 +15,8 @@
 // 等 M5 真正做原生 UI 时，这一层换成 SwiftUI + XPC（ADR-0005），
 // 但"起引擎、等就绪、杀进程"这三件事的代码可以原样搬过去。
 import Cocoa
+import UserNotifications
+import UniformTypeIdentifiers
 import WebKit
 
 // ---------------------------------------------------------------- 端口探测
@@ -149,7 +151,8 @@ private func dbg(_ s: String) {
 
 // ---------------------------------------------------------------- 主界面
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
-                         WKNavigationDelegate, WKScriptMessageHandler, WKUIDelegate {
+                         WKNavigationDelegate, WKScriptMessageHandler, WKUIDelegate,
+                         UNUserNotificationCenterDelegate {
     private var window: NSWindow!
     private var webView: WKWebView!
     private var engine: Process?
@@ -165,6 +168,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var usedRememberedModel = false
     private var logInitialized = false
     private var pendingModelURL: URL?
+    // 引擎在界面已经起来之后挂掉，自动拉起的次数与上次时间。
+    // 连续崩要在有限次内停手，否则一个必崩的模型会变成重启风暴。
+    private var crashCount = 0
+    private var lastCrashAt = Date.distantPast
+    // 界面**至少**成功加载过一次。不能用 uiLoaded 判断"这是运行中崩溃还是
+    // 启动失败"：showSplash 会把 uiLoaded 置回 false，于是崩溃重启循环里
+    // 第 2 次以后会被误判成启动失败，计数永远涨不到上限。
+    private var everLoadedUI = false
+    private var notifyAllowed = false
 
     // 上次在界面里加载过的模型。存路径而不是名字：同名模型可能在两个目录里。
     private static let lastModelKey = "lastModelPath"
@@ -193,6 +205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
 
         installSignalHandlers()
+        setupNotifications()
         buildMenu()
         buildWindow()
         // 由"打开 .gguf"触发启动时，第一个要加载的就是它，别再先用
@@ -224,10 +237,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // 关窗口 = 退出（这是一个单窗口工具，不是文档型 App）
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
 
+    // ------------------------------------------------------------ 生成完成的通知
+    //
+    // 长回答动辄几十秒，用户切去干别的，回来时既不知道生成完没完、也不知道
+    // 结果如何。这里做两件事（都只在"人不在这个窗口前面"时发生）：
+    //   1. 系统通知（带回答开头一段，扫一眼就知道值不值得切回来）
+    //   2. Dock 图标跳一下 + 挂角标
+    //
+    // UNUserNotificationCenter 在**没有 bundle** 的裸二进制里会抛异常
+    // （bundleProxyForCurrentProcess 为 nil），所以先确认 bundleIdentifier 在。
+    private func setupNotifications() {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, err in
+            DispatchQueue.main.async { self?.notifyAllowed = granted }
+            dbg("notify auth granted=\(granted) err=\(err?.localizedDescription ?? "-")")
+        }
+    }
+
+    // 前台时不弹横幅：用户正看着屏幕，通知只会挡住内容。
+    // 这里的判断和 notifyTurnEnd 里的不重复——通知可能在派发途中 App 被激活。
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler:
+                                    @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler(NSApp.isActive ? [] : [.banner, .sound])
+    }
+
+    private func notifyTurnEnd(_ body: String) {
+        let front = NSApp.isActive && window != nil && window.isKeyWindow
+                    && !window.isMiniaturized
+        if front { return }
+        dbg("notify turn end (front=\(front), allowed=\(notifyAllowed))")
+        NSApp.requestUserAttention(.informationalRequest)
+        NSApp.dockTile.badgeLabel = "1"
+        guard notifyAllowed else { return }
+        let c = UNMutableNotificationContent()
+        c.title = "Dubhe · 天枢"
+        c.body = body
+        c.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+    }
+
+    func applicationDidBecomeActive(_ note: Notification) {
+        // 用户回来了，角标就该消失——它表达的是"有你没看的东西"
+        NSApp.dockTile.badgeLabel = nil
+    }
+
     // 把 .gguf 拖到 Dock 图标上（或在 Finder 里"打开方式 → Dubhe"）。
     // 拖进来的文件直接当"这次要加载的模型"，走重启引擎那条路。
     func application(_ sender: NSApplication, open urls: [URL]) {
-        guard let gguf = urls.first(where: { $0.pathExtension.lowercased() == "gguf" }) else { return }
+        guard let gguf = urls.first(where: { $0.pathExtension.lowercased() == "gguf" }) else {
+            // 不是模型文件。以前这里直接 return，用户拖一张图到 Dock 图标上
+            // 得到的是"什么都没发生"。说清楚能做什么，比沉默好。
+            if webView != nil, let first = urls.first {
+                let a = NSAlert()
+                a.messageText = "只能这样打开 .gguf 模型"
+                a.informativeText = "「\(first.lastPathComponent)」不是模型文件。"
+                    + "图片、文档、音频请直接拖进对话窗口，或者在输入框左边点附件。"
+                a.alertStyle = .informational
+                a.runModal()
+            }
+            return
+        }
         dbg("open file \(gguf.path)")
         // 如果是"用这个文件启动"的场景，窗口还没建好，先记下来，
         // 等 applicationDidFinishLaunching 里再决定用哪个模型起引擎。
@@ -272,6 +346,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         appItem.submenu = appMenu
         main.addItem(appItem)
 
+        // 「文件」菜单：Mac 用户找「打开」的第一反应就在这里。⌘O 是系统级的
+        // 肌肉记忆，只把它藏在应用菜单里等于没有。
+        let fileItem = NSMenuItem()
+        let file = NSMenu(title: "文件")
+        file.addItem(withTitle: "打开模型…", action: #selector(openModel), keyEquivalent: "o")
+        file.addItem(.separator())
+        file.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)),
+                     keyEquivalent: "w")
+        fileItem.submenu = file
+        main.addItem(fileItem)
+
         let editItem = NSMenuItem()
         let edit = NSMenu(title: "编辑")
         // 用字符串 selector 走响应链交给 WKWebView，自己不实现
@@ -301,8 +386,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let win = NSMenu(title: "窗口")
         win.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)),
                     keyEquivalent: "m")
-        win.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)),
-                    keyEquivalent: "w")
         winItem.submenu = win
         main.addItem(winItem)
 
@@ -330,6 +413,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let dir = NSHomeDirectory() + "/.dubhe/models"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(URL(fileURLWithPath: dir))
+    }
+
+    // ⌘O：选一个 .gguf 直接换模型。走的是和"拖到 Dock 图标"完全同一条路
+    // （记住路径 → 重启引擎），所以两种入口不可能出现行为差异。
+    @objc private func openModel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "选择一个 GGUF 模型"
+        panel.prompt = "加载"
+        // UTType(filenameExtension:) 对自定义扩展名会给出动态类型，
+        // 只要文件真的是 .gguf 就能选中；万一系统解析不出来也不拦。
+        if let t = UTType(filenameExtension: "gguf") {
+            panel.allowedContentTypes = [t]
+        }
+        let start = NSHomeDirectory() + "/.dubhe/models"
+        if FileManager.default.fileExists(atPath: start) {
+            panel.directoryURL = URL(fileURLWithPath: start)
+        }
+        let handler: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
+            guard let self, resp == .OK, let url = panel.url else { return }
+            dbg("open model \(url.path)")
+            UserDefaults.standard.set(url.path, forKey: Self.lastModelKey)
+            self.usedRememberedModel = false
+            self.restartEngine()
+        }
+        if let w = window { panel.beginSheetModal(for: w, completionHandler: handler) }
+        else { panel.begin(completionHandler: handler) }
+    }
+
+    // Dock 图标右键：不打开窗口也能换模型/重启/看日志。
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let m = NSMenu()
+        for (title, sel) in [("打开模型…", #selector(openModel)),
+                             ("重启引擎", #selector(restartEngine)),
+                             ("打开引擎日志", #selector(openEngineLog))] {
+            let it = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            it.target = self
+            m.addItem(it)
+        }
+        return m
     }
 
     // 关于面板里放真正有用的东西：版本、引擎端口、当前模型。用户来这儿
@@ -510,12 +635,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 guard let self, !self.shuttingDown, self.engine === pr else { return }
                 let code = pr.terminationStatus
                 self.stopPolling()
+                self.stopStateWatch()
                 self.engine = nil
 
-                // 启动阶段就挂了，而且用的是"上次记住的模型"——多半是那个
-                // 模型文件坏了/不兼容。忘掉它，退回到无模型状态再来一次，
-                // 别让用户卡在一个永远起不来的循环里。只退一次。
-                if !self.uiLoaded && self.usedRememberedModel {
+                // ① 界面上跑着跑着引擎没了：OOM、崩溃、被外部 kill。
+                //    自己拉起来，但要有上限 —— 一个必然 OOM 的模型会变成
+                //    "重启 → 崩 → 重启"的风暴，那比停下来更糟。
+                //    上限用**时间窗**判定：60 秒内连着崩才算"连续"，
+                //    跑了五分钟才崩一次的是新问题，计数重新开始。
+                if self.everLoadedUI {
+                    let now = Date()
+                    if now.timeIntervalSince(self.lastCrashAt) > 60 { self.crashCount = 0 }
+                    self.lastCrashAt = now
+                    self.crashCount += 1
+                    if self.crashCount <= 3 {
+                        dbg("engine died (exit \(code)) after UI load, auto-restart #\(self.crashCount)")
+                        self.showSplash("引擎意外退出（退出码 \(code)），"
+                                        + "第 \(self.crashCount) 次自动重启…")
+                        let delay = Double(self.crashCount)      // 1s / 2s / 3s
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                            guard let self, !self.shuttingDown, self.engine == nil else { return }
+                            self.startEngine()
+                        }
+                    } else {
+                        dbg("engine keeps dying, giving up after \(self.crashCount)")
+                        self.showSplash("引擎连续 \(self.crashCount) 次意外退出（退出码 \(code)）。"
+                                        + "多半是模型太大、文件损坏，或者内存不够。",
+                                        retry: true)
+                    }
+                    return
+                }
+
+                // ② 启动阶段就挂了，而且用的是"上次记住的模型"——多半是那个
+                //    模型文件坏了/不兼容。忘掉它，退回到无模型状态再来一次，
+                //    别让用户卡在一个永远起不来的循环里。只退一次。
+                if self.usedRememberedModel {
                     self.usedRememberedModel = false
                     UserDefaults.standard.removeObject(forKey: Self.lastModelKey)
                     dbg("remembered model failed (exit \(code)), forgetting it")
@@ -524,9 +678,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     return
                 }
 
-                self.showSplash(self.uiLoaded
-                    ? "引擎已退出（退出码 \(code)）。"
-                    : "引擎启动失败（退出码 \(code)）。", retry: true)
+                self.showSplash("引擎启动失败（退出码 \(code)）。", retry: true)
             }
         }
         do {
@@ -556,6 +708,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // 所以"重启能修好的问题，冷启动也一定能修好"这句话是成立的。
     @objc private func restartEngine() {
         dbg("restart engine")
+        // 人主动点重启（或点了错误页的重试）：崩溃计数重新开始。
+        // 自动重启那条路不经过这里，所以不会被它绕开上限。
+        crashCount = 0
         stopEngine()
         uiLoaded = false
         showSplash("正在重启本地引擎…")
@@ -564,16 +719,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     // ------------------------------------------------------------ 转圈页上的按钮
     //
-    // 只认两个字符串，不做通用 bridge：转圈页是我们自己写死的一小段 HTML，
-    // 页面本身不加载任何外部内容。
+    // 两条消息来源：
+    //   * 转圈页的字符串命令（retry / openLog）—— 页面是我们自己写死的一小段 HTML
+    //   * 正页发来的字典事件（turnEnd）—— web/app.js 里的 shellPost
+    // 只认白名单里的 type，不做通用 bridge：任何一条都必须是"外壳能独立验证
+    // 语义"的动作，不能变成网页随意调 Swift 的入口。
     func userContentController(_ ucc: WKUserContentController,
                                didReceive message: WKScriptMessage) {
-        guard message.name == "shell", let cmd = message.body as? String else { return }
-        dbg("shell message \(cmd)")
-        switch cmd {
-        case "retry":   restartEngine()
-        case "openLog": openEngineLog()
-        default:        break
+        guard message.name == "shell" else { return }
+        if let cmd = message.body as? String {
+            dbg("shell message \(cmd)")
+            switch cmd {
+            case "retry":   restartEngine()
+            case "openLog": openEngineLog()
+            default:        break
+            }
+            return
+        }
+        guard let obj = message.body as? [String: Any],
+              let type = obj["type"] as? String else { return }
+        dbg("shell event \(type)")
+        switch type {
+        case "turnEnd":
+            notifyTurnEnd((obj["body"] as? String) ?? "回答已生成")
+        default:
+            break
         }
     }
 
@@ -653,6 +823,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         dbg("port accepting, loading UI on \(port)")
         guard let url = URL(string: "http://127.0.0.1:\(port)/") else { return }
         uiLoaded = true
+        everLoadedUI = true
         webView.load(URLRequest(url: url))
         window.makeFirstResponder(webView)
         startStateWatch()
@@ -712,6 +883,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             dbg("autorestart in \(secs)s")
             DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
                 self?.restartEngine()
+            }
+        }
+        // DUBHE_SHELL_NOTIFY_TEST=3：3 秒后按"生成完成"走一遍通知路径。
+        // 通知本身要靠人看，但这条至少能验证断链（授权、delegate、角标）不崩。
+        if let s = env["DUBHE_SHELL_NOTIFY_TEST"], let secs = Double(s), secs > 0 {
+            dbg("notify test in \(secs)s")
+            DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
+                self?.notifyTurnEnd("测试通知：这一轮回答已经生成完了。")
+            }
+        }
+        // DUBHE_SHELL_EVAL="js…"：界面加载完后在页面里跑一段 JS，只给调试用。
+        // 验证页面侧到外壳的那条通道（window.webkit.messageHandlers）时，
+        // 没有这条就只能靠手点。
+        if debugOn, let js = env["DUBHE_SHELL_EVAL"], !js.isEmpty {
+            dbg("eval \(js)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.webView.evaluateJavaScript(js) { val, err in
+                    if let err { dbg("eval error \(err.localizedDescription)") }
+                    else { dbg("eval -> \(val.map { String(describing: $0) } ?? "nil")") }
+                }
             }
         }
     }

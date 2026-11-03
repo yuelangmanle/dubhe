@@ -361,6 +361,7 @@ body::after {
 }
 .pane.chat { background: var(--glass-strong); }
 
+
 /* 背景山脊：给玻璃一个"背后有东西"的理由。
  * 用 SVG 而不是照片 —— 照片会抢内容注意力，而且换主题时压不住色。
  */
@@ -569,7 +570,9 @@ body::after {
 .mp-badge svg { width: 16px; height: 16px; display: block; }
 .mp-name {
   font-size: 13px; font-weight: 620; color: var(--text);
-  max-width: 156px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 190px; min-width: 96px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 0 1 auto;
 }
 .mp-tags { display: flex; gap: 4px; flex: 0 0 auto; }
 .mp-tags span {
@@ -1993,3 +1996,30 @@ body[data-glass="off"] .edge::before { display: none; }
   .view-head { padding: 11px 13px 9px; }
   .view-body { padding: 12px 13px 24px; }
 }
+
+/* 顶栏挤不下时按"信息密度"退让，越次要的先走：
+ *   「本地运行 ·」前缀（状态点 + 已加载 已经说明问题了）→ 上下文标签
+ *   （模型面板里有）→ 项目文件夹胶囊（title 里有全路径）。
+ * 模型名一个字都不省 —— 那是这条顶栏最该看清的东西。
+ *
+ * 用媒体查询而不是容器查询：给 .pane.chat 加 container-type 会让它的
+ * 固有宽度变成 0，而外层是按内容定宽的，中栏当场塌成 22px（实测）。
+ * 两侧栏宽度是固定的，所以"窗口宽度"能可靠地推出中栏宽度：
+ * 中栏 ≈ 视口 − 250（左）− 280（右）− 间距。 */
+@media (max-width: 1240px) {
+  .live-p { display: none; }
+  .mp-badge { display: none; }              /* 纯装饰，让位给模型名 */
+  /* 参数量（0.63B）在「模型信息」面板里第一行就是；上下文长度也在那儿。
+     顶栏只留量化 —— 它决定"跑得动跑不动"，是最该在顶栏看到的一档。 */
+  .mp-tags span:nth-child(1) { display: none; }
+  .mp-tags span:nth-child(3) { display: none; }
+  .model-pick { gap: 6px; padding: 4px 6px 4px 6px; }
+  .cwd-chip { max-width: 78px; }
+}
+@media (max-width: 1060px) {
+  .live { display: none; }
+}
+
+/* 右栏的模型名保持单行 + 省略号：试过 -webkit-line-clamp 折两行，但在
+ * flex 行里 -webkit-box 拿不到确定的宽度，结果是"截断但没有省略号"，
+ * 比原来更像个 bug。要显示全名用 title（已经挂上了）。 */
