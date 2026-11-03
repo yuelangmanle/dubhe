@@ -1288,5 +1288,33 @@ void fwd_reset_conv() {
     std::memset([g_bconvst contents], 0, bytes);
 }
 
+// ---------------------------------------------------------------- Qwen3.5
+//
+// 5 个内核已经写在 metal_kernels.h 里（k_ssm_prep / k_ssm_conv /
+// k_l2norm_heads / k_delta_rule / k_gated_rmsnorm），这里先给出明确的
+// "未实现"，而不是悄悄退回 CPU —— 调用方看到 false 就知道该走 model.cpp。
+//
+// 下一轮要补的三块：
+//   1. k_rope_mrope（频率按 section 重置）+ k_gate_mul_dim（逐维门）。
+//      现有的 k_rope / k_gate_mul 是给 LFM3 的连续频率 / 逐 head 标量写的。
+//   2. q35 自己的 f16 KV 缓冲：k_attn / k_rope 只认 half，而 model.cpp
+//      的 CPU 路径用 f32，两边不能共用一块。
+//   3. q35_token 的 32 层编排（每 token 一次提交）—— 这是性能的全部来源。
+//
+// 为什么不在这一轮硬塞进 fwd_impl：那套编码是按"每层 9 个矩阵 + 三种层型"
+// 长出来的，DeltaNet 的 8192 宽 qkv、128x128 递归状态、per-head L2 norm
+// 会把分支密度再翻一倍，而且两边的 KV 精度还不一样。
+bool q35_init(const Q35Spec&, std::string* err) {
+    if (err) *err = "Qwen3.5 的 Metal 编排尚未实现（5 个内核已就位）";
+    return false;
+}
+
+bool q35_token(const float*, int, float*, std::string* err) {
+    if (err) *err = "Qwen3.5 的 Metal 编排尚未实现";
+    return false;
+}
+
+void q35_reset() {}
+
 }  // namespace metal
 }  // namespace dubhe

@@ -2927,6 +2927,114 @@ kernel void k_conv_shift(device const float* h    [[buffer(0)]],
     for (uint k = 0; k + 2u < K; k++) st[(ulong)k * n + gid] = st[(ulong)(k + 1u) * n + gid];
     st[(ulong)(K - 2u) * n + gid] = hh[gid];
 }
+
+// ================================================================ Qwen3.5
+// Gated DeltaNet 的四个算子。它和 LFM3 的 ShortConv 长得像，但状态是
+// 128x128 的递归矩阵而不是几个历史向量，所以单独一组内核。
+
+// beta = sigmoid(beta); alpha = softplus(alpha + dt) * A
+// 一次算完 32 个 head，省掉两次 dispatch。
+kernel void k_ssm_prep(device float* beta  [[buffer(0)]],
+                       device float* alpha [[buffer(1)]],
+                       device const uchar* w [[buffer(2)]],
+                       constant ulong& dtoff [[buffer(3)]],
+                       constant ulong& aoff  [[buffer(4)]],
+                       constant uint& nv     [[buffer(5)]],
+                       uint i [[thread_position_in_grid]])
+{
+    if (i >= nv) return;
+    const device float* dt = (device const float*)(w + dtoff);
+    const device float* av = (device const float*)(w + aoff);
+    beta[i] = 1.0f / (1.0f + exp(-beta[i]));
+    const float x = alpha[i] + dt[i];
+    // softplus 在 x>20 之后等于 x；exp 会溢出，但结果本来就一样
+    const float sp = x > 20.0f ? x : log(1.0f + exp(x));
+    alpha[i] = sp * av[i];
+}
+
+// depthwise 因果卷积 + silu + 历史滚动。一个线程一个通道。
+// 通道之间互不依赖，所以不需要任何同步。
+kernel void k_ssm_conv(device float* state       [[buffer(0)]],  // [K-1][cdim]
+                       device const float* x     [[buffer(1)]],  // [cdim]
+                       device const uchar* w     [[buffer(2)]],
+                       constant ulong& woff      [[buffer(3)]],
+                       constant uint& cdim       [[buffer(4)]],
+                       constant uint& K          [[buffer(5)]],
+                       device float* y           [[buffer(6)]],
+                       uint c [[thread_position_in_grid]])
+{
+    if (c >= cdim) return;
+    const device float* wc = (device const float*)(w + woff) + (ulong)c * K;
+    float acc = 0.0f;
+    for (uint k = 0; k + 1u < K; k++) acc += wc[k] * state[(ulong)k * cdim + c];
+    acc += wc[K - 1u] * x[c];
+    y[c] = acc / (1.0f + exp(-acc));
+    for (uint k = 0; k + 2u < K; k++) state[(ulong)k * cdim + c] = state[(ulong)(k + 1u) * cdim + c];
+    state[(ulong)(K - 2u) * cdim + c] = x[c];
+}
+
+// 每 head 的 L2 norm（不是 RMSNorm：没有可学习权重）
+kernel void k_l2norm_heads(device const float* x [[buffer(0)]],
+                           device float* y       [[buffer(1)]],
+                           constant uint& S      [[buffer(2)]],
+                           constant float& eps   [[buffer(3)]],
+                           uint h [[thread_position_in_grid]])
+{
+    float ss = 0.0f;
+    for (uint i = 0; i < S; i++) { const float v = x[(ulong)h * S + i]; ss += v * v; }
+    const float r = rsqrt(ss + eps);
+    for (uint i = 0; i < S; i++) y[(ulong)h * S + i] = x[(ulong)h * S + i] * r;
+}
+
+// delta rule：一个线程负责状态矩阵的一行。
+//
+// 状态按 M[j][i] = S[i][j] 存（转置），第 j 行连续。每行只需要读自己那一行，
+// 所以 128 个线程各管一行，**全程无同步**。
+kernel void k_delta_rule(device float* state        [[buffer(0)]],  // [nv][S][S]
+                         device const float* q      [[buffer(1)]],  // [nk][S]
+                         device const float* k      [[buffer(2)]],
+                         device const float* v      [[buffer(3)]],  // [nv][S]
+                         device const float* alpha  [[buffer(4)]],
+                         device const float* beta   [[buffer(5)]],
+                         device float* out          [[buffer(6)]],
+                         constant uint& S           [[buffer(7)]],
+                         constant uint& nk          [[buffer(8)]],
+                         uint2 gid [[thread_position_in_grid]])    // (j, h)
+{
+    const uint j = gid.x, h = gid.y;
+    if (j >= S) return;
+    const uint kh = h % nk;
+    device float* row = state + ((ulong)h * S + j) * S;
+    const device float* kk = k + (ulong)kh * S;
+    const device float* qq = q + (ulong)kh * S;
+    const float g = exp(alpha[h]);
+    float sk = 0.0f;
+    for (uint i = 0; i < S; i++) { row[i] *= g; sk += row[i] * kk[i]; }
+    const float d = (v[(ulong)h * S + j] - sk) * beta[h];
+    float sq = 0.0f;
+    for (uint i = 0; i < S; i++) { row[i] += d * kk[i]; sq += row[i] * qq[i]; }
+    out[(ulong)h * S + j] = sq * rsqrt((float)S);
+}
+
+// gated RMSNorm：每 head 归一化后乘 silu(z)
+kernel void k_gated_rmsnorm(device float* x        [[buffer(0)]],  // [nv][S] 原地
+                            device const float* z  [[buffer(1)]],  // [nv][S]
+                            device const uchar* w  [[buffer(2)]],
+                            constant ulong& woff   [[buffer(3)]],
+                            constant uint& S       [[buffer(4)]],
+                            constant float& eps    [[buffer(5)]],
+                            uint h [[thread_position_in_grid]])
+{
+    float ss = 0.0f;
+    for (uint i = 0; i < S; i++) { const float v = x[(ulong)h * S + i]; ss += v * v; }
+    const float r = rsqrt(ss / (float)S + eps);
+    const device float* wf = (device const float*)(w + woff);
+    for (uint i = 0; i < S; i++) {
+        const float v = x[(ulong)h * S + i];
+        const float zz = z[(ulong)h * S + i];
+        x[(ulong)h * S + i] = v * r * wf[i] * (zz / (1.0f + exp(-zz)));
+    }
+}
 )MSL";
 
 // ---------------------------------------------------------------- C++ 侧常量

@@ -111,5 +111,60 @@ void fwd_reset_conv();
 // 调试：把 GPU 侧的残差流（g_bx 第 0 行）拷出来，用于和 CPU 路径逐位置对拍
 bool fwd_copy_x(float* dst, int n);
 
+// ---------------------------------------------------------------- Qwen3.5
+//
+// 单独一套 spec / 缓冲 / 编码路径，**不复用 fwd_impl**。
+// 原因：DeltaNet 层的算子形状（8192 宽的 qkv、128x128 递归状态、per-head
+// L2 norm）和 Llama/LFM3 那套对不上，硬塞进 fwd_impl 的分支会让原本就
+// 很密的编码逻辑更难维护；而 matvec 内核本身是复用的（g_pipe2）。
+//
+// 每 token 一次提交、一次同步。248 次逐算子提交实测 4.0 tok/s（比 CPU
+// 还慢），所以这条路径的全部意义就是"一个 command buffer 装完 32 层"。
+struct Q35Layer {
+    int kind = 0;          // 0 = Gated DeltaNet, 1 = gated full attention
+    int ssm_slot = -1;     // delta 层在状态缓冲里的槽位
+
+    // 公共：attn norm / FFN
+    uint64_t off_attn_norm = 0, off_ffn_norm = 0;
+    uint64_t off_gate = 0, off_up = 0, off_down = 0;
+    uint32_t ty_gate = 0, ty_up = 0, ty_down = 0;
+
+    // delta 层
+    uint64_t off_qkv = 0, off_z = 0, off_conv = 0, off_dt = 0, off_a = 0;
+    uint64_t off_beta = 0, off_alpha = 0, off_norm = 0, off_sout = 0;
+    uint32_t ty_qkv = 0, ty_z = 0, ty_beta = 0, ty_alpha = 0, ty_sout = 0;
+
+    // full attention 层
+    uint64_t off_q = 0, off_k = 0, off_v = 0, off_o = 0;
+    uint64_t off_qn = 0, off_kn = 0;
+    uint32_t ty_q = 0, ty_k = 0, ty_v = 0, ty_o = 0;
+};
+
+struct Q35Spec {
+    int n_embd = 0, n_ff = 0, n_vocab = 0, n_layer = 0;
+    int n_head = 0, n_head_kv = 0, hd = 0;      // full attention
+    int n_delta = 0;
+    int ssm_S = 0;        // 128：head_k_dim = head_v_dim
+    int ssm_nk = 0;       // 16：q/k head 数
+    int ssm_nv = 0;       // 32：v head 数
+    int ssm_kdim = 0;     // nk*S
+    int ssm_vdim = 0;     // nv*S
+    int ssm_conv = 0;     // 卷积核宽（4）
+    float rms_eps = 1e-6f;
+    float rope_theta = 1e7f;
+    int rope_angles = 0;
+    int rope_sections[4] = {0, 0, 0, 0};
+    int kv_cap = 0;
+    uint64_t off_out_norm = 0, off_out_w = 0;
+    uint32_t ty_out_w = 0;
+    std::vector<Q35Layer> layers;
+};
+
+bool q35_init(const Q35Spec& s, std::string* err);
+// x0 是已反量化的 embedding；每 token 一次提交
+bool q35_token(const float* x0, int pos, float* logits, std::string* err);
+// 清 DeltaNet 状态与 KV（新序列）
+void q35_reset();
+
 }  // namespace metal
 }  // namespace dubhe

@@ -345,10 +345,33 @@ bool Model::enable_gpu(std::string* err) {
     // Qwen3.5 还没有 Metal 内核：整层融合的 spec 只认识 conv / 滑窗 / 全注意力
     // 三种层，DeltaNet 会被错当成 full attention 去跑，结果是"能出字但全错"。
     // 在补上 Metal 之前，宁可明确走 CPU，也不做一半的加速。
-    if (arch_is_qwen35()) {
-        gpu_note_ = "Qwen3.5 暂用 CPU 路径（Gated DeltaNet 尚无 Metal 内核）";
+    if (!metal::available()) {
+        gpu_note_ = "无 Metal 设备";
         if (err) *err = gpu_note_;
         return false;
+    }
+    if (arch_is_qwen35()) {
+        // 整层融合的 spec 只认识 conv / 滑窗 / 全注意力，DeltaNet 会被错当成
+        // full attention 去跑。但**逐算子的 matvec 仍可以走 GPU** —— 它占
+        // 前向时间的 90% 以上，先把这个拿回来，融合内核后面再补。
+        std::string e;
+        if (!metal::init(&e)) {
+            gpu_note_ = "Metal 初始化失败: " + e;
+            if (err) *err = gpu_note_;
+            return false;
+        }
+        if (!metal::bind_weights(file_.mapping(), file_.file_size(), &e)) {
+            gpu_note_ = "权重零拷贝绑定失败: " + e;
+            if (err) *err = gpu_note_;
+            return false;
+        }
+        // 实测：逐算子 mfvec 每次提交+同步约 0.3 ms，248 次/token 就是
+        // 75 ms，比 CPU 的 4.4 tok/s 还慢（4.0）。所以这里只保留权重绑定，
+        // matvec 仍走 CPU —— 等整层融合内核写完再打开 gpu_fused_。
+        gpu_active_ = false;
+        gpu_fused_ = false;
+        gpu_note_ = "Qwen3.5：整层融合未支持（逐算子提交比 CPU 还慢）";
+        return true;
     }
     if (!metal::available()) {
         gpu_note_ = "无 Metal 设备";
