@@ -6,6 +6,50 @@
 
 ---
 
+## [0.22.0] · 2026-11-03 · Qwen3.5 的 prefill 批量：13 → 85 tok/s
+
+prefill 一直是 0.21.x 的最大短板：`q35_token` 一次只吃一个 token，于是
+681 token 的 prompt 要把 5.44 GB 权重从头读 681 遍 —— **52 秒**。
+批量后同一份权重喂 32 个 token，降到 **8 秒**。
+
+### 新增
+
+- **8 个 prefill 批量内核**：`k_ssm_prep_b` / `k_ssm_conv_b` / `k_l2norm_b` /
+  `k_delta_rule_b` / `k_gated_rmsnorm_b` / `k_rope_mrope_b` / `k_split_qg_b` /
+  `k_gate_mul_b`
+  - 除 delta rule 外都只是多一个 row 维度（卷积沿 t 滚动历史、delta rule
+    沿 t 串行推进递归，这两件本来就只能按时间顺序做）
+  - 行内布局与 decode 完全一致，这是能和 `q35_token` 逐位对拍的前提
+- **`q35_prefill()`**：32 行一叠（= MSL 的 MMA_BM），复用 LFM3 那套
+  `mm3_*` simdgroup_matrix 分块内核；只有末行算 logits（24 万词表 × 32 行
+  是纯浪费）
+- `DUBHE_NO_PREFILL=1` 强制逐 token，用于 A/B —— 两条路必须逐字一致
+
+### 变更
+
+- `batch_size()` 对 Qwen3.5 从恒返回 1 改成 32。**这是整个优化的开关**：
+  之前批量内核写好了也不会被调用，因为引擎按 `batch_size()` 切块，
+  它返回 1 就一直走单 token 分支。
+- `gemm` 在没有 MMA 内核时回退逐行 matvec，而不是跳过。Qwen3.5 的
+  `ssm_alpha` / `ssm_beta` 是 F32（32×4096，量化器不碰这种窄矩阵），
+  F32 没有 `mm3_f32`。原来这条判定让整个 `batch_ok` 变成 false。
+
+### 基准
+
+M4 / 24 GB，MiMo-V2.6-Distill-Qwen-9B Q4_K_M（5.44 GB），贪心：
+
+| prompt | 逐 token | 批量 | 倍数 |
+| ---: | ---: | ---: | ---: |
+| 171 tok | 13.0 tok/s | 35.1 tok/s | 2.7x |
+| 651 tok | 13.0 tok/s | 77.9 tok/s | 6.0x |
+| 1291 tok | 12.9 tok/s | 85.9 tok/s | 6.7x |
+
+每叠 32 行的成本约 390 ms → 14 GB/s 有效带宽。这和 LFM3 的 prefill 是
+同一个天花板（443 tok/s × 32 行 / 1.05 GB ≈ 14.5 GB/s），瓶颈在 `mm3_*`
+的反量化路径，不在这次的批量改造。
+
+---
+
 ## [0.21.1] · 2026-11-03 · 修掉 acc[4] 越界：GPU 输出终于和 CPU 一致
 
 0.21.0 的 Metal 路径跑得很快，但贪心输出是错的（`The capital of France is`

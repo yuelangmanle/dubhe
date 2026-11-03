@@ -1415,8 +1415,9 @@ void Model::rope(float* q, float* k, int n_head, int n_head_kv, int head_dim, in
 
 int Model::batch_size() const {
     if (!gpu_fused_) return 1;
-    // Qwen3.5 还没有批量前向：DeltaNet 的 chunked 实现没做，逐 token 更稳
-    if (arch_is_qwen35()) return 1;
+    // Qwen3.5 的批量尺寸由 MMA 分块内核定死：一次 32 行（MMA_BM）。
+    // 没有 MMA 内核时退回 1，走逐 token。
+    if (arch_is_qwen35()) return metal::q35_prefill_ok() ? 32 : 1;
     return metal::fwd_batch_max();
 }
 
@@ -1428,10 +1429,42 @@ bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* log
     if (n <= 0 || !tokens) { if (err) *err = "空批"; return false; }
     if (n == 1 && slab0 == 0 && cslot == 0) return forward(tokens[0], pos0, logits, err);
 
-    // Qwen3.5 还没有 prefill 批量内核（DeltaNet 的 chunked 版本是另一轮的事）。
-    // 逐 token 走 q35_token：每 token 一次提交，权重读一遍 —— 比 CPU 快，
-    // 也比把 delta 层喂给不认识它的 fwd_batch 正确。
+    // Qwen3.5 的 prefill：有 MMA 批量内核就 32 行一叠走 q35_prefill，
+    // 权重每叠只读一遍；没有（老 GPU / Q4_0 权重 / 无 Metal）就退回逐 token。
+    // 逐 token 在长 prompt 上是灾难：681 token 要 52 秒，因为每个 token
+    // 都把 5.4 GB 权重从头读了一遍。
     if (arch_is_qwen35() && n > 1) {
+        if (gpu_fused_ && slab0 == 0 && cslot == 0 && metal::q35_prefill_ok()) {
+            const int n_embd = cfg_.n_embd;
+            xbatch_.resize((size_t)n * (size_t)n_embd);
+            for (int i = 0; i < n; i++) {
+                const void* row = (const char*)file_.tensor_data(tok_embd_) +
+                                  (size_t)tokens[i] * type_row_bytes(tok_embd_.type, n_embd);
+                dequant_row(tok_embd_.type, row, xbatch_.data() + (size_t)i * n_embd, n_embd);
+            }
+            if (mm_embeds_) {
+                for (int i = 0; i < n; i++) {
+                    const int p = pos0 + i;
+                    if (p < mm_at_ || p >= mm_at_ + mm_n_) continue;
+                    std::memcpy(xbatch_.data() + (size_t)i * n_embd,
+                                mm_embeds_ + (size_t)(p - mm_at_) * n_embd,
+                                sizeof(float) * (size_t)n_embd);
+                }
+            }
+            for (int i = 0; i < n; i += 32) {
+                const int ch = std::min(32, n - i);
+                float* out = (i + ch == n) ? logits : logits_.data();
+                if (!metal::q35_prefill(xbatch_.data() + (size_t)i * n_embd, ch,
+                                        pos0 + i, out, err)) {
+                    if (err && err->empty()) *err = "Qwen3.5 批量 prefill 失败";
+                    return false;
+                }
+            }
+            if (pos0 != kv_len_) kv_toks_.clear();
+            kv_toks_.insert(kv_toks_.end(), tokens, tokens + n);
+            kv_len_ = pos0 + n;
+            return true;
+        }
         for (int i = 0; i < n; i++) {
             float* out = (i == n - 1) ? logits : logits_.data();
             if (!forward(tokens[i], pos0 + i, out, err)) return false;

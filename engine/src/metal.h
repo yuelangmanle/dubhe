@@ -165,6 +165,11 @@ struct Q35Spec {
 bool q35_init(const Q35Spec& s, std::string* err);
 // x0 是已反量化的 embedding；每 token 一次提交
 bool q35_token(const float* x0, int pos, float* logits, std::string* err);
+// prefill：x0 是 [nrow][n_embd]，pos0 是第一行的位置。权重只读一遍。
+// 只有末行的 logits 有效。批处理需要 MMA 内核，不支持时返回 false，
+// 调用方退回逐 token（慢 30 倍，但结果正确）。
+bool q35_prefill(const float* x0, int nrow, int pos0, float* logits, std::string* err);
+bool q35_prefill_ok();
 // 清 DeltaNet 状态与 KV（新序列）
 void q35_reset();
 

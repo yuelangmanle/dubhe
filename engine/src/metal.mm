@@ -1296,15 +1296,26 @@ void fwd_reset_conv() {
 namespace {
 
 enum Q35Kernel {
-    Q_PREP = 0, Q_CONV, Q_L2NORM, Q_DELTA, Q_GRMS, Q_ROPE, Q_SPLIT, Q_GATEDIM, Q_COUNT
+    Q_PREP = 0, Q_CONV, Q_L2NORM, Q_DELTA, Q_GRMS, Q_ROPE, Q_SPLIT, Q_GATEDIM,
+    Q_PREP_B, Q_CONV_B, Q_L2NORM_B, Q_DELTA_B, Q_GRMS_B, Q_ROPE_B, Q_SPLIT_B,
+    Q_GATEDIM_B, Q_COUNT
 };
 const char* const kQ35Names[Q_COUNT] = {
     "k_ssm_prep", "k_ssm_conv", "k_l2norm_heads", "k_delta_rule",
-    "k_gated_rmsnorm", "k_rope_mrope", "k_split_qg", "k_gate_mul_dim"
+    "k_gated_rmsnorm", "k_rope_mrope", "k_split_qg", "k_gate_mul_dim",
+    // prefill 批量版
+    "k_ssm_prep_b", "k_ssm_conv_b", "k_l2norm_b", "k_delta_rule_b",
+    "k_gated_rmsnorm_b", "k_rope_mrope_b", "k_split_qg_b", "k_gate_mul_b"
 };
+
+// prefill 一次喂多少个 token。32 = MSL 里 MMA_BM，也是 kMmaBm。
+// 再大也不会更快：分块内核一次只吃 32 行，多出来的还是要把权重再读一遍。
+constexpr int kQ35Ch = 32;
 
 Q35Spec g_q35;
 bool g_q35_ready = false;
+// prefill 批量是否可用：所有层权重都得有 MMA 内核（Q4_0/Q5_0/F32 没有）
+bool g_q35_batch = false;
 id<MTLComputePipelineState> g_q35pipe[Q_COUNT] = {nil};
 
 id<MTLBuffer> g_q35_x = nil, g_q35_xb = nil, g_q35_qkv = nil, g_q35_y = nil;
@@ -1315,8 +1326,16 @@ id<MTLBuffer> g_q35_ffn = nil, g_q35_up = nil, g_q35_ffn2 = nil, g_q35_down = ni
 id<MTLBuffer> g_q35_logits = nil;
 id<MTLBuffer> g_q35_state = nil, g_q35_conv = nil, g_q35_kc = nil, g_q35_vc = nil;
 
+// prefill 的批缓冲：[kQ35Ch][宽度]，行内布局和 decode 一模一样
+id<MTLBuffer> g_q35_px = nil, g_q35_pxb = nil, g_q35_po = nil;
+id<MTLBuffer> g_q35_pa = nil, g_q35_pb = nil, g_q35_pz = nil;
+id<MTLBuffer> g_q35_pqkv = nil, g_q35_pqg = nil, g_q35_pq = nil, g_q35_pg = nil;
+id<MTLBuffer> g_q35_pk = nil, g_q35_pv = nil, g_q35_pal = nil, g_q35_pbe = nil;
+id<MTLBuffer> g_q35_pxt = nil;
+
 void q35_release() {
     g_q35_ready = false;
+    g_q35_batch = false;
     g_q35_x = g_q35_xb = g_q35_qkv = g_q35_y = nil;
     g_q35_qk = g_q35_z = g_q35_beta = g_q35_alpha = nil;
     g_q35_o = g_q35_att = g_q35_qg = g_q35_q = nil;
@@ -1324,6 +1343,11 @@ void q35_release() {
     g_q35_ffn = g_q35_up = g_q35_ffn2 = g_q35_down = nil;
     g_q35_logits = nil;
     g_q35_state = g_q35_conv = g_q35_kc = g_q35_vc = nil;
+    g_q35_px = g_q35_pxb = g_q35_po = nil;
+    g_q35_pa = g_q35_pb = g_q35_pz = nil;
+    g_q35_pqkv = g_q35_pqg = g_q35_pq = g_q35_pg = nil;
+    g_q35_pk = g_q35_pv = g_q35_pal = g_q35_pbe = nil;
+    g_q35_pxt = nil;
     for (int i = 0; i < Q_COUNT; i++) g_q35pipe[i] = nil;
 }
 
@@ -1353,6 +1377,7 @@ bool q35_init(const Q35Spec& s, std::string* err) {
         const std::pair<int, const char*> common[] = {
             {F_RMSNORM, "k_rmsnorm"}, {F_ADD, "k_add"}, {F_SILU, "k_silu_mul"},
             {F_COPY_H, "k_copy_h"}, {F_HEADNORM, "k_headnorm"}, {F_ATTN, "k_attn"},
+            {F_TRANS, "k_trans"},
         };
         for (auto& p : common) {
             id<MTLFunction> fn = [g_lib newFunctionWithName:
@@ -1365,6 +1390,17 @@ bool q35_init(const Q35Spec& s, std::string* err) {
                 return false;
             }
         }
+    }
+
+    // prefill 的 MMA 内核。这里失败**不是**错误：没有它只是退回逐 token。
+    // 老 GPU 可能不支持 simdgroup_matrix，Q4_0/Q5_0 则压根没有 MMA 版本。
+    for (int i = 0; i < K_COUNT; i++) {
+        if (g_m3pipe[i] || !kM3Names[i][0]) continue;
+        id<MTLFunction> fn = [g_lib newFunctionWithName:
+                              [NSString stringWithUTF8String:kM3Names[i]]];
+        if (!fn) continue;
+        NSError* pe = nil;
+        g_m3pipe[i] = [g_dev newComputePipelineStateWithFunction:fn error:&pe];
     }
 
     const size_t F = sizeof(float);
@@ -1407,6 +1443,51 @@ bool q35_init(const Q35Spec& s, std::string* err) {
         if (err) *err = "Qwen3.5 缓冲分配失败（内存不足）";
         return false;
     }
+
+    // ---- prefill 批缓冲
+    const size_t CH = (size_t)kQ35Ch;
+    const int wide = std::max(std::max(s.n_ff, cdim), 2 * q_dim);
+    g_q35_px   = make_buf(CH * (size_t)s.n_embd * F);
+    g_q35_pxb  = make_buf(CH * (size_t)s.n_embd * F);
+    g_q35_po   = make_buf(CH * (size_t)s.n_embd * F);
+    g_q35_pa   = make_buf(CH * (size_t)wide * F);
+    g_q35_pb   = make_buf(CH * (size_t)wide * F);
+    g_q35_pz   = make_buf(CH * (size_t)s.ssm_vdim * F);
+    g_q35_pqkv = make_buf(CH * (size_t)cdim * F);
+    g_q35_pqg  = make_buf(CH * (size_t)(2 * q_dim) * F);
+    g_q35_pq   = make_buf(CH * (size_t)q_dim * F);
+    g_q35_pg   = make_buf(CH * (size_t)q_dim * F);
+    g_q35_pk   = make_buf(CH * (size_t)kv_dim * F);
+    g_q35_pv   = make_buf(CH * (size_t)kv_dim * F);
+    g_q35_pal  = make_buf(CH * (size_t)s.ssm_nv * F);
+    g_q35_pbe  = make_buf(CH * (size_t)s.ssm_nv * F);
+    g_q35_pxt  = make_buf(CH * (size_t)std::max(s.n_ff, s.n_embd) * F);
+
+    // 批量 prefill 能不能用，取决于**每一层**的每个矩阵有没有 MMA 内核。
+    // 缺一个就整条路径作废 —— 悄悄跳过某个 gemm 只会得到通顺的胡话。
+    bool batch_ok = g_q35_px && g_q35_pxb && g_q35_po && g_q35_pa && g_q35_pb &&
+                    g_q35_pz && g_q35_pqkv && g_q35_pqg && g_q35_pq && g_q35_pg &&
+                    g_q35_pk && g_q35_pv && g_q35_pal && g_q35_pbe && g_q35_pxt &&
+                    g_fpipe[F_TRANS] != nil;
+    if (batch_ok) {
+        auto need = [&](uint32_t ty) {
+            const int k = kind_of(ty);
+            if (k < 0) { batch_ok = false; return; }
+            // 有 MMA 走分块；没有但能走 matvec 也行（F32 那种窄矩阵）
+            if (!g_m3pipe[k] && !g_pipe2[k] && !g_pipe[k]) batch_ok = false;
+        };
+        for (const Q35Layer& L : s.layers) {
+            need(L.ty_gate); need(L.ty_up); need(L.ty_down);
+            if (L.kind == 0) { need(L.ty_qkv); need(L.ty_z); need(L.ty_beta);
+                               need(L.ty_alpha); need(L.ty_sout); }
+            else { need(L.ty_q); need(L.ty_k); need(L.ty_v); need(L.ty_o); }
+        }
+        need(s.ty_out_w);
+    }
+    g_q35_batch = batch_ok;
+    if (std::getenv("DUBHE_Q35_DEBUG"))
+        std::fprintf(stderr, "[q35] init batch=%d bufs=%d\n", (int)g_q35_batch,
+                     (int)(g_q35_px != nil));
     std::memset([g_q35_state contents], 0, [g_q35_state length]);
     std::memset([g_q35_conv contents], 0, [g_q35_conv length]);
     std::memset([g_q35_kc contents], 0, [g_q35_kc length]);
@@ -1770,6 +1851,368 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err) {
         }
         std::fprintf(stderr, "[q35] pos=%d argmax=%d max=%.4f bad=%d\n", pos, am, mx, nbad);
     }
+    return true;
+}
+
+// ---------------------------------------------------------------- prefill
+//
+// 和 q35_token 的区别只有一处：一次喂 nrow 个 token，权重只读一遍。
+// 32 行是 MMA 分块内核的原生尺寸（MMA_BM），再大的批也还是要把权重再读一遍，
+// 所以固定按 32 切块，调用方在上面循环。
+//
+// 行内布局和 decode 完全一致 —— 这是能和 q35_token 逐位对拍的前提。
+
+bool q35_prefill_ok() {
+    // DUBHE_NO_PREFILL 强制逐 token，用于 A/B 对拍（两条路必须逐字一致）
+    static const bool off = std::getenv("DUBHE_NO_PREFILL") != nullptr;
+    return g_q35_ready && g_q35_batch && !off;
+}
+
+bool q35_prefill(const float* x0, int nrow, int pos0, float* logits, std::string* err) {
+    if (std::getenv("DUBHE_Q35_DEBUG"))
+        std::fprintf(stderr, "[q35] prefill nrow=%d pos0=%d batch=%d\n",
+                     nrow, pos0, (int)g_q35_batch);
+    if (!g_q35_ready) { if (err) *err = "Qwen3.5 Metal 未初始化"; return false; }
+    if (!g_q35_batch) { if (err) *err = "Qwen3.5 prefill 批量不可用"; return false; }
+    const Q35Spec& s = g_q35;
+    if (nrow <= 0 || nrow > kQ35Ch || !x0) { if (err) *err = "prefill 批大小非法"; return false; }
+    if (pos0 < 0 || pos0 + nrow > s.kv_cap) { if (err) *err = "Qwen3.5 上下文已满"; return false; }
+
+    const int n_embd = s.n_embd, n_ff = s.n_ff;
+    const int hd = s.hd, nh = s.n_head, nkv = s.n_head_kv;
+    const int kv_dim = nkv * hd, q_dim = nh * hd;
+    const int S = s.ssm_S, nk = s.ssm_nk, nv = s.ssm_nv;
+    const int kdim = s.ssm_kdim, vdim = s.ssm_vdim;
+    const int cdim = 2 * kdim + vdim;
+    const int ck = s.ssm_conv;
+    const uint32_t R = (uint32_t)nrow;
+
+    std::memcpy([g_q35_px contents], x0, sizeof(float) * (size_t)nrow * (size_t)n_embd);
+
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
+
+    // 权重一次、激活 nrow 行：先转置成 [n_in][32]，再交给 MMA 分块内核。
+    //
+    // F32 没有 MMA 版本（Qwen3.5 的 ssm_alpha / ssm_beta 就是 F32，虽然只有
+    // 32×4096），这类矩阵退回逐行 matvec：32 次小 dispatch，代价可以忽略。
+    auto gemm = [&](uint32_t type, id<MTLBuffer> xin, id<MTLBuffer> yout, uint64_t woff,
+                    int n_out, int n_in, int rows) {
+        const int k = kind_of(type);
+        uint32_t nin = (uint32_t)n_in, nout = (uint32_t)n_out, nr = (uint32_t)rows;
+        if (!g_m3pipe[k]) {
+            const NSUInteger per_tg = (NSUInteger)(kSgPerTg * g_mv_rows);
+            const NSUInteger tgc = (NSUInteger)((n_out + (int)per_tg - 1) / (int)per_tg);
+            for (int r = 0; r < rows; r++) {
+                [en setComputePipelineState:(g_pipe2[k] ? g_pipe2[k] : g_pipe[k])];
+                [en setBuffer:g_w offset:0 atIndex:0];
+                [en setBuffer:xin offset:(NSUInteger)((uint64_t)r * (uint64_t)n_in * 4u) atIndex:1];
+                [en setBuffer:yout offset:(NSUInteger)((uint64_t)r * (uint64_t)n_out * 4u) atIndex:2];
+                [en setBytes:&nin length:4 atIndex:3];
+                [en setBytes:&woff length:8 atIndex:4];
+                [en setBytes:&nout length:4 atIndex:5];
+                [en dispatchThreadgroups:MTLSizeMake(tgc, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            }
+            return;
+        }
+        uint32_t j0 = 0, st = (uint32_t)kMmaBm;
+        [en setComputePipelineState:g_fpipe[F_TRANS]];
+        [en setBuffer:xin offset:0 atIndex:0];
+        [en setBuffer:g_q35_pxt offset:0 atIndex:1];
+        [en setBytes:&nin length:4 atIndex:2];
+        [en setBytes:&nr length:4 atIndex:3];
+        [en setBytes:&j0 length:4 atIndex:4];
+        [en setBytes:&st length:4 atIndex:5];
+        [en dispatchThreads:MTLSizeMake((NSUInteger)n_in, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        uint64_t yo = 0;
+        [en setComputePipelineState:g_m3pipe[k]];
+        [en setBuffer:g_w offset:0 atIndex:0];
+        [en setBuffer:g_q35_pxt offset:0 atIndex:1];
+        [en setBuffer:yout offset:0 atIndex:2];
+        [en setBytes:&nin length:4 atIndex:3];
+        [en setBytes:&woff length:8 atIndex:4];
+        [en setBytes:&nout length:4 atIndex:5];
+        [en setBytes:&nr length:4 atIndex:6];
+        [en setBytes:&st length:4 atIndex:7];
+        [en setBytes:&yo length:8 atIndex:8];
+        [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_out + kMmaBn - 1) / kMmaBn), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    };
+    // 逐行的 RMSNorm：行号直接就是 threadgroup 下标，通用内核本来就支持
+    auto rmsb = [&](id<MTLBuffer> xin, uint64_t woff, id<MTLBuffer> yout, int rows) {
+        uint32_t n = (uint32_t)n_embd;
+        float eps = s.rms_eps;
+        [en setComputePipelineState:g_fpipe[F_RMSNORM]];
+        [en setBuffer:xin offset:0 atIndex:0];
+        [en setBuffer:g_w offset:0 atIndex:1];
+        [en setBuffer:yout offset:0 atIndex:2];
+        [en setBytes:&n length:4 atIndex:3];
+        [en setBytes:&eps length:4 atIndex:4];
+        [en setBytes:&woff length:8 atIndex:5];
+        [en dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
+    auto addb = [&](id<MTLBuffer> d, id<MTLBuffer> src, int rows) {
+        uint32_t n = (uint32_t)n_embd;
+        [en setComputePipelineState:g_fpipe[F_ADD]];
+        [en setBuffer:d offset:0 atIndex:0];
+        [en setBuffer:src offset:0 atIndex:1];
+        [en setBytes:&n length:4 atIndex:2];
+        [en dispatchThreads:MTLSizeMake((NSUInteger)n_embd, (NSUInteger)rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
+    auto hnormb = [&](id<MTLBuffer> x, uint64_t woff, int heads) {
+        uint32_t nhv = (uint32_t)heads, d = (uint32_t)hd;
+        float eps = s.rms_eps;
+        uint64_t w = woff;
+        [en setComputePipelineState:g_fpipe[F_HEADNORM]];
+        [en setBuffer:x offset:0 atIndex:0];
+        [en setBuffer:g_w offset:0 atIndex:1];
+        [en setBuffer:x offset:0 atIndex:2];
+        [en setBytes:&nhv length:4 atIndex:3];
+        [en setBytes:&d length:4 atIndex:4];
+        [en setBytes:&eps length:4 atIndex:5];
+        [en setBytes:&w length:8 atIndex:6];
+        [en dispatchThreadgroups:MTLSizeMake((NSUInteger)(nrow * heads), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    };
+
+    for (int l = 0; l < s.n_layer; l++) {
+        const Q35Layer& L = s.layers[(size_t)l];
+        rmsb(g_q35_px, L.off_attn_norm, g_q35_pxb, nrow);
+
+        if (L.kind == 0) {
+            // ---- Gated DeltaNet
+            gemm(L.ty_qkv,   g_q35_pxb, g_q35_pqkv, L.off_qkv,   cdim, n_embd, nrow);
+            gemm(L.ty_z,     g_q35_pxb, g_q35_pz,   L.off_z,     vdim, n_embd, nrow);
+            gemm(L.ty_beta,  g_q35_pxb, g_q35_pbe,  L.off_beta,  nv,   n_embd, nrow);
+            gemm(L.ty_alpha, g_q35_pxb, g_q35_pal,  L.off_alpha, nv,   n_embd, nrow);
+            {
+                uint32_t nvv = (uint32_t)nv;
+                [en setComputePipelineState:g_q35pipe[Q_PREP_B]];
+                [en setBuffer:g_q35_pbe offset:0 atIndex:0];
+                [en setBuffer:g_q35_pal offset:0 atIndex:1];
+                [en setBuffer:g_w offset:0 atIndex:2];
+                [en setBytes:&L.off_dt length:8 atIndex:3];
+                [en setBytes:&L.off_a length:8 atIndex:4];
+                [en setBytes:&nvv length:4 atIndex:5];
+                [en dispatchThreads:MTLSizeMake((NSUInteger)nv, (NSUInteger)nrow, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
+            {
+                uint64_t soff = (uint64_t)L.ssm_slot * (uint64_t)(ck - 1) * (uint64_t)cdim * 4u;
+                uint64_t woff = L.off_conv;
+                uint32_t cd = (uint32_t)cdim, kk = (uint32_t)ck;
+                [en setComputePipelineState:g_q35pipe[Q_CONV_B]];
+                [en setBuffer:g_q35_conv offset:(NSUInteger)soff atIndex:0];
+                [en setBuffer:g_q35_pqkv offset:0 atIndex:1];
+                [en setBuffer:g_w offset:0 atIndex:2];
+                [en setBytes:&woff length:8 atIndex:3];
+                [en setBytes:&cd length:4 atIndex:4];
+                [en setBytes:&kk length:4 atIndex:5];
+                [en setBytes:&R length:4 atIndex:6];
+                [en setBuffer:g_q35_pa offset:0 atIndex:7];   // conv 输出，[nrow][cdim]
+                [en dispatchThreads:MTLSizeMake((NSUInteger)cdim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
+            {
+                uint32_t cd = (uint32_t)cdim, kd = (uint32_t)kdim, ss = (uint32_t)S,
+                         nkk = (uint32_t)nk;
+                float eps = s.rms_eps;
+                [en setComputePipelineState:g_q35pipe[Q_L2NORM_B]];
+                [en setBuffer:g_q35_pa offset:0 atIndex:0];
+                [en setBytes:&cd length:4 atIndex:1];
+                [en setBytes:&kd length:4 atIndex:2];
+                [en setBytes:&ss length:4 atIndex:3];
+                [en setBytes:&nkk length:4 atIndex:4];
+                [en setBytes:&eps length:4 atIndex:5];
+                [en dispatchThreads:MTLSizeMake((NSUInteger)(2 * nk), (NSUInteger)nrow, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
+            {
+                uint64_t soff = (uint64_t)L.ssm_slot * (uint64_t)nv * S * S * 4u;
+                uint32_t cd = (uint32_t)cdim, kd = (uint32_t)kdim, vd = (uint32_t)vdim,
+                         ss = (uint32_t)S, nkk = (uint32_t)nk, nvv = (uint32_t)nv;
+                [en setComputePipelineState:g_q35pipe[Q_DELTA_B]];
+                [en setBuffer:g_q35_state offset:(NSUInteger)soff atIndex:0];
+                [en setBuffer:g_q35_pa offset:0 atIndex:1];
+                [en setBuffer:g_q35_pal offset:0 atIndex:2];
+                [en setBuffer:g_q35_pbe offset:0 atIndex:3];
+                [en setBuffer:g_q35_po offset:0 atIndex:4];    // 输出，[nrow][vdim]
+                [en setBytes:&cd length:4 atIndex:5];
+                [en setBytes:&kd length:4 atIndex:6];
+                [en setBytes:&vd length:4 atIndex:7];
+                [en setBytes:&ss length:4 atIndex:8];
+                [en setBytes:&nkk length:4 atIndex:9];
+                [en setBytes:&nvv length:4 atIndex:10];
+                [en setBytes:&R length:4 atIndex:11];
+                [en dispatchThreads:MTLSizeMake((NSUInteger)S, (NSUInteger)nv, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            }
+            {
+                uint32_t ss = (uint32_t)S, vd = (uint32_t)vdim;
+                float eps = s.rms_eps;
+                [en setComputePipelineState:g_q35pipe[Q_GRMS_B]];
+                [en setBuffer:g_q35_po offset:0 atIndex:0];
+                [en setBuffer:g_q35_pz offset:0 atIndex:1];
+                [en setBuffer:g_w offset:0 atIndex:2];
+                [en setBytes:&L.off_norm length:8 atIndex:3];
+                [en setBytes:&ss length:4 atIndex:4];
+                [en setBytes:&vd length:4 atIndex:5];
+                [en setBytes:&eps length:4 atIndex:6];
+                [en dispatchThreads:MTLSizeMake((NSUInteger)nv, (NSUInteger)nrow, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
+            // xb 此时已经用完了，拿来装子层输出
+            gemm(L.ty_sout, g_q35_po, g_q35_pxb, L.off_sout, n_embd, vdim, nrow);
+            addb(g_q35_px, g_q35_pxb, nrow);
+        } else {
+            // ---- gated full attention
+            gemm(L.ty_q, g_q35_pxb, g_q35_pqg, L.off_q, 2 * q_dim, n_embd, nrow);
+            gemm(L.ty_k, g_q35_pxb, g_q35_pk,  L.off_k, kv_dim,   n_embd, nrow);
+            gemm(L.ty_v, g_q35_pxb, g_q35_pv,  L.off_v, kv_dim,   n_embd, nrow);
+            {
+                uint32_t d = (uint32_t)hd, nhh = (uint32_t)nh;
+                [en setComputePipelineState:g_q35pipe[Q_SPLIT_B]];
+                [en setBuffer:g_q35_pqg offset:0 atIndex:0];
+                [en setBuffer:g_q35_pq offset:0 atIndex:1];
+                [en setBuffer:g_q35_pg offset:0 atIndex:2];
+                [en setBytes:&d length:4 atIndex:3];
+                [en setBytes:&nhh length:4 atIndex:4];
+                [en dispatchThreads:MTLSizeMake((NSUInteger)hd, (NSUInteger)nh, (NSUInteger)nrow)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            }
+            hnormb(g_q35_pq, L.off_qn, nh);
+            hnormb(g_q35_pk, L.off_kn, nkv);
+
+            const uint64_t coff = (uint64_t)L.kv_slot * (uint64_t)s.kv_cap *
+                                  (uint64_t)kv_dim * 2u;
+            {
+                uint32_t nrot = (uint32_t)(s.rope_angles * 2);
+                const uint32_t hh = (uint32_t)(nrot >> 1);
+                uint32_t a = (uint32_t)nh, b = (uint32_t)nkv, c = (uint32_t)hd;
+                uint32_t p0 = (uint32_t)pos0;
+                float th = s.rope_theta;
+                uint32_t ang = (uint32_t)s.rope_angles;
+                uint32_t s0 = (uint32_t)s.rope_sections[0], s1 = (uint32_t)s.rope_sections[1];
+                uint32_t s2 = (uint32_t)s.rope_sections[2], s3 = (uint32_t)s.rope_sections[3];
+                [en setComputePipelineState:g_q35pipe[Q_ROPE_B]];
+                [en setBuffer:g_q35_pq offset:0 atIndex:0];
+                [en setBuffer:g_q35_pk offset:0 atIndex:1];
+                [en setBuffer:g_q35_kc offset:0 atIndex:2];
+                [en setBytes:&coff length:8 atIndex:3];
+                [en setBytes:&a length:4 atIndex:4];
+                [en setBytes:&b length:4 atIndex:5];
+                [en setBytes:&c length:4 atIndex:6];
+                [en setBytes:&p0 length:4 atIndex:7];
+                [en setBytes:&th length:4 atIndex:8];
+                [en setBytes:&ang length:4 atIndex:9];
+                [en setBytes:&nrot length:4 atIndex:10];
+                [en setBytes:&s0 length:4 atIndex:11];
+                [en setBytes:&s1 length:4 atIndex:12];
+                [en setBytes:&s2 length:4 atIndex:13];
+                [en setBytes:&s3 length:4 atIndex:14];
+                [en dispatchThreads:MTLSizeMake((NSUInteger)hh,
+                                                (NSUInteger)(nh + nkv), (NSUInteger)nrow)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
+            {
+                uint64_t voff = coff + (uint64_t)pos0 * (uint64_t)kv_dim * 2u, zero = 0;
+                uint32_t n = (uint32_t)kv_dim;
+                [en setComputePipelineState:g_fpipe[F_COPY_H]];
+                [en setBuffer:g_q35_vc offset:0 atIndex:0];
+                [en setBytes:&voff length:8 atIndex:1];
+                [en setBuffer:g_q35_pv offset:0 atIndex:2];
+                [en setBytes:&zero length:8 atIndex:3];
+                [en setBytes:&n length:4 atIndex:4];
+                [en dispatchThreads:MTLSizeMake((NSUInteger)kv_dim, (NSUInteger)nrow, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
+            {
+                uint32_t a = (uint32_t)nh, b = (uint32_t)nkv, c = (uint32_t)hd;
+                uint32_t nlen = (uint32_t)(pos0 + 1);
+                uint32_t kvd = (uint32_t)kv_dim;
+                float sc = 1.0f / std::sqrt((float)hd);
+                uint32_t win = 0, wrap = 0;
+                [en setComputePipelineState:g_fpipe[F_ATTN]];
+                [en setBuffer:g_q35_pq offset:0 atIndex:0];
+                [en setBuffer:g_q35_kc offset:0 atIndex:1];
+                [en setBuffer:g_q35_vc offset:0 atIndex:2];
+                [en setBuffer:g_q35_po offset:0 atIndex:3];
+                [en setBytes:&coff length:8 atIndex:4];
+                [en setBytes:&a length:4 atIndex:5];
+                [en setBytes:&b length:4 atIndex:6];
+                [en setBytes:&c length:4 atIndex:7];
+                [en setBytes:&nlen length:4 atIndex:8];
+                [en setBytes:&kvd length:4 atIndex:9];
+                [en setBytes:&sc length:4 atIndex:10];
+                [en setBytes:&win length:4 atIndex:11];
+                [en setBytes:&wrap length:4 atIndex:12];
+                [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((nh + 3) / 4),
+                                                     (NSUInteger)nrow, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            }
+            {
+                uint32_t n = (uint32_t)q_dim;
+                [en setComputePipelineState:g_q35pipe[Q_GATEDIM_B]];
+                [en setBuffer:g_q35_po offset:0 atIndex:0];
+                [en setBuffer:g_q35_pg offset:0 atIndex:1];
+                [en setBytes:&n length:4 atIndex:2];
+                [en dispatchThreads:MTLSizeMake((NSUInteger)q_dim, (NSUInteger)nrow, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
+            gemm(L.ty_o, g_q35_po, g_q35_pxb, L.off_o, n_embd, q_dim, nrow);
+            addb(g_q35_px, g_q35_pxb, nrow);
+        }
+
+        // ---- FFN（SwiGLU）
+        rmsb(g_q35_px, L.off_ffn_norm, g_q35_pxb, nrow);
+        gemm(L.ty_gate, g_q35_pxb, g_q35_pa, L.off_gate, n_ff, n_embd, nrow);
+        gemm(L.ty_up,   g_q35_pxb, g_q35_pb, L.off_up,   n_ff, n_embd, nrow);
+        {
+            uint32_t n = (uint32_t)n_ff;
+            [en setComputePipelineState:g_fpipe[F_SILU]];
+            [en setBuffer:g_q35_pa offset:0 atIndex:0];   // 原地：每个线程只碰自己的下标
+            [en setBuffer:g_q35_pa offset:0 atIndex:1];
+            [en setBuffer:g_q35_pb offset:0 atIndex:2];
+            [en setBytes:&n length:4 atIndex:3];
+            [en dispatchThreads:MTLSizeMake((NSUInteger)n_ff, (NSUInteger)nrow, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+        gemm(L.ty_down, g_q35_pa, g_q35_pxb, L.off_down, n_embd, n_ff, nrow);
+        addb(g_q35_px, g_q35_pxb, nrow);
+    }
+
+    // 只有末行需要 logits：n_vocab 有 24 万，全算一遍是 1 MB × nrow 的白费
+    {
+        const uint64_t xo = (uint64_t)(nrow - 1) * (uint64_t)n_embd * 4u;
+        uint32_t n = (uint32_t)n_embd;
+        float eps = s.rms_eps;
+        [en setComputePipelineState:g_fpipe[F_RMSNORM]];
+        [en setBuffer:g_q35_px offset:(NSUInteger)xo atIndex:0];
+        [en setBuffer:g_w offset:0 atIndex:1];
+        [en setBuffer:g_q35_po offset:0 atIndex:2];
+        [en setBytes:&n length:4 atIndex:3];
+        [en setBytes:&eps length:4 atIndex:4];
+        [en setBytes:&s.off_out_norm length:8 atIndex:5];
+        [en dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    gemm(s.ty_out_w, g_q35_po, g_q35_logits, s.off_out_w, s.n_vocab, n_embd, 1);
+
+    [en endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {
+        if (err) *err = cb.error ? [[cb.error localizedDescription] UTF8String]
+                                 : "Qwen3.5 prefill 命令缓冲执行失败";
+        return false;
+    }
+    if (logits)
+        std::memcpy(logits, [g_q35_logits contents], sizeof(float) * (size_t)s.n_vocab);
     return true;
 }
 

@@ -3112,6 +3112,208 @@ kernel void k_gate_mul_dim(device float* x       [[buffer(0)]],
     if (i >= n) return;
     x[i] *= 1.0f / (1.0f + exp(-g[i]));
 }
+
+// ================================================================ prefill 批量
+//
+// 上面 8 个内核一行一个 token。prefill 时同一份权重喂 nrow 个 token，
+// 权重流量就摊薄 nrow 倍 —— 这是从 13 tok/s 到几百 tok/s 的唯一来源。
+//
+// 只有 delta rule 不能跨行并行（状态是递归的），它在核内按 t 串行累积；
+// 其余每个内核都只是多带一个 row 维度。
+//
+// 行内布局和 decode 完全一致，这样 decode 和 prefill 才可能对拍：
+//   conv  [nrow][cdim]，cdim = 2*kdim + vdim，q 在 0、k 在 kdim、v 在 2*kdim
+
+kernel void k_ssm_prep_b(device float* beta  [[buffer(0)]],   // [nrow][nv]
+                         device float* alpha [[buffer(1)]],   // [nrow][nv]
+                         device const uchar* w [[buffer(2)]],
+                         constant ulong& dtoff [[buffer(3)]],
+                         constant ulong& aoff  [[buffer(4)]],
+                         constant uint& nv     [[buffer(5)]],
+                         uint2 gid [[thread_position_in_grid]])   // (h, row)
+{
+    const uint h = gid.x, r = gid.y;
+    if (h >= nv) return;
+    const device float* dt = (device const float*)(w + dtoff);
+    const device float* av = (device const float*)(w + aoff);
+    device float* b = beta + (ulong)r * nv + h;
+    device float* a = alpha + (ulong)r * nv + h;
+    b[0] = 1.0f / (1.0f + exp(-b[0]));
+    const float x = a[0] + dt[h];
+    const float sp = x > 20.0f ? x : log(1.0f + exp(x));
+    a[0] = sp * av[h];
+}
+
+// depthwise 因果卷积：一个线程一个通道，沿 t 串行滚动历史。
+// 通道之间无依赖，所以不需要同步 —— 但同一通道必须按时间顺序更新，
+// 这也正是它不能跨行并行的原因。
+kernel void k_ssm_conv_b(device float* state       [[buffer(0)]],  // [K-1][cdim]
+                         device const float* x     [[buffer(1)]],  // [nrow][cdim]
+                         device const uchar* w     [[buffer(2)]],
+                         constant ulong& woff      [[buffer(3)]],
+                         constant uint& cdim       [[buffer(4)]],
+                         constant uint& K          [[buffer(5)]],
+                         constant uint& nrow       [[buffer(6)]],
+                         device float* y           [[buffer(7)]],  // [nrow][cdim]
+                         uint c [[thread_position_in_grid]])
+{
+    if (c >= cdim) return;
+    const device float* wc = (device const float*)(w + woff) + (ulong)c * K;
+    for (uint t = 0; t < nrow; t++) {
+        device const float* xr = x + (ulong)t * cdim;
+        float acc = 0.0f;
+        for (uint k = 0; k + 1u < K; k++) acc += wc[k] * state[(ulong)k * cdim + c];
+        acc += wc[K - 1u] * xr[c];
+        y[(ulong)t * cdim + c] = acc / (1.0f + exp(-acc));
+        for (uint k = 0; k + 2u < K; k++) state[(ulong)k * cdim + c] = state[(ulong)(k + 1u) * cdim + c];
+        state[(ulong)(K - 2u) * cdim + c] = xr[c];
+    }
+}
+
+// q/k 的 per-head L2 norm，**原地**。h < nk 是 q 段，否则是 k 段。
+kernel void k_l2norm_b(device float* x        [[buffer(0)]],  // [nrow][cdim]
+                       constant uint& cdim    [[buffer(1)]],
+                       constant uint& kdim    [[buffer(2)]],
+                       constant uint& S       [[buffer(3)]],
+                       constant uint& nk      [[buffer(4)]],
+                       constant float& eps    [[buffer(5)]],
+                       uint2 gid [[thread_position_in_grid]])   // (h, row)
+{
+    const uint h = gid.x, r = gid.y;
+    if (h >= 2u * nk) return;
+    const uint base = (h < nk) ? (h * S) : (kdim + (h - nk) * S);
+    device float* p = x + (ulong)r * cdim + base;
+    float ss = 0.0f;
+    for (uint i = 0; i < S; i++) ss += p[i] * p[i];
+    const float sc = rsqrt(ss + eps);
+    for (uint i = 0; i < S; i++) p[i] *= sc;
+}
+
+// delta rule：一个线程负责状态矩阵的一行，沿 t 串行推进。
+// 状态在行间是独立的，所以 (j, h) 两个维度可以全并行。
+kernel void k_delta_rule_b(device float* state         [[buffer(0)]],  // [nv][S][S]
+                           device const float* conv    [[buffer(1)]],  // [nrow][cdim]
+                           device const float* alpha   [[buffer(2)]],  // [nrow][nv]
+                           device const float* beta    [[buffer(3)]],  // [nrow][nv]
+                           device float* out           [[buffer(4)]],  // [nrow][vdim]
+                           constant uint& cdim         [[buffer(5)]],
+                           constant uint& kdim         [[buffer(6)]],
+                           constant uint& vdim         [[buffer(7)]],
+                           constant uint& S            [[buffer(8)]],
+                           constant uint& nk           [[buffer(9)]],
+                           constant uint& nv           [[buffer(10)]],
+                           constant uint& nrow         [[buffer(11)]],
+                           uint2 gid [[thread_position_in_grid]])     // (j, h)
+{
+    const uint j = gid.x, h = gid.y;
+    if (j >= S) return;
+    const uint kh = h % nk;
+    device float* row = state + ((ulong)h * S + j) * S;
+    const float sc = rsqrt((float)S);
+    for (uint t = 0; t < nrow; t++) {
+        device const float* cr = conv + (ulong)t * cdim;
+        device const float* kk = cr + kdim + (ulong)kh * S;
+        device const float* qq = cr + (ulong)kh * S;
+        const float g = exp(alpha[(ulong)t * nv + h]);
+        float sk = 0.0f;
+        for (uint i = 0; i < S; i++) { row[i] *= g; sk += row[i] * kk[i]; }
+        const float d = (cr[2u * kdim + (ulong)h * S + j] - sk) * beta[(ulong)t * nv + h];
+        float sq = 0.0f;
+        for (uint i = 0; i < S; i++) { row[i] += d * kk[i]; sq += row[i] * qq[i]; }
+        out[(ulong)t * vdim + (ulong)h * S + j] = sq * sc;
+    }
+}
+
+kernel void k_gated_rmsnorm_b(device float* x        [[buffer(0)]],  // [nrow][vdim] 原地
+                              device const float* z  [[buffer(1)]],  // [nrow][vdim]
+                              device const uchar* w  [[buffer(2)]],
+                              constant ulong& woff   [[buffer(3)]],
+                              constant uint& S       [[buffer(4)]],
+                              constant uint& vdim    [[buffer(5)]],
+                              constant float& eps    [[buffer(6)]],
+                              uint2 gid [[thread_position_in_grid]])   // (head, row)
+{
+    const uint h = gid.x, r = gid.y;
+    if ((h + 1u) * S > vdim) return;
+    const ulong base = (ulong)r * vdim + (ulong)h * S;
+    device float* p = x + base;
+    float ss = 0.0f;
+    for (uint i = 0; i < S; i++) ss += p[i] * p[i];
+    const float sc = rsqrt(ss / (float)S + eps);
+    const device float* wf = (device const float*)(w + woff);
+    for (uint i = 0; i < S; i++) {
+        const float zz = z[base + i];
+        p[i] = p[i] * sc * wf[i] * (zz / (1.0f + exp(-zz)));
+    }
+}
+
+// MRoPE 的批量版：q 就地旋转，k 旋转后写进 KV cache 的第 pos0+row 槽。
+kernel void k_rope_mrope_b(device float* q          [[buffer(0)]],
+                           device const float* k    [[buffer(1)]],
+                           device half* kc          [[buffer(2)]],
+                           constant ulong& coff     [[buffer(3)]],  // 槽基址（字节）
+                           constant uint& n_head    [[buffer(4)]],
+                           constant uint& n_kvh     [[buffer(5)]],
+                           constant uint& hd        [[buffer(6)]],
+                           constant uint& pos0      [[buffer(7)]],
+                           constant float& theta    [[buffer(8)]],
+                           constant uint& angles    [[buffer(9)]],
+                           constant uint& n_rot     [[buffer(10)]],
+                           constant uint& s0        [[buffer(11)]],
+                           constant uint& s1        [[buffer(12)]],
+                           constant uint& s2        [[buffer(13)]],
+                           constant uint& s3        [[buffer(14)]],
+                           uint3 gid [[thread_position_in_grid]])   // (i, h, row)
+{
+    const uint hh = n_rot >> 1;
+    const uint i = gid.x, h = gid.y, r = gid.z;
+    if (i >= hh) return;
+    uint j = i;
+    if (i >= s0 && i < s0 + s1) j = i - s0;
+    else if (i >= s0 + s1 && i < s0 + s1 + s2) j = i - s0 - s1;
+    else if (i >= s0 + s1 + s2) j = i - s0 - s1 - s2;
+    const float freq = (i < angles) ? (1.0f / pow(theta, float(2u * j) / float(n_rot))) : 0.0f;
+    const float a = float(pos0 + r) * freq;
+    const float c = cos(a), s = sin(a);
+    const uint qdim = n_head * hd, kdim = n_kvh * hd;
+    if (h < n_head) {
+        device float* v = q + (ulong)r * qdim + (ulong)h * hd;
+        const float x0 = v[i], x1 = v[i + hh];
+        v[i]      = x0 * c - x1 * s;
+        v[i + hh] = x0 * s + x1 * c;
+    } else {
+        const uint kh = h - n_head;
+        device const float* src = k + (ulong)r * kdim + (ulong)kh * hd;
+        device half* dst = (device half*)((device uchar*)kc + coff)
+                         + (ulong)(pos0 + r) * kdim + (ulong)kh * hd;
+        const float x0 = src[i], x1 = src[i + hh];
+        dst[i]      = half(x0 * c - x1 * s);
+        dst[i + hh] = half(x0 * s + x1 * c);
+    }
+}
+
+kernel void k_split_qg_b(device const float* qg [[buffer(0)]],  // [nrow][2*nh*hd]
+                         device float* q        [[buffer(1)]],  // [nrow][nh*hd]
+                         device float* g        [[buffer(2)]],
+                         constant uint& hd      [[buffer(3)]],
+                         constant uint& nh      [[buffer(4)]],
+                         uint3 gid [[thread_position_in_grid]])   // (d, h, row)
+{
+    const ulong src = ((ulong)gid.z * 2ul * nh + 2ul * gid.y) * hd + gid.x;
+    const ulong dst = ((ulong)gid.z * nh + gid.y) * hd + gid.x;
+    q[dst] = qg[src];
+    g[dst] = qg[src + hd];
+}
+
+kernel void k_gate_mul_b(device float* x       [[buffer(0)]],
+                         device const float* g [[buffer(1)]],
+                         constant uint& n      [[buffer(2)]],
+                         uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= n) return;
+    const ulong o = (ulong)gid.y * n + gid.x;
+    x[o] *= 1.0f / (1.0f + exp(-g[o]));
+}
 )MSL";
 
 // ---------------------------------------------------------------- C++ 侧常量
