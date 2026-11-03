@@ -378,10 +378,8 @@ bool Model::enable_gpu(std::string* err) {
         s.hd = cfg_.head_dim;
         s.n_delta = cfg_.n_delta;
         s.n_kv_layer = n_kv_layer_;
-        // 先按 32K 分配：8 层 × 32K × 1024 × 2 × 2B ≈ 1.0 GB。
-        // 176K 要 5.8 GB，加上权重会顶到 macOS 的 Metal 上限；等正确性
-        // 验过再按需增长（或改成按需分配）。
-        s.kv_cap = std::min(n_ctx_, 32768);
+        // 请求满上下文，真正的尺寸由 q35_init 按显存预算夹（q35_kv_cap 回报）
+        s.kv_cap = n_ctx_;
         s.ssm_S = cfg_.ssm_state_size;
         s.ssm_nk = cfg_.ssm_group_count;
         s.ssm_nv = cfg_.ssm_time_step_rank;
@@ -434,9 +432,20 @@ bool Model::enable_gpu(std::string* err) {
             if (err) *err = gpu_note_;
             return false;
         }
+        // KV 的最终尺寸由 Metal 按显存预算定（可能比请求的小），后面对外
+        // 报的上下文上限、以及 prefill 的越界判断都要用这个数。
+        const int kv_real = metal::q35_kv_cap();
+        if (kv_real > 0 && kv_real < n_ctx_) {
+            std::fprintf(stderr, "[dubhe] GPU 只分配了 %d token 的 KV，上下文按此收紧\n",
+                         kv_real);
+            n_ctx_ = kv_real;
+            n_ctx_ceiling_ = kv_real;
+        }
+        kv_cap_ = std::min(kv_cap_, n_ctx_);
         gpu_active_ = false;
         gpu_fused_ = true;
-        gpu_note_ = "Metal · Apple M4（Qwen3.5 整层融合，KV 8 层 fp16）";
+        gpu_note_ = "Metal · Apple M4（Qwen3.5 整层融合，KV 8 层 fp16，上下文 " +
+                    std::to_string(n_ctx_) + "）";
         return true;
     }
     if (!metal::available()) {
@@ -1579,7 +1588,12 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
                    std::to_string(n_ctx_) + "（调大 -c/--ctx）";
         return false;
     }
-    if (pos >= kv_cap_ && !grow_kv(pos + 1)) { if (err) *err = "KV cache 扩容失败"; return false; }
+    // Qwen3.5 的融合路径把 KV 完全放在 GPU 侧，CPU 侧的 k_cache_ 一次都不会读。
+    // 这里再扩容就是按 f32 再存一份 —— 176K 上下文要 11.6 GB，纯浪费。
+    if (!(gpu_fused_ && arch_is_qwen35()) && pos >= kv_cap_ && !grow_kv(pos + 1)) {
+        if (err) *err = "KV cache 扩容失败";
+        return false;
+    }
 
     const int n_embd = cfg_.n_embd;
     const int hd = cfg_.head_dim;

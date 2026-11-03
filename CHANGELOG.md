@@ -6,6 +6,47 @@
 
 ---
 
+## [0.23.0] · 2026-11-03 · 上下文从 32K 放开到 176K，decode 长文不再掉队
+
+两件事：把"先跑通"时写死的 KV 容量改成按显存算，以及给注意力接上
+split-K —— 后者是长上下文下 decode 掉速的主因。
+
+### 新增
+
+- **KV 容量按 `recommendedMaxWorkingSetSize` 定**，不再写死 32768。
+  这台机器 maxWS 17.76 GB、权重 5.44 GB，留给 8 层 fp16 KV 的是 5.8 GB
+  → **176 896 token**，正好等于模型训练上下文被内存夹完之后的值。
+  `q35_kv_cap()` 把实际分配量回报给 Model，`n_ctx_` 跟着收紧，
+  `inspect` 里显示的上下文和实际能跑的一致。
+- **decode 的注意力用 split-K**（`k_attn_split` + `k_attn_comb`）。
+  解码时网格只有 `(n_head+3)/4 = 4` 个 threadgroup，而 M4 有 40 个
+  SIMD 单元 —— 每个位置都要串行等 `simd_sum`/`exp`。切成 nsp 段后
+  串行长度除以 nsp。阈值沿用 `fwd_impl` 扫出来的 `nlen/6`（`DUBHE_ATTN_DIV`
+  可覆盖）。
+- prefill **不切** split-K：网格已经是 4×nrow，nrow=32 就 128 个
+  threadgroup，切了反而多一次 combine（实测 85 → 72 tok/s）。
+
+### 修复
+
+- **q35 不再在 CPU 侧再存一份 f32 KV**。`forward()` 的 `grow_kv` 对所有
+  GPU 路径都生效，可 Qwen3.5 的融合路径根本不读 `k_cache_` —— 176K 上下文
+  等于白占 11.6 GB。现在这条路径跳过扩容。
+- **`F_ATTN_SPLIT` / `F_ATTN_COMB` 没在 `q35_init` 里创建**，又是
+  `setComputePipelineState:nil` 直接 SIGSEGV。这是同一个坑的第二次
+  （0.21.0 的 `g_fpipe` 是第一次），已经把它们并进通用 pipeline 那张表。
+
+### 基准
+
+M4 / 24 GB，MiMo-V2.6-Distill-Qwen-9B Q4_K_M：
+
+| 上下文 | decode（0.22.0） | decode（0.23.0） | prefill |
+| ---: | ---: | ---: | ---: |
+| 短 | 15.0 tok/s | 15.0 tok/s | 85 tok/s |
+| 681 | 10.5 tok/s | **13.4 tok/s** | 71 tok/s |
+| 2111 | 6.0 tok/s | **10.9 tok/s** | 80 tok/s |
+
+---
+
 ## [0.22.0] · 2026-11-03 · Qwen3.5 的 prefill 批量：13 → 85 tok/s
 
 prefill 一直是 0.21.x 的最大短板：`q35_token` 一次只吃一个 token，于是

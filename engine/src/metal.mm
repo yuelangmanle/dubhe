@@ -87,6 +87,7 @@ id<MTLDevice>       g_dev = nil;
 id<MTLCommandQueue> g_queue = nil;
 id<MTLLibrary>      g_lib = nil;
 id<MTLBuffer>       g_w = nil;        // 整个 mmap（零拷贝）
+size_t              g_wbytes = 0;    // 上面对应的页对齐长度（算 KV 预算用）
 id<MTLBuffer>       g_x = nil;        // 激活（可复用，按需扩容）
 id<MTLBuffer>       g_y = nil;        // 输出（可复用，按需扩容）
 size_t              g_x_cap = 0;
@@ -267,6 +268,7 @@ bool bind_weights(const void* base, size_t size, std::string* err) {
                                    length:len
                                   options:MTLResourceStorageModeShared
                               deallocator:nil];
+    g_wbytes = len;
     if (!g_w) {
         if (err) *err = "权重零拷贝绑定失败（文件过大或地址未对齐）";
         return false;
@@ -1312,6 +1314,21 @@ const char* const kQ35Names[Q_COUNT] = {
 // 再大也不会更快：分块内核一次只吃 32 行，多出来的还是要把权重再读一遍。
 constexpr int kQ35Ch = 32;
 
+// 注意力要切几段（split-K）。
+//
+// 解码时注意力只有 (n_head+3)/4 = 4 个 threadgroup，M4 有 40 个 SIMD 单元 ——
+// 网格根本填不满，每个位置都要串行等 simd_sum/exp。切 nsp 段就把串行长度
+// 除以 nsp。除数 6 是 fwd_impl 那边扫出来的（见它的注释），这里沿用。
+uint32_t q35_nsp(int nlen) {
+    static const int div = []() {
+        const char* s = getenv("DUBHE_ATTN_DIV");
+        const int v = s ? atoi(s) : 6;
+        return v >= 1 && v <= 512 ? v : 6;
+    }();
+    const int n = std::max(1, nlen / div);
+    return (uint32_t)std::min(kAttnSplits, n);
+}
+
 Q35Spec g_q35;
 bool g_q35_ready = false;
 // prefill 批量是否可用：所有层权重都得有 MMA 内核（Q4_0/Q5_0/F32 没有）
@@ -1325,6 +1342,7 @@ id<MTLBuffer> g_q35_gate = nil, g_q35_k = nil, g_q35_v = nil;
 id<MTLBuffer> g_q35_ffn = nil, g_q35_up = nil, g_q35_ffn2 = nil, g_q35_down = nil;
 id<MTLBuffer> g_q35_logits = nil;
 id<MTLBuffer> g_q35_state = nil, g_q35_conv = nil, g_q35_kc = nil, g_q35_vc = nil;
+id<MTLBuffer> g_q35_part = nil;   // split-K 的局部 (m, l, acc)
 
 // prefill 的批缓冲：[kQ35Ch][宽度]，行内布局和 decode 一模一样
 id<MTLBuffer> g_q35_px = nil, g_q35_pxb = nil, g_q35_po = nil;
@@ -1343,6 +1361,7 @@ void q35_release() {
     g_q35_ffn = g_q35_up = g_q35_ffn2 = g_q35_down = nil;
     g_q35_logits = nil;
     g_q35_state = g_q35_conv = g_q35_kc = g_q35_vc = nil;
+    g_q35_part = nil;
     g_q35_px = g_q35_pxb = g_q35_po = nil;
     g_q35_pa = g_q35_pb = g_q35_pz = nil;
     g_q35_pqkv = g_q35_pqg = g_q35_pq = g_q35_pg = nil;
@@ -1377,6 +1396,7 @@ bool q35_init(const Q35Spec& s, std::string* err) {
         const std::pair<int, const char*> common[] = {
             {F_RMSNORM, "k_rmsnorm"}, {F_ADD, "k_add"}, {F_SILU, "k_silu_mul"},
             {F_COPY_H, "k_copy_h"}, {F_HEADNORM, "k_headnorm"}, {F_ATTN, "k_attn"},
+            {F_ATTN_SPLIT, "k_attn_split"}, {F_ATTN_COMB, "k_attn_comb"},
             {F_TRANS, "k_trans"},
         };
         for (auto& p : common) {
@@ -1431,15 +1451,42 @@ bool q35_init(const Q35Spec& s, std::string* err) {
     g_q35_logits = make_buf((size_t)s.n_vocab * F);
     g_q35_state  = make_buf((size_t)s.n_delta * s.ssm_nv * s.ssm_S * s.ssm_S * F);
     g_q35_conv   = make_buf((size_t)s.n_delta * (size_t)(s.ssm_conv - 1) * cdim * F);
-    const size_t kvb = (size_t)s.n_kv_layer * (size_t)s.kv_cap * (size_t)kv_dim * 2;
+
+    // KV 容量按这台机器真正能给的量定，不写死。
+    //
+    // 8 层 fp16 的 KV 每千 token 32 MB：176K 要 5.8 GB，加 5.4 GB 权重是
+    // 11.2 GB —— 24 GB 的机器放得下。0.21.0 里写死 32768 是因为那时前向
+    // 还有 bug、先求能跑通；现在按 recommendedMaxWorkingSetSize 算。
+    const double per_pos = (double)s.n_kv_layer * (double)kv_dim * 2.0 * 2.0;
+    int cap = s.kv_cap;
+    const double maxws = (double)[g_dev recommendedMaxWorkingSetSize];
+    if (maxws > 0.0 && per_pos > 0.0) {
+        const double reserve = (double)g_wbytes * 1.05 + 320.0 * 1024.0 * 1024.0;
+        double avail = maxws - reserve;
+        if (avail < 128.0 * 1024.0 * 1024.0) avail = 128.0 * 1024.0 * 1024.0;
+        int fit = (int)(avail / per_pos);
+        fit = fit / 256 * 256;
+        if (fit < cap) cap = fit;
+    }
+    if (cap < 4096) cap = 4096;
+    if (cap > s.kv_cap) cap = s.kv_cap;
+    g_q35.kv_cap = cap;
+
+    const size_t kvb = (size_t)s.n_kv_layer * (size_t)cap * (size_t)kv_dim * 2;
     g_q35_kc = make_buf(kvb);
     g_q35_vc = make_buf(kvb);
+    // split-K 的局部缓冲：[行][nsp][head][hd+2]，nsp 上限是 kAttnSplits
+    g_q35_part = make_buf((size_t)kQ35Ch * (size_t)kAttnSplits *
+                          (size_t)s.n_head * ((size_t)s.hd + 2u) * F);
+    if (std::getenv("DUBHE_Q35_DEBUG"))
+        std::fprintf(stderr, "[q35] kv_cap=%d (请求 %d) maxWS=%.2f GB 权重=%.2f GB\n",
+                     cap, s.kv_cap, maxws / 1073741824.0, (double)g_wbytes / 1073741824.0);
 
     if (!g_q35_x || !g_q35_xb || !g_q35_qkv || !g_q35_y || !g_q35_qk || !g_q35_z ||
         !g_q35_beta || !g_q35_alpha || !g_q35_o || !g_q35_att || !g_q35_qg ||
         !g_q35_q || !g_q35_gate || !g_q35_k || !g_q35_v || !g_q35_ffn ||
         !g_q35_up || !g_q35_ffn2 || !g_q35_down || !g_q35_logits ||
-        !g_q35_state || !g_q35_conv || !g_q35_kc || !g_q35_vc) {
+        !g_q35_state || !g_q35_conv || !g_q35_kc || !g_q35_vc || !g_q35_part) {
         if (err) *err = "Qwen3.5 缓冲分配失败（内存不足）";
         return false;
     }
@@ -1758,22 +1805,53 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err) {
                 uint32_t kvd = (uint32_t)kv_dim;
                 float sc = 1.0f / std::sqrt((float)hd);
                 uint32_t win = 0, wrap = 0;
-                [en setComputePipelineState:g_fpipe[F_ATTN]];
-                [en setBuffer:g_q35_q offset:0 atIndex:0];
-                [en setBuffer:g_q35_kc offset:0 atIndex:1];
-                [en setBuffer:g_q35_vc offset:0 atIndex:2];
-                [en setBuffer:g_q35_att offset:0 atIndex:3];
-                [en setBytes:&coff length:8 atIndex:4];
-                [en setBytes:&a length:4 atIndex:5];
-                [en setBytes:&b length:4 atIndex:6];
-                [en setBytes:&c length:4 atIndex:7];
-                [en setBytes:&nlen length:4 atIndex:8];
-                [en setBytes:&kvd length:4 atIndex:9];
-                [en setBytes:&sc length:4 atIndex:10];
-                [en setBytes:&win length:4 atIndex:11];
-                [en setBytes:&wrap length:4 atIndex:12];
-                [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((nh + 3) / 4), 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                const uint32_t nsp = q35_nsp((int)nlen);
+                if (nsp <= 1) {
+                    [en setComputePipelineState:g_fpipe[F_ATTN]];
+                    [en setBuffer:g_q35_q offset:0 atIndex:0];
+                    [en setBuffer:g_q35_kc offset:0 atIndex:1];
+                    [en setBuffer:g_q35_vc offset:0 atIndex:2];
+                    [en setBuffer:g_q35_att offset:0 atIndex:3];
+                    [en setBytes:&coff length:8 atIndex:4];
+                    [en setBytes:&a length:4 atIndex:5];
+                    [en setBytes:&b length:4 atIndex:6];
+                    [en setBytes:&c length:4 atIndex:7];
+                    [en setBytes:&nlen length:4 atIndex:8];
+                    [en setBytes:&kvd length:4 atIndex:9];
+                    [en setBytes:&sc length:4 atIndex:10];
+                    [en setBytes:&win length:4 atIndex:11];
+                    [en setBytes:&wrap length:4 atIndex:12];
+                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((nh + 3) / 4), 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                } else {
+                    [en setComputePipelineState:g_fpipe[F_ATTN_SPLIT]];
+                    [en setBuffer:g_q35_q offset:0 atIndex:0];
+                    [en setBuffer:g_q35_kc offset:0 atIndex:1];
+                    [en setBuffer:g_q35_vc offset:0 atIndex:2];
+                    [en setBuffer:g_q35_part offset:0 atIndex:3];
+                    [en setBytes:&coff length:8 atIndex:4];
+                    [en setBytes:&a length:4 atIndex:5];
+                    [en setBytes:&b length:4 atIndex:6];
+                    [en setBytes:&c length:4 atIndex:7];
+                    [en setBytes:&nlen length:4 atIndex:8];
+                    [en setBytes:&kvd length:4 atIndex:9];
+                    [en setBytes:&sc length:4 atIndex:10];
+                    [en setBytes:&nsp length:4 atIndex:11];
+                    [en setBytes:&win length:4 atIndex:12];
+                    [en setBytes:&wrap length:4 atIndex:13];
+                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((nh + 3) / 4), 1,
+                                                         (NSUInteger)nsp)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [en setComputePipelineState:g_fpipe[F_ATTN_COMB]];
+                    [en setBuffer:g_q35_part offset:0 atIndex:0];
+                    [en setBuffer:g_q35_att offset:0 atIndex:1];
+                    [en setBytes:&a length:4 atIndex:2];
+                    [en setBytes:&c length:4 atIndex:3];
+                    [en setBytes:&nsp length:4 atIndex:4];
+                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((nh + 3) / 4), 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
             }
             sdump(l, pos, "attn", g_q35_att, q_dim);
             {
@@ -1867,6 +1945,8 @@ bool q35_prefill_ok() {
     static const bool off = std::getenv("DUBHE_NO_PREFILL") != nullptr;
     return g_q35_ready && g_q35_batch && !off;
 }
+
+int q35_kv_cap() { return g_q35_ready ? g_q35.kv_cap : 0; }
 
 bool q35_prefill(const float* x0, int nrow, int pos0, float* logits, std::string* err) {
     if (std::getenv("DUBHE_Q35_DEBUG"))
@@ -2137,23 +2217,58 @@ bool q35_prefill(const float* x0, int nrow, int pos0, float* logits, std::string
                 uint32_t kvd = (uint32_t)kv_dim;
                 float sc = 1.0f / std::sqrt((float)hd);
                 uint32_t win = 0, wrap = 0;
-                [en setComputePipelineState:g_fpipe[F_ATTN]];
-                [en setBuffer:g_q35_pq offset:0 atIndex:0];
-                [en setBuffer:g_q35_kc offset:0 atIndex:1];
-                [en setBuffer:g_q35_vc offset:0 atIndex:2];
-                [en setBuffer:g_q35_po offset:0 atIndex:3];
-                [en setBytes:&coff length:8 atIndex:4];
-                [en setBytes:&a length:4 atIndex:5];
-                [en setBytes:&b length:4 atIndex:6];
-                [en setBytes:&c length:4 atIndex:7];
-                [en setBytes:&nlen length:4 atIndex:8];
-                [en setBytes:&kvd length:4 atIndex:9];
-                [en setBytes:&sc length:4 atIndex:10];
-                [en setBytes:&win length:4 atIndex:11];
-                [en setBytes:&wrap length:4 atIndex:12];
-                [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((nh + 3) / 4),
-                                                     (NSUInteger)nrow, 1)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                // prefill 不切 split-K：网格已经是 4 × nrow 个 threadgroup，
+                // nrow=32 就 128 个，把 40 个 SIMD 单元填满了 —— 再切只会多
+                // 一次 combine 和一圈 partial 流量（实测 84 → 72 tok/s）。
+                const uint32_t nsp = 1;
+                if (nsp <= 1) {
+                    [en setComputePipelineState:g_fpipe[F_ATTN]];
+                    [en setBuffer:g_q35_pq offset:0 atIndex:0];
+                    [en setBuffer:g_q35_kc offset:0 atIndex:1];
+                    [en setBuffer:g_q35_vc offset:0 atIndex:2];
+                    [en setBuffer:g_q35_po offset:0 atIndex:3];
+                    [en setBytes:&coff length:8 atIndex:4];
+                    [en setBytes:&a length:4 atIndex:5];
+                    [en setBytes:&b length:4 atIndex:6];
+                    [en setBytes:&c length:4 atIndex:7];
+                    [en setBytes:&nlen length:4 atIndex:8];
+                    [en setBytes:&kvd length:4 atIndex:9];
+                    [en setBytes:&sc length:4 atIndex:10];
+                    [en setBytes:&win length:4 atIndex:11];
+                    [en setBytes:&wrap length:4 atIndex:12];
+                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((nh + 3) / 4),
+                                                         (NSUInteger)nrow, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                } else {
+                    [en setComputePipelineState:g_fpipe[F_ATTN_SPLIT]];
+                    [en setBuffer:g_q35_pq offset:0 atIndex:0];
+                    [en setBuffer:g_q35_kc offset:0 atIndex:1];
+                    [en setBuffer:g_q35_vc offset:0 atIndex:2];
+                    [en setBuffer:g_q35_part offset:0 atIndex:3];
+                    [en setBytes:&coff length:8 atIndex:4];
+                    [en setBytes:&a length:4 atIndex:5];
+                    [en setBytes:&b length:4 atIndex:6];
+                    [en setBytes:&c length:4 atIndex:7];
+                    [en setBytes:&nlen length:4 atIndex:8];
+                    [en setBytes:&kvd length:4 atIndex:9];
+                    [en setBytes:&sc length:4 atIndex:10];
+                    [en setBytes:&nsp length:4 atIndex:11];
+                    [en setBytes:&win length:4 atIndex:12];
+                    [en setBytes:&wrap length:4 atIndex:13];
+                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((nh + 3) / 4),
+                                                         (NSUInteger)nrow, (NSUInteger)nsp)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                    [en setComputePipelineState:g_fpipe[F_ATTN_COMB]];
+                    [en setBuffer:g_q35_part offset:0 atIndex:0];
+                    [en setBuffer:g_q35_po offset:0 atIndex:1];
+                    [en setBytes:&a length:4 atIndex:2];
+                    [en setBytes:&c length:4 atIndex:3];
+                    [en setBytes:&nsp length:4 atIndex:4];
+                    [en dispatchThreadgroups:MTLSizeMake((NSUInteger)((nh + 3) / 4),
+                                                         (NSUInteger)nrow, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
             }
             {
                 uint32_t n = (uint32_t)q_dim;

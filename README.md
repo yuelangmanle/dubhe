@@ -51,6 +51,26 @@ prefill 的两个数是「短提示 / 904 token 长文」。MLX 的 495 是 601 
 | CPU · NEON | 20.6 tok/s | 21.3 tok/s |
 | **Metal GPU** | **79–84 tok/s** | **382 tok/s** |
 
+**MiMo-V2.6-Distill-Qwen-9B（Qwen3.5 混合架构，5.44 GB）**
+
+32 层里有 24 层是 Gated DeltaNet（递归状态固定 50 MB，不随上下文涨），
+8 层是 gated full attention。
+
+| 后端 | 上下文 | decode | prefill |
+| --- | ---: | ---: | ---: |
+| CPU · NEON | 短 | 4.4 tok/s | 3.9 tok/s |
+| **Metal GPU** | 短 | **15.0 tok/s** | **85 tok/s** |
+| Metal GPU | 681 | 13.4 tok/s | 71 tok/s |
+| Metal GPU | 2111 | 10.9 tok/s | 80 tok/s |
+
+可用的上下文是 **176 896 token**（8 层 fp16 KV，占 5.8 GB）。KV 容量不是写死的：
+启动时按 `recommendedMaxWorkingSetSize` 减去权重算，装不下才收紧。
+
+数值一致性：GPU 与 CPU 逐层残差流的 RMS 差 < 0.6%（f16 KV + 量化舍入），
+681 token 提示下贪心输出与逐 token 路径**逐字一致**。
+`DUBHE_NO_PREFILL=1` 关掉批量 prefill 可做 A/B，`DUBHE_Q35_DUMP=1` 打印
+GPU 逐层指纹对拍 CPU 的 `DUBHE_DEBUG_NAN=1`。
+
 数值一致性：GPU 与纯 f32 参考逐位置 logits 最大差 **9.4e-6**、argmax 一致；
 631 token 上下文下贪心输出与 CPU **逐字一致**。
 `make gpu` 复现性能对比，`make optest` 逐个算子对拍，

@@ -170,6 +170,9 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err);
 // 调用方退回逐 token（慢 30 倍，但结果正确）。
 bool q35_prefill(const float* x0, int nrow, int pos0, float* logits, std::string* err);
 bool q35_prefill_ok();
+// 实际分配到的 KV 槽位数。它可能小于 Q35Spec.kv_cap（按显存预算夹过），
+// 所以上限要对这个值报，而不是对请求值。
+int q35_kv_cap();
 // 清 DeltaNet 状态与 KV（新序列）
 void q35_reset();
 
