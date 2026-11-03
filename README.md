@@ -2,7 +2,7 @@
 
 > Apple Silicon MacBook 与 Android 手机上的本地大模型推理引擎。GGUF 原生直读，单路与多路都不掉速。
 
-状态：M0 已交付（引擎 + CLI + HTTP + Web UI 全链路可跑）· **M1 Metal GPU 后端 + LFM3 tri-hybrid + 量化 matvec 重写** · 闭源 · 私有仓库
+状态：**v0.19.0** · M0 已交付（引擎 + CLI + HTTP + Web UI 全链路可跑）· **M1 性能收敛**（prefill 追平 MLX，decode 差距来自权重大小）· 客户端（Web + macOS 外壳）已落地 · 闭源 · 私有仓库
 
 ---
 
@@ -23,21 +23,26 @@ make optest                 # 7 个 Metal 融合算子逐个和 C 参考实现�
 ./build/dubhed -m <model.gguf> --share
 ```
 
-实测（M4 24GB，同一会话内背靠背测量）：
+实测（M4 / 10 核 / 24 GB，2026-11-03，`dubhe bench` 三次取均值）：
 
 **LFM3-1.7B（tri-hybrid，1.73B 参数）**
 
-| 后端 | 权重 | 体积 | decode | 有效带宽 |
+| 后端 | 权重 | 体积 | decode | prefill |
 | --- | --- | ---: | ---: | ---: |
-| 天枢 Metal | Q4_K_M | 1.10 GB | **47.2 tok/s** | 52 GB/s |
-| 天枢 Metal | Q8_0 | 1.85 GB | 33.5 tok/s | 62 GB/s |
-| 天枢 Metal | F16 | 3.47 GB | 20.8 tok/s | 72 GB/s |
-| 天枢 CPU · NEON | Q4_K_M | 1.10 GB | 10.7 tok/s | 12 GB/s |
-| 苹果 MLX | 4bit | 0.97 GB | 87.1 tok/s | 85 GB/s |
-| 苹果 MLX | 8bit | 1.90 GB | 47.9 tok/s | 91 GB/s |
+| 天枢 Metal | Q4_K_M | 1.10 GB | **58.7 tok/s** | **369 / 443 tok/s** |
+| 天枢 Metal | Q8_0 | 1.85 GB | 36.5 tok/s | 389 tok/s |
+| 天枢 Metal | F16 | 3.47 GB | 22.7 tok/s | 364 tok/s |
+| 天枢 CPU · NEON | Q4_K_M | 1.10 GB | 13.5 tok/s | 14.0 tok/s |
+| 苹果 MLX | 4bit | 0.97 GB | 87.1 tok/s | 495 tok/s |
+| 苹果 MLX | 8bit | 1.90 GB | 47.9 tok/s | — |
 
-长上下文（601 token 提示）prefill：天枢 **66 tok/s**，MLX **495 tok/s**。
-prefill 是当前最大的短板，根因是激活被重复读 55 倍 —— 下一轮做 GEMM 二维分块。
+prefill 的两个数是「短提示 / 904 token 长文」。MLX 的 495 是 601 token 读数，
+按量级对齐后差距约 1.1x，**已经不是短板**：0.5.0 的二维分块 + 0.15.3 的 MMA
+把 prefill 推到 2.19 TFLOP/s，是 M4 上 8×8×8 MMA 天花板（2.72 TFLOP/s）的 81%。
+
+剩下的差距在 decode（58.7 vs 87.1 = 0.67x）。原因不是内核效率 —— 解码已经
+跑在 84 GB/s、贴着这台机器的只读带宽上限 —— 而是 GGUF Q4_K_M（1.10 GB）
+比 MLX 4bit（0.97 GB）大 13%。同体积下两者基本同速。
 
 **Qwen2.5-0.5B-Instruct Q4_K_M**
 
@@ -51,8 +56,9 @@ prefill 是当前最大的短板，根因是激活被重复读 55 倍 —— 下
 `make gpu` 复现性能对比，`make optest` 逐个算子对拍，
 `DUBHE_FUSED_CHECK_VERBOSE=1` 打印逐位置对拍明细。
 
-> 这台机器在跑其它任务时 decode 会从 47 掉到 13 tok/s（2.8x 波动），
-> 所以绝对数字只反映当时的负载，**倍数**是背靠背测量得出的。
+> 同一台机器有其它负载时 decode 会明显掉（实测见过 58 → 13 tok/s），
+> 所以绝对数字只反映当时负载；要横向比较时用 `tools/ab.py` 的
+> **交错配对 + 取比值中位数**，不要拿两次不同会话的绝对值相除。
 > 完整的精度 × 后端矩阵见
 > [LFM3 精度与后端实测](docs/references/LFM3-精度与后端实测.md)。
 
