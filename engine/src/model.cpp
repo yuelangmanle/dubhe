@@ -351,9 +351,6 @@ bool Model::enable_gpu(std::string* err) {
         return false;
     }
     if (arch_is_qwen35()) {
-        // 整层融合的 spec 只认识 conv / 滑窗 / 全注意力，DeltaNet 会被错当成
-        // full attention 去跑。但**逐算子的 matvec 仍可以走 GPU** —— 它占
-        // 前向时间的 90% 以上，先把这个拿回来，融合内核后面再补。
         std::string e;
         if (!metal::init(&e)) {
             gpu_note_ = "Metal 初始化失败: " + e;
@@ -365,12 +362,81 @@ bool Model::enable_gpu(std::string* err) {
             if (err) *err = gpu_note_;
             return false;
         }
-        // 实测：逐算子 mfvec 每次提交+同步约 0.3 ms，248 次/token 就是
-        // 75 ms，比 CPU 的 4.4 tok/s 还慢（4.0）。所以这里只保留权重绑定，
-        // matvec 仍走 CPU —— 等整层融合内核写完再打开 gpu_fused_。
+
+        auto off = [&](const TensorInfo& t) -> uint64_t {
+            if (t.ne[0] <= 0) return 0;
+            return (uint64_t)((const char*)file_.tensor_data(t) - (const char*)file_.mapping());
+        };
+
+        metal::Q35Spec s;
+        s.n_embd = cfg_.n_embd;
+        s.n_ff = cfg_.n_ff;
+        s.n_vocab = cfg_.n_vocab;
+        s.n_layer = cfg_.n_layer;
+        s.n_head = cfg_.n_head;
+        s.n_head_kv = cfg_.n_head_kv;
+        s.hd = cfg_.head_dim;
+        s.n_delta = cfg_.n_delta;
+        s.n_kv_layer = n_kv_layer_;
+        // 先按 32K 分配：8 层 × 32K × 1024 × 2 × 2B ≈ 1.0 GB。
+        // 176K 要 5.8 GB，加上权重会顶到 macOS 的 Metal 上限；等正确性
+        // 验过再按需增长（或改成按需分配）。
+        s.kv_cap = std::min(n_ctx_, 32768);
+        s.ssm_S = cfg_.ssm_state_size;
+        s.ssm_nk = cfg_.ssm_group_count;
+        s.ssm_nv = cfg_.ssm_time_step_rank;
+        s.ssm_kdim = cfg_.ssm_group_count * cfg_.ssm_state_size;
+        s.ssm_vdim = cfg_.ssm_inner_size;
+        s.ssm_conv = cfg_.ssm_conv_kernel;
+        s.rms_eps = cfg_.rms_eps;
+        s.rope_theta = cfg_.rope_theta;
+        s.rope_angles = cfg_.rope_angles;
+        for (int i = 0; i < 4; i++) s.rope_sections[i] = cfg_.rope_sections[i];
+        s.off_out_norm = off(out_norm_);
+        s.off_out_w = off(out_w_);
+        s.ty_out_w = out_w_.type;
+
+        s.layers.resize((size_t)cfg_.n_layer);
+        int kv_slot = 0;
+        for (int l = 0; l < cfg_.n_layer; l++) {
+            const Layer& L = layers_[(size_t)l];
+            metal::Q35Layer& d = s.layers[(size_t)l];
+            d.kind = (L.kind == LK_DELTA) ? 0 : 1;
+            d.ssm_slot = (L.kind == LK_DELTA) ? ssm_slot_[(size_t)l] : -1;
+            d.kv_slot = (L.kind == LK_DELTA) ? -1 : kv_slot++;
+            d.off_attn_norm = off(L.attn_norm);
+            d.off_ffn_norm = off(L.ffn_norm);
+            d.off_gate = off(L.ffn_gate); d.ty_gate = L.ffn_gate.type;
+            d.off_up = off(L.ffn_up);     d.ty_up = L.ffn_up.type;
+            d.off_down = off(L.ffn_down); d.ty_down = L.ffn_down.type;
+            if (L.kind == LK_DELTA) {
+                d.off_qkv = off(L.ssm_qkv);     d.ty_qkv = L.ssm_qkv.type;
+                d.off_z = off(L.ssm_gate);      d.ty_z = L.ssm_gate.type;
+                d.off_conv = off(L.ssm_conv1d);
+                d.off_dt = off(L.ssm_dt);
+                d.off_a = off(L.ssm_a);
+                d.off_beta = off(L.ssm_beta);   d.ty_beta = L.ssm_beta.type;
+                d.off_alpha = off(L.ssm_alpha); d.ty_alpha = L.ssm_alpha.type;
+                d.off_norm = off(L.ssm_norm);
+                d.off_sout = off(L.ssm_out);    d.ty_sout = L.ssm_out.type;
+            } else {
+                d.off_q = off(L.attn_q);  d.ty_q = L.attn_q.type;
+                d.off_k = off(L.attn_k);  d.ty_k = L.attn_k.type;
+                d.off_v = off(L.attn_v);  d.ty_v = L.attn_v.type;
+                d.off_o = off(L.attn_output); d.ty_o = L.attn_output.type;
+                d.off_qn = off(L.attn_q_norm);
+                d.off_kn = off(L.attn_k_norm);
+            }
+        }
+
+        if (!metal::q35_init(s, &e)) {
+            gpu_note_ = "Qwen3.5 Metal 初始化失败: " + e;
+            if (err) *err = gpu_note_;
+            return false;
+        }
         gpu_active_ = false;
-        gpu_fused_ = false;
-        gpu_note_ = "Qwen3.5：整层融合未支持（逐算子提交比 CPU 还慢）";
+        gpu_fused_ = true;
+        gpu_note_ = "Metal · Apple M4（Qwen3.5 整层融合，KV 8 层 fp16）";
         return true;
     }
     if (!metal::available()) {
@@ -1005,7 +1071,10 @@ void Model::reset_kv() {
     // DeltaNet 的状态和 ShortConv 一样是"滚动"的，没法按位置回退，
     // 换 prompt 只能整体清零。
     clear_ssm_state();
-    if (gpu_fused_) metal::fwd_reset_conv();
+    if (gpu_fused_) {
+        if (arch_is_qwen35()) metal::q35_reset();
+        else metal::fwd_reset_conv();
+    }
 }
 
 void Model::clear_conv_state() { std::fill(conv_state_.begin(), conv_state_.end(), 0.f); }
@@ -1346,6 +1415,8 @@ void Model::rope(float* q, float* k, int n_head, int n_head_kv, int head_dim, in
 
 int Model::batch_size() const {
     if (!gpu_fused_) return 1;
+    // Qwen3.5 还没有批量前向：DeltaNet 的 chunked 实现没做，逐 token 更稳
+    if (arch_is_qwen35()) return 1;
     return metal::fwd_batch_max();
 }
 
@@ -1356,6 +1427,17 @@ bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* log
     if (!loaded_) { if (err) *err = "模型未加载"; return false; }
     if (n <= 0 || !tokens) { if (err) *err = "空批"; return false; }
     if (n == 1 && slab0 == 0 && cslot == 0) return forward(tokens[0], pos0, logits, err);
+
+    // Qwen3.5 还没有 prefill 批量内核（DeltaNet 的 chunked 版本是另一轮的事）。
+    // 逐 token 走 q35_token：每 token 一次提交，权重读一遍 —— 比 CPU 快，
+    // 也比把 delta 层喂给不认识它的 fwd_batch 正确。
+    if (arch_is_qwen35() && n > 1) {
+        for (int i = 0; i < n; i++) {
+            float* out = (i == n - 1) ? logits : logits_.data();
+            if (!forward(tokens[i], pos0 + i, out, err)) return false;
+        }
+        return true;
+    }
 
     if (!gpu_fused_) {
         // CPU 路径和 forward() 都只认"整条序列从 0 开始"，没有槽位概念。
@@ -1485,9 +1567,14 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
     }
 
     if (gpu_fused_) {
+        if (std::getenv("DUBHE_Q35_DEBUG"))
+            std::fprintf(stderr, "[dbg] forward pos=%d q35=%d\n", pos, (int)arch_is_qwen35());
         // 整层前向一次提交、一次同步。失败就整体报错——此时 GPU 的 KV 已经
         // 前进了一步，切回 CPU 会得到错误结果，静默降级比报错更危险。
-        if (!metal::fwd_token(x_.data(), pos, logits, err)) {
+        const bool ok = arch_is_qwen35()
+                            ? metal::q35_token(x_.data(), pos, logits, err)
+                            : metal::fwd_token(x_.data(), pos, logits, err);
+        if (!ok) {
             gpu_active_ = false;
             gpu_fused_ = false;
             if (err && err->empty()) *err = "GPU 前向失败";

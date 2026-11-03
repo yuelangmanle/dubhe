@@ -3035,6 +3035,76 @@ kernel void k_gated_rmsnorm(device float* x        [[buffer(0)]],  // [nv][S] �
         x[(ulong)h * S + i] = v * r * wf[i] * (zz / (1.0f + exp(-zz)));
     }
 }
+
+// MRoPE：和 k_rope 只差一处 —— 频率按 section 重置。
+// [11,11,10,0] 意味着第 11-22 对又从 base^0 开始，不是连续递增。
+// 文本输入下三个 section 的位置相同，所以不需要真的维护三套位置。
+kernel void k_rope_mrope(device float* q        [[buffer(0)]],
+                         device const float* k  [[buffer(1)]],
+                         device half* kc        [[buffer(2)]],
+                         constant ulong& koff   [[buffer(3)]],
+                         constant uint& n_head  [[buffer(4)]],
+                         constant uint& n_kvh   [[buffer(5)]],
+                         constant uint& hd      [[buffer(6)]],
+                         constant uint& pos     [[buffer(7)]],
+                         constant float& theta  [[buffer(8)]],
+                         constant uint& angles  [[buffer(9)]],
+                         constant uint& n_rot   [[buffer(10)]],
+                         constant uint& s0      [[buffer(11)]],
+                         constant uint& s1      [[buffer(12)]],
+                         constant uint& s2      [[buffer(13)]],
+                         constant uint& s3      [[buffer(14)]],
+                         uint2 gid [[thread_position_in_grid]])
+{
+    const uint hh = n_rot >> 1;
+    if (gid.x >= (n_head + n_kvh) * hh) return;
+    const uint h = gid.x / hh;
+    const uint i = gid.x - h * hh;
+    uint j = i;
+    if (i >= s0 && i < s0 + s1) j = i - s0;
+    else if (i >= s0 + s1 && i < s0 + s1 + s2) j = i - s0 - s1;
+    else if (i >= s0 + s1 + s2) j = i - s0 - s1 - s2;
+    const float freq = (i < angles) ? (1.0f / pow(theta, float(2u * j) / float(n_rot))) : 0.0f;
+    const float a = float(pos) * freq;
+    const float c = cos(a), s = sin(a);
+    const uint qdim = n_head * hd, kdim = n_kvh * hd;
+    if (h < n_head) {
+        device float* v = q + (ulong)h * hd;
+        const float x0 = v[i], x1 = v[i + hh];
+        v[i]      = x0 * c - x1 * s;
+        v[i + hh] = x0 * s + x1 * c;
+    } else {
+        const uint kh = h - n_head;
+        device const float* src = k + (ulong)kh * hd;
+        device half* dst = (device half*)((device uchar*)kc + koff) + (ulong)kh * hd;
+        const float x0 = src[i], x1 = src[i + hh];
+        dst[i]      = half(x0 * c - x1 * s);
+        dst[i + hh] = half(x0 * s + x1 * c);
+    }
+}
+
+// Qwen3.5 的 attn_q 把 [Q | gate] 按 head 交错存（每 head 2*hd）。
+kernel void k_split_qg(device const float* qg [[buffer(0)]],
+                       device float* q        [[buffer(1)]],
+                       device float* g        [[buffer(2)]],
+                       constant uint& hd      [[buffer(3)]],
+                       uint2 gid [[thread_position_in_grid]])
+{
+    const ulong src = ((ulong)gid.y * 2ul) * hd + gid.x;
+    const ulong dst = (ulong)gid.y * hd + gid.x;
+    q[dst] = qg[src];
+    g[dst] = qg[src + hd];
+}
+
+// 逐维的 sigmoid 输出门（不是逐 head 标量）
+kernel void k_gate_mul_dim(device float* x       [[buffer(0)]],
+                           device const float* g [[buffer(1)]],
+                           constant uint& n      [[buffer(2)]],
+                           uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    x[i] *= 1.0f / (1.0f + exp(-g[i]));
+}
 )MSL";
 
 // ---------------------------------------------------------------- C++ 侧常量

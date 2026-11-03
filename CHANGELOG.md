@@ -6,6 +6,61 @@
 
 ---
 
+## [0.21.0] · 2026-11-03 · Qwen3.5 上 Metal：4.4 → 13.4 tok/s
+
+DeltaNet 的整层融合落地。32 层编进**一个** command buffer，每 token 只提交
+一次、同步一次。MiMo-V2.6-Distill-Qwen-9B 的 decode 从纯 CPU 的 4.4 tok/s
+提到 **13.4 tok/s**（3.0x），贪心输出与 CPU 逐字一致。
+
+### 新增
+
+- **8 个 MSL 内核**：`k_ssm_prep` / `k_ssm_conv` / `k_l2norm_heads` /
+  `k_delta_rule` / `k_gated_rmsnorm` / `k_rope_mrope` / `k_split_qg` /
+  `k_gate_mul_dim`
+  - `k_delta_rule` 一个线程负责状态矩阵的一行（128×128），128 个线程
+    各管一行，**全程无同步** —— 每行只读写自己那一行，天然无竞争
+  - `k_rope_mrope` 和 `k_rope` 只差频率计算：按 `[11,11,10,0]` 分段重置
+- **独立的 q35 前向路径**（`Q35Spec` / `q35_init` / `q35_token` /
+  `q35_reset`），不复用 `fwd_impl`：DeltaNet 的 8192 宽 qkv、递归状态、
+  per-head L2 norm 会把那套已经按"9 个矩阵 + 三种层型"长出来的编码再翻一倍
+- **8 层 f16 KV**：`k_attn` / `k_rope` 只认 half，CPU 路径是 f32，两边各一份
+- q35 复用通用内核（rmsnorm / add / silu / copy_h / headnorm / attn），
+  在 `q35_init` 里单独创建 pipeline
+
+### 修复
+
+- **第一次跑就段错误**：`g_fpipe`（通用内核的 pipeline 数组）只在
+  `fwd_init` 里创建，q35 走自己的初始化路径，拿到的是 nil。
+  `setComputePipelineState:nil` 不报错，直接 SIGSEGV。
+- **KV 缓冲分配失败不报错**：`q35_init` 原来只检查了 4 个缓冲，漏掉的
+  一个是 nil 时会在第一次 `setBuffer` 崩掉。现在 24 个全部检查。
+
+### 基准
+
+M4 / 24 GB，MiMo-V2.6-Distill-Qwen-9B Q4_K_M（5.84 GB）：
+
+| 路径 | prefill | decode |
+| --- | ---: | ---: |
+| 纯 CPU（0.20.0） | 1.9–3.9 tok/s | 4.4 tok/s |
+| **Metal 整层融合** | 6.7 tok/s | **13.4 tok/s** |
+
+13.4 tok/s 对应 72 ms/token，而 5.4 GB 权重 ÷ 84 GB/s 是 64 ms ——
+已经跑到带宽账的 **89%**，继续抠内核的收益很小。
+
+正确性：`--temp 0` 下 CPU 与 GPU 的 24 token 贪心输出**逐字相同**。
+
+### 已知限制
+
+- **prefill 还是逐 token**：DeltaNet 的 chunked 版本没做，prefill 每 token
+  一次提交。14 token 的 prompt 约 2.1 s（含初始化）。
+- **KV 上限 32K**：8 层 × 32K 已经是 1 GB；176K 要 5.8 GB，会顶到
+  macOS 的 Metal 上限。按需分页是下一轮的事。
+- **thinking 模板**：GGUF 的模板支持 `enable_thinking=false`，但 `dubhe run`
+  还没把这个参数透传进去，所以模型默认走 `<think>` 路径。9B SFT 在贪心
+  思考下会跑偏（把 `1+1` 写成 `1+2`），关掉思考后预计会好很多。
+
+---
+
 ## [0.20.0] · 2026-11-03 · Qwen3.5 架构：Gated DeltaNet 跑通
 
 第一个**混合线性注意力**架构进引擎。MiMo-V2.6-Distill-Qwen-9B（Q4_K_M，

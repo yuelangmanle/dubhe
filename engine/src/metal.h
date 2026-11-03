@@ -123,6 +123,7 @@ bool fwd_copy_x(float* dst, int n);
 struct Q35Layer {
     int kind = 0;          // 0 = Gated DeltaNet, 1 = gated full attention
     int ssm_slot = -1;     // delta 层在状态缓冲里的槽位
+    int kv_slot = -1;      // full attention 层在 KV 缓冲里的槽位
 
     // 公共：attn norm / FFN
     uint64_t off_attn_norm = 0, off_ffn_norm = 0;
@@ -144,6 +145,8 @@ struct Q35Spec {
     int n_embd = 0, n_ff = 0, n_vocab = 0, n_layer = 0;
     int n_head = 0, n_head_kv = 0, hd = 0;      // full attention
     int n_delta = 0;
+    int n_kv_layer = 0;   // 需要 KV 的层数（Qwen3.5 只有 8 层）
+    int kv_cap = 0;       // 每层槽位数
     int ssm_S = 0;        // 128：head_k_dim = head_v_dim
     int ssm_nk = 0;       // 16：q/k head 数
     int ssm_nv = 0;       // 32：v head 数
@@ -154,7 +157,6 @@ struct Q35Spec {
     float rope_theta = 1e7f;
     int rope_angles = 0;
     int rope_sections[4] = {0, 0, 0, 0};
-    int kv_cap = 0;
     uint64_t off_out_norm = 0, off_out_w = 0;
     uint32_t ty_out_w = 0;
     std::vector<Q35Layer> layers;
