@@ -2077,3 +2077,29 @@ body[data-glass="off"] .edge::before { display: none; }
 /* 右栏的模型名保持单行 + 省略号：试过 -webkit-line-clamp 折两行，但在
  * flex 行里 -webkit-box 拿不到确定的宽度，结果是"截断但没有省略号"，
  * 比原来更像个 bug。要显示全名用 title（已经挂上了）。 */
+
+/* ------------------------------------------------------------ 首屏布局稳定
+ *
+ * 窗口刚打开、还没发消息时，顶栏和输入框那一排会被挤坏：量化标签被
+ * "本地运行·已加载"压住，"智能模式"竖排成两行。发过消息之后中栏变高、
+ * 滚动条出现，宽度一变就又正常了 —— 所以看起来像"撑大以后才好"。
+ *
+ * 根因是这些行里所有子项都可以收缩，浏览器在放不下时就地折行。
+ * 正确做法是：不许折行，放不下就按优先级少显示文字（只留图标）。
+ */
+.model-pick { min-width: 0; }
+.mp-tags { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live, .cwd-chip { flex: 0 0 auto; white-space: nowrap; }
+
+.composer-bar { white-space: nowrap; }
+.cbtn, .cmode, .send-btn { flex: 0 0 auto; white-space: nowrap; }
+
+@media (max-width: 1200px) {
+  #btnThink span, #btnWeb span { display: none; }
+  #btnThink, #btnWeb { padding: 0 7px; }
+}
+@media (max-width: 1080px) {
+  #btnMode span { display: none; }
+  #btnMode { padding: 0 6px; }
+  .mp-tags { display: none; }
+}

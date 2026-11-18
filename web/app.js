@@ -2412,7 +2412,7 @@
       body.appendChild(el('div', 'group-title', '生成参数'));
       slider(body, '温度', '越高越随机，0 为确定性输出', 'temperature', 0, 1.5, 0.05, (v) => v.toFixed(2));
       slider(body, 'Top-P', '核采样阈值', 'top_p', 0.1, 1, 0.01, (v) => v.toFixed(2));
-      slider(body, '最大输出', '单次回复的 token 上限', 'max_tokens', 128, 4096, 64, (v) => String(v));
+      slider(body, '最大输出', '单次回复的 token 上限', 'max_tokens', 128, 16384, 128, (v) => String(v));
 
       body.appendChild(el('div', 'group-title', '工具'));
       toggle(body, '启用工具调用', '允许模型读取文件、列目录、执行命令', () => settings.tools, (v) => { settings.tools = v; state.tools = v; localStorage.setItem(TOOLS_TOUCHED, '1'); saveSettings(); });

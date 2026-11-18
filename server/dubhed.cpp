@@ -1072,6 +1072,89 @@ std::vector<WebHit> web_search_hits(const std::string& q, int n) {
     return hits;
 }
 
+// 前置声明：字符串替换的实现在后面（跟算术短路放一起），这里先用。
+static void str_replace_all(std::string* s, const std::string& from, const std::string& to);
+
+// 把"今天/最近"换成具体日期再搜。
+//
+// 为什么非换不可：搜索引擎不认识"今天"。实测搜"今天新闻"，DuckDuckGo 回的
+// 是今日头条、Google 新闻、BBC 中文三个**门户首页** —— 模型再老实，也只能
+// 把这三个首页标题抄一遍，用户拿到的是"新闻网站的目录"而不是新闻。
+// 换成 "2026年11月18日 新闻"，才可能搜到当天真正发出来的稿子。
+// 只在查询没写明年份时替换，用户自己写了日期就不动。
+std::string localize_query(std::string q) {
+    bool has_year = false;
+    for (size_t i = 0; i + 4 <= q.size(); i++) {
+        if (std::isdigit((unsigned char)q[i]) && std::isdigit((unsigned char)q[i + 1]) &&
+            std::isdigit((unsigned char)q[i + 2]) && std::isdigit((unsigned char)q[i + 3])) {
+            const int y = std::atoi(q.substr(i, 4).c_str());
+            if (y >= 2000 && y <= 2099) { has_year = true; break; }
+        }
+    }
+    if (has_year) return q;
+
+    std::time_t t = std::time(nullptr);
+    std::tm tm {};
+    localtime_r(&t, &tm);
+    char day[40], mon[40];
+    std::snprintf(day, sizeof(day), "%d年%d月%d日", tm.tm_year + 1900, tm.tm_mon + 1,
+                  tm.tm_mday);
+    std::snprintf(mon, sizeof(mon), "%d年%d月", tm.tm_year + 1900, tm.tm_mon + 1);
+
+    bool changed = false;
+    for (const char* k : {"今天", "今日"}) {
+        if (q.find(k) != std::string::npos) { str_replace_all(&q, k, day); changed = true; }
+    }
+    if (!changed) {
+        for (const char* k : {"最近", "最新"}) {
+            if (q.find(k) != std::string::npos) { str_replace_all(&q, k, mon); changed = true; }
+        }
+    }
+    return q;
+}
+
+// 抓一页正文，压成一段纯文本。
+std::string fetch_page_text(const std::string& url, size_t limit) {
+    const std::string cmd =
+        "curl -sSL --compressed -m 12 -A 'Mozilla/5.0 (Dubhe)' " + shell_quote(url);
+    ProcOut po = run_proc(cmd, g.workspace, 15000, 512 * 1024, false);
+    std::string t = html_to_text(po.out);
+
+    // 丢掉导航栏。
+    //
+    // html_to_text 只做标签剥离，菜单、面包屑、版权信息全留着。实测抓新浪的
+    // 新闻页，前 400 字是"新浪首页 / 体育 / 财经 / 娱乐 / 博客 / 图片…"，
+    // 真正的正文被挤出 1200 字的预算 —— 模型读到的还是噪声，等于白抓。
+    // 新闻段落长且成句，导航项短且不成句，按行长度切一刀就能滤掉绝大部分。
+    {
+        std::string kept;
+        size_t pos = 0;
+        while (pos <= t.size()) {
+            size_t nl = t.find('\n', pos);
+            if (nl == std::string::npos) nl = t.size();
+            std::string line = t.substr(pos, nl - pos);
+            size_t a = line.find_first_not_of(" \t\r");
+            size_t b = line.find_last_not_of(" \t\r");
+            if (a != std::string::npos) {
+                line = line.substr(a, b - a + 1);
+                if (line.size() >= 24) kept += line + "\n";   // 24 字节 ≈ 8 个汉字
+            }
+            if (nl == t.size()) break;
+            pos = nl + 1;
+        }
+        if (!kept.empty()) t = kept;
+    }
+
+    while (t.find("\n\n\n") != std::string::npos) str_replace_all(&t, "\n\n\n", "\n\n");
+    if (t.size() > limit) {
+        t.resize(limit);
+        // 别切在半个 UTF-8 字符上
+        while (!t.empty() && (t.back() & 0xC0) == 0x80) t.pop_back();
+        t += "…";
+    }
+    return t;
+}
+
 // 给模型读的那一份。编号是必要的：模型要在回答里标"据 [2]"，
 // 没有编号它只能含糊地说"有资料显示"。
 std::string hits_to_text(const std::vector<WebHit>& hits) {
@@ -1535,17 +1618,40 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
         return r;
     }
     if (name == "web_search") {
-        const std::string q = args.s("query");
+        const std::string asked = args.s("query");
+        const std::string q = localize_query(asked);
         const std::vector<WebHit> hits = web_search_hits(q, (int)args.n("n", 6));
         r.ok = !hits.empty();
         if (!r.ok) {
             r.output = "搜索没有返回结果（可能被限流，或本机无法访问外网）";
         } else {
             r.output = hits_to_text(hits);
+
+            // 顺手把前几条的正文抓回来。
+            //
+            // 为什么工具自己要做这件事：1.7B 这类模型拿到"标题 + 链接 + 摘要"
+            // 之后，绝大多数情况直接把列表抄一遍当答案 —— 它不会想到"再调一次
+            // fetch_url 把正文读进来"。实测原话是"帮我查一下今天一些新闻"，
+            // 它调了两次 web_search，最后输出三个新闻网站的首页地址和简介。
+            // 与其教它编排（教不会），不如一次给全：标题、链接，外加正文摘录。
+            const int read = (int)args.n("read", 2);
+            std::string extra;
+            for (int i = 0; i < (int)hits.size() && i < read; i++) {
+                if (hits[i].url.empty()) continue;
+                std::string body = fetch_page_text(hits[i].url, 1200);
+                if (body.empty()) continue;
+                extra += "\n【" + hits[i].title + "】网页正文摘录：\n" + body + "\n";
+            }
+            if (!extra.empty()) {
+                r.output += "\n" + extra +
+                            "\n（以上摘录由搜索工具自动抓取。归纳要点即可，"
+                            "需要细节再用 fetch_url 打开某一篇。）";
+            }
         }
         r.card = "web";
         r.meta.set("kind", json::Value::make_str("search"));
-        r.meta.set("query", json::Value::make_str(q));
+        r.meta.set("query", json::Value::make_str(asked));
+        if (q != asked) r.meta.set("localized", json::Value::make_str(q));
         r.meta.set("count", json::Value::make_num((double)hits.size()));
         // 结构化的一份给界面画可点的来源列表。只给文本的话，前端得按
         // "    https://…" 这种缩进约定去啃，格式一调界面就跟着坏。
@@ -1663,7 +1769,11 @@ std::string tool_prompt() {
         "- shell(command, cwd): 执行 shell 命令\n"
         "- kb_search(query, k): 在本地知识库（项目文档）里检索相关片段。\n"
         "  问“这个项目怎么设计的”这类问题时先用它，比 grep 更懂语义。\n"
-        "- web_search(query, n): 联网搜索\n"
+        "- web_search(query, n, read): 联网搜索。返回标题、链接、摘要，"
+        "并自动附上前 read 条（默认 2）的网页正文摘录 —— 直接据此归纳就行，"
+        "不要只把标题和链接抄一遍。\n"
+        "  查新闻/时事时把用户说的“今天”换成年月日再搜，"
+        "例如 query=\"2026年11月18日 新闻\"。\n"
         "- fetch_url(url): 抓取网页正文\n"
         "不需要工具时直接回答。不要描述你打算怎么做，直接输出工具调用。"
         "不要自己写工具返回块（" + g_tool_open + "），那是系统给你的，不是你输出的。"
@@ -2454,6 +2564,25 @@ bool try_quick_answer(const std::string& q, std::string* out) {
     return true;
 }
 
+// 当前时间，给模型当"现在"用。
+//
+// 模型的知识停在训练那一刻，它不知道今天几号。于是"今天的新闻""最近发布了
+// 什么"这类问题，它只能猜 —— 实测它会搜"今天新闻"，搜索引擎回一堆门户首页，
+// 它就把首页标题抄一遍当答案。
+std::string now_stamp() {
+    std::time_t t = std::time(nullptr);
+    std::tm tm {};
+    localtime_r(&t, &tm);
+    static const char* wd[] = {"日", "一", "二", "三", "四", "五", "六"};
+    // 用中文格式而不是 2026-11-18：实测 1.7B 会把连字符日期读错 ——
+    // 给它 "2026-11-18"，它转手搜成"2026年1月8日"，搜回来的全是 1 月的新闻。
+    // 中文年月日它不用做格式换算，直接抄就行。
+    char b[80];
+    std::snprintf(b, sizeof(b), "%d年%d月%d日 %02d:%02d 星期%s", tm.tm_year + 1900,
+                  tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, wd[tm.tm_wday]);
+    return b;
+}
+
 std::string build_prompt(const json::Value& messages, bool chatml, bool with_tools) {
     std::string p;
     if (!chatml) {
@@ -2468,7 +2597,17 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
         return p;
     }
     bool has_system = false;
-    for (auto& m : messages.arr) {
+    // 时间戳只贴在**最后一条** user 上。
+    //
+    // 放在 system 里最自然，但 system 是整段 prompt 的开头：它一变，前缀缓存
+    // 全部作废，多轮对话每轮都要重新 prefill 整段历史（实测 7 秒）。
+    // 贴在最后一条问题前面，前面一个字节都不动，缓存照常命中。
+    size_t last_user = std::string::npos;
+    for (size_t i = 0; i < messages.arr.size(); i++)
+        if (messages.arr[i].s("role") == "user") last_user = i;
+
+    for (size_t mi = 0; mi < messages.arr.size(); mi++) {
+        auto& m = messages.arr[mi];
         std::string role = m.s("role");
         std::string content = m.s("content");
         if (role == "system") {
@@ -2476,6 +2615,8 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
             if (with_tools) content += tool_prompt();
             p += "<|im_start|>system\n" + content + "<|im_end|>\n";
         } else if (role == "user") {
+            // 让模型知道"今天"是哪天：新闻、版本、最近发生了什么都要用到。
+            if (mi == last_user) content = "（当前时间：" + now_stamp() + "）\n" + content;
             p += "<|im_start|>user\n" + content + "<|im_end|>\n";
         } else if (role == "assistant") {
             content = scrub_history(content);
@@ -3289,7 +3430,7 @@ json::Value tools_json() {
     add("write_file", "写入文件（覆盖）", "path, content", g.allow_write);
     add("edit_file", "精确替换文件里的一段原文（只改一处，要求唯一）", "path, old, new", g.allow_write);
     add("shell", "执行 shell 命令（有超时与写盘沙箱）", "command, cwd", g.allow_shell);
-    add("web_search", "联网搜索", "query, n", g.allow_net);
+    add("web_search", "联网搜索；会自动抓取前几条正文摘录", "query, n, read", g.allow_net);
     add("kb_search", "在本地知识库（项目文档）里检索相关片段", "query, k", true);
     add("fetch_url", "抓取网页并转成纯文本", "url", g.allow_net);
     return arr;
