@@ -97,6 +97,9 @@
     // 正在生成的那个对话对象。停止按钮只在这个对话里出现 —— 切到别的
     // 对话还显示停止键，按下去停的却是另一条，没人能猜到。
     genConv: null,
+    // 排队发送。引擎一次只答一个，所以"在别的对话里点发送"只能排队 ——
+    // 但排上之后用户就不必守着这条回答结束再手动发一次。
+    queue: [],
     view: null,     // 当前打开的功能视图（null = 对话）
     fsPath: '',     // 文件视图当前目录
     memory: [],     // 记忆条目（见 loadMemory）
@@ -1649,6 +1652,24 @@
   // 否则从 Agent 里跑完一次，之后所有普通对话都会带上工具说明。实测
   // 2B 级模型带着工具说明问"今天天气怎么样"，回的是"我需要调用工具…"，
   // 一个一次性动作污染了长期配置。
+  // 取一条排队的消息发出去。
+  // send() 读的是 state.current，所以先把对话切过去 —— 用户会看到界面自动
+  // 跳到那条对话，这正是"你排的那条开始发了"的反馈。
+  function drainQueue() {
+    if (state.streaming || !state.queue.length) return;
+    const job = state.queue.shift();
+    const conv = state.convs.find((c) => c.id === job.convId);
+    if (!conv) { drainQueue(); return; }
+    state.current = conv;
+    renderConvList();
+    renderMessages();
+    renderTools();
+    renderCwd();
+    $('#convTitle').textContent = conv.title;
+    log('轮到排队中的消息了，开始发送');
+    setTimeout(() => send(job.text), 80);
+  }
+
   async function send(text, opts = {}) {
     if (state.streaming) return;
     const content = (text != null ? text : $('#input').value).trim();
@@ -2132,6 +2153,9 @@
       delete ai.noteText;
       state.genConv = null;
       setSendEnabled();
+      // 有排队的消息就接着发。放在 finally 里：即使这一轮报错/被中止，
+      // 排队的那条也不会永远卡着。
+      setTimeout(drainQueue, 120);
       const total = (performance.now() - t0) / 1000;
       const tokens = (ai.meta && ai.meta.tokens) || state.gen.tokens || 0;
       state.gen = {
@@ -3577,11 +3601,16 @@
         if (state.abort) state.abort.abort();
         return;
       }
-      // 别的对话在生成：服务端是串行的（后来的请求会排队），现在发只会让
-      // 用户以为卡住。说清楚，别装作没发生 —— 也别把按钮变成停止键。
+      // 别的对话在生成：引擎是串行的，现在发只会排队。与其拦住用户，
+      // 不如把这条消息排上 —— 当前回答一结束就自动切过去发送。
       if (state.streaming) {
+        const text = $('#input').value.trim();
+        if (!text) return;
+        state.queue.push({ convId: state.current && state.current.id, text });
+        $('#input').value = '';
+        autoGrow();
         const t = (state.genConv && state.genConv.title) || '另一个对话';
-        log('「' + t + '」还在生成。等它结束，或切回去点停止再发。', 'err');
+        log('已排队：「' + t + '」回答结束后自动发送', '');
         return;
       }
       send();
