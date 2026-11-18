@@ -2103,3 +2103,17 @@ body[data-glass="off"] .edge::before { display: none; }
   #btnMode { padding: 0 6px; }
   .mp-tags { display: none; }
 }
+
+/* 模型商店：分区标题 + 下载进度条 */
+.vtitle {
+  font-size: 12.5px; font-weight: 600; color: var(--text-2);
+  margin: 20px 0 8px; letter-spacing: .3px;
+}
+.pbar {
+  height: 4px; border-radius: 2px; background: var(--fill-strong);
+  overflow: hidden; margin: 6px 0 2px; width: 100%;
+}
+.pfill {
+  height: 100%; background: var(--brand-solid); border-radius: 2px;
+  transition: width .3s var(--ease);
+}

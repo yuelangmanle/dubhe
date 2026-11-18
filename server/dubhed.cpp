@@ -3807,6 +3807,179 @@ int main(int argc, char** argv) {
     // ---- 模型清单：UI 的「模型」视图靠它列出本地所有 gguf。
     // 只 stat 文件、不读 GGUF 头 —— 一个目录几十个模型时读头要好几百毫秒，
     // 而名字里已经带了量化和参数量。真正加载时才读头。
+    // ---------------------------------------------------------------- 模型商店
+    //
+    // 只列引擎真能加载的架构（llama 家族 / lfm2 / lfm3 / qwen35），并且每个
+    // 链接的 content-length 都验证过。清单里出现一个下下来跑不起来的模型，
+    // 比商店空着更伤信任 —— 用户会花二十分钟下载，然后得到一个"加载失败"。
+    // 设计取舍见 docs/adr/ADR-0006-模型商店.md。
+    struct StoreEntry {
+        const char* id;
+        const char* name;
+        const char* params;
+        const char* quant;
+        long long bytes;
+        const char* file;
+        const char* url;
+        const char* note;
+    };
+    static const StoreEntry kStore[] = {
+        {"qwen25-7b-q4", "Qwen2.5-7B-Instruct", "7B", "Q4_K_M", 4683074240LL,
+         "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+         "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/"
+         "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+         "通用首选：中文好、指令跟随稳，24GB 上约 20–30 tok/s"},
+        {"qwen25-3b-q4", "Qwen2.5-3B-Instruct", "3B", "Q4_K_M", 2104932768LL,
+         "qwen2.5-3b-instruct-q4_k_m.gguf",
+         "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/"
+         "qwen2.5-3b-instruct-q4_k_m.gguf",
+         "速度优先，内存余量很大，适合边聊边干别的"},
+        {"qwen25-05b-q4", "Qwen2.5-0.5B-Instruct", "0.5B", "Q4_K_M", 491400032LL,
+         "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+         "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/"
+         "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+         "最小最快，适合分类、打标这类杂活"},
+    };
+
+    struct DlJob {
+        std::string id, file;
+        long long total = 0;
+        std::string state = "running";   // running / done / error
+        std::string error;
+        std::thread th;
+    };
+    auto dl_mu = std::make_shared<std::mutex>();
+    auto dl_jobs = std::make_shared<std::map<std::string, std::shared_ptr<DlJob>>>();
+
+    srv.get("/api/store", [dl_mu, dl_jobs](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value root = json::Value::make_obj();
+        root.set("dir", json::Value::make_str(g.model_dir));
+        json::Value arr = json::Value::make_arr();
+        for (const auto& e : kStore) {
+            json::Value o = json::Value::make_obj();
+            const std::string target = g.model_dir + "/" + e.file;
+            o.set("id", json::Value::make_str(e.id));
+            o.set("name", json::Value::make_str(e.name));
+            o.set("params", json::Value::make_str(e.params));
+            o.set("quant", json::Value::make_str(e.quant));
+            o.set("bytes", json::Value::make_num((double)e.bytes));
+            o.set("note", json::Value::make_str(e.note));
+            o.set("installed", json::Value::make_bool(is_file_p(target)));
+            {
+                std::lock_guard<std::mutex> lk(*dl_mu);
+                auto it = dl_jobs->find(e.id);
+                if (it != dl_jobs->end()) {
+                    auto& j = *it->second;
+                    o.set("state", json::Value::make_str(j.state));
+                    o.set("total", json::Value::make_num((double)j.total));
+                    long long got = 0;
+                    struct stat st {};
+                    if (::stat((target + ".part").c_str(), &st) == 0) got = (long long)st.st_size;
+                    o.set("got", json::Value::make_num((double)got));
+                    if (!j.error.empty())
+                        o.set("error", json::Value::make_str(j.error));
+                }
+            }
+            arr.arr.push_back(o);
+        }
+        root.set("items", arr);
+        c.send(200, "application/json", json::dump(root));
+    });
+
+    srv.post("/api/store/download", [dl_mu, dl_jobs](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        std::string id = req.param("id");
+        if (id.empty() && json::parse(req.body, &body)) id = body.s("id");
+        const StoreEntry* e = nullptr;
+        for (const auto& s : kStore) if (id == s.id) { e = &s; break; }
+        if (!e) {
+            c.send(400, "application/json", "{\"error\":\"没有这个模型\"}");
+            return;
+        }
+        if (g.model_dir.empty()) {
+            c.send(400, "application/json", "{\"error\":\"模型目录未配置\"}");
+            return;
+        }
+        const std::string target = g.model_dir + "/" + e->file;
+        const std::string part = target + ".part";
+        {
+            std::lock_guard<std::mutex> lk(*dl_mu);
+            auto it = dl_jobs->find(id);
+            if (it != dl_jobs->end() && it->second->state == "running") {
+                c.send(200, "application/json", "{\"ok\":true,\"state\":\"running\"}");
+                return;
+            }
+            auto job = std::make_shared<DlJob>();
+            job->id = id;
+            job->file = e->file;
+            job->total = e->bytes;
+            const std::string url = e->url;
+            job->th = std::thread([job, url, part, target]() {
+                // -C - 断点续传：上次下到一半的 .part 接着下，不用从头来。
+                // 下载完再改名，避免半个文件被 scan_models 扫进清单。
+                const std::string cmd = "curl -fL --retry 3 --retry-delay 2 -C - -o '" +
+                                        part + "' '" + url + "' >/dev/null 2>&1";
+                const int rc = std::system(cmd.c_str());
+                if (rc == 0) {
+                    if (std::rename(part.c_str(), target.c_str()) == 0) {
+                        job->state = "done";
+                    } else {
+                        job->state = "error";
+                        job->error = "下载完成但改名失败";
+                    }
+                } else {
+                    job->state = "error";
+                    job->error = "下载失败（网络或磁盘），已保留 .part 可续传";
+                }
+            });
+            job->th.detach();
+            (*dl_jobs)[id] = job;
+        }
+        c.send(200, "application/json", "{\"ok\":true,\"state\":\"running\"}");
+    });
+
+    // 导入：把用户自己的 .gguf 软链进模型目录。
+    // 不复制 —— 一个 5GB 的文件复制一份，磁盘直接少 5GB。
+    srv.post("/api/models/import", [](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        std::string p = req.param("path");
+        if (p.empty() && json::parse(req.body, &body)) p = body.s("path");
+        if (p.empty()) {
+            c.send(400, "application/json", "{\"error\":\"缺少 path\"}");
+            return;
+        }
+        const std::string full = path_abs(p);
+        if (!is_file_p(full)) {
+            c.send(400, "application/json", "{\"error\":\"文件不存在\"}");
+            return;
+        }
+        const std::string name = full.substr(full.find_last_of('/') + 1);
+        const std::string link = g.model_dir + "/" + name;
+        std::error_code ec;
+        std::filesystem::create_symlink(full, link, ec);
+        if (ec) {
+            c.send(400, "application/json",
+                   "{\"error\":\"建链接失败：" + json_escape(ec.message()) + "\"}");
+            return;
+        }
+        json::Value r = json::Value::make_obj();
+        r.set("ok", json::Value::make_bool(true));
+        r.set("name", json::Value::make_str(name));
+        c.send(200, "application/json", json::dump(r));
+    });
+
     srv.get("/api/models", [](const http::Request& req, http::Conn& c) {
         if (!is_local(req) && !authorized(req)) {
             c.send(401, "application/json", "{\"error\":\"未授权\"}");

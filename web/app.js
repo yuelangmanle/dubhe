@@ -2899,6 +2899,92 @@
       + code;
   }
 
+  // 可下载区。清单来自 /api/store —— 服务端内置、链接验证过、架构与引擎匹配。
+  // 下载是后台 curl（断点续传），这里只负责画进度和轮询。
+  async function viewStore(host) {
+    let d;
+    try {
+      d = await vapi('/api/store');
+    } catch (e) {
+      return;   // 商店读不到不影响本地模型列表，静默跳过
+    }
+    host.innerHTML = '';
+    if (!d.items || !d.items.length) return;
+
+    host.appendChild(el('div', 'vtitle', '可下载'));
+    const card = el('div', 'vcard');
+    let polling = false;
+    d.items.forEach((m) => {
+      const row = el('div', 'vrow');
+      const ico = el('div', 'vico');
+      ico.appendChild(iconNode('cube'));
+      row.appendChild(ico);
+
+      const main = el('div', 'vmain');
+      const nm = el('div', 'vname', m.name);
+      nm.appendChild(el('span', 'vtag', m.params + ' · ' + m.quant));
+      if (m.installed) nm.appendChild(el('span', 'vtag on', '已下载'));
+      main.appendChild(nm);
+      main.appendChild(el('div', 'vmeta', m.note + ' · ' + fmtBytes(m.bytes)));
+      row.appendChild(main);
+
+      if (m.installed) {
+        row.appendChild(el('div', 'vmeta', '已就绪'));
+        card.appendChild(row);
+        return;
+      }
+
+      const running = m.state === 'running';
+      if (running) {
+        const got = m.got || 0;
+        const pct = m.total ? Math.min(100, Math.round((got / m.total) * 100)) : 0;
+        const bar = el('div', 'pbar');
+        const fill = el('div', 'pfill');
+        fill.style.width = pct + '%';
+        bar.appendChild(fill);
+        const info = el('div', 'vmeta', '下载中 ' + pct + '% · ' + fmtBytes(got) + ' / ' + fmtBytes(m.total));
+        main.appendChild(info);
+        main.appendChild(bar);
+        polling = true;
+        card.appendChild(row);
+        return;
+      }
+
+      const b = el('button', 'vbtn', m.state === 'error' ? '重试' : '下载');
+      b.onclick = async () => {
+        b.disabled = true;
+        b.textContent = '启动…';
+        try {
+          await vpost('/api/store/download', { id: m.id });
+          setTimeout(() => viewStore(host), 600);
+        } catch (e) {
+          b.disabled = false;
+          b.textContent = '下载';
+          const note = el('div', 'vnote bad', '下载失败：' + e.message);
+          row.parentNode.insertBefore(note, row);
+          setTimeout(() => note.remove(), 6000);
+        }
+      };
+      row.appendChild(b);
+      if (m.state === 'error' && m.error) {
+        main.appendChild(el('div', 'vnote bad', m.error));
+      }
+      card.appendChild(row);
+    });
+    host.appendChild(card);
+    host.appendChild(el('div', 'vnote',
+      '只列引擎确认能加载的模型（llama 家族 / LFM / Qwen3.5）。'
+      + '下载支持断点续传，中断后点「重试」会接着下；完成后自动出现在上面的列表里。'));
+
+    if (polling && !storeTimer) {
+      storeTimer = setTimeout(() => {
+        storeTimer = 0;
+        viewStore(host);
+      }, 1200);
+    }
+  }
+  let storeTimer = 0;
+
   // ---------------------------------------------------------------- 模型
   async function viewModels() {
     const body = $('#viewBody');
@@ -3002,6 +3088,18 @@
       card.appendChild(row);
     });
     body.appendChild(card);
+
+    // ---- 可下载（模型商店的第一版：可信清单 + 直接下载）
+    //
+    // 故意不列"海量仓库"：清单里每个链接都验证过能下、每个架构都是引擎
+    // 真能加载的。宁可只有三条，也不让用户下 20GB 之后卡在"加载失败"。
+    // 取舍见 docs/adr/ADR-0006-模型商店.md。
+    // 单独给商店一个容器：viewStore 每次刷新会清空自己的 host，
+    // 直接传 body 会把上面刚画好的本地模型列表一起清掉（踩过一次）。
+    const storeBox = el('div');
+    body.appendChild(storeBox);
+    viewStore(storeBox);
+
     body.appendChild(el('div', 'vnote',
       '切换模型会先卸载当前权重再加载新的，通常 1~2 秒。加载失败会自动装回原来的模型，不会把服务变成没有模型的状态。'));
     body.appendChild(el('div', 'vnote',
