@@ -165,6 +165,21 @@
   function loadConvs() {
     try { state.convs = JSON.parse(localStorage.getItem(STORE_KEY) || '[]'); } catch (e) { state.convs = []; }
     if (!Array.isArray(state.convs)) state.convs = [];
+    // 上次退出时正在生成的那条消息，会把 streaming:true 一起存下来。
+    // 重新打开时它就永远显示"生成中…"——一个转不完的圈。这里统一收尾：
+    // 有内容的算"被中断"，没内容的直接说清楚重问就好。
+    for (const c of state.convs) {
+      for (const m of (c.messages || [])) {
+        if (!m.streaming) continue;
+        m.streaming = false;
+        if (m.role !== 'assistant') continue;
+        if (!String(m.content || '').trim()) {
+          m.content = '（上次的生成被中断了，重新提问即可。）';
+        } else {
+          m.content += '\n\n> ⚠️ 上次的生成被中断了，这条回答可能不完整。';
+        }
+      }
+    }
   }
   function saveSettings() { localStorage.setItem(SET_KEY, JSON.stringify(settings)); }
 
