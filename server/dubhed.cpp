@@ -3373,6 +3373,17 @@ int main(int argc, char** argv) {
             };
             stamp("href=\"", "/app.css");
             stamp("src=\"", "/app.js");
+            // 版本号也注进去，别让前端再手工维护一份（两份迟早对不上，
+            // 而"到底跑的是哪一版"正是排查时第一个要确认的事）。
+            const std::string ver = std::to_string(DUBHE_VERSION_MAJOR) + "." +
+                                    std::to_string(DUBHE_VERSION_MINOR) + "." +
+                                    std::to_string(DUBHE_VERSION_PATCH);
+            const std::string head = "<head>";
+            const size_t at = body.find(head);
+            if (at != std::string::npos) {
+                body.insert(at + head.size(),
+                            "\n<meta name=\"dubhe-version\" content=\"" + ver + "\">");
+            }
         }
         c.send(200, guess_mime(full), body);
     };

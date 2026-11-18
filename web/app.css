@@ -608,6 +608,14 @@ body::after {
    * 跟随逻辑本身在 scrollBottom() 里（贴底才跟随），不需要 CSS 补动画。
    */
   scroll-behavior: auto;
+  /* 关掉浏览器自带的滚动锚定。
+   *
+   * 流式生成时，视口上方的东西一直在变高（思考块在长、工具卡片在插），
+   * WebKit 会为了"别让读者看丢"自动改 scrollTop —— 表现就是用户往上翻
+   * 的时候画面自己抖。跟随逻辑完全由 scrollBottom 管（贴底才跟），
+   * 这里不需要浏览器再猜一次。
+   */
+  overflow-anchor: none;
   /* 滚动链不外溢：到底了继续滚不该把整个页面/WebView 拽着弹 */
   overscroll-behavior: contain;
 }
@@ -1127,6 +1135,10 @@ pre:hover .copy-code { opacity: 1; }
   height: 29px; padding: 0 8px; border-radius: 8px;
   border: none; background: none; color: var(--text-2);
   font-family: inherit; font-size: 12px; cursor: pointer;
+  /* 不加 nowrap 的话，工具栏一挤"深度思考"就折成两行，而按钮高度是写死的
+     29px —— 第二行直接被裁掉一半，看着像字被切了。挤不下应该由媒体查询
+     决定"要不要显示文字"，而不是让浏览器自己折行。 */
+  white-space: nowrap;
   transition: background .18s var(--ease), color .18s var(--ease), opacity .18s;
 }
 .cbtn .i { width: 15px; height: 15px; flex: 0 0 15px; }
@@ -2051,13 +2063,13 @@ body[data-glass="off"] .edge::before { display: none; }
   .mp-tags span:nth-child(3) { display: none; }
   .model-pick { gap: 6px; padding: 4px 6px 4px 6px; }
   .cwd-chip { max-width: 78px; }
+  /* 工具栏再多一个「深度思考」就挤不下了。留图标 + title 提示 ——
+     它的 on 态有高亮，用两次就记住了，比折行把字切掉好。 */
+  #btnThink span { display: none; }
+  #btnThink { padding: 0 7px; }
 }
 @media (max-width: 1060px) {
   .live { display: none; }
-  /* 工具栏这一排在中栏变窄后最先挤爆。「深度思考」留图标就够 ——
-     它有 title，也有 on 态的高亮，不必占三个字的位置。 */
-  #btnThink span { display: none; }
-  #btnThink { padding: 0 7px; }
 }
 
 /* 右栏的模型名保持单行 + 省略号：试过 -webkit-line-clamp 折两行，但在

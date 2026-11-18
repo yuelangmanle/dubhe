@@ -18,7 +18,7 @@ extern "C" {
 
 #define DUBHE_VERSION_MAJOR 0
 #define DUBHE_VERSION_MINOR 26
-#define DUBHE_VERSION_PATCH 0
+#define DUBHE_VERSION_PATCH 1
 
 typedef struct dubhe_engine dubhe_engine;
 

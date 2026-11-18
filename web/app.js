@@ -5,8 +5,9 @@
   // 构建标记。界面出了问题的时候，"跑的是不是这一版的代码"必须先能确认 ——
   // 这一版就吃过亏：旧实例在内存里跑着 0.25.0 的 app.js，但窗口里新按钮
   // 照样显示（那是 index.html 提供的），于是所有排查都建立在一个错误前提上。
-  // 现在 DUBHE_SHELL_EVAL 里读一下 window.__dubheBuild 就能分辨。
-  window.__dubheBuild = '0.26.0';
+  // 版本号由服务端注入 index.html（见 serve_file），这里只负责读。
+  window.__dubheBuild =
+    (document.querySelector('meta[name="dubhe-version"]') || {}).content || 'dev';
 
   const $ = (s) => document.querySelector(s);
   const el = (tag, cls, txt) => {
@@ -869,8 +870,14 @@
     if (m.think) {
       const d = document.createElement('details');
       d.className = 'think-box';
-      d.open = m.streaming ? true : !!m.thinkOpen;
-      d.addEventListener('toggle', () => { m.thinkOpen = d.open; });
+      // 三态：用户手动开合过（thinkOpen 有值）就听他的；没碰过的话，
+      // 流式期间展开、结束后收起。原来是 `m.streaming ? true : ...`，
+      // 于是"收起来看正文"这个动作每来一段推理就被推翻一次。
+      d.open = (m.thinkOpen === undefined) ? !!m.streaming : !!m.thinkOpen;
+      d.addEventListener('toggle', () => {
+        m.thinkTouched = true;
+        m.thinkOpen = d.open;
+      });
       const s = document.createElement('summary');
       s.textContent = '思考过程 · ' + m.think.length + ' 字';
       d.appendChild(s);
@@ -1020,6 +1027,11 @@
     box.addEventListener('scroll', () => {
       // 自己滚出来的事件不算用户意图，否则跟随开关会被自己关掉
       if (progScroll) return;
+      // 内容还不到一屏时，"在底部"是恒真的 —— 不能拿它当"用户想跟随"的
+      // 证据。否则就是这个现象：用户往上滑了一下（其实也没地方可滑），
+      // 下一个 scroll 事件立刻把跟随打开，然后生成一开始，画面就被一路
+      // 拽到底部，看起来像"上下滑动时不停跳闪"。
+      if (box.scrollHeight <= box.clientHeight + 8) return;
       stick.on = atBottom(box);
     }, { passive: true });
     // 滚轮/触摸立刻表态，不用等 scroll 事件排队 —— 差一帧就会被拽回去
@@ -1804,7 +1816,69 @@
         headEl.className = 'md-head';
         tailEl.className = 'md-tail';
         lastHead = null;
+        // 节点换了，缓存的那几个思考块的引用全部作废
+        thinkBox = thinkText = thinkSum = null;
         paint();
+      };
+
+      // 思考过程走"原地追加"，不走 reswap。
+      //
+      // reswap 是整块重建消息节点。工具卡片那种"结构变了"的更新用它没问题，
+      // 但推理是每几十毫秒来一段的连续文本，重建有三个副作用，用户全都看得见：
+      //   1) <details> 的 open 被重置 → 手动收起，下一段推理又把它弹开；
+      //   2) 新节点会重播 .msg 的入场动画 → 整个气泡在"跳闪"；
+      //   3) 每帧重建整棵子树，滚动位置跟着抖，上下滑根本滑不住。
+      // 所以这里节点只建一次，之后只 append 文本，并用 rAF 合并写入。
+      let thinkBox = null, thinkText = null, thinkSum = null;
+      let thinkBuf = '', thinkRaf = 0;
+
+      const ensureThink = () => {
+        if (thinkBox && thinkBox.isConnected) return;
+        const exist = node.querySelector('.think-box');
+        if (exist) {
+          thinkBox = exist;
+          thinkSum = exist.querySelector('summary');
+          thinkText = exist.querySelector('.think-txt');
+          return;
+        }
+        thinkBox = el('details', 'think-box');
+        thinkSum = el('summary', '', '思考过程');
+        thinkText = el('div', 'think-txt');
+        thinkBox.appendChild(thinkSum);
+        thinkBox.appendChild(thinkText);
+        // 流式期间默认展开（否则那几十秒里正文一个字都没有，看着像卡死），
+        // 但用户一旦手动收过，就一直听他的。
+        thinkBox.open = ai.thinkOpen !== false;
+        thinkBox.addEventListener('toggle', () => {
+          ai.thinkTouched = true;
+          ai.thinkOpen = thinkBox.open;
+        });
+        if (ai.think) thinkText.textContent = ai.think;
+        thinkSum.textContent = '思考过程 · ' + (ai.think || '').length + ' 字';
+        thinkBuf = '';   // 已经在上面一次性画全了
+        body.parentNode.insertBefore(thinkBox, body);
+      };
+
+      const flushThink = () => {
+        if (!thinkText) return;
+        if (thinkBuf) {
+          thinkText.appendChild(document.createTextNode(thinkBuf));
+          thinkBuf = '';
+        }
+        thinkSum.textContent = '思考过程 · ' + thinkText.textContent.length + ' 字';
+      };
+
+      const appendThink = (t) => {
+        if (!t) return;
+        ai.think = (ai.think || '') + t;
+        thinkBuf += t;
+        ensureThink();
+        if (thinkRaf) return;
+        thinkRaf = requestAnimationFrame(() => {
+          thinkRaf = 0;
+          flushThink();
+          if (stick.on) scrollBottom();
+        });
       };
 
       const paintNow = () => {
@@ -1861,12 +1935,9 @@
               log('Tool call: ' + j.dubhe.name);
               renderTools();
             } else if (j.dubhe.type === 'think') {
-              // 推理过程单独一条流。攒在 ai.think 上，由 messageNode 画成
-              // 可折叠的块。这里限流到 10fps：reswap 是整块重建，按 token
-              // 重建的话光推理就能把主线程占满，正文反而卡住不动。
-              ai.think = (ai.think || '') + (j.dubhe.text || '');
-              const tn = performance.now();
-              if (tn - (ai.thinkAt || 0) > 100) { ai.thinkAt = tn; reswap(); }
+              // 推理过程逐段追加到已有的折叠块里，不重建节点 —— 重建会把
+              // 用户收起的块重新弹开，还会让气泡一直重播入场动画。
+              appendThink(j.dubhe.text || '');
             } else if (j.dubhe.type === 'queued') {
               // 引擎一次只答一个，第二个请求在服务端排队。排队时它一个字节都
               // 还没发，界面和"卡死"长得一模一样 —— 所以服务端会先推这个事件，
@@ -1968,6 +2039,9 @@
           }
         }
       }
+      // 流结束了，把 rAF 里还没落盘的那一小段补上（通常最后一个 chunk
+      // 正好卡在一帧里，不补的话推理末尾会少几个字）。
+      flushThink();
     } catch (e) {
       if (e.name === 'AbortError') {
         // 用户主动停止：保留已生成的部分，不报错
