@@ -21,6 +21,7 @@
 
 #include "http.h"
 #include "json.h"
+#include "calc.h"
 
 #include <ifaddrs.h>
 #include <dirent.h>
@@ -1133,7 +1134,11 @@ GateOut gate(const std::string& name, const json::Value& args, bool approved = f
     // 而不是"它绕过了所有权限"。fail-closed 的全部意义就在这里。
     static const char* kKnown[] = {"read_file", "list_dir", "write_file", "edit_file",
                                    "grep",      "glob",     "fetch_url",  "web_search",
-                                   "kb_search", "shell"};
+                                   "kb_search", "shell",    "calc",
+                                    // 模型训练里见过的同义工具名。不登记的话
+                                    // gate 会返回"未知工具"，模型连着试三四轮
+                                    // 编出来的名字，最后干脆自己心算一堆乱码。
+                                    "calculate", "calculator", "math", "bash", "terminal"};
     bool known = false;
     for (const char* k : kKnown) {
         if (name == k) {
@@ -1256,6 +1261,31 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
         // note 是给卡片看的。output 是给模型看的，里面常带"换个范围明确的做法"
         // 这类指导语 —— 原样摆在卡片上，用户会觉得程序在对他讲黑话。
         r.meta.set("note", json::Value::make_str(gt.reason));
+        return r;
+    }
+    // 9B（MiMo）实测会发明 calculate / calculator，0.5B 反而老老实实写 calc。
+    // 与其纠正模型，不如在服务端认这些别名 —— 反正它们要的都是同一件事。
+    if (name == "calc" || name == "calculate" || name == "calculator" || name == "math") {
+        // 模型经常把参数名写错成 expression / query / input，都收下。
+        // 它甚至会把整个 JSON 片段塞进来，这里也试着捞一下。
+        std::string e = args.s("expr");
+        if (e.empty()) e = args.s("expression");
+        if (e.empty()) e = args.s("query");
+        if (e.empty()) e = args.s("command");
+        if (e.empty()) {
+            r.output = "缺少 expr 参数：把要算的式子放在 expr 里，例如 expr=\"376*49\"";
+            return r;
+        }
+        const dubhe_calc::CalcResult c = dubhe_calc::calc_eval(e);
+        r.ok = c.ok;
+        // output 是模型唯一能看到的东西。**只给结果，不给过程**——
+        // 过程里带函数名、引号、括号，小模型会把它当成让它继续调用的指令。
+        r.output = c.ok ? (e + " = " + c.text)
+                        : ("计算失败：" + c.error + "。表达式: " + e);
+        r.card = "calc";
+        r.meta.set("kind", json::Value::make_str("calc"));
+        r.meta.set("expr", json::Value::make_str(e));
+        if (c.ok) r.meta.set("value", json::Value::make_str(c.text));
         return r;
     }
     if (name == "read_file") {
@@ -1527,7 +1557,7 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
         r.meta.set("results", arr);
         return r;
     }
-    if (name == "shell") {
+    if (name == "shell" || name == "bash" || name == "terminal") {
         const std::string cmd = args.s("command");
         const std::string cwd = args.s("cwd", g.workspace);
         const bool sb = sandbox_active();   // 探过一次就缓存，不再每条命令 fork 两次
@@ -1594,7 +1624,12 @@ static int g_tool_fmt = 0;
 
 std::string tool_prompt() {
     std::string s =
-        "\n\n需要读文件、列目录、写文件或执行命令时，调用工具。格式严格如下：\n";
+        "\n\n以下事情**必须调用工具，不许猜、不许心算**：\n"
+        "- 任何算术（加减乘除、百分比、幂、日期差、单位换算）→ calc\n"
+        "- 当前时间、日期、星期几、系统信息 → shell\n"
+        "- 可能记错的事实、新闻、价格、版本号 → web_search\n"
+        "算错比慢一点糟得多。哪怕你觉得“这个我会算”，也必须调工具。\n\n"
+        "需要读文件、列目录、写文件或执行命令时，调用工具。格式严格如下：\n";
     if (g_tool_fmt == 1) {
         s +=
             "<tool_call>\n<function=工具名>\n<parameter=参数名>\n参数值\n</parameter>\n"
@@ -1609,7 +1644,12 @@ std::string tool_prompt() {
             "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}</tool_call>\n";
     }
     s +=
+        // 这里原来有"工具名必须严格从列表里选"这类提醒，实测 0.5B 把它
+        // 理解成"写出工具名就行"，输出 calc("376*49") 这种伪函数调用，
+        // 连 <tool_call> 都不吐了。名字纠正放在服务端做别名，别教模型。
         "一次只调用一个工具。可用工具：\n"
+        "- calc(expr): 精确算术，支持 + - * / % ^ 和括号，以及 sqrt/abs/round/floor/ceil/pow/min/max。\n"
+        "  例：expr=\"376*49\"。**所有算术都用它，不要自己算。**\n"
         "- read_file(path, offset, limit): 读取文本文件，默认给前 120 行。\n"
         "  文件很长时先读开头；需要后面的内容再用 offset=121 往下翻。\n"
         "- list_dir(path): 列出目录内容\n"
@@ -1627,7 +1667,12 @@ std::string tool_prompt() {
         // 实测 1.7B 会把"我知道工作目录是什么"讲成"我执行了 pwd，返回…"。
         // 工作目录确实在下面那句里给了它，所以它没编内容，只是把"知道"
         // 说成了"做过"。用户看到的是"它跑了命令"，而界面上一条工具卡都没有。
-        "没有真的调用过工具时，不要说\"我已经执行了\"，只说你知道什么。";
+        "没有真的调用过工具时，不要说\"我已经执行了\"，只说你知道什么。"
+        // 截图里工具返回 2026-11-03，模型最终回答写 2026-01-03 —— 数字
+        // 就在上下文里，它还是自己编了一个。泛泛说"基于结果回答"不够，
+        // 必须明确"逐字照抄、不许改写"，小模型才可能照做。
+        "工具返回里的数字、日期、时间、路径必须**逐字照抄**到回答中，"
+        "一个字符都不许改；不确定就原样引用，不要转述。";
     if (!g.workspace.empty()) {
         s += "\n当前工作目录是 " + g.workspace + "，相对路径都以它为根。";
     }
@@ -2078,6 +2123,10 @@ std::string gguf_meta_string(const std::string& path, const std::string& key) {
 // "用户要求我使用 read_file 工具……我需要先调用……"，答案被埋在最后。
 // 对话产品要的是答案，所以统一走"不想"那条路。
 static int g_think_style = 0;   // 0 = 模板没有思考标记；1 = LFM3 系
+// 上面的注释说"对话产品要的是答案，所以统一不想"——那是 2026-11-03 的决定。
+// 现在做成可配：DUBHE_THINKING=1 时保留 <think> 开洞，让模型先推理再答。
+// 对外行为不变（默认仍是关闭），只是给了难题一条出路。
+static bool g_think_enabled = false;
 
 void refresh_model_markers(const std::string& model_path) {
     g_tool_open = "<tool_result>";
@@ -2104,7 +2153,7 @@ void refresh_model_markers(const std::string& model_path) {
     if (tpl.find("<function=") != std::string::npos) g_tool_fmt = 1;
     std::fprintf(stderr, "  模板: 返回 %s · 调用 %s · 思考块 %s\n", g_tool_open.c_str(),
                  g_tool_fmt ? "<function=> 风格" : "JSON 风格",
-                 g_think_style ? "有（已关闭）" : "无");
+                 g_think_style ? (g_think_enabled ? "有（已开启）" : "有（已关闭）") : "无");
 }
 
 std::string build_prompt(const json::Value& messages, bool chatml, bool with_tools) {
@@ -2134,7 +2183,8 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
             // 历史里的助手轮也要带上"空思考块"。模板在 keep_thinking 为假时
             // 会补一个，我们自己拼 prompt 就得手动补 —— 少了它，模型看到
             // 自己上一轮"没有思考块"，会以为格式错了，接着把推理写出来。
-            if (g_think_style && content.rfind("<think>", 0) != 0) content = "<think></think>" + content;
+            if (g_think_style && !g_think_enabled && content.rfind("<think>", 0) != 0)
+                content = "<think></think>" + content;
             p += "<|im_start|>assistant\n" + content + "<|im_end|>\n";
         } else if (role == "tool" || role == "tool_denied") {
             // 光把结果摆上去，小模型会以为"我还没调用"，于是再要一次同样的工具，
@@ -2152,7 +2202,9 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
             } else {
                 p += "<|im_start|>user\n" + g_tool_open + content + g_tool_close +
                      "\n工具已经执行完毕，上面就是返回结果。"
-                     "请直接基于这个结果回答，不要再调用同一个工具。<|im_end|>\n";
+                     "请直接基于这个结果回答，不要再调用同一个工具。"
+                     "回答里的数字/日期/时间必须与上面的返回值**逐字一致**，"
+                     "不许改写、不许凭记忆另写一个。<|im_end|>\n";
             }
         }
     }
@@ -2160,7 +2212,8 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
         p = std::string("<|im_start|>system\n") + tool_prompt() + "<|im_end|>\n" + p;
     }
     p += "<|im_start|>assistant\n";
-    if (g_think_style) p += "<think></think>";   // 空块 = 这轮不要思考，直接答
+    if (g_think_style && !g_think_enabled)
+        p += "<think></think>";   // 空块 = 这轮不要思考，直接答
     return p;
 }
 
@@ -2858,6 +2911,7 @@ json::Value tools_json() {
         o.set("enabled", json::Value::make_bool(on));
         arr.arr.push_back(o);
     };
+    add("calc", "精确计算四则运算、幂、括号和常用函数（expr），算术一律用它", "expr", true);
     add("read_file", "读取文本文件，默认前 120 行，可用 offset/limit 分页", "path, offset, limit", true);
     add("list_dir", "列出目录内容", "path", true);
     add("grep", "在目录里递归搜索文本（正则）", "pattern, path, limit", true);
@@ -2912,6 +2966,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-write") g.allow_write = false;
         else if (a == "--model-dir") g.model_dir = next();
         else if (a == "--no-gpu") no_gpu = true;
+        else if (a == "--thinking") g_think_enabled = true;
         else if (a == "--api-key") g.api_key = next();
         else if (a == "--mmproj") mmprojs.push_back(next());
         else if (a == "--no-mmproj") no_mmproj = true;
@@ -2926,7 +2981,7 @@ int main(int argc, char** argv) {
                 "dubhed %s\n\n"
                 "用法: dubhed -m <model.gguf> [--port 7777] [--host 127.0.0.1]\n"
                 "             [--web web] [-c 4096] [-t N] [--allow-shell] [--no-gpu]\n"
-                "             [--mmproj <mmproj.gguf>] [--tmp-dir /tmp]\n"
+                "             [--mmproj <mmproj.gguf>] [--tmp-dir /tmp] [--thinking]\n"
                 "             [--share] [--api-key <key>]\n\n"
                 "  --mmproj P     加载视觉塔或语音塔（可给多次，Omni 模型两个都要）\n"
                 "                 不给的话，模型同目录下的 mmproj*.gguf 会自动挂上\n"
@@ -2950,6 +3005,8 @@ int main(int argc, char** argv) {
 
     g.web_root = web_root;
     g.workspace = ".";
+    // DUBHE_THINKING=1 让支持思考块的模型先推理再答；默认仍关闭
+    if (const char* th = std::getenv("DUBHE_THINKING")) g_think_enabled = std::string(th) == "1";
     char cwd[1024];
     if (getcwd(cwd, sizeof(cwd))) g.workspace = cwd;
 

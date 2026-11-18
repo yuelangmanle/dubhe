@@ -503,6 +503,7 @@
       return meta.shape === 'matches' ? (meta.total || 0) + ' 处' : (meta.count || 0) + ' 个';
     }
     if (card === 'web') return meta.kind === 'fetch' ? '抓取' : (meta.count || 0) + ' 条';
+    if (card === 'calc') return '精确计算';
     return '';
   }
 
@@ -514,6 +515,7 @@
     if (card === 'diff' || card === 'read') return baseName(meta.path) || t.name;
     if (card === 'search') return meta.pattern || baseName(meta.path) || t.name;
     if (card === 'web') return meta.kind === 'fetch' ? hostOf(meta.url) : ('“' + (meta.query || '') + '”');
+    if (card === 'calc') return meta.expr || t.name;
     return t.name;
   }
 
