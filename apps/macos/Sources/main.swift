@@ -150,6 +150,47 @@ private func dbg(_ s: String) {
 }
 
 // ---------------------------------------------------------------- 主界面
+//
+// 引擎的退出原因必须落到 engine.log 里，不能只在 DUBHE_SHELL_DEBUG 打开时
+// 才记。用户报上来的现象是"聊到一半报错，然后自己重启了"，而日志里只有
+// 一行「──── 重启引擎 ────」—— 看不出是崩溃、被 OOM 杀掉，还是我们自己
+// 重启的。这一段就是补上那个缺口：谁、什么码、什么时候。
+private func logEngineEvent(_ s: String) {
+    let dir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/Dubhe", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let url = dir.appendingPathComponent("engine.log")
+    guard let data = "\n[dubhe-shell] \(s)\n".data(using: .utf8) else { return }
+    if let fh = try? FileHandle(forWritingTo: url) {
+        fh.seekToEndOfFile()
+        fh.write(data)
+        fh.closeFile()
+    } else {
+        try? data.write(to: url)
+    }
+}
+
+// 单实例锁。
+//
+// 用 flock 而不是 pid 文件、也不查 LaunchServices：锁由内核在进程退出时
+// 自动释放，SIGKILL 也不会留下"死锁文件"，更不怕 pid 被复用。
+// fd 故意不关 —— 一关锁就没了。
+private var instanceLockFD: Int32 = -1
+private func acquireInstanceLock() -> Bool {
+    let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Dubhe", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let path = dir.appendingPathComponent("instance.lock").path
+    let fd = open(path, O_CREAT | O_RDWR, 0o644)
+    if fd < 0 { return true }   // 锁文件都建不了就别把人挡在门外
+    if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+        close(fd)
+        return false
+    }
+    instanceLockFD = fd
+    return true
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                          WKNavigationDelegate, WKScriptMessageHandler, WKUIDelegate,
                          UNUserNotificationCenterDelegate {
@@ -194,13 +235,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         // 第二次双击时不要再起一份引擎：macOS 一般会把已经开着的那个激活，
         // 但从终端直接跑二进制、或者两份不同路径的拷贝，都会真的起两个
         // 引擎（各占一个端口、各吃一份内存）。这里主动退让。
-        let others = NSRunningApplication
-            .runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.dubhe.desktop")
-            .filter { $0.processIdentifier != getpid() }
-        dbg("other instances: \(others.map { $0.processIdentifier })")
-        if let other = others.first {
-            other.activate()
-            dbg("another instance running (pid \(other.processIdentifier)), bowing out")
+        // 只认真正活着的那个实例。
+        //
+        // 原来用 NSRunningApplication.runningApplications(withBundleIdentifier:)
+        // 判断"是不是已经开了一份"。这条路有两个坑，而且都会变成"双击没反应"：
+        //   1. LaunchServices 会留下"进程已经没了"的残留记录；
+        //   2. 就算加 kill(pid, 0) 复核也不够 —— 那个 pid 可能早被别的进程复用，
+        //      探活成功，于是一份正常运行的新实例把自己 exit 掉。
+        // 换成 flock：锁由内核在进程退出时自动释放，pid 复用、LS 残留都影响不到。
+        if ProcessInfo.processInfo.environment["DUBHE_SHELL_ALLOW_MULTI"] != "1",
+           !acquireInstanceLock() {
+            dbg("another instance holds the lock, activating it and bowing out")
+            NSRunningApplication
+                .runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.dubhe.desktop")
+                .first { $0.processIdentifier != getpid() }?
+                .activate()
             exit(0)
         }
 
@@ -634,6 +683,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             DispatchQueue.main.async {
                 guard let self, !self.shuttingDown, self.engine === pr else { return }
                 let code = pr.terminationStatus
+                logEngineEvent("引擎退出：退出码 \(code)（\(pr.terminationReason == .uncaughtSignal ? "被信号终止" : "正常退出")）")
                 self.stopPolling()
                 self.stopStateWatch()
                 self.engine = nil

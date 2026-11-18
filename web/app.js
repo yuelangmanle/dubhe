@@ -2,6 +2,12 @@
 (() => {
   'use strict';
 
+  // 构建标记。界面出了问题的时候，"跑的是不是这一版的代码"必须先能确认 ——
+  // 这一版就吃过亏：旧实例在内存里跑着 0.25.0 的 app.js，但窗口里新按钮
+  // 照样显示（那是 index.html 提供的），于是所有排查都建立在一个错误前提上。
+  // 现在 DUBHE_SHELL_EVAL 里读一下 window.__dubheBuild 就能分辨。
+  window.__dubheBuild = '0.26.0';
+
   const $ = (s) => document.querySelector(s);
   const el = (tag, cls, txt) => {
     const n = document.createElement(tag);
@@ -78,6 +84,9 @@
     // 联网搜索：只在本次会话有效。打开后每个问题前面会加一句"先搜再答"，
     // 并临时打开工具（否则模型没有 web_search 可用，开关等于摆设）。
     web: false,
+    // 深度思考：模型有思考通道时可用。默认关 —— 打开后每个回答都要先想一遍，
+    // 首字延迟会明显变长，日常问答没必要付这个代价。选择记在本机。
+    think: localStorage.getItem('dubhe.think.v1') === '1',
     attach: null,   // 待发送的图片/音频/视频（一次只允许一个）
     logs: [],       // 右栏系统日志：只记真实事件，不编
     gen: null,      // 本轮生成统计 { tokens, tps, total, ttft }
@@ -137,10 +146,17 @@
   function slimConv(c) {
     const out = Object.assign({}, c);
     out.messages = (c.messages || []).map((m) => {
-      if (!m.tools || !m.tools.length) return m;
-      const mm = Object.assign({}, m);
-      mm.tools = m.tools.map(slimTool);
-      return mm;
+      // 推理过程可能比正文长十倍。原样存进 localStorage 的话，几轮下来
+      // 5 MB 的配额就见底了，症状是"对话越多越存不上"。截断够用了 ——
+      // 没人会回看三轮之前的完整推理，但完全丢掉又太浪费。
+      let mm = m;
+      if (m.think && m.think.length > 4000) {
+        mm = Object.assign({}, m, { think: m.think.slice(0, 4000) + '\n…（推理过程已截断）' });
+      }
+      if (!mm.tools || !mm.tools.length) return mm;
+      const o = Object.assign({}, mm);
+      o.tools = mm.tools.map(slimTool);
+      return o;
     });
     return out;
   }
@@ -385,9 +401,29 @@
     return html;
   }
 
-  // 隐藏模型输出的 tool_call 原文
+  // 隐藏模型输出的工具调用/思考标记原文。
+  //
+  // 服务端现在会把它们从流里摘掉，这里再兜一层，理由有两个：
+  //   1. 旧对话（0.25.0 之前存的）正文里本来就带着这些标签，重新打开时
+  //      不该继续看到它们；
+  //   2. 别家客户端/API 直接写进来的 messages 也可能带。
+  // 剥完顺手压掉剩下的空行，否则气泡里会留一大片空白。
   function stripToolCalls(s) {
-    return s.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').replace(/<tool_result>[\s\S]*?<\/tool_result>/g, '').trim();
+    let r = String(s || '');
+    const cut = (open, close) => {
+      for (;;) {
+        const a = r.indexOf(open);
+        if (a < 0) break;
+        const b = r.indexOf(close, a + open.length);
+        if (b < 0) { r = r.slice(0, a); break; }
+        r = r.slice(0, a) + r.slice(b + close.length);
+      }
+    };
+    cut('<tool_call>', '</tool_call>');
+    cut('<tool_result>', '</tool_result>');
+    cut('<function=', '</function>');
+    r = r.replace(/<\/?(?:think|tool_call|tool_result|function|parameter)[^>]*>/g, '');
+    return r.replace(/\n{3,}/g, '\n\n').trim();
   }
 
   // 流式渲染的"安全切点"：返回一个下标，之前的文本已经定型、不会再变。
@@ -505,6 +541,15 @@
     if (card === 'web') return meta.kind === 'fetch' ? '抓取' : (meta.count || 0) + ' 条';
     if (card === 'calc') return '精确计算';
     return '';
+  }
+
+  // 工具名/命令标题的显示上限。
+  //
+  // 服务端已经把"整段话被当成工具名"挡在解析层了，这里再兜一层：卡片标题
+  // 是一行长字，超过几十个字符就该截断，否则它会横向撑开整张卡片。
+  function toolLabel(s) {
+    const t = String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+    return t.length > 60 ? t.slice(0, 60) + '…' : t;
   }
 
   // 卡片主标题 = "它到底动了什么"，不是工具名。用户不关心工具叫 read_file，
@@ -625,7 +670,7 @@
       const ic = el('span', 'ic');
       ic.appendChild(iconNode(wait ? 'shield' : (t.askAllow ? 'check' : 'x'), 'i'));
       head.appendChild(ic);
-      head.appendChild(el('span', 'tool-name', t.name));
+      head.appendChild(el('span', 'tool-name', toolLabel(t.name)));
       head.appendChild(el('span', 'tool-sub',
         wait ? '等待确认' : (t.askAllow ? '已允许' : (t.askTimeout ? '超时未答' : '已拒绝'))));
       box2.appendChild(head);
@@ -649,7 +694,7 @@
     const ic = el('span', 'ic');
     ic.appendChild(iconNode(t.denied ? 'shield' : (t.ok === false ? 'x' : (CARD_ICON[card] || 'terminal')), 'i'));
     head.appendChild(ic);
-    head.appendChild(el('span', 'tool-name', cardTitle(t, meta)));
+    head.appendChild(el('span', 'tool-name', toolLabel(cardTitle(t, meta))));
     const sub = cardSub(t, meta);
     // 沙箱没生效这件事必须让用户看见。
     //
@@ -814,6 +859,25 @@
 
     const body = el('div', 'body');
     body.innerHTML = bodyHtml(m.content, m.tools && m.tools.length);
+
+    // 深度思考的推理过程。
+    //
+    // 默认折起来：用户打开这个开关是为了答案更准，不是想看几屏自言自语。
+    // 但流式期间必须展开 —— 推理往往比答案长得多，那几十秒里正文一个字都
+    // 没有，收起状态下界面和卡死没有区别。用户手动开合的状态记在 m 上，
+    // 这样后面 reswap 重建节点时不会把人家展开的块又收回去。
+    if (m.think) {
+      const d = document.createElement('details');
+      d.className = 'think-box';
+      d.open = m.streaming ? true : !!m.thinkOpen;
+      d.addEventListener('toggle', () => { m.thinkOpen = d.open; });
+      const s = document.createElement('summary');
+      s.textContent = '思考过程 · ' + m.think.length + ' 字';
+      d.appendChild(s);
+      d.appendChild(el('div', 'think-txt', m.think));
+      col.appendChild(d);
+    }
+
     col.appendChild(body);
 
     // 服务端在流里报的错。不显示出来的话，这一轮就是一个永远转着
@@ -1686,6 +1750,9 @@
           top_p: settings.top_p,
           max_tokens: settings.max_tokens,
           dubhe_tools: withTools,
+          // 深度思考：按请求传，服务端在请求作用域内覆盖启动默认值。
+          // 显式传 false 是有意的 —— 启动参数带 --thinking 时也要能被界面关掉。
+          thinking: !!state.think,
           // 本对话绑定的项目文件夹。服务端在请求作用域内把它当成工具的根，
           // 请求结束就恢复 —— 所以两个对话各读各的项目，不会串。
           workspace: conv.cwd || undefined,
@@ -1793,6 +1860,13 @@
               ai.tools.push({ name: j.dubhe.name, args: j.dubhe.arguments, ok: true, t0: performance.now() });
               log('Tool call: ' + j.dubhe.name);
               renderTools();
+            } else if (j.dubhe.type === 'think') {
+              // 推理过程单独一条流。攒在 ai.think 上，由 messageNode 画成
+              // 可折叠的块。这里限流到 10fps：reswap 是整块重建，按 token
+              // 重建的话光推理就能把主线程占满，正文反而卡住不动。
+              ai.think = (ai.think || '') + (j.dubhe.text || '');
+              const tn = performance.now();
+              if (tn - (ai.thinkAt || 0) > 100) { ai.thinkAt = tn; reswap(); }
             } else if (j.dubhe.type === 'queued') {
               // 引擎一次只答一个，第二个请求在服务端排队。排队时它一个字节都
               // 还没发，界面和"卡死"长得一模一样 —— 所以服务端会先推这个事件，
@@ -1900,7 +1974,14 @@
         ai.stopped = true;
         if (!ai.content) ai.content = '（已停止）';
       } else {
-        ai.content = (ai.content || '') + `\n\n> ⚠️ 请求失败：${e.message}`;
+        // 引擎中途没了的时候，WebKit 报的就是一句 "Load failed"，用户完全
+        // 无法把它和"网络断了""服务没起来"区分开。翻译成人话，并且说清楚
+        // 下一步该干什么 —— 自动重启一般 1～3 秒，重发就行。
+        const raw = e.message || '未知错误';
+        const msg = /load failed|failed to fetch|network ?error|networkconnectionlost/i.test(raw)
+          ? '与本地引擎的连接中断了（引擎可能刚意外退出，客户端正在自动重启）。等几秒重新发送即可。'
+          : raw;
+        ai.content = (ai.content || '') + `\n\n> ⚠️ 请求失败：${msg}`;
       }
     } finally {
       state.streaming = false;
@@ -3310,6 +3391,24 @@
       $('#btnWeb').classList.toggle('on', state.web);
       log(state.web ? '联网搜索已开：下一个问题会先搜再答' : '联网搜索已关');
     };
+    // 深度思考。模型没有思考通道时按钮灰掉 —— 能点却毫无反应最让人困惑。
+    // 服务器把这件事报在 /api/state 的 model.think 上（refresh_model_markers
+    // 读的是 GGUF 里的 chat_template，不是猜的）。
+    $('#btnThink').onclick = () => {
+      const s = state.server || {};
+      const info = (s.info && s.info.think !== undefined) ? s.info.think : true;
+      if (info === false) {
+        log('当前模型没有思考通道（chat_template 里没有 <think>）', 'err');
+        return;
+      }
+      state.think = !state.think;
+      localStorage.setItem('dubhe.think.v1', state.think ? '1' : '0');
+      $('#btnThink').classList.toggle('on', state.think);
+      $('#btnThink').setAttribute('aria-pressed', state.think ? 'true' : 'false');
+      log(state.think ? '深度思考已开：模型会先推理再作答' : '深度思考已关');
+    };
+    $('#btnThink').classList.toggle('on', state.think);
+
     $('#fileInput').onchange = async (e) => {
       const f = e.target.files && e.target.files[0];
       if (!f) return;

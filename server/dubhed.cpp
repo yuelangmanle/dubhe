@@ -90,6 +90,9 @@ struct AppState {
     // 的（2B 模型看到工具结果会反复要工具），但 2 太紧；改成可调，默认 6，
     // 同时保留"同一个工具同样的参数连调两次就停"的原地打转保护。
     int max_tool_rounds = 6;
+    // 纯算式短路（见 try_arith）。默认开：算术有唯一正确答案，交给模型算
+    // 只会得到"自信的错"。真要看模型怎么算，用 --no-arith 关掉。
+    int no_arith_fastpath = 0;
     // 写域默认只到当前项目文件夹。读可以看整个家目录（模型权重就在
     // ~/.dubhe 下，读不到等于残废），但"能读"和"能改"不该是同一个范围 ——
     // 这是 DeepSeek Harness 的 workspace-write 默认值，也是用户把文件夹
@@ -1733,6 +1736,22 @@ bool extract_lfm_tool_call(const std::string& text, std::string* name, json::Val
         name->pop_back();
     if (name->empty()) return false;
 
+    // 工具名必须是个标识符。
+    //
+    // 不校验的后果比"调用失败"难看得多：模型写坏一个 <function= ，比如漏掉
+    // 结尾的 '>'，那"名字"就会一路吃到下一个 '>' —— 实测抓到过一个 1850 字符的
+    // "工具名"，内容是模型的整段自言自语。这条调用当然过不了白名单，于是界面
+    // 上多出一张失败卡片，卡片标题就是那 1850 个字：用户看到的是一大段乱码，
+    // 而且会误以为是程序崩了。
+    // 工具名只可能是 snake_case（read_file / web_search / calc），见到别的
+    // 字符就说明这段不是合法的调用，当普通文本处理。
+    if (name->size() > 32) return false;
+    for (char ch : *name) {
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' ||
+                        ch == '-' || ch == '.';
+        if (!ok) return false;
+    }
+
     *args = json::Value::make_obj();
     size_t p = fe;
     while (true) {
@@ -1741,6 +1760,15 @@ bool extract_lfm_tool_call(const std::string& text, std::string* name, json::Val
         const size_t ke = body.find('>', k);
         if (ke == std::string::npos) break;
         const std::string key = body.substr(k + 11, ke - k - 11);
+        // 参数名同理：不是标识符就说明这一段本来就不是合法调用，跳过它，
+        // 别把半句话当成参数名塞进 JSON（界面上会显示成一串乱码键）。
+        if (key.empty() || key.size() > 32) break;
+        bool key_ok = true;
+        for (char ch : key) {
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                  (ch >= '0' && ch <= '9') || ch == '_' || ch == '-')) { key_ok = false; break; }
+        }
+        if (!key_ok) break;
         size_t vs = ke + 1;
         while (vs < body.size() && (body[vs] == '\n' || body[vs] == '\r')) vs++;
         const size_t ve = body.find("</parameter>", vs);
@@ -2156,6 +2184,160 @@ void refresh_model_markers(const std::string& model_path) {
                  g_think_style ? (g_think_enabled ? "有（已开启）" : "有（已关闭）") : "无");
 }
 
+// 历史里的思考块和工具调用原文，回灌前必须剥掉。
+//
+// 不剥会有连锁反应，而且一步比一步难看：
+//   1. 模型上一轮写出来的推理被原样塞回 prompt，它看到"这就是我的输出风格"，
+//      下一轮推理更长 —— 1.7B 这种小模型尤其收不住，几轮之后整条回复都是
+//      自我复述，正事一个字没有。
+//   2. 下面给历史助手轮补 <think></think> 的那段逻辑，碰到正文里已经含有
+//      <think> 的内容，会拼成 "<think></think>推理…</think>" 这种畸形结构。
+//      模型随后就学会了在正文里乱吐 </think> —— 界面上看到的那堆标签就是这么来的。
+std::string scrub_history(const std::string& s) {
+    std::string r = s;
+    auto cut = [&r](const std::string& open, const std::string& close) {
+        for (;;) {
+            const size_t a = r.find(open);
+            if (a == std::string::npos) break;
+            const size_t b = r.find(close, a + open.size());
+            if (b == std::string::npos) { r.erase(a); break; }   // 没闭合，连尾巴一起丢
+            r.erase(a, b + close.size() - a);
+        }
+    };
+    cut("<think>", "</think>");
+    cut("<tool_call>", "</tool_call>");
+    cut("<function=", "</function>");
+    // 上面 cut 没兜住的孤立结束标签
+    for (const char* t : {"</think>", "</tool_call>", "</function>"}) {
+        for (size_t p = r.find(t); p != std::string::npos; p = r.find(t, p)) r.erase(p, strlen(t));
+    }
+    // 剥完常留下成串空行，压一压，别把 prompt 撑长
+    std::string out;
+    out.reserve(r.size());
+    int blank = 0;
+    for (char ch : r) {
+        if (ch == '\n') {
+            if (++blank > 2) continue;
+        } else {
+            blank = 0;
+        }
+        out.push_back(ch);
+    }
+    const size_t b = out.find_first_not_of(" \t\n\r");
+    if (b == std::string::npos) return std::string();
+    const size_t e = out.find_last_not_of(" \t\n\r");
+    return out.substr(b, e - b + 1);
+}
+
+// ------------------------------------------------------------ 纯算术短路
+//
+// 为什么要在"进模型"之前拦一道：让 1.7B 自己做 887×7737，它会把数字读错、
+// 把中间步骤写错，最后给出一个很自信的错误答案；让它调用 calc，它又经常
+// 写不出合法的参数（实测 expr 会写成 "8*87*7*73*7*...?"，还会把数字拆成
+// "8 8 7"）。而这类问题根本不需要模型 —— 表达式是确定的，答案也是确定的。
+//
+// 只认"整句就是一个算式"的情况。带解释、带上下文的问法一律交回模型：
+// 抢答比答错更让人恼火。
+
+static void str_replace_all(std::string* s, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    for (size_t at = s->find(from); at != std::string::npos; at = s->find(from, at + to.size()))
+        s->replace(at, from.size(), to);
+}
+
+static bool ends_with(const std::string& s, const std::string& t) {
+    return s.size() >= t.size() && s.compare(s.size() - t.size(), t.size(), t) == 0;
+}
+
+static bool starts_with(const std::string& s, const std::string& t) {
+    return s.size() >= t.size() && s.compare(0, t.size(), t) == 0;
+}
+
+// 取最后一条 user 的纯文本。多模态消息里 content 是数组，只拼其中的文本片段。
+std::string last_user_text(const json::Value& messages) {
+    std::string last;
+    for (auto& m : messages.arr) {
+        if (m.s("role") != "user") continue;
+        const json::Value* c = m.get("content");
+        if (!c) continue;
+        if (c->type == json::Value::STR) {
+            last = c->str;
+        } else if (c->type == json::Value::ARR) {
+            std::string t;
+            for (auto& p : c->arr) {
+                if (p.type == json::Value::OBJ && p.s("type") == "text") t += p.s("text");
+            }
+            if (!t.empty()) last = t;
+        }
+    }
+    return last;
+}
+
+bool try_arith(const std::string& q, std::string* out) {
+    std::string s = q;
+    if (s.empty() || s.size() > 200) return false;
+
+    // 全角符号 / 数学符号
+    str_replace_all(&s, "×", "*");
+    str_replace_all(&s, "✕", "*");
+    str_replace_all(&s, "÷", "/");
+    str_replace_all(&s, "（", "(");
+    str_replace_all(&s, "）", ")");
+    str_replace_all(&s, "＝", "=");
+    // 中文动词（先长后短，"乘以" 必须先于 "乘" 替换）
+    str_replace_all(&s, "乘以", "*");
+    str_replace_all(&s, "除以", "/");
+    str_replace_all(&s, "加上", "+");
+    str_replace_all(&s, "减去", "-");
+    str_replace_all(&s, "乘", "*");
+    str_replace_all(&s, "除", "/");
+    str_replace_all(&s, "加", "+");
+    str_replace_all(&s, "减", "-");
+
+    // 剥掉问句外壳。反复剥，因为 "请问 3+6 等于多少？" 是两层。
+    const char* tails[] = {"等于多少", "等于几", "是多少", "结果是多少", "等于", "结果",
+                           "多少", "=", "?", "？", "。", "！", "!", "，", ","};
+    const char* heads[] = {"请问", "帮我算一下", "帮我算算", "帮我算", "请计算", "计算一下",
+                           "计算", "算一下", "算算"};
+    for (bool changed = true; changed;) {
+        changed = false;
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\n')) {
+            s.pop_back();
+            changed = true;
+        }
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\n')) {
+            s.erase(0, 1);
+            changed = true;
+        }
+        for (const char* t : tails) {
+            if (ends_with(s, t)) { s.erase(s.size() - strlen(t)); changed = true; }
+        }
+        for (const char* h : heads) {
+            if (starts_with(s, h)) { s.erase(0, strlen(h)); changed = true; }
+        }
+    }
+
+    // 校验：只允许数字、运算符、括号、小数点。出现任何别的字符（汉字、字母、
+    // 单位）就说明这不是"整句一个算式"，交回模型。
+    bool has_digit = false, has_op = false;
+    int digits = 0;
+    for (char ch : s) {
+        if (ch >= '0' && ch <= '9') { has_digit = true; digits++; continue; }
+        if (ch == '+' || ch == '-' || ch == '*' || ch == '/' || ch == '%' || ch == '^') {
+            has_op = true;
+            continue;
+        }
+        if (ch == '.' || ch == '(' || ch == ')' || ch == ' ') continue;
+        return false;
+    }
+    if (!has_digit || !has_op || digits < 2) return false;
+
+    const dubhe_calc::CalcResult r = dubhe_calc::calc_eval(s);
+    if (!r.ok) return false;
+    *out = s + " = " + r.text;
+    return true;
+}
+
 std::string build_prompt(const json::Value& messages, bool chatml, bool with_tools) {
     std::string p;
     if (!chatml) {
@@ -2180,10 +2362,12 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
         } else if (role == "user") {
             p += "<|im_start|>user\n" + content + "<|im_end|>\n";
         } else if (role == "assistant") {
+            content = scrub_history(content);
+            if (content.empty()) continue;   // 整轮都是工具调用/推理，没什么可回灌的
             // 历史里的助手轮也要带上"空思考块"。模板在 keep_thinking 为假时
             // 会补一个，我们自己拼 prompt 就得手动补 —— 少了它，模型看到
             // 自己上一轮"没有思考块"，会以为格式错了，接着把推理写出来。
-            if (g_think_style && !g_think_enabled && content.rfind("<think>", 0) != 0)
+            if (g_think_style && !g_think_enabled)
                 content = "<think></think>" + content;
             p += "<|im_start|>assistant\n" + content + "<|im_end|>\n";
         } else if (role == "tool" || role == "tool_denied") {
@@ -2513,6 +2697,14 @@ struct StreamCtx {
     // 万一模型还是写了 <think>…</think>，整段丢掉，别让推理过程占满气泡。
     bool in_think = false;
     std::string think_buf;
+    // 末尾没凑齐的半个标签（"<thi"、"</thin"）。引擎按 token 吐字节，标签
+    // 边界和 token 边界毫无关系，所以必须跨片拼接 —— 见 feed_think 的注释。
+    std::string think_scan;
+    // 用户这次要了"深度思考"：推理过程不当垃圾丢掉，而是单独推给界面。
+    bool think_emit = false;
+    // 这一轮真正给用户看到了多少字节。用来区分"模型什么都没说"和"只是我们
+    // 把内容藏起来了"——前者要交代一句，后者不该再补废话。
+    size_t visible = 0;
     // 上一片末尾没凑齐的多字节字符。引擎是按 token 吐字节的，一个汉字
     // （3 字节）经常被切在两个 token 之间；半截字节进了 JSON，浏览器那边
     // 就只能解成 U+FFFD —— 中文回复里随机冒出"均���的"这种方块。
@@ -2564,6 +2756,7 @@ void emit_delta(StreamCtx* x, const std::string& delta) {
                     json_escape(delta) + "},\"finish_reason\":null}]}\n\n";
     x->c->write_chunk(s);
     x->first = false;
+    x->visible += delta.size();
 }
 
 // 按 OpenAI 的流式协议把工具调用发出去。
@@ -2582,6 +2775,58 @@ void emit_tool_calls_delta(StreamCtx* x, const std::string& name, const json::Va
     x->c->write_chunk(s);
 }
 
+// 思考过程的增量推送。只有用户显式开了"深度思考"才会走到这里。
+void emit_think_delta(StreamCtx* x, const std::string& s) {
+    if (s.empty()) return;
+    x->c->write_chunk("data: {\"dubhe\":{\"type\":\"think\",\"text\":" + json_escape(s) + "}}\n\n");
+}
+
+// 把一片 token 拆成"可见正文"和"思考内容"，结果写进 out。
+//
+// 为什么不能拿整片去和 "<think>" 比较：BPE 分词根本不管标签边界，模型吐出来
+// 的常常是 "</think><tool_call>"、"让我们调用: </think>" 这样一长片。按整片
+// 比较的话标签一条都匹配不上，推理过程和 </think> 就原样流进气泡 —— 用户
+// 看到的是一大段自我复述外加一堆看不懂的标签，这就是"回复乱七八糟"的主因。
+//
+// 所以逐字符扫，末尾几个字符先扣住，等下一片补全再判断。每片最多扣 7 字节。
+void feed_think(StreamCtx* x, const std::string& piece, std::string* out) {
+    const std::string OPEN = "<think>", CLOSE = "</think>";
+    std::string s = x->think_scan + piece;
+    x->think_scan.clear();
+
+    size_t i = 0;
+    while (i < s.size()) {
+        const std::string& tag = x->in_think ? CLOSE : OPEN;
+        const size_t k = s.find(tag, i);
+        if (k == std::string::npos) {
+            // 尾部可能是被切断的半个标签，扣住等下一片。
+            const size_t n = s.size() - i;
+            size_t keep = 0;
+            for (size_t L = std::min(n, tag.size() - 1); L > 0; --L) {
+                if (s.compare(s.size() - L, L, tag, 0, L) == 0) { keep = L; break; }
+            }
+            if (x->in_think) {
+                x->think_buf.append(s, i, n - keep);
+                if (x->think_emit) emit_think_delta(x, s.substr(i, n - keep));
+            } else {
+                out->append(s, i, n - keep);
+            }
+            x->think_scan.assign(s, s.size() - keep, keep);
+            return;
+        }
+        if (x->in_think) {
+            x->think_buf.append(s, i, k - i);
+            if (x->think_emit) emit_think_delta(x, s.substr(i, k - i));
+            x->in_think = false;
+        } else {
+            out->append(s, i, k - i);
+            x->think_buf.clear();
+            x->in_think = true;
+        }
+        i = k + tag.size();
+    }
+}
+
 // 前 16 个字符足以判断"这是不是一段工具调用"
 void on_piece(void* ud, int32_t tok, const char* piece) {
     auto* x = (StreamCtx*)ud;
@@ -2589,30 +2834,16 @@ void on_piece(void* ud, int32_t tok, const char* piece) {
     x->acc->append(piece);
     x->gtoks.push_back(tok);
 
-    // 思考块：整段吞掉，不进正文
-    {
-        const std::string pc(piece);
-        if (pc == "<think>") {
-            x->in_think = true;
-            x->think_buf.clear();
-            return;
-        }
-        if (pc == "</think>") {
-            x->in_think = false;
-            x->think_buf.clear();
-            return;
-        }
-        if (x->in_think) {
-            x->think_buf += pc;
-            return;
-        }
-    }
+    // 思考块：拆出来，正文继续往下走
+    std::string vis;
+    feed_think(x, std::string(piece), &vis);
+    if (vis.empty()) return;
 
     if (x->suppress) return;
 
     // 先和上一片留下的半截字符拼起来，再把末尾凑不齐的部分留住，
     // 剩下的才是能安全写进 JSON 的。
-    std::string s = x->tail + std::string(piece);
+    std::string s = x->tail + vis;
     const size_t hold = utf8_incomplete_tail(s);
     if (hold) {
         x->tail.assign(s, s.size() - hold, hold);
@@ -2663,16 +2894,28 @@ void on_piece(void* ud, int32_t tok, const char* piece) {
 
 // 流结束后把还没吐出去的缓冲补发
 void flush_pending(StreamCtx* x) {
-    // 思考块没闭合（多半是被 max_tokens 截断在中间）。这时候丢弃等于一个字
-    // 都不给，用户看到的是空白气泡 —— 与其这样，不如把它原样吐出来。
+    // 思考块没闭合（多半是被 max_tokens 截断在推理中间）。
+    //
+    // 原来这里的做法是"原样吐出来，总比空白强"。但那等于把模型最没价值的
+    // 一段自言自语塞进气泡 —— 实测 1.7B 模型很容易一路推理到 max_tokens，
+    // 用户看到的就是几屏"也许用户想问…"的复述，误以为程序坏了。
+    // 现在改成：推理只在用户开了深度思考时才有资格露脸，否则丢掉，
+    // 但这一轮如果什么都没剩下，得明确说一句为什么。
     if (x->in_think) {
         x->in_think = false;
-        if (!x->think_buf.empty()) {
-            const std::string t = x->think_buf;
-            x->think_buf.clear();
-            x->decided = true;
-            emit_delta(x, t);
+        const bool had = !x->think_buf.empty();
+        x->think_buf.clear();
+        if (had && !x->think_emit && x->visible == 0 && !x->suppress) {
+            x->c->write_chunk(
+                "data: {\"dubhe\":{\"type\":\"note\",\"message\":"
+                "\"模型把全部输出预算都用在了内部推理上，没有留下答案。"
+                "打开「深度思考」可以看到它想了什么，或者把最大生成长度调大再试。\"}}\n\n");
         }
+    }
+    // 末尾那个"可能是半个标签"的残留：既然流已经结束，就不是标签，是正文。
+    if (!x->think_scan.empty() && !x->suppress && !x->in_think) {
+        emit_delta(x, x->think_scan);
+        x->think_scan.clear();
     }
     if (!x->decided && !x->pending.empty()) {
         const std::string all = x->pending;
@@ -2967,6 +3210,7 @@ int main(int argc, char** argv) {
         else if (a == "--model-dir") g.model_dir = next();
         else if (a == "--no-gpu") no_gpu = true;
         else if (a == "--thinking") g_think_enabled = true;
+        else if (a == "--no-arith") g.no_arith_fastpath = 1;
         else if (a == "--api-key") g.api_key = next();
         else if (a == "--mmproj") mmprojs.push_back(next());
         else if (a == "--no-mmproj") no_mmproj = true;
@@ -3106,6 +3350,30 @@ int main(int argc, char** argv) {
             c.send(404, "application/json", "{\"error\":\"not found\"}");
             return;
         }
+
+        // 静态资源加版本戳（用文件 mtime 当版本号）。
+        //
+        // 为什么非做不可：桌面壳子加载的是 http://127.0.0.1:<port>/，端口不变、
+        // URL 不变。只要 WebKit 的磁盘缓存里还留着上一次的 app.js，它就会直接
+        // 用旧的 —— 表现是"代码改了、界面没变"，而且 index.html 和 app.js
+        // 还可能一个新一个旧（我在这版上就踩了：按钮出现了但没绑定任何逻辑，
+        // 旧的标签泄漏 bug 也照旧，从画面上完全看不出是缓存问题）。
+        // 加上 mtime 之后每次构建都是新 URL，缓存自然失效，也不用手工维护版本号。
+        if (p == "/index.html") {
+            auto stamp = [&](const std::string& attr, const std::string& file) {
+                struct stat st {};
+                const long long v =
+                    (::stat((root + file).c_str(), &st) == 0) ? (long long)st.st_mtime : 0;
+                const std::string from = attr + file + "\"";
+                const std::string to = attr + file + "?v=" + std::to_string(v) + "\"";
+                for (size_t at = body.find(from); at != std::string::npos;
+                     at = body.find(from, at + to.size())) {
+                    body.replace(at, from.size(), to);
+                }
+            };
+            stamp("href=\"", "/app.css");
+            stamp("src=\"", "/app.js");
+        }
         c.send(200, guess_mime(full), body);
     };
 
@@ -3210,6 +3478,10 @@ int main(int argc, char** argv) {
                 m.set("n_vocab", json::Value::make_num(mi.n_vocab));
                 m.set("chatml", json::Value::make_bool(mi.has_chat_template != 0));
                 m.set("gpu", json::Value::make_bool(mi.is_gpu != 0));
+                // 这个模型的对话模板里到底有没有思考通道。没有的话界面上
+                // 那个「深度思考」按钮要灰掉 —— 放着能点却毫无反应，
+                // 比直接告诉用户"这个模型不支持"更让人困惑。
+                m.set("think", json::Value::make_bool(g_think_style != 0));
                 o.set("info", m);
             }
         }
@@ -4013,6 +4285,26 @@ int main(int argc, char** argv) {
             ~BusyGuard() { g.busy = false; }
         } busy_guard;
 
+        // 请求级的"深度思考"。界面上那个开关按每条消息发过来，覆盖启动时的
+        // 全局默认值（--thinking / DUBHE_THINKING），请求结束还原。
+        //
+        // 为什么敢用全局量：整条请求串行化在 g.mu 上（上面刚拿到锁），同一
+        // 时刻只有一个请求在拼 prompt。而且这个 scope 声明在锁之后，
+        // 析构（还原）发生在锁释放之前，不会漏给下一个请求。
+        struct ThinkScope {
+            bool old = false;
+            bool active = false;
+            ~ThinkScope() { if (active) g_think_enabled = old; }
+        } think_scope;
+        if (body.get("thinking")) {
+            const bool want = body.flag("thinking", false);
+            if (want != g_think_enabled) {
+                think_scope.old = g_think_enabled;
+                think_scope.active = true;
+                g_think_enabled = want;
+            }
+        }
+
         // 提前失败的统一出口。
         //
         // 排队那条路上头已经发出去了（见上），此时 c.send(400) 会因为
@@ -4093,6 +4385,56 @@ int main(int argc, char** argv) {
         const std::string id = now_id();
         long long created = (long long)time(nullptr);
 
+        // ---- 纯算式直接给答案，不经过模型 ----
+        //
+        // 这一条对所有模型都生效，不只是小模型：算术没有"风格"可言，正确答案
+        // 只有一个。让模型算，最坏的结果是它算错了还说得很有道理。
+        // 命中条件很窄（整句就是一个算式），所以不会抢走"解释一下为什么"这类问题。
+        {
+            std::string ans;
+            if (g.no_arith_fastpath == 0 && try_arith(last_user_text(*msgs), &ans)) {
+                if (stream) {
+                    if (!c.header_sent()) c.begin_stream();
+                    c.write_chunk("data: {\"id\":\"" + id +
+                                  "\",\"object\":\"chat.completion.chunk\",\"created\":" +
+                                  std::to_string(created) +
+                                  ",\"choices\":[{\"index\":0,\"delta\":{\"content\":" +
+                                  json_escape(ans) + "},\"finish_reason\":null}]}\n\n");
+                    c.write_chunk("data: {\"id\":\"" + id +
+                                  "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,"
+                                  "\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{"
+                                  "\"completion_tokens\":0,\"prompt_tokens\":0,"
+                                  "\"decode_tps\":0,\"reused_tokens\":0}}\n\n");
+                    c.write_chunk("data: [DONE]\n\n");
+                    c.end_stream();
+                } else {
+                    json::Value root = json::Value::make_obj();
+                    root.set("id", json::Value::make_str(id));
+                    root.set("object", json::Value::make_str("chat.completion"));
+                    root.set("created", json::Value::make_num((double)created));
+                    json::Value choices = json::Value::make_arr();
+                    json::Value ch = json::Value::make_obj();
+                    ch.set("index", json::Value::make_num(0));
+                    json::Value msg = json::Value::make_obj();
+                    msg.set("role", json::Value::make_str("assistant"));
+                    msg.set("content", json::Value::make_str(ans));
+                    ch.set("message", msg);
+                    ch.set("finish_reason", json::Value::make_str("stop"));
+                    choices.arr.push_back(ch);
+                    root.set("choices", choices);
+                    json::Value usage = json::Value::make_obj();
+                    usage.set("prompt_tokens", json::Value::make_num(0));
+                    usage.set("completion_tokens", json::Value::make_num(0));
+                    usage.set("decode_tps", json::Value::make_num(0));
+                    usage.set("reused_tokens", json::Value::make_num(0));
+                    root.set("usage", usage);
+                    c.send(200, "application/json", json::dump(root));
+                }
+                g.total_requests++;
+                return;
+            }
+        }
+
         // 大输入先报一声。
         //
         // 预填充是**一个字节都不吐**的一段：5 万 token 在 1.7B 上大约要一分钟，
@@ -4120,6 +4462,9 @@ int main(int argc, char** argv) {
             ctx.acc = &rtext;
             ctx.id = &id;
             ctx.created = created;
+            // 开了深度思考就把推理过程推给界面（单独一条 think 事件，
+            // 由前端折进"思考过程"块）；关着就照旧当垃圾丢掉。
+            ctx.think_emit = g_think_enabled && g_think_style;
 
             dubhe_stats st{};
 
@@ -4183,6 +4528,8 @@ int main(int argc, char** argv) {
                 ctx.tail.clear();
                 ctx.in_think = false;
                 ctx.think_buf.clear();
+                ctx.think_scan.clear();
+                ctx.visible = 0;
                 ctx.gtoks.clear();
                 // 有工具说明时才做抑制判定 —— 否则根本没在找 tool_call，
                 // 直接往外吐就是最快的路。
@@ -4221,10 +4568,21 @@ int main(int argc, char** argv) {
                 size_t endpos = 0;
                 if (!extract_tool_call(rtext, &tname, &targs, &endpos)) {
                     // 开头的字符看着像工具调用，原文被藏了，可解析不出来
-                    // （模型少个尖括号、JSON 截断在 max_tokens 上，都很常见）。
-                    // 藏了又没人接手 —— 用户看到的就是"已完成 · 0 tokens"加一片空白。
-                    // 原文吐回去，难看至少能读。
-                    if (ctx.suppress) emit_delta(&ctx, rtext);
+                    // （模型少个尖括号、工具名写坏、JSON 截断在 max_tokens 上，
+                    // 都很常见）。藏了又没人接手 —— 用户看到的就是
+                    // "已完成 · 0 tokens"加一片空白。
+                    //
+                    // 但"原样吐回去"也不行：吐回去的是
+                    // <tool_call><function=… 这种程序内部结构，用户读不懂，
+                    // 只会觉得软件坏了（上一版就是这么被投诉的）。
+                    // 剥掉标签，剩下的才是模型真说过的人话；一句都没有，
+                    // 就明说这次为什么没答案。
+                    if (ctx.suppress) {
+                        const std::string vis = scrub_history(rtext);
+                        emit_delta(&ctx, vis.empty()
+                            ? "（模型这一轮想调用工具，但调用格式不合法，没有产生可显示的回答。换个问法再试一次。）"
+                            : vis);
+                    }
                     break;
                 }
 
