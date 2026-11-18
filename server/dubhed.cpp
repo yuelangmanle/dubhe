@@ -2421,8 +2421,14 @@ bool try_arith(const std::string& q, std::string* out) {
     str_replace_all(&s, "减", "-");
 
     // 剥掉问句外壳。反复剥，因为 "请问 3+6 等于多少？" 是两层。
+    //
+    // 后面那几个是"元指令"（直接给结果/不要解释）。它们不影响这是一道算式，
+    // 但会让 try_arith 的字符校验失败，于是整句被推给模型 —— 实测 9B 拿到
+    // "887乘以7737等于多少？直接给结果，不要解释" 会想满 1500 token 还不给答案。
     const char* tails[] = {"等于多少", "等于几", "是多少", "结果是多少", "等于", "结果",
-                           "多少", "=", "?", "？", "。", "！", "!", "，", ","};
+                           "多少", "=", "?", "？", "。", "！", "!", "，", ",",
+                           "直接给结果", "直接回答", "直接说结果", "不要解释", "不用解释",
+                           "只给结果", "只给答案", "只输出结果", "只输出答案"};
     const char* heads[] = {"请问", "帮我算一下", "帮我算算", "帮我算", "请计算", "计算一下",
                            "计算", "算一下", "算算"};
     for (bool changed = true; changed;) {
@@ -2435,8 +2441,17 @@ bool try_arith(const std::string& q, std::string* out) {
             s.erase(0, 1);
             changed = true;
         }
-        for (const char* t : tails) {
-            if (ends_with(s, t)) { s.erase(s.size() - strlen(t)); changed = true; }
+        // 必须按**最长**匹配剥。
+        // 按数组顺序剥会出事："…等于多少？直接给结果" 里 "结果" 是后缀，
+        // 先被剥掉就剩 "…直接给"，再也没法还原，整句被判定成"不是算式"。
+        // 实测就是这么漏的 —— 明明是个纯算式却要走模型。
+        {
+            size_t best = 0;
+            for (const char* t : tails) {
+                const size_t n = strlen(t);
+                if (n > best && ends_with(s, t)) best = n;
+            }
+            if (best) { s.erase(s.size() - best); changed = true; }
         }
         for (const char* h : heads) {
             if (starts_with(s, h)) { s.erase(0, strlen(h)); changed = true; }
@@ -2549,6 +2564,17 @@ bool try_quick_answer(const std::string& q, std::string* out) {
 
     std::string joined;
     for (auto& s : segs) {
+        // 纯元指令的小段（"不要解释""直接给结果"）直接丢掉，不要它拖累整句。
+        // 实测 "887乘以7737等于多少？直接给结果，不要解释" 被逗号切成两段后，
+        // 第二段答不了，整句就退回模型 —— 明明是个算式。
+        {
+            static const char* kMeta[] = {"直接给结果", "直接回答", "不要解释", "不用解释",
+                                          "只给结果", "只给答案", "只输出", "请", "谢谢"};
+            bool meta = false, has_digit = false;
+            for (const char* mk : kMeta) if (s.find(mk) != std::string::npos) { meta = true; break; }
+            for (char c : s) if (c >= '0' && c <= '9') { has_digit = true; break; }
+            if (meta && !has_digit) continue;
+        }
         std::string a;
         if (try_arith(s, &a) || try_clock(s, &a)) {
             // 用中文逗号接起来：markdown 会把单个换行当成同一段，
