@@ -2193,6 +2193,22 @@ void refresh_model_markers(const std::string& model_path) {
 //   2. 下面给历史助手轮补 <think></think> 的那段逻辑，碰到正文里已经含有
 //      <think> 的内容，会拼成 "<think></think>推理…</think>" 这种畸形结构。
 //      模型随后就学会了在正文里乱吐 </think> —— 界面上看到的那堆标签就是这么来的。
+// 从"整段原始输出"里取出真正的答案。
+//
+// 提示词末尾已经替模型开了 <think>，所以输出形如
+//   推理……</think>答案
+// 流式通道有 feed_think 逐片分流，非流式没有，只能事后切一刀。
+//
+// 没有 </think> 时要分两种情况，不能一律当成"没想"：
+//   · 撞了 max_tokens → 推理还没写完，这段是草稿，扔掉；
+//   · 正常结束（EOS）  → 模型压根没进思考块，直接给的答案，原样保留。
+std::string strip_think_block(const std::string& s, bool truncated, bool think_model) {
+    const size_t k = s.rfind("</think>");
+    if (k != std::string::npos) return s.substr(k + 8);
+    if (think_model && truncated) return std::string();
+    return s;
+}
+
 std::string scrub_history(const std::string& s) {
     std::string r = s;
     auto cut = [&r](const std::string& open, const std::string& close) {
@@ -2335,6 +2351,106 @@ bool try_arith(const std::string& q, std::string* out) {
     const dubhe_calc::CalcResult r = dubhe_calc::calc_eval(s);
     if (!r.ok) return false;
     *out = s + " = " + r.text;
+    return true;
+}
+
+// 现在几点 / 今天星期几。这类问题同样是确定性的 —— 机器上有表，没必要问模型。
+//
+// 只认短句：长句里出现"今天"往往是在讲故事（"今天我去了趟超市"），
+// 抢答会答非所问。所以限制长度 + 必须命中"星期几/几号/几点"这种明确的问法。
+bool try_clock(const std::string& q, std::string* out) {
+    std::string s;
+    for (char ch : q) {
+        if (ch == ' ' || ch == '\t' || ch == '\n') continue;
+        s.push_back(ch);
+    }
+    // 收尾的问号/句号。中文标点是三字节，不能写成 char 字面量比较。
+    static const char* kTail[] = {"?", "？", "。", "!", "！", "~", " "};
+    for (bool changed = true; changed && !s.empty();) {
+        changed = false;
+        for (const char* t : kTail) {
+            const size_t n = strlen(t);
+            if (s.size() >= n && s.compare(s.size() - n, n, t) == 0) {
+                s.resize(s.size() - n);
+                changed = true;
+            }
+        }
+    }
+    if (s.empty() || s.size() > 24) return false;
+
+    static const char* kDate[] = {"星期几", "周几", "几号", "今天的日期", "今天是什么日子",
+                                  "今天几", "现在几号", "日期"};
+    static const char* kTime[] = {"现在几点", "当前时间", "现在的时间", "几点钟", "现在时间"};
+    bool date = false, time = false;
+    for (const char* k : kDate) if (s.find(k) != std::string::npos) { date = true; break; }
+    for (const char* k : kTime) if (s.find(k) != std::string::npos) { time = true; break; }
+    if (!date && !time) return false;
+
+    std::time_t t = std::time(nullptr);
+    std::tm tm {};
+    localtime_r(&t, &tm);
+    static const char* wd[] = {"日", "一", "二", "三", "四", "五", "六"};
+    char buf[96];
+    if (date && !time) {
+        std::snprintf(buf, sizeof(buf), "%d年%d月%d日 星期%s", tm.tm_year + 1900,
+                      tm.tm_mon + 1, tm.tm_mday, wd[tm.tm_wday]);
+        *out = std::string("今天是 ") + buf;
+    } else if (time && !date) {
+        std::snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
+        *out = std::string("现在是 ") + buf;
+    } else {
+        std::snprintf(buf, sizeof(buf), "%d年%d月%d日 星期%s %02d:%02d", tm.tm_year + 1900,
+                      tm.tm_mon + 1, tm.tm_mday, wd[tm.tm_wday], tm.tm_hour, tm.tm_min);
+        *out = std::string("现在是 ") + buf;
+    }
+    return true;
+}
+
+// 一条消息里塞了几个互不相干的小问题（"今天是星期几，887乘以7737等于多少"）
+// —— 逐个看能不能确定性回答；**只要有一段答不了，整条交回模型**。
+// 半抢答比不答更糟：用户会以为后面那半句被吞了。
+bool try_quick_answer(const std::string& q, std::string* out) {
+    std::vector<std::string> segs;
+    std::string cur;
+    auto flush = [&]() {
+        if (!cur.empty()) segs.push_back(cur);
+        cur.clear();
+    };
+    for (size_t i = 0; i < q.size();) {
+        // 中文标点按 UTF-8 三字节匹配，英文标点单字节
+        if (q.compare(i, 3, "，") == 0 || q.compare(i, 3, "；") == 0 ||
+            q.compare(i, 3, "、") == 0) {
+            flush();
+            i += 3;
+            continue;
+        }
+        if (q[i] == ',' || q[i] == ';' || q[i] == '\n') {
+            flush();
+            i++;
+            continue;
+        }
+        const bool conn = q.compare(i, 6, "还有") == 0 || q.compare(i, 6, "以及") == 0;
+        if (conn) { flush(); i += 6; continue; }
+        cur.push_back(q[i]);
+        i++;
+    }
+    flush();
+    if (segs.empty() || segs.size() > 3) return false;
+
+    std::string joined;
+    for (auto& s : segs) {
+        std::string a;
+        if (try_arith(s, &a) || try_clock(s, &a)) {
+            // 用中文逗号接起来：markdown 会把单个换行当成同一段，
+            // 拼出来就成了"星期三887*7737"，两句话黏在一起。
+            if (!joined.empty()) joined += "，";
+            joined += a;
+            continue;
+        }
+        return false;
+    }
+    if (joined.empty()) return false;
+    *out = joined;
     return true;
 }
 
@@ -2913,11 +3029,14 @@ void flush_pending(StreamCtx* x) {
         x->in_think = false;
         const bool had = !x->think_buf.empty();
         x->think_buf.clear();
-        if (had && !x->think_emit && x->visible == 0 && !x->suppress) {
+        // 不管推理给不给用户看，只要这一轮一个字答案都没剩下，就得交代
+        // 一句为什么。否则界面上要么是空气泡，要么是一个思考块下面空着 ——
+        // 两种都像"程序坏了"。
+        if (had && x->visible == 0 && !x->suppress) {
             x->c->write_chunk(
                 "data: {\"dubhe\":{\"type\":\"note\",\"message\":"
                 "\"模型把全部输出预算都用在了内部推理上，没有留下答案。"
-                "打开「思考过程」可以看到它想了什么，或者把最大生成长度调大再试。\"}}\n\n");
+                "可以把最大生成长度调大，或者换个更明确的问法。\"}}\n\n");
         }
     }
     // 末尾那个"可能是半个标签"的残留：既然流已经结束，就不是标签，是正文。
@@ -4422,7 +4541,7 @@ int main(int argc, char** argv) {
         // 命中条件很窄（整句就是一个算式），所以不会抢走"解释一下为什么"这类问题。
         {
             std::string ans;
-            if (g.no_arith_fastpath == 0 && try_arith(last_user_text(*msgs), &ans)) {
+            if (g.no_arith_fastpath == 0 && try_quick_answer(last_user_text(*msgs), &ans)) {
                 if (stream) {
                     if (!c.header_sent()) c.begin_stream();
                     c.write_chunk("data: {\"id\":\"" + id +
@@ -4942,7 +5061,17 @@ int main(int argc, char** argv) {
             msg.set("tool_calls", calls);
             ch.set("finish_reason", json::Value::make_str("tool_calls"));
         } else {
-            msg.set("content", json::Value::make_str(acc));
+            // 非流式这条路把**原始输出**整段吐回去，其中包括
+            // "<推理…</think>答案" 这种结构 —— 流式通道有 feed_think 分流，
+            // 这里没有，于是同一条请求 stream=true 干净、stream=false 满屏
+            // 自言自语。scrub 一下，两条路给的东西保持一致。
+            const bool truncated = sp.max_tokens > 0 && st.n_generated >= sp.max_tokens;
+            std::string shown = scrub_history(strip_think_block(acc, truncated, g_think_style != 0));
+            if (shown.empty() && !acc.empty()) {
+                shown = "（模型把全部输出预算都用在了内部推理上，没有留下答案。"
+                        "可以把最大生成长度调大，或打开「思考过程」看看它想了什么。）";
+            }
+            msg.set("content", json::Value::make_str(shown));
             ch.set("finish_reason", json::Value::make_str("stop"));
         }
         ch.set("message", msg);
