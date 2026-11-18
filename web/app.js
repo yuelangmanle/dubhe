@@ -85,14 +85,18 @@
     // 联网搜索：只在本次会话有效。打开后每个问题前面会加一句"先搜再答"，
     // 并临时打开工具（否则模型没有 web_search 可用，开关等于摆设）。
     web: false,
-    // 深度思考：模型有思考通道时可用。默认关 —— 打开后每个回答都要先想一遍，
-    // 首字延迟会明显变长，日常问答没必要付这个代价。选择记在本机。
+    // 是否显示模型的推理过程。默认关 —— 它只控制"看不着得见"，
+    // 不控制"想不想"：支持的模型（LFM3 这类）本来就会先想一遍，
+    // 关掉这个开关也拦不住，只会让推理漏进正文。
     think: localStorage.getItem('dubhe.think.v1') === '1',
     attach: null,   // 待发送的图片/音频/视频（一次只允许一个）
     logs: [],       // 右栏系统日志：只记真实事件，不编
     gen: null,      // 本轮生成统计 { tokens, tps, total, ttft }
     q: '',          // 左栏搜索关键词
     abort: null,    // 生成中的 AbortController，用于"停止"
+    // 正在生成的那个对话对象。停止按钮只在这个对话里出现 —— 切到别的
+    // 对话还显示停止键，按下去停的却是另一条，没人能猜到。
+    genConv: null,
     view: null,     // 当前打开的功能视图（null = 对话）
     fsPath: '',     // 文件视图当前目录
     memory: [],     // 记忆条目（见 loadMemory）
@@ -493,6 +497,7 @@
         renderMessages();
         renderTools();
         renderCwd();
+        refreshComposer();
         $('#convTitle').textContent = c.title;
         if (window.innerWidth <= 860) closeSidebar();
       };
@@ -802,6 +807,14 @@
     return node;
   }
 
+  // 消息 id。用途只有一个：流式生成期间用户切到别的对话再切回来，
+  // DOM 会被 renderMessages 整表重建，闭包里那个 node 引用就悬空了 ——
+  // 靠 id 才能在重建后的列表里把同一条消息找回来，接着往里写字。
+  let msgSeq = 0;
+  function newMsgId() {
+    return 'm' + Date.now().toString(36) + '_' + (++msgSeq);
+  }
+
   function messageNode(m) {
     if (m.role === 'user') {
       const wrap = el('div', 'msg user');
@@ -827,6 +840,7 @@
       }
       if (m.content) b.appendChild(document.createTextNode(m.content));
       wrap.appendChild(b);
+      if (m.id) wrap.dataset.mid = m.id;
       return markDrawn(wrap, m);
     }
 
@@ -955,6 +969,7 @@
       acts.appendChild(globBtn);
       col.appendChild(acts);
     }
+    if (m.id) wrap.dataset.mid = m.id;
     return markDrawn(wrap, m);
   }
 
@@ -1004,7 +1019,12 @@
   // 才重新打开。程序滚动期间用一个短标记忽略自己触发的 scroll 事件。
   const stick = { on: true };
   let progScroll = false;
-  const STICK_GAP = 72;   // 离底多少像素以内算"在底部"
+  // 离底多少像素以内算"在底部"。
+  //
+  // 原来是 72 —— 太松了。用户在底部往上滑个几十像素，仍然被判定成"在底部"，
+  // 下一段文字一到就把他拽回去；反复滑就反复弹，表现就是"在答案底部上下
+  // 滑动会跳"。12px 只够吸收亚像素误差和滚轮惯性，不会吃掉用户的上滑。
+  const STICK_GAP = 12;
 
   function atBottom(box) {
     return box.scrollHeight - box.scrollTop - box.clientHeight < STICK_GAP;
@@ -1025,8 +1045,11 @@
     if (!box || box.dataset.stickBound) return;
     box.dataset.stickBound = '1';
     box.addEventListener('scroll', () => {
-      // 自己滚出来的事件不算用户意图，否则跟随开关会被自己关掉
-      if (progScroll) return;
+      // 自己滚到底产生的事件不算用户意图；但只要位置不在底部，无论是不是
+      // 自己滚出来的，都说明内容被翻上去了 → 停止跟随。
+      // 原来是一刀切 `if (progScroll) return;`：用户在那一帧里的上滑会被
+      // 一起吞掉，下一段文字到达时又把他拽回底部 —— 这就是"底部上下滑会跳"。
+      if (progScroll && atBottom(box)) return;
       // 内容还不到一屏时，"在底部"是恒真的 —— 不能拿它当"用户想跟随"的
       // 证据。否则就是这个现象：用户往上滑了一下（其实也没地方可滑），
       // 下一个 scroll 事件立刻把跟随打开，然后生成一开始，画面就被一路
@@ -1650,7 +1673,7 @@
       wire = '```' + head + '\n' + att.text + '\n```' + (content ? '\n\n' + content : '');
     }
 
-    const userMsg = { role: 'user', content };
+    const userMsg = { role: 'user', content, id: newMsgId() };
     if (att) userMsg.att = { kind: att.kind, name: att.name, thumb: att.thumb, mime: att.mime, bytes: att.bytes };
     conv.messages.push(userMsg);
     if (conv.title === '新对话') {
@@ -1663,7 +1686,7 @@
     $('#input').value = '';
     autoGrow();
 
-    const ai = { role: 'assistant', content: '', tools: [], meta: null, streaming: true };
+    const ai = { role: 'assistant', content: '', tools: [], meta: null, streaming: true, id: newMsgId() };
     conv.messages.push(ai);
     state.gen = { tokens: 0, tps: 0, total: 0, ttft: 0 };
     setGauge(0, 0, 0, 0);
@@ -1685,7 +1708,8 @@
     scrollBottom(true);
 
     state.streaming = true;
-    setSendEnabled(false);
+    state.genConv = conv;
+    setSendEnabled();
     saveConvs();
     renderConvList();
 
@@ -1804,6 +1828,9 @@
       // 时又要抄一遍 —— 抄漏一处的症状是"后面的增量写进了已经不在 DOM
       // 里的旧节点"，界面上看着像卡住，控制台一句错都不报。
       const reswap = () => {
+        // 用户正在看别的对话：先把引用接回来；接不回来就只更新 ai 上的状态，
+        // 反正 reswap 的意义是"让当前 DOM 反映最新状态"，没有 DOM 就跳过。
+        if (!node.isConnected && !rebind()) return;
         const fresh = messageNode(ai);
         node.replaceWith(fresh);
         node = fresh;
@@ -1872,10 +1899,11 @@
         if (!t) return;
         ai.think = (ai.think || '') + t;
         thinkBuf += t;
-        ensureThink();
         if (thinkRaf) return;
         thinkRaf = requestAnimationFrame(() => {
           thinkRaf = 0;
+          if (!node.isConnected && !rebind()) return;
+          ensureThink();
           flushThink();
           if (stick.on) scrollBottom();
         });
@@ -1910,9 +1938,42 @@
         if (raf) return;
         raf = requestAnimationFrame(() => {
           raf = null;
+          // 用户切到别的对话去了：这个 node 已经不在文档里，写进去也没人看。
+          // 先把引用接回列表里的新节点；接不回来就这一帧不画，ai.content
+          // 仍然在长，切回来时 renderMessages 会一次性画出最新的。
+          if (!node.isConnected && !rebind()) return;
           paintNow();
           scrollBottom();
         });
+      };
+
+      // 把 node/body 重新绑到"当前 DOM 里那条消息"上。
+      //
+      // 为什么需要：切走对话会触发 renderMessages 整表重建，闭包里的 node
+      // 变成游离节点。之后所有 delta 都写进这个孤儿 —— 表现就是用户说的
+      // "切回来字幕不动了，再切一次又冒出一段"。
+      const rebind = () => {
+        if (node && node.isConnected) return true;
+        if (!ai.id) return false;
+        const fresh = document.querySelector('#messages .msg[data-mid="' + ai.id + '"]');
+        if (!fresh) return false;   // 正在看别的对话
+        node = fresh;
+        body = node.querySelector('.body');
+        if (!body) return false;
+        body.classList.add('typing');
+        // messageNode 已经把内容整段写进 .body 了。这里清掉，重建成
+        // "稳定头 + 尾部"两段式，接着往里面追加（否则内容会写两遍）。
+        body.innerHTML = '';
+        headEl = document.createElement('div');
+        tailEl = document.createElement('div');
+        headEl.className = 'md-head';
+        tailEl.className = 'md-tail';
+        body.appendChild(headEl);
+        body.appendChild(tailEl);
+        lastHead = null;
+        thinkBox = thinkText = thinkSum = null;   // 思考块的引用也随节点作废
+        paintNow();
+        return true;
       };
 
       while (true) {
@@ -2024,6 +2085,12 @@
               reswap();
             }
             ai.content += delta.content;
+            // 每片算一个 token。这个服务端是按 token 逐个 on_piece 推的，
+            // 所以计数是准的；最后那份 usage 还会再校正一次。
+            //
+            // 不加这一行的话，生成过程中右栏永远是"已生成 0 / 0 tok/s" ——
+            // 明明字在往外冒，仪表却是死的，看着就像界面卡住了。
+            state.gen.tokens = (state.gen.tokens || 0) + 1;
             paint();
             // 生成中每 12 帧刷一次仪表，别让 DOM 写操作拖慢解码
             if (++genTick % 12 === 0) {
@@ -2063,7 +2130,8 @@
       ai.streaming = false;
       delete ai.queued;    // 状态行用的临时标记，不该跟着会话存下去
       delete ai.noteText;
-      setSendEnabled(true);
+      state.genConv = null;
+      setSendEnabled();
       const total = (performance.now() - t0) / 1000;
       const tokens = (ai.meta && ai.meta.tokens) || state.gen.tokens || 0;
       state.gen = {
@@ -2117,12 +2185,24 @@
 
   // 生成中按钮不能变灰：它要变成"停止"。禁用掉的话，用户只能刷新页面，
   // 这是流式对话里最反直觉的一个坑。
-  function setSendEnabled(on) {
+  //
+  // 但"停止"只对**正在生成的那个对话**成立。原来只看全局 state.streaming，
+  // 于是切到别的对话后按钮照样是个停止键 —— 那个对话根本没在生成，按下去
+  // 停的是另一条，谁也想不到。现在按对话判断。
+  function refreshComposer() {
     const b = $('#send');
+    if (!b) return;
+    const busyHere = state.streaming && state.genConv && state.current &&
+                     state.genConv.id === state.current.id;
     b.disabled = false;
-    b.classList.toggle('stop', !on);
-    b.title = on ? '发送' : '停止生成';
-    b.innerHTML = on ? ICON_SEND : ICON_STOP;
+    b.classList.toggle('stop', !!busyHere);
+    b.title = busyHere ? '停止生成' : '发送';
+    b.innerHTML = busyHere ? ICON_STOP : ICON_SEND;
+  }
+
+  // 兼容旧调用点：只按当前状态重画，不再自己改 state。
+  function setSendEnabled() {
+    refreshComposer();
   }
 
   // ---------------------------------------------------------------- 面板
@@ -3393,7 +3473,19 @@
     }
 
     $('#send').onclick = () => {
-      if (state.streaming) { if (state.abort) state.abort.abort(); return; }
+      // 正在生成的是**当前这个**对话 → 停止
+      if (state.streaming && state.genConv && state.current &&
+          state.genConv.id === state.current.id) {
+        if (state.abort) state.abort.abort();
+        return;
+      }
+      // 别的对话在生成：服务端是串行的（后来的请求会排队），现在发只会让
+      // 用户以为卡住。说清楚，别装作没发生 —— 也别把按钮变成停止键。
+      if (state.streaming) {
+        const t = (state.genConv && state.genConv.title) || '另一个对话';
+        log('「' + t + '」还在生成。等它结束，或切回去点停止再发。', 'err');
+        return;
+      }
       send();
     };
     $('#newChat').onclick = () => { newConv(); closeSidebar(); };
@@ -3479,7 +3571,7 @@
       localStorage.setItem('dubhe.think.v1', state.think ? '1' : '0');
       $('#btnThink').classList.toggle('on', state.think);
       $('#btnThink').setAttribute('aria-pressed', state.think ? 'true' : 'false');
-      log(state.think ? '深度思考已开：模型会先推理再作答' : '深度思考已关');
+      log(state.think ? '会显示模型的推理过程' : '不显示推理过程（模型仍然会思考）');
     };
     $('#btnThink').classList.toggle('on', state.think);
 

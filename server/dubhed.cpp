@@ -2364,10 +2364,10 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
         } else if (role == "assistant") {
             content = scrub_history(content);
             if (content.empty()) continue;   // 整轮都是工具调用/推理，没什么可回灌的
-            // 历史里的助手轮也要带上"空思考块"。模板在 keep_thinking 为假时
-            // 会补一个，我们自己拼 prompt 就得手动补 —— 少了它，模型看到
-            // 自己上一轮"没有思考块"，会以为格式错了，接着把推理写出来。
-            if (g_think_style && !g_think_enabled)
+            // 历史里的助手轮统一补一个**空**思考块：历史不该回灌推理（那是
+            // 上一轮的草稿，越长越带偏），但格式必须完整 —— 少了它，模型
+            // 看到自己上一轮"没有思考块"，会以为格式错了，接着把推理写出来。
+            if (g_think_style)
                 content = "<think></think>" + content;
             p += "<|im_start|>assistant\n" + content + "<|im_end|>\n";
         } else if (role == "tool" || role == "tool_denied") {
@@ -2396,8 +2396,16 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
         p = std::string("<|im_start|>system\n") + tool_prompt() + "<|im_end|>\n" + p;
     }
     p += "<|im_start|>assistant\n";
-    if (g_think_style && !g_think_enabled)
-        p += "<think></think>";   // 空块 = 这轮不要思考，直接答
+    // 思考通道**永远打开**，不再取决于用户的开关。
+    //
+    // 之前的做法是"关掉思考"就塞一个空的 <think></think>，指望模型直接作答。
+    // 实测 LFM3-1.7B 根本不照办：它照样要想，只是把整段推理写进正文 ——
+    // 用户看到的就是几屏英文自言自语加最后一句答案，比开着思考还难读。
+    //
+    // 既然它无论如何都要想，那就让它在自己的通道里想：同样的 token 数、
+    // 同样的速度，但推理会被 </think> 收走，正文干净。界面上那个开关
+    // 改成"要不要把这段推理显示出来"，而不是"要不要想"。
+    if (g_think_style) p += "<think>";
     return p;
 }
 
@@ -2909,7 +2917,7 @@ void flush_pending(StreamCtx* x) {
             x->c->write_chunk(
                 "data: {\"dubhe\":{\"type\":\"note\",\"message\":"
                 "\"模型把全部输出预算都用在了内部推理上，没有留下答案。"
-                "打开「深度思考」可以看到它想了什么，或者把最大生成长度调大再试。\"}}\n\n");
+                "打开「思考过程」可以看到它想了什么，或者把最大生成长度调大再试。\"}}\n\n");
         }
     }
     // 末尾那个"可能是半个标签"的残留：既然流已经结束，就不是标签，是正文。
@@ -3183,6 +3191,17 @@ static void sum_piece_cb(void* ud, int32_t tok, const char* piece) {
 
 // ---------------------------------------------------------------- handlers
 int main(int argc, char** argv) {
+    // SIGPIPE 必须忽略。
+    //
+    // 这是本机 SSE 服务的头号杀手：用户切到别的对话、点停止、或者刷新页面，
+    // 前端会中止 fetch，socket 那头就没了；服务端还在按 token 往这条已经
+    // 关闭的连接写数据，内核直接给进程一个 SIGPIPE —— 整个引擎当场死掉，
+    // 而日志里只有"退出码 13（被信号终止）"这一行，看起来像玄学崩溃。
+    // 实测就是这样：切一次对话 = 崩一次。
+    // 忽略之后 send() 会返回 -1/EPIPE，write_all 里已经把它标成 broken_，
+    // 连接自己回收，进程继续服务其它请求。
+    ::signal(SIGPIPE, SIG_IGN);
+
     std::string host = "127.0.0.1";
     int port = 7777;
     std::string model;
@@ -4537,7 +4556,12 @@ int main(int argc, char** argv) {
                 ctx.suppress = false;
                 ctx.pending.clear();
                 ctx.tail.clear();
-                ctx.in_think = false;
+                // 提示词末尾已经替模型打开了 <think>（见 build_prompt），
+                // 所以这条流是**从思考块内部**开始的 —— 模型不会再吐一个
+                // <think> 出来，扫描器必须一开始就处于 in_think。
+                // 原来这里写 false，结果整段推理被当成正文直接吐出去，
+                // 就是"关了开关反而更难读"的原因。
+                ctx.in_think = (g_think_style != 0);
                 ctx.think_buf.clear();
                 ctx.think_scan.clear();
                 ctx.visible = 0;
