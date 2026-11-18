@@ -2117,3 +2117,12 @@ body[data-glass="off"] .edge::before { display: none; }
   height: 100%; background: var(--brand-solid); border-radius: 2px;
   transition: width .3s var(--ease);
 }
+
+/* 翻译视图 */
+.vsel {
+  margin-top: 8px; padding: 7px 10px; border-radius: var(--r-s);
+  border: 1px solid var(--glass-line); background: var(--glass-soft);
+  color: var(--text); font-family: inherit; font-size: 13.5px; max-width: 100%;
+}
+.tbar { display: flex; align-items: center; gap: 10px; margin: 12px 0; flex-wrap: wrap; }
+.tbar .vmeta { margin: 0; }

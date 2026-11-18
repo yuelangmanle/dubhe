@@ -2753,6 +2753,7 @@
 
   const VIEWS = {
     models: { title: '模型', render: () => viewModels() },
+    translate: { title: '翻译', render: () => viewTranslate() },
     tools: { title: '工具', render: () => viewTools() },
     agent: { title: 'Agent', render: () => viewAgent() },
     files: { title: '文件', render: () => viewFiles(state.fsPath) },
@@ -3129,6 +3130,199 @@
     body.appendChild(el('div', 'vnote',
       '速度是按"内存带宽 ÷ 模型体积"估的，拿当前模型的实测值外推 —— 同一台机器上，'
       + 'F16 的体积是 Q4_K_M 的三倍，速度也就只有三分之一。觉得慢先换小量化档，换内核没用。'));
+  }
+
+  // ---------------------------------------------------------------- 翻译
+  //
+  // 为什么放在客户端：翻译 = 切段 + 逐段请求 + 进度/中断，全是交互层的活。
+  // 服务端再加一个 /api/translate，等于把流式、中止、进度原样再实现一遍。
+  //
+  // 模型可选：引擎一次只加载一个模型，选了别的会先切过去（1~2 秒）。
+  // 界面明写"正在切换模型"，不做无声的重活。
+  const LANGS = [
+    ['zh', '简体中文'], ['en', 'English'], ['ja', '日本語'],
+    ['ko', '한국어'], ['fr', 'Français'], ['de', 'Deutsch'],
+  ];
+
+  // 按段落切，尽量不把一句话劈两半。单段超长才硬切。
+  function splitChunks(text, max) {
+    const paras = text.split(/\n\s*\n/);
+    const out = [];
+    let cur = '';
+    for (let p of paras) {
+      p = p.trim();
+      if (!p) continue;
+      if (p.length > max) {
+        if (cur) { out.push(cur); cur = ''; }
+        for (let i = 0; i < p.length; i += max) out.push(p.slice(i, i + max));
+        continue;
+      }
+      if (cur.length + p.length + 2 > max) { out.push(cur); cur = p; }
+      else cur = cur ? cur + '\n\n' + p : p;
+    }
+    if (cur) out.push(cur);
+    return out;
+  }
+
+  async function viewTranslate() {
+    const body = $('#viewBody');
+    body.innerHTML = '';
+    setViewHead('翻译', '文本 / 文档 · 可指定模型', []);
+
+    let items = [];
+    let curPath = '';
+    try {
+      const d = await vapi('/api/models');
+      items = (d.items || []).filter((x) => x.loadable);
+      curPath = d.current || '';
+    } catch (e) { /* 读不到清单就只留当前模型 */ }
+
+    const card = el('div', 'vcard');
+
+    // 模型 + 目标语言
+    const row1 = el('div', 'vrow');
+    const m1 = el('div', 'vmain');
+    m1.appendChild(el('div', 'vname', '用哪个模型翻译'));
+    const selM = document.createElement('select');
+    selM.className = 'vsel';
+    items.forEach((m) => {
+      const o = document.createElement('option');
+      o.value = m.path;
+      o.textContent = m.name + (m.path === curPath ? '（当前已加载）' : '');
+      if (m.path === curPath) o.selected = true;
+      selM.appendChild(o);
+    });
+    m1.appendChild(selM);
+    m1.appendChild(el('div', 'vmeta',
+      '换模型要先加载权重，约 1–2 秒；正在生成的回答会被中断。'));
+    row1.appendChild(m1);
+
+    const m2 = el('div', 'vmain');
+    m2.appendChild(el('div', 'vname', '译成'));
+    const selL = document.createElement('select');
+    selL.className = 'vsel';
+    LANGS.forEach(([v, t]) => {
+      const o = document.createElement('option');
+      o.value = v;
+      o.textContent = t;
+      if (v === 'en') o.selected = true;
+      selL.appendChild(o);
+    });
+    m2.appendChild(selL);
+    row1.appendChild(m2);
+    card.appendChild(row1);
+    body.appendChild(card);
+
+    // 原文
+    const ta = document.createElement('textarea');
+    ta.className = 'field';
+    ta.rows = 8;
+    ta.placeholder = '把要翻译的文字贴在这里，或点「读文件」选一个 .txt / .md …';
+    const srcCard = el('div', 'vcard');
+    srcCard.appendChild(ta);
+    body.appendChild(srcCard);
+
+    const bar = el('div', 'tbar');
+    const fileBtn = el('button', 'vbtn', '读文件');
+    const inputFile = document.createElement('input');
+    inputFile.type = 'file';
+    inputFile.accept = '.txt,.md,.markdown,.csv,.log';
+    inputFile.style.display = 'none';
+    fileBtn.onclick = () => inputFile.click();
+    inputFile.onchange = () => {
+      const f = inputFile.files && inputFile.files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = () => { ta.value = String(r.result || ''); };
+      r.readAsText(f);
+    };
+    bar.appendChild(fileBtn);
+    bar.appendChild(inputFile);
+
+    const go = el('button', 'vbtn pri', '翻译');
+    bar.appendChild(go);
+    const prog = el('span', 'vmeta', '');
+    bar.appendChild(prog);
+    body.appendChild(bar);
+
+    // 结果
+    const outBox = el('pre', 'code-box');
+    outBox.style.minHeight = '120px';
+    const outCard = el('div', 'vcard');
+    outCard.appendChild(outBox);
+    const copyBtn = el('button', 'vbtn', '复制译文');
+    copyBtn.style.marginTop = '8px';
+    copyBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(outBox.textContent || '');
+        copyBtn.textContent = '已复制';
+        setTimeout(() => (copyBtn.textContent = '复制译文'), 1500);
+      } catch (e) { /* 剪贴板没权限就算了 */ }
+    };
+    outCard.appendChild(copyBtn);
+    body.appendChild(outCard);
+
+    go.onclick = async () => {
+      const text = ta.value.trim();
+      if (!text) { prog.textContent = '先贴点东西'; return; }
+      go.disabled = true;
+      copyBtn.disabled = true;
+      outBox.textContent = '';
+      const lang = LANGS.find(([v]) => v === selL.value)[1];
+
+      try {
+        // 换模型（如果用户选的不是当前加载的那个）
+        if (selM.value && selM.value !== curPath) {
+          prog.textContent = '正在切换模型…';
+          await vpost('/api/load', { path: selM.value });
+          curPath = selM.value;
+        }
+
+        const chunks = splitChunks(text, 1200);
+        let acc = '';
+        for (let i = 0; i < chunks.length; i++) {
+          prog.textContent = (i + 1) + ' / ' + chunks.length + ' 段';
+          const r = await fetch('/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              messages: [
+                {
+                  role: 'system',
+                  content: '你是专业翻译引擎。只输出译文：不解释、不加引号、'
+                    + '不重复原文、不写"以下是译文"这类前言。保留原有换行与段落；'
+                    + '代码、URL、数字、人名原样保留。',
+                },
+                { role: 'user', content: '把下面的内容翻译成' + lang + '：\n\n' + chunks[i] },
+              ],
+              stream: false,
+              thinking: false,
+              temperature: 0.2,
+              // 下限给到 1500：LFM3 这类模型即使不想答，也要先在自己的
+              // 思考通道里走一遍。512 的结果就是"预算全用在推理上"、
+              // 译文一个字没有（实测过）。
+              max_tokens: Math.min(4096, Math.max(1500, Math.round(chunks[i].length * 3))),
+            }),
+          });
+          const j = await r.json();
+          const piece = (((j.choices || [])[0] || {}).message || {}).content || '';
+          acc += (acc ? '\n\n' : '') + piece.trim();
+          outBox.textContent = acc;
+          if (i === 0 && !piece.trim()) {
+            outBox.textContent = '（这一段没有输出。多半是模型把预算花在推理上了 —— '
+              + '换一个模型，或在设置里把最大输出调大。）';
+            break;
+          }
+        }
+        prog.textContent = '完成 · ' + chunks.length + ' 段';
+      } catch (e) {
+        outBox.textContent += '\n\n⚠️ ' + e.message;
+        prog.textContent = '失败';
+      } finally {
+        go.disabled = false;
+        copyBtn.disabled = false;
+      }
+    };
   }
 
   // ---------------------------------------------------------------- 工具

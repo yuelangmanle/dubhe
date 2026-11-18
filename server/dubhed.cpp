@@ -3824,21 +3824,31 @@ int main(int argc, char** argv) {
         const char* note;
     };
     static const StoreEntry kStore[] = {
-        {"qwen25-7b-q4", "Qwen2.5-7B-Instruct", "7B", "Q4_K_M", 4683074240LL,
-         "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
-         "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/"
-         "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
-         "通用首选：中文好、指令跟随稳，24GB 上约 20–30 tok/s"},
-        {"qwen25-3b-q4", "Qwen2.5-3B-Instruct", "3B", "Q4_K_M", 2104932768LL,
-         "qwen2.5-3b-instruct-q4_k_m.gguf",
-         "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/"
-         "qwen2.5-3b-instruct-q4_k_m.gguf",
-         "速度优先，内存余量很大，适合边聊边干别的"},
-        {"qwen25-05b-q4", "Qwen2.5-0.5B-Instruct", "0.5B", "Q4_K_M", 491400032LL,
-         "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-         "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/"
-         "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-         "最小最快，适合分类、打标这类杂活"},
+        {"qwen35-9b-q4", "Qwen3.5-9B Instruct", "9B", "Q4_K_M", 5680522464LL,
+         "Qwen3.5-9B-Q4_K_M.gguf",
+         "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
+         "最新一代，引擎有专属内核（Gated DeltaNet）；24GB 上约 10–12 tok/s"},
+        {"qwen35-4b-q4", "Qwen3.5-4B Instruct", "4B", "Q4_K_M", 2740937888LL,
+         "Qwen3.5-4B-Q4_K_M.gguf",
+         "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+         "质量与速度的平衡点，比 1.7B 明显聪明，速度还有 20 tok/s 上下"},
+        {"lfm25-26b-q4", "LFM2.5-2.6B", "2.6B", "Q4_K_M", 1674455040LL,
+         "LFM2.5-2.6B-Q4_K_M.gguf",
+         "https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF/resolve/main/LFM2.5-2.6B-Q4_K_M.gguf",
+         "LiquidAI 新一代端侧模型，多语言好、延迟低"},
+        {"lfm25-12b-q4", "LFM2.5-1.2B Instruct", "1.2B", "Q4_K_M", 730895168LL,
+         "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
+         "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/main/"
+         "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
+         "最小最快，适合分类、打标、翻译这类高频杂活"},
+        // 千问 3.8 目前只有 27B 一个尺寸（另两个是 MoE 巨兽）。架构名仍然是
+        // qwen35，引擎能加载；但 16.5 GB 塞进 24GB 机器后剩不下多少给 KV，
+        // 上下文会很短、速度掉到个位数。列出来是为了有据可查，不是推荐。
+        {"qwen38-27b-q4", "Qwen3.8-27B（大，24GB 吃紧）", "27B", "UD-Q4_K_M",
+         16564259744LL, "Qwen3.8-27B-UD-Q4_K_M.gguf",
+         "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-UD-Q4_K_M.gguf",
+         "最新旗舰，但 16.5 GB 在 24GB 机器上只剩很少上下文，约 4–5 tok/s；"
+         "想试可以，不建议日常用"},
     };
 
     struct DlJob {
