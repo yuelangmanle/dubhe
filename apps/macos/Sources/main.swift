@@ -560,6 +560,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
+        // ⌘⇧T：把当前选中的文字送去翻译。
+        // 全局监听本身也要辅助功能权限；没授权时收不到按键，但不会崩，
+        // 也不会影响其它快捷键。真正的权限提示在 translateSelection 里。
+        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            let mods = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard mods.contains([.command, .shift]),
+                  e.charactersIgnoringModifiers?.lowercased() == "t" else { return }
+            self?.translateSelection()
+        }
+
         showSplash("正在启动本地引擎…")
     }
 
@@ -795,6 +805,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             notifyTurnEnd((obj["body"] as? String) ?? "回答已生成")
         case "ocr":
             captureAndOCR()
+        case "translateSelection":
+            translateSelection()
         default:
             break
         }
@@ -861,6 +873,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     self.ocrReply("")
                 }
             }
+        }
+    }
+
+    // ------------------------------------------------------------ 划词翻译
+    //
+    // 读"系统里当前选中的文字"，靠的是辅助功能（Accessibility）接口：
+    // AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElement) 拿到
+    // 当前焦点控件，再读它的 kAXSelectedTextAttribute。
+    //
+    // 它需要用户在系统设置里授予「辅助功能」权限 —— 不给就是读不到，
+    // 而且 macOS 不会报错，只会返回 -25211。所以第一次调用前先
+    // AXIsProcessTrusted()，未授权就弹系统引导，别让用户以为程序坏了。
+    private func translateSelection() {
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+        guard AXIsProcessTrustedWithOptions(opts as CFDictionary) else {
+            dbg("accessibility 未授权")
+            return
+        }
+        let sys = AXUIElementCreateSystemWide()
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString,
+                                            &focused) == .success,
+              let el = focused else {
+            dbg("ax: 拿不到焦点控件")
+            return
+        }
+        var sel: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el as! AXUIElement,
+                                            kAXSelectedTextAttribute as CFString,
+                                            &sel) == .success,
+              let text = sel as? String, !text.isEmpty else {
+            dbg("ax: 没有选中文本")
+            return
+        }
+        dbg("ax 选中 \(text.count) 字")
+        pushTextToPage(text)
+    }
+
+    private func pushTextToPage(_ text: String) {
+        guard let data = try? JSONSerialization.data(withJSONObject: [text]),
+              let s = String(data: data, encoding: .utf8) else { return }
+        let lit = String(s.dropFirst().dropLast())
+        DispatchQueue.main.async {
+            self.webView.evaluateJavaScript(
+                "window.dubheText && window.dubheText(\(lit))") { _, _ in }
         }
     }
 

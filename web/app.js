@@ -3168,6 +3168,23 @@
   let ocrSink = null;
   window.dubheOcr = (text) => { if (ocrSink) ocrSink(text || ''); };
 
+  // 划词翻译的回灌口：外壳读到系统里选中的文字，送到这里就切到翻译页并开翻。
+  window.dubheText = (text) => {
+    if (!text) return;
+    openView('translate');
+    // 视图是 async 渲染的，等 textarea 出现再填。
+    let tries = 0;
+    const tick = setInterval(() => {
+      const ta = document.querySelector('#viewBody textarea');
+      if (!ta) { if (++tries > 40) clearInterval(tick); return; }
+      clearInterval(tick);
+      ta.value = text;
+      const go = Array.from(document.querySelectorAll('#viewBody .vbtn'))
+        .find((b) => b.textContent.trim() === '翻译');
+      if (go) go.click();
+    }, 120);
+  };
+
   async function viewTranslate() {
     const body = $('#viewBody');
     body.innerHTML = '';

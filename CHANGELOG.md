@@ -6,6 +6,17 @@
 
 ---
 
+## [0.26.10] · 2026-11-19 · 划词翻译（需要辅助功能权限）
+
+- 全局快捷键 **⌘⇧T**：读系统当前选中的文字 → 切到翻译页 → 自动开翻。
+- 读取走辅助功能接口：`AXUIElementCopyAttributeValue(systemWide,
+  kAXFocusedUIElement)` 拿到焦点控件，再读 `kAXSelectedTextAttribute`。
+- **第一次用需要在「系统设置 → 隐私与安全性 → 辅助功能」里勾上 Dubhe**。
+  没授权时 `AXIsProcessTrustedWithOptions` 会弹系统引导，我们这边只记一行
+  `accessibility 未授权` —— 不静默失败，也不假装成功。
+
+---
+
 ## [0.26.9] · 2026-11-19 · no_think + 截图取词（Vision OCR）
 
 ### 新增
