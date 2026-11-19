@@ -2609,6 +2609,13 @@ std::string now_stamp() {
     return b;
 }
 
+// 本次请求是否跳过思考通道。
+//
+// 用 thread_local 而不是参数一路传：build_tokens 已经被四个地方调用，
+// 每加一个开关就要改四遍，漏一处就是"某个路径行为不一致"这种最难查的 bug。
+// 每个请求在自己的线程上跑，进 handler 时设置、结束自然回收。
+static thread_local bool t_no_think = false;
+
 std::string build_prompt(const json::Value& messages, bool chatml, bool with_tools) {
     std::string p;
     if (!chatml) {
@@ -2688,7 +2695,7 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
     // 既然它无论如何都要想，那就让它在自己的通道里想：同样的 token 数、
     // 同样的速度，但推理会被 </think> 收走，正文干净。界面上那个开关
     // 改成"要不要把这段推理显示出来"，而不是"要不要想"。
-    if (g_think_style) p += "<think>";
+    if (g_think_style && !t_no_think) p += "<think>";
     return p;
 }
 
@@ -4804,6 +4811,14 @@ int main(int argc, char** argv) {
             }
         }
 
+        // 跳过思考通道：翻译、改写、抽取这类"照着做就行"的任务用。
+        //
+        // 和 thinking=false 的区别：那个只是"想完了不给你看"，模型照样要想，
+        // 时间照样花；no_think 是连 `<think>` 都不替它开，让它直接出结果。
+        // 万一它还是自己写了 <think>，扫描器照样会把那段收进通道丢掉 ——
+        // 所以不会出现"推理漏进译文"。
+        t_no_think = body.get("no_think") && body.flag("no_think", false);
+
         // 提前失败的统一出口。
         //
         // 排队那条路上头已经发出去了（见上），此时 c.send(400) 会因为
@@ -5030,7 +5045,7 @@ int main(int argc, char** argv) {
                 // <think> 出来，扫描器必须一开始就处于 in_think。
                 // 原来这里写 false，结果整段推理被当成正文直接吐出去，
                 // 就是"关了开关反而更难读"的原因。
-                ctx.in_think = (g_think_style != 0);
+                ctx.in_think = (g_think_style != 0 && !t_no_think);
                 ctx.think_buf.clear();
                 ctx.think_scan.clear();
                 ctx.visible = 0;

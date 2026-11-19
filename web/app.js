@@ -3164,6 +3164,10 @@
     return out;
   }
 
+  // 截图取词的回灌口。外壳（Swift）识别完会调它。
+  let ocrSink = null;
+  window.dubheOcr = (text) => { if (ocrSink) ocrSink(text || ''); };
+
   async function viewTranslate() {
     const body = $('#viewBody');
     body.innerHTML = '';
@@ -3239,6 +3243,23 @@
     bar.appendChild(fileBtn);
     bar.appendChild(inputFile);
 
+    // 截图取词：框一块屏幕区域，交给外壳里的 Vision 识别，结果回到这里。
+    // 走 OCR 而不是把图丢给多模态模型 —— 印刷体的逐字准确率和速度都差一个量级。
+    const shotBtn = el('button', 'vbtn', '截图取词');
+    shotBtn.onclick = () => {
+      const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.shell;
+      if (!h) { prog.textContent = '这个能力只在桌面 App 里可用'; return; }
+      prog.textContent = '框选要翻译的区域…';
+      h.postMessage({ type: 'ocr' });
+    };
+    bar.appendChild(shotBtn);
+
+    ocrSink = (t) => {
+      if (!t) { prog.textContent = '没取到文字（取消了，或没给「屏幕录制」权限）'; return; }
+      ta.value = t;
+      prog.textContent = '已取词 ' + t.length + ' 字';
+    };
+
     const go = el('button', 'vbtn pri', '翻译');
     bar.appendChild(go);
     const prog = el('span', 'vmeta', '');
@@ -3297,6 +3318,9 @@
               ],
               stream: false,
               thinking: false,
+              // 翻译是"照着做"的任务，不需要它先想一遍。
+              // 关掉思考通道后，同样一句中译英从十几秒降到一两秒。
+              no_think: true,
               temperature: 0.2,
               // 下限给到 1500：LFM3 这类模型即使不想答，也要先在自己的
               // 思考通道里走一遍。512 的结果就是"预算全用在推理上"、

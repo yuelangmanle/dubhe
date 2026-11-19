@@ -18,6 +18,7 @@ import Cocoa
 import UserNotifications
 import UniformTypeIdentifiers
 import WebKit
+import Vision
 
 // ---------------------------------------------------------------- 端口探测
 //
@@ -792,9 +793,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         switch type {
         case "turnEnd":
             notifyTurnEnd((obj["body"] as? String) ?? "回答已生成")
+        case "ocr":
+            captureAndOCR()
         default:
             break
         }
+    }
+
+    // ------------------------------------------------------------ 截图取词
+    //
+    // 为什么必须在外壳里：网页拿不到屏幕。截屏和文字识别（Vision）都是
+    // 原生框架，只有 App 进程能调。
+    //
+    // 用 -i 交互选区：框一块就识别。识别结果回灌给页面里的 window.dubheOcr，
+    // 由翻译页填进输入框 —— 这里不做翻译，只负责"把图上的字变成文本"。
+    private func captureAndOCR() {
+        let tmp = NSTemporaryDirectory() + "dubhe-ocr.png"
+        // 调试口：给一张现成的图，跳过交互选区直接识别。
+        // 没有这个，验证 OCR 只能靠人手框选，没法自动化。
+        if let fixed = ProcessInfo.processInfo.environment["DUBHE_OCR_FILE"], !fixed.isEmpty {
+            ocrFile(fixed)
+            return
+        }
+        try? FileManager.default.removeItem(atPath: tmp)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        p.arguments = ["-i", "-x", tmp]     // -x：不播快门声
+        do {
+            try p.run()
+        } catch {
+            ocrReply("")
+            return
+        }
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { ocrReply(""); return }
+        ocrFile(tmp)
+    }
+
+    private func ocrFile(_ path: String) {
+        guard let img = NSImage(contentsOfFile: path),
+              let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            ocrReply("")
+            return
+        }
+        let req = VNRecognizeTextRequest { r, _ in
+            var lines: [String] = []
+            let obs = (r.results as? [VNRecognizedTextObservation]) ?? []
+            for o in obs {
+                if let t = o.topCandidates(1).first?.string { lines.append(t) }
+            }
+            DispatchQueue.main.async {
+                dbg("ocr -> \(lines.count) 行 / \(lines.joined(separator: "\n").count) 字")
+                self.ocrReply(lines.joined(separator: "\n"))
+            }
+        }
+        req.recognitionLevel = .accurate
+        req.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+        req.usesLanguageCorrection = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try VNImageRequestHandler(cgImage: cg, options: [:]).perform([req])
+            } catch {
+                // 别用 try? 吞掉：perform 抛错时 completion 根本不会回调，
+                // 表现就是"点了没反应"，一句日志都没有。
+                DispatchQueue.main.async {
+                    dbg("ocr perform failed: \(error)")
+                    self.ocrReply("")
+                }
+            }
+        }
+    }
+
+    private func ocrReply(_ text: String) {
+        // 用 JSONSerialization 转义，别自己拼引号：识别出来的文本里
+        // 换行、引号、反斜杠都有，手拼必然漏。
+        guard let data = try? JSONSerialization.data(withJSONObject: [text]),
+              let s = String(data: data, encoding: .utf8) else { return }
+        let lit = String(s.dropFirst().dropLast())   // 去掉外层方括号
+        webView.evaluateJavaScript("window.dubheOcr && window.dubheOcr(\(lit))") { _, _ in }
     }
 
     // ------------------------------------------------------------ 等就绪
