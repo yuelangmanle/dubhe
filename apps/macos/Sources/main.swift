@@ -807,6 +807,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             captureAndOCR()
         case "translateSelection":
             translateSelection()
+        case "openAx":
+            // 直接跳到「隐私与安全性 → 辅助功能」，省得用户自己翻三层菜单。
+            if let u = URL(string:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                NSWorkspace.shared.open(u)
+            }
+        case "axStatus":
+            let ok = AXIsProcessTrusted()
+            webView.evaluateJavaScript(
+                "window.dubheAxStatus && window.dubheAxStatus(\(ok ? "true" : "false"))") { _, _ in }
         default:
             break
         }

@@ -2970,12 +2970,21 @@
         const info = el('div', 'vmeta', '下载中 ' + pct + '% · ' + fmtBytes(got) + ' / ' + fmtBytes(m.total));
         main.appendChild(info);
         main.appendChild(bar);
+        // 取消：kill 掉 curl，.part 留着 —— 反悔了还能接着下。
+        const cx = el('button', 'vbtn', '取消');
+        cx.onclick = async () => {
+          cx.disabled = true;
+          try { await vpost('/api/store/cancel', { id: m.id }); } catch (e) { /* 忽略 */ }
+          setTimeout(() => viewStore(host), 400);
+        };
+        row.appendChild(cx);
         polling = true;
         card.appendChild(row);
         return;
       }
 
-      const b = el('button', 'vbtn', m.state === 'error' ? '重试' : '下载');
+      const b = el('button', 'vbtn', m.state === 'error' ? '重试'
+        : m.state === 'cancelled' ? '继续' : '下载');
       b.onclick = async () => {
         b.disabled = true;
         b.textContent = '启动…';
@@ -2997,6 +3006,35 @@
       card.appendChild(row);
     });
     host.appendChild(card);
+
+    // 下载源。国内直连 huggingface.co 常常只有几百 KB/s —— 4.7GB 要下两小时。
+    // 换成镜像能快一个数量级，但镜像的可用性不归我们管，所以做成可切换而不是写死。
+    const mrow = el('div', 'vrow');
+    const mm = el('div', 'vmain');
+    mm.appendChild(el('div', 'vname', '下载源'));
+    const inp = document.createElement('input');
+    inp.className = 'vsel';
+    inp.style.width = '100%';
+    inp.placeholder = 'https://hf-mirror.com（留空 = 官方 huggingface.co）';
+    inp.value = d.mirror || '';
+    mm.appendChild(inp);
+    mm.appendChild(el('div', 'vmeta', '只替换域名，路径不变。改完对之后开始的下载生效。'));
+    mrow.appendChild(mm);
+    const save = el('button', 'vbtn', '保存');
+    save.onclick = async () => {
+      save.disabled = true;
+      try {
+        await vpost('/api/store/mirror', { mirror: inp.value.trim() });
+        save.textContent = '已保存';
+        setTimeout(() => { save.textContent = '保存'; save.disabled = false; }, 1200);
+      } catch (e) {
+        save.disabled = false;
+        save.textContent = '失败';
+      }
+    };
+    mrow.appendChild(save);
+    host.appendChild(mrow);
+
     host.appendChild(el('div', 'vnote',
       '只列引擎确认能加载的模型（llama 家族 / LFM / Qwen3.5）。'
       + '下载支持断点续传，中断后点「重试」会接着下；完成后自动出现在上面的列表里。'));
@@ -3109,6 +3147,28 @@
           }
         };
         row.appendChild(b);
+
+        // 删除。只有"不是当前加载的"才给这个按钮 —— 删掉正在用的权重，
+        // 引擎手里还攥着已映射的文件，之后任何一次切换都会失败。
+        if (!m.loaded) {
+          const del = el('button', 'vbtn', '删除');
+          del.title = '从磁盘删除这个文件';
+          del.onclick = async () => {
+            if (!window.confirm('删除 ' + m.name + '？\n文件会直接从磁盘移除，不能撤销。')) return;
+            del.disabled = true;
+            try {
+              await vpost('/api/models/delete', { path: m.path });
+              viewModels();
+            } catch (e) {
+              del.disabled = false;
+              del.textContent = '删不掉';
+              const note = el('div', 'vnote bad', '删除失败：' + e.message);
+              card.parentNode.insertBefore(note, card);
+              setTimeout(() => note.remove(), 6000);
+            }
+          };
+          row.appendChild(del);
+        }
       }
       card.appendChild(row);
     });
@@ -3144,21 +3204,65 @@
     ['ko', '한국어'], ['fr', 'Français'], ['de', 'Deutsch'],
   ];
 
-  // 按段落切，尽量不把一句话劈两半。单段超长才硬切。
+  // 按"块"切，不是按段切。
+  //
+  // 翻译文档时最忌讳把结构切坏：代码块切一半、表格从中间断开、标题和正文
+  // 分到两段，模型就会各翻各的，拼回去格式全乱。所以先按块归组 ——
+  // ``` 围栏、表格、以及"标题 + 紧跟的正文"算一个不可分割的块，
+  // 再把这些块打包到 max 以内。
   function splitChunks(text, max) {
-    const paras = text.split(/\n\s*\n/);
-    const out = [];
-    let cur = '';
-    for (let p of paras) {
-      p = p.trim();
-      if (!p) continue;
-      if (p.length > max) {
-        if (cur) { out.push(cur); cur = ''; }
-        for (let i = 0; i < p.length; i += max) out.push(p.slice(i, i + max));
+    const lines = text.split('\n');
+    const blocks = [];
+    let i = 0;
+    while (i < lines.length) {
+      const ln = lines[i];
+      // 代码围栏：整块带走，哪怕超长也不切
+      if (/^\s*```/.test(ln)) {
+        const buf = [ln];
+        i++;
+        while (i < lines.length && !/^\s*```/.test(lines[i])) buf.push(lines[i++]);
+        if (i < lines.length) buf.push(lines[i++]);
+        blocks.push(buf.join('\n'));
         continue;
       }
-      if (cur.length + p.length + 2 > max) { out.push(cur); cur = p; }
-      else cur = cur ? cur + '\n\n' + p : p;
+      // 表格：连续的 | 开头行
+      if (/^\s*\|/.test(ln)) {
+        const buf = [];
+        while (i < lines.length && /^\s*\|/.test(lines[i])) buf.push(lines[i++]);
+        blocks.push(buf.join('\n'));
+        continue;
+      }
+      // 标题：和后面第一段正文绑在一起
+      if (/^\s*#{1,6}\s/.test(ln)) {
+        const buf = [ln];
+        i++;
+        while (i < lines.length && !lines[i].trim()) i++;
+        while (i < lines.length && lines[i].trim() && !/^\s*(```|\||#{1,6}\s)/.test(lines[i])) {
+          buf.push(lines[i++]);
+        }
+        blocks.push(buf.join('\n'));
+        continue;
+      }
+      // 普通段落
+      if (!ln.trim()) { i++; continue; }
+      const buf = [];
+      while (i < lines.length && lines[i].trim() &&
+             !/^\s*(```|\||#{1,6}\s)/.test(lines[i])) {
+        buf.push(lines[i++]);
+      }
+      blocks.push(buf.join('\n'));
+    }
+
+    const out = [];
+    let cur = '';
+    for (const b of blocks) {
+      if (b.length > max) {
+        if (cur) { out.push(cur); cur = ''; }
+        for (let k = 0; k < b.length; k += max) out.push(b.slice(k, k + max));
+        continue;
+      }
+      if (cur.length + b.length + 2 > max) { out.push(cur); cur = b; }
+      else cur = cur ? cur + '\n\n' + b : b;
     }
     if (cur) out.push(cur);
     return out;
@@ -3277,6 +3381,29 @@
       prog.textContent = '已取词 ' + t.length + ' 字';
     };
 
+    // 划词翻译的权限引导。macOS 的辅助功能授权只能在系统设置里点，
+    // 程序既不能代点、也不能假装能用 —— 所以给一条明确的路：
+    // 检查状态 →（没开）→ 直接跳到那个面板。
+    const axBar = el('div', 'tbar');
+    const axBtn = el('button', 'vbtn', '检查划词权限');
+    const axOpen = el('button', 'vbtn', '打开辅助功能设置');
+    const axTip = el('span', 'vmeta',
+      '划词翻译（⌘⇧T）需要「辅助功能」权限；截图取词需要「屏幕录制」权限。');
+    const post = (t) => {
+      const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.shell;
+      if (h) h.postMessage({ type: t });
+    };
+    window.dubheAxStatus = (ok) => {
+      axTip.textContent = ok ? '辅助功能已授权，⌘⇧T 可用。'
+        : '还没授权 —— 点右边按钮，在列表里勾上 Dubhe，然后重启 App。';
+    };
+    axBtn.onclick = () => post('axStatus');
+    axOpen.onclick = () => post('openAx');
+    axBar.appendChild(axBtn);
+    axBar.appendChild(axOpen);
+    axBar.appendChild(axTip);
+    body.appendChild(axBar);
+
     const go = el('button', 'vbtn pri', '翻译');
     bar.appendChild(go);
     const prog = el('span', 'vmeta', '');
@@ -3328,8 +3455,10 @@
                 {
                   role: 'system',
                   content: '你是专业翻译引擎。只输出译文：不解释、不加引号、'
-                    + '不重复原文、不写"以下是译文"这类前言。保留原有换行与段落；'
-                    + '代码、URL、数字、人名原样保留。',
+                    + '不重复原文、不写"以下是译文"这类前言。'
+                    + '保留原有的 Markdown 结构：标题层级、列表符号、表格竖线、'
+                    + '段落换行都要原样保留。代码块里的代码、URL、路径、命令、'
+                    + '数字、人名一律不翻译。',
                 },
                 { role: 'user', content: '把下面的内容翻译成' + lang + '：\n\n' + chunks[i] },
               ],

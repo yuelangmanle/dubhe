@@ -3861,20 +3861,48 @@ int main(int argc, char** argv) {
     struct DlJob {
         std::string id, file;
         long long total = 0;
-        std::string state = "running";   // running / done / error
+        std::string state = "running";   // running / done / error / cancelled
         std::string error;
+        pid_t pid = 0;                   // curl 的进程号，取消时要 kill 它
         std::thread th;
     };
     auto dl_mu = std::make_shared<std::mutex>();
     auto dl_jobs = std::make_shared<std::map<std::string, std::shared_ptr<DlJob>>>();
 
-    srv.get("/api/store", [dl_mu, dl_jobs](const http::Request& req, http::Conn& c) {
+    // 下载源。国内直连 huggingface.co 常常只有几百 KB/s，一个 4.7GB 的模型
+    // 要下两个小时。换成 hf-mirror.com 这类镜像能快一个数量级。
+    // 存在 ~/.dubhe/store.json 里，重启后仍然生效。
+    auto mirror = std::make_shared<std::string>();
+    {
+        const std::string cfg = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.dubhe/store.json";
+        FILE* f = std::fopen(cfg.c_str(), "rb");
+        if (f) {
+            std::string s;
+            char buf[512];
+            size_t n;
+            while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
+            std::fclose(f);
+            json::Value v;
+            if (json::parse(s, &v)) *mirror = v.s("mirror");
+        }
+    }
+    auto save_mirror = [mirror]() {
+        const std::string cfg = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.dubhe/store.json";
+        json::Value v = json::Value::make_obj();
+        v.set("mirror", json::Value::make_str(*mirror));
+        FILE* f = std::fopen(cfg.c_str(), "wb");
+        if (f) { std::fputs(json::dump(v).c_str(), f); std::fclose(f); }
+    };
+
+
+    srv.get("/api/store", [dl_mu, dl_jobs, mirror](const http::Request& req, http::Conn& c) {
         if (!is_local(req) && !authorized(req)) {
             c.send(401, "application/json", "{\"error\":\"未授权\"}");
             return;
         }
         json::Value root = json::Value::make_obj();
         root.set("dir", json::Value::make_str(g.model_dir));
+        root.set("mirror", json::Value::make_str(*mirror));
         json::Value arr = json::Value::make_arr();
         for (const auto& e : kStore) {
             json::Value o = json::Value::make_obj();
@@ -3907,7 +3935,7 @@ int main(int argc, char** argv) {
         c.send(200, "application/json", json::dump(root));
     });
 
-    srv.post("/api/store/download", [dl_mu, dl_jobs](const http::Request& req, http::Conn& c) {
+    srv.post("/api/store/download", [dl_mu, dl_jobs, mirror](const http::Request& req, http::Conn& c) {
         if (!is_local(req) && !authorized(req)) {
             c.send(401, "application/json", "{\"error\":\"未授权\"}");
             return;
@@ -3938,14 +3966,40 @@ int main(int argc, char** argv) {
             job->id = id;
             job->file = e->file;
             job->total = e->bytes;
-            const std::string url = e->url;
-            job->th = std::thread([job, url, part, target]() {
-                // -C - 断点续传：上次下到一半的 .part 接着下，不用从头来。
-                // 下载完再改名，避免半个文件被 scan_models 扫进清单。
-                const std::string cmd = "curl -fL --retry 3 --retry-delay 2 -C - -o '" +
-                                        part + "' '" + url + "' >/dev/null 2>&1";
-                const int rc = std::system(cmd.c_str());
-                if (rc == 0) {
+            std::string url = e->url;
+            // 镜像只在 host 层面替换，路径一个字节都不动 —— 镜像站用的
+            // 就是同一套路径，改别的反而会 404。
+            static const std::string kHf = "https://huggingface.co";
+            if (!mirror->empty() && url.rfind(kHf, 0) == 0)
+                url = *mirror + url.substr(kHf.size());
+            job->th = std::thread([job, url, part, target, dl_mu]() {
+                // 用 fork/exec 而不是 std::system：
+                // 取消下载必须能拿到 curl 的 pid 去 kill，而 system() 只返回
+                // 一个退出码 —— 拿到退出码的时候 curl 已经跑完了，停不下来。
+                pid_t pid = fork();
+                if (pid == 0) {
+                    // -C - 断点续传；下载完再改名，避免半个文件被扫进清单。
+                    execl("/usr/bin/curl", "curl", "-fL", "--retry", "3",
+                          "--retry-delay", "2", "-C", "-", "-o", part.c_str(),
+                          url.c_str(), (char*)nullptr);
+                    _exit(127);
+                }
+                if (pid < 0) {
+                    job->state = "error";
+                    job->error = "无法启动下载进程";
+                    return;
+                }
+                job->pid = pid;
+                int st = 0;
+                while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+                {
+                    std::lock_guard<std::mutex> lk2(*dl_mu);
+                    if (job->state == "cancelled") {
+                        // 用户取消：半截 .part 留着，下次「重试」能接着下。
+                        return;
+                    }
+                }
+                if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
                     if (std::rename(part.c_str(), target.c_str()) == 0) {
                         job->state = "done";
                     } else {
@@ -3994,6 +4048,95 @@ int main(int argc, char** argv) {
         json::Value r = json::Value::make_obj();
         r.set("ok", json::Value::make_bool(true));
         r.set("name", json::Value::make_str(name));
+        c.send(200, "application/json", json::dump(r));
+    });
+
+    // 取消下载。kill 掉 curl，把状态标成 cancelled 并保留 .part ——
+    // 用户点了取消之后又想要，还能接着下，不用从头来。
+    srv.post("/api/store/cancel", [dl_mu, dl_jobs](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        std::string id = req.param("id");
+        if (id.empty() && json::parse(req.body, &body)) id = body.s("id");
+        {
+            std::lock_guard<std::mutex> lk(*dl_mu);
+            auto it = dl_jobs->find(id);
+            if (it != dl_jobs->end() && it->second->state == "running") {
+                it->second->state = "cancelled";
+                if (it->second->pid > 0) ::kill(it->second->pid, SIGTERM);
+                c.send(200, "application/json", "{\"ok\":true,\"state\":\"cancelled\"}");
+                return;
+            }
+        }
+        c.send(200, "application/json", "{\"ok\":true,\"state\":\"idle\"}");
+    });
+
+    // 删除模型。只允许删模型目录里的文件，且不能删当前正在加载的那个 ——
+    // 删了它，引擎手里还攥着已映射的权重，之后任何一次切换都会失败。
+    srv.post("/api/models/delete", [](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        std::string p = req.param("path");
+        if (p.empty() && json::parse(req.body, &body)) p = body.s("path");
+        if (p.empty()) {
+            c.send(400, "application/json", "{\"error\":\"缺少 path\"}");
+            return;
+        }
+        const std::string full = path_abs(p);
+        if (g.model_dir.empty() || full.rfind(path_abs(g.model_dir) + "/", 0) != 0) {
+            c.send(400, "application/json", "{\"error\":\"只能删模型目录里的文件\"}");
+            return;
+        }
+        if (full == path_abs(g.model_path)) {
+            c.send(400, "application/json",
+                   "{\"error\":\"这是当前加载的模型，先切到别的再删\"}");
+            return;
+        }
+        if (!is_file_p(full)) {
+            c.send(404, "application/json", "{\"error\":\"文件不存在\"}");
+            return;
+        }
+        if (std::remove(full.c_str()) != 0) {
+            c.send(400, "application/json", "{\"error\":\"删除失败，可能没有权限\"}");
+            return;
+        }
+        c.send(200, "application/json", "{\"ok\":true}");
+    });
+
+    // 下载源。空字符串 = 官方 huggingface.co。
+    srv.get("/api/store/mirror", [mirror](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value r = json::Value::make_obj();
+        r.set("mirror", json::Value::make_str(*mirror));
+        c.send(200, "application/json", json::dump(r));
+    });
+    srv.post("/api/store/mirror", [mirror, save_mirror](const http::Request& req, http::Conn& c) {
+        if (!is_local(req) && !authorized(req)) {
+            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+            return;
+        }
+        json::Value body;
+        std::string m;
+        if (json::parse(req.body, &body)) m = body.s("mirror");
+        if (!m.empty() && m.rfind("http", 0) != 0) {
+            c.send(400, "application/json", "{\"error\":\"镜像地址要以 http 开头\"}");
+            return;
+        }
+        while (!m.empty() && m.back() == '/') m.pop_back();
+        *mirror = m;
+        save_mirror();
+        json::Value r = json::Value::make_obj();
+        r.set("ok", json::Value::make_bool(true));
+        r.set("mirror", json::Value::make_str(*mirror));
         c.send(200, "application/json", json::dump(r));
     });
 
