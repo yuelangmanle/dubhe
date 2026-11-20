@@ -1,0 +1,57 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Build and run native tests
+        run: make -j 2 all test TEST_ALLOW_NO_METAL=1
+      - name: Run service and browser tests
+        run: make integration-test
+      - name: Build and verify the macOS package
+        if: runner.os == 'macOS'
+        run: make dmg
+      - name: Test the Swift SDK
+        if: runner.os == 'macOS'
+        run: swift test --package-path sdk/swift -j 2
+
+  android:
+    runs-on: ubuntu-24.04
+    env:
+      NDK_VERSION: 27.2.12479018
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Android build tools
+        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;$NDK_VERSION"
+      - name: Cross-compile the Android CLI
+        run: |
+          export ANDROID_NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          make -j 2 PLATFORM=android
+          make -j 2 PLATFORM=android test
+          for target in dubhe dubhed test_abi test_quant; do
+            readelf -h "build-android-arm64-v8a/$target" | grep -E 'Machine:[[:space:]]*AArch64'
+          done
+      - name: Build the Android app and Kotlin SDK
+        run: |
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          ./apps/android/gradlew -p apps/android --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest :dubhekit:assembleRelease
+          ./apps/android/gradlew -p apps/android --no-daemon -PdubheVulkan=true :app:assembleDebug

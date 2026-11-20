@@ -33,6 +33,14 @@
 
   const STORE_KEY = 'dubhe.conv.v1';
   const SET_KEY = 'dubhe.settings.v1';
+  const THINK_KEY = 'dubhe.think.v1';
+
+  function readPreference(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  }
+  function writePreference(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) {}
+  }
 
   // ---------------------------------------------------------------- 原生外壳通道
   //
@@ -88,8 +96,8 @@
     // 是否显示模型的推理过程。默认关 —— 它只控制"看不着得见"，
     // 不控制"想不想"：支持的模型（LFM3 这类）本来就会先想一遍，
     // 关掉这个开关也拦不住，只会让推理漏进正文。
-    think: localStorage.getItem('dubhe.think.v1') === '1',
-    attach: null,   // 待发送的图片/音频/视频（一次只允许一个）
+    think: readPreference(THINK_KEY) === '1',
+    drafts: new Map(),
     logs: [],       // 右栏系统日志：只记真实事件，不编
     gen: null,      // 本轮生成统计 { tokens, tps, total, ttft }
     q: '',          // 左栏搜索关键词
@@ -105,107 +113,219 @@
     memory: [],     // 记忆条目（见 loadMemory）
   };
 
-  const settings = Object.assign(
-    { temperature: 0.7, top_p: 0.95, max_tokens: 1024, system: '', tools: false },
-    JSON.parse(localStorage.getItem(SET_KEY) || '{}')
-  );
+  const settings = { temperature: 0.7, top_p: 0.95, max_tokens: 1024, system: '', tools: false };
+  try { Object.assign(settings, JSON.parse(readPreference(SET_KEY) || '{}')); } catch (e) {}
   // 迁移：老版本的默认值是 tools:true，而且它随其它设置一起被存进了
   // localStorage。光把默认值改成 false 救不了老用户 —— Object.assign
   // 会被存储里的 true 盖掉。没拨过开关就说明这个 true 不是用户选的。
-  if (!localStorage.getItem(TOOLS_TOUCHED)) settings.tools = false;
+  if (!readPreference(TOOLS_TOUCHED)) settings.tools = false;
   // 输入框旁的工具栏按钮切的是 state.tools（本次会话），设置面板切的是
   // settings.tools（持久偏好）。两个开关如果各判各的，就会出现"按钮亮着
   // 但没生效"这种没法解释的状态。启动时以偏好为准，之后按钮独立。
   state.tools = settings.tools;
 
   // ---------------------------------------------------------------- 存储
-  //
-  // localStorage 只有 5 MB 左右，写满时 setItem 抛 QuotaExceededError。
-  // 这里原来的 catch 是空的 —— 于是"对话突然不再保存"，重启后丢一片，
-  // 界面上一个字都不提示。工具结果动辄 8 KB（read_file 的正文、diff 的
-  // old/new），一次会话几十条就上千 KB，这个上限不是理论上的。
-  //
-  // 两道处理：
-  //   1) 存之前把只对"看"有用的东西截短：工具 output 留 1500 字（回放时
-  //      卡片照样画得出来，meta 里的 path/command/diff 全部保留），
-  //      搜索结果的摘要不留。
-  //   2) 还是写不进去，就从最老的对话开始丢（绝不丢当前打开的那条），
-  //      丢到能写进去为止，并且明确告诉用户丢了哪一条 —— 静默丢数据
-  //      是所有处理方式里最坏的一种。
+  const HISTORY_IMPORTED = 'dubhe.history.imported.v1';
+  const HISTORY_PENDING = 'dubhe.history.pending.v1:';
+  const pendingHistory = new Map();
+  const fallbackFailures = new Set();
+  const isLocalPage = ['127.0.0.1', 'localhost', '[::1]'].includes(location.hostname);
+  let legacyHistory = [];
+  let historyImported = false;
+  let historyConnected = false;
+  let historyWriting = false;
+  let historyRetry;
+  let historyError = '';
+  // 保留旧记录中用于提示截断的字数。
   const TOOL_OUT_KEEP = 1500;
 
-  function slimTool(t) {
-    const o = { name: t.name, ok: t.ok, card: t.card };
-    if (t.ms) o.ms = Math.round(t.ms);
-    if (t.denied) o.denied = 1;
-    if (t.output) {
-      const s = String(t.output);
-      o.output = s.slice(0, TOOL_OUT_KEEP);
-      if (s.length > TOOL_OUT_KEEP) o.trunc = 1;
-    }
-    if (t.meta) {
-      const m = Object.assign({}, t.meta);
-      if (Array.isArray(m.results)) m.results = m.results.map((r) => ({ t: r.t, u: r.u }));
-      o.meta = m;
-    }
-    return o;
+  function validConvs(items) {
+    return Array.isArray(items) ? items.filter((c) =>
+      c && typeof c.id === 'string' && c.id && Array.isArray(c.messages)) : [];
   }
 
-  function slimConv(c) {
-    const out = Object.assign({}, c);
-    out.messages = (c.messages || []).map((m) => {
-      // 推理过程可能比正文长十倍。原样存进 localStorage 的话，几轮下来
-      // 5 MB 的配额就见底了，症状是"对话越多越存不上"。截断够用了 ——
-      // 没人会回看三轮之前的完整推理，但完全丢掉又太浪费。
-      let mm = m;
-      if (m.think && m.think.length > 4000) {
-        mm = Object.assign({}, m, { think: m.think.slice(0, 4000) + '\n…（推理过程已截断）' });
+  function recoverConvs(items) {
+    return validConvs(items).map((c) => ({
+      ...c,
+      title: typeof c.title === 'string' ? c.title : '新对话',
+      messages: c.messages.filter(Boolean).map((m) => {
+        if (!m.streaming) return m;
+        const next = { ...m, streaming: false };
+        if (m.role !== 'assistant') return next;
+        next.content = (m.content || '').trim()
+          ? m.content + '\n\n> ⚠️ 上次的生成被中断了，这条回答可能不完整。'
+          : '（上次的生成被中断了，重新提问即可。）';
+        return next;
+      }),
+    }));
+  }
+
+  function orderedConvs(records) {
+    return Array.from(records).sort((a, b) => (b.at || 0) - (a.at || 0));
+  }
+
+  function loadFallbackHistory() {
+    const records = new Map();
+    try {
+      legacyHistory = validConvs(JSON.parse(readPreference(STORE_KEY) || '[]'));
+      for (const c of recoverConvs(legacyHistory)) records.set(c.id, c);
+    } catch (e) { /* 保留原来的历史数据 */ }
+    historyImported = readPreference(HISTORY_IMPORTED) === '1';
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key?.startsWith(HISTORY_PENDING)) continue;
+        const raw = localStorage.getItem(key);
+        try {
+          const [c] = recoverConvs([JSON.parse(raw)]);
+          if (!c || key !== HISTORY_PENDING + c.id) continue;
+          records.set(c.id, c);
+          pendingHistory.set(c.id, { conv: c, raw });
+        } catch (e) { /* 留下看不懂的原始记录以便恢复 */ }
       }
-      if (!mm.tools || !mm.tools.length) return mm;
-      const o = Object.assign({}, mm);
-      o.tools = mm.tools.map(slimTool);
-      return o;
+    } catch (e) { /* 浏览器可能禁用了存储，服务端仍可保存 */ }
+    state.convs = orderedConvs(records.values());
+  }
+
+  function snapshotConv(c) {
+    const messages = c.messages.map(({ queued, noteText, stopped, thinkTouched, ...m }) => {
+      if (m.tools) m.tools = m.tools.map(({ askId, askPending, t0, ...tool }) => tool);
+      return m;
     });
-    return out;
+    return { ...c, messages };
   }
 
-  function saveConvs() {
-    for (let guard = 0; guard < 24; guard++) {
-      try {
-        localStorage.setItem(STORE_KEY, JSON.stringify(state.convs.map(slimConv)));
-        return;
-      } catch (e) {
-        const idx = state.convs.findIndex((c) => c !== state.current);
-        if (idx < 0) {
-          log('对话没能保存到本地：存储空间不足', 'err');
-          return;
-        }
-        const gone = state.convs.splice(idx, 1)[0];
-        log('本地存储满了，已丢弃最早的对话「' + (gone.title || gone.id) + '」', 'err');
-      }
+  function renderHistoryNotice() {
+    const notice = $('#historyNotice');
+    let text = '';
+    if (!isLocalPage || historyError) {
+      if (fallbackFailures.size) text = '有聊天记录还没保存，请导出备份。';
+      else if (!isLocalPage) text = '聊天记录保存在当前浏览器。';
+      else if (pendingHistory.size) text = '写入历史失败，聊天记录暂存在浏览器，稍后会重试。';
+      else text = '读取历史失败，当前显示浏览器中的记录，稍后会重试。';
     }
-    log('对话没能保存到本地：存储空间不足', 'err');
+    notice.textContent = text;
+    notice.title = historyError;
+    notice.hidden = !text;
   }
-  function loadConvs() {
-    try { state.convs = JSON.parse(localStorage.getItem(STORE_KEY) || '[]'); } catch (e) { state.convs = []; }
-    if (!Array.isArray(state.convs)) state.convs = [];
-    // 上次退出时正在生成的那条消息，会把 streaming:true 一起存下来。
-    // 重新打开时它就永远显示"生成中…"——一个转不完的圈。这里统一收尾：
-    // 有内容的算"被中断"，没内容的直接说清楚重问就好。
-    for (const c of state.convs) {
-      for (const m of (c.messages || [])) {
-        if (!m.streaming) continue;
-        m.streaming = false;
-        if (m.role !== 'assistant') continue;
-        if (!String(m.content || '').trim()) {
-          m.content = '（上次的生成被中断了，重新提问即可。）';
-        } else {
-          m.content += '\n\n> ⚠️ 上次的生成被中断了，这条回答可能不完整。';
-        }
+
+  function saveConv(conv) {
+    const c = snapshotConv(conv);
+    const raw = JSON.stringify(c);
+    pendingHistory.set(c.id, { conv: c, raw });
+    try {
+      localStorage.setItem(HISTORY_PENDING + c.id, raw);
+      fallbackFailures.delete(c.id);
+    } catch (e) {
+      fallbackFailures.add(c.id);
+    }
+    renderHistoryNotice();
+    syncHistory();
+  }
+
+  function mergeHistory(items) {
+    const previous = new Map(state.convs.map((c) => [c.id, c]));
+    const records = new Map();
+    for (const c of recoverConvs(items)) {
+      const old = previous.get(c.id);
+      if (old && pendingHistory.has(c.id)) continue;
+      if (!old) {
+        records.set(c.id, c);
+        continue;
       }
+      // 草稿、排队任务和目录选择器可能仍引用这个对话对象。
+      Object.keys(old).forEach((key) => { delete old[key]; });
+      Object.assign(old, c);
+      records.set(c.id, old);
+    }
+    for (const [id, entry] of pendingHistory) records.set(id, previous.get(id) || entry.conv);
+    state.convs = orderedConvs(records.values());
+    const current = state.current;
+    const draft = draftFor();
+    if (current && records.has(current.id)) {
+      if (!pendingHistory.has(current.id)) {
+        $('#convTitle').textContent = current.title;
+        renderMessages();
+        renderTools();
+        renderCwd();
+      }
+      renderConvList();
+    } else if (current || !(draft.text || draft.att || draft.loading)) {
+      activateConv(state.convs[0] || null);
+    } else {
+      renderConvList();
     }
   }
-  function saveSettings() { localStorage.setItem(SET_KEY, JSON.stringify(settings)); }
+
+  async function syncHistory() {
+    if (!isLocalPage || historyWriting || historyRetry) return;
+    historyWriting = true;
+    let failure = '';
+    try {
+      if (!historyConnected) {
+        if (!historyImported && legacyHistory.length) {
+          const r = await vpost('/api/history', { import: legacyHistory });
+          if (!r.ok) throw new Error('未能导入旧记录');
+          historyImported = true;
+          writePreference(HISTORY_IMPORTED, '1');
+        }
+        const r = await vapi('/api/history');
+        if (!Array.isArray(r.items)) throw new Error('历史数据格式有误');
+        mergeHistory(r.items);
+        historyConnected = true;
+      }
+      for (const [id, entry] of pendingHistory) {
+        try {
+          const r = await vpost('/api/history', { upsert: [entry.conv] });
+          if (!r.ok) throw new Error('未能写入记录');
+        } catch (e) {
+          if (e.status !== 400 && e.status !== 413) throw e;
+          // 单条记录格式或长度不合要求时，仍然保存其他对话。
+          failure = e.message;
+          continue;
+        }
+        // 同一对话可能在上传期间继续生成，只确认这次发送的版本。
+        const saved = pendingHistory.get(id) === entry;
+        if (saved) {
+          pendingHistory.delete(id);
+          fallbackFailures.delete(id);
+        }
+        try {
+          const key = HISTORY_PENDING + id;
+          if (saved && localStorage.getItem(key) === entry.raw) localStorage.removeItem(key);
+        } catch (e) {}
+      }
+    } catch (e) {
+      failure = e.message || '连接中断';
+    } finally {
+      historyWriting = false;
+      historyError = failure;
+      if (historyError) {
+        historyRetry = setTimeout(() => {
+          historyRetry = null;
+          syncHistory();
+        }, 4000);
+      }
+      renderHistoryNotice();
+      if (pendingHistory.size && !historyRetry) syncHistory();
+    }
+  }
+
+  function exportHistory() {
+    const text = JSON.stringify({ items: state.convs.map(snapshotConv) }, null, 2);
+    if (window.webkit?.messageHandlers?.shell) {
+      shellPost({ type: 'historyExport', text });
+      return;
+    }
+    const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    const link = el('a');
+    link.href = url;
+    link.download = 'Dubhe-history.json';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function saveSettings() { writePreference(SET_KEY, JSON.stringify(settings)); }
 
   // ---------------------------------------------------------------- 记忆
   //
@@ -214,8 +334,7 @@
   //                对话里去（"不同对话会串记忆"这条问题的正面解法）。
   //   global    —— 显式选择才写，所有对话共享。
   //
-  // 为什么存在浏览器而不是服务端：对话本身就只存在这里（localStorage），
-  // 记忆是对话的附属物，放到服务端反而会出现"对话删了、记忆还在"的错位。
+  // 记忆保存在当前浏览器，按对话 ID 或全局作用域读取。
   const MEM_KEY = 'dubhe.memory.v1';
   function loadMemory() {
     try {
@@ -258,9 +377,8 @@
   const COMPRESS_AT = 16;   // 未折叠的消息超过这个数就压
   const KEEP_RECENT = 8;    // 无论如何保留最近这么多条原文
 
-  async function maybeCompress(conv) {
+  async function maybeCompress(conv, total, signal) {
     const folded = conv.folded || 0;
-    const total = conv.messages.length;
     if (total - folded <= COMPRESS_AT) return;
     const end = total - KEEP_RECENT;
     if (end <= folded) return;
@@ -270,34 +388,57 @@
     if (slice.length < 4) return;
     log('上下文压缩中（' + slice.length + ' 条）…');
     try {
-      const r = await vpost('/api/summarize', { messages: slice });
+      const r = await vpost('/api/summarize', { messages: slice }, signal);
+      signal.throwIfAborted();
       const sum = (r && r.summary ? String(r.summary) : '').trim();
       if (!sum) { log('压缩没拿到摘要，本轮按原样发', 'err'); return; }
       conv.summary = (conv.summary ? conv.summary + '\n' : '') + sum;
       conv.folded = end;
-      saveConvs();
+      saveConv(conv);
       log('已压缩 ' + slice.length + ' 条 → 摘要 ' + sum.length + ' 字');
-      renderMessages();
+      if (state.current === conv) renderMessages();
     } catch (e) {
+      if (signal.aborted) throw e;
       // 压缩失败不该挡住这一轮对话：原样发出去，下次再试
       log('压缩失败：' + e.message, 'err');
     }
   }
 
-  function newConv() {
+  function draftFor(conv = state.current) {
+    const id = conv ? conv.id : '';
+    if (!state.drafts.has(id)) state.drafts.set(id, { text: '', att: null, loading: null });
+    return state.drafts.get(id);
+  }
+
+  function activateConv(c, focus = false) {
+    const input = $('#input');
+    draftFor().text = input.value;
+    state.current = c;
+    input.value = draftFor().text;
+    autoGrow();
+    renderAttach();
+    renderQueue();
+    renderConvList();
+    renderMessages();
+    renderTools();
+    renderCwd();
+    refreshComposer();
+    $('#convTitle').textContent = c ? c.title : '新对话';
+    if (focus) input.focus();
+  }
+
+  function newConv(keepDraft = false, focus = true) {
     // 新对话默认继承上一个对话绑定的项目文件夹 —— 像 Codex 那样"开个新
     // 会话继续在同一个项目里干活"，而不是每次都要重新选一遍目录。
     const inherit = state.current && state.current.cwd;
-    const c = { id: 'c' + Date.now(), title: '新对话', messages: [], at: Date.now() };
+    const id = 'c' + crypto.getRandomValues(new Uint32Array(4)).join('-');
+    const c = { id, title: '新对话', messages: [], at: Date.now() };
     if (inherit) c.cwd = inherit;
     state.convs.unshift(c);
-    state.current = c;
-    saveConvs();
-    renderConvList();
-    renderMessages();
-    renderCwd();
-    $('#convTitle').textContent = '新对话';
-    $('#input').focus();
+    if (keepDraft && !state.current) state.drafts.set(c.id, draftFor());
+    activateConv(c, focus);
+    if (keepDraft) state.drafts.delete('');
+    saveConv(c);
     return c;
   }
 
@@ -359,32 +500,55 @@
       + '<pre tabindex="0"><code>' + code + '</code></pre></div>';
   }
 
-  function renderMarkdown(src) {
+  function renderMarkdown(src, { codeActions = true, tables = false } = {}) {
     const lines = escapeHtml(src).split('\n');
     let html = '';
-    let inCode = false, codeLang = '', codeBuf = [];
+    let fence = '', codeLang = '', codeBuf = [];
     let listType = null;
 
     const closeList = () => { if (listType) { html += `</${listType}>`; listType = null; } };
+    const codeBlock = () => codeActions ? codeBlockHtml(codeLang, codeBuf.join('\n'))
+      : '<pre><code>' + codeBuf.join('\n') + '</code></pre>';
+    const cells = line => line.trim().replace(/^\||\|$/g, '').split(/(?<!\\)\|/).map(cell => cell.trim());
 
     for (let i = 0; i < lines.length; i++) {
       const raw = lines[i];
       const line = raw.replace(/\s+$/, '');
 
-      if (/^```/.test(line)) {
-        if (!inCode) { inCode = true; codeLang = line.slice(3).trim(); codeBuf = []; closeList(); }
-        else {
-          inCode = false;
-          html += codeBlockHtml(codeLang, codeBuf.join('\n'));
-        }
+      if (fence) {
+        if (line.trimStart().startsWith(fence) && [...line.trim()].every(c => c === fence[0])) {
+          html += codeBlock();
+          fence = '';
+        } else codeBuf.push(raw);
         continue;
       }
-      if (inCode) { codeBuf.push(raw); continue; }
+      const opener = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (opener) {
+        [, fence, codeLang] = opener;
+        codeBuf = [];
+        closeList();
+        continue;
+      }
 
       if (!line.trim()) { closeList(); continue; }
 
-      const h = line.match(/^(#{1,3})\s+(.*)$/);
+      const h = line.match(/^(#{1,6})\s+(.*)$/);
       if (h) { closeList(); html += `<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`; continue; }
+
+      if (tables && line.includes('|') && lines[i + 1]?.includes('|')) {
+        const headings = cells(line);
+        const rule = cells(lines[i + 1]);
+        if (headings.length === rule.length && rule.every(cell => /^:?-{3,}:?$/.test(cell))) {
+          closeList();
+          html += '<table><thead><tr>' + headings.map(cell => '<th>' + inline(cell) + '</th>').join('') + '</tr></thead><tbody>';
+          i++;
+          while (lines[i + 1]?.includes('|') && cells(lines[i + 1]).length === headings.length) {
+            html += '<tr>' + cells(lines[++i]).map(cell => '<td>' + inline(cell) + '</td>').join('') + '</tr>';
+          }
+          html += '</tbody></table>';
+          continue;
+        }
+      }
 
       const ul = line.match(/^\s*[-*+]\s+(.*)$/);
       if (ul) {
@@ -392,10 +556,10 @@
         html += `<li>${inline(ul[1])}</li>`;
         continue;
       }
-      const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      const ol = line.match(/^\s*(\d{1,9})[.)]\s+(.*)$/);
       if (ol) {
-        if (listType !== 'ol') { closeList(); html += '<ol>'; listType = 'ol'; }
-        html += `<li>${inline(ol[1])}</li>`;
+        if (listType !== 'ol') { closeList(); html += '<ol start="' + Number(ol[1]) + '">'; listType = 'ol'; }
+        html += `<li>${inline(ol[2])}</li>`;
         continue;
       }
       const bq = line.match(/^>\s?(.*)$/);
@@ -404,7 +568,7 @@
       closeList();
       html += `<p>${inline(line)}</p>`;
     }
-    if (inCode && codeBuf.length) html += codeBlockHtml(codeLang, codeBuf.join('\n'));
+    if (fence && codeBuf.length) html += codeBlock();
     closeList();
     return html;
   }
@@ -494,14 +658,10 @@
       ci.appendChild(iconNode('chat', 'i'));
       d.appendChild(ci);
       d.appendChild(el('span', 'conv-title', c.title));
+      const waiting = state.queue.filter((job) => job.conv === c).length;
+      if (waiting) d.appendChild(el('span', 'conv-waiting', '排队 ' + waiting));
       d.onclick = () => {
-        state.current = c;
-        renderConvList();
-        renderMessages();
-        renderTools();
-        renderCwd();
-        refreshComposer();
-        $('#convTitle').textContent = c.title;
+        activateConv(c);
         if (window.innerWidth <= 860) closeSidebar();
       };
       list.appendChild(d);
@@ -770,7 +930,7 @@
       const tb = el('pre', 'tool-body');
       tb.textContent = text.slice(0, 1200);
       box.appendChild(tb);
-      // 存盘时工具输出被截过（见 saveConvs）。回放时要说清楚，否则用户会
+      // 旧历史可能截过工具输出。回放时要说清楚，否则用户会
       // 以为工具当时只返回了这么多 —— 那等于替他改动记忆。
       // 这句必须挂在 pre **外面**：pre 里的正文自己就截到 1200 字，写进
       // text 末尾等于写进了看不见的地方。
@@ -976,13 +1136,13 @@
     return markDrawn(wrap, m);
   }
 
+  let emptyState;
   function renderMessages() {
     const box = $('#messages');
     box.innerHTML = '';
     const c = state.current;
     if (!c || !c.messages.length) {
-      const empty = $('#emptyState');
-      if (empty) box.appendChild(empty);
+      if (emptyState) box.appendChild(emptyState);
       return;
     }
     for (const m of c.messages) box.appendChild(messageNode(m));
@@ -1080,10 +1240,15 @@
 
   async function refreshState() {
     try {
-      const r = await fetch('/api/state');
-      const s = await r.json();
+      const s = await vapi('/api/state');
       const first = !state.server;
       state.server = s;
+      $('#app').hidden = s.share_only === true;
+      $('#shareNotice').hidden = !s.share_only;
+      if (s.share_only) {
+        $('#shareModel').textContent = s.loaded ? ('已加载 ' + (s.model_id || '模型')) : '未加载模型';
+        return s;
+      }
       renderHead(s);
       renderModelInfo(s);
       renderMeters(s);
@@ -1349,6 +1514,7 @@
   // ---------------------------------------------------------------- 附件
   // 服务端一次只接受一个媒体（视觉塔和语音塔是两个独立的 mmproj，同时注入
   // 需要两套前缀），所以这里也做成单选。
+  let filePickerDraft;
   function pickAttachment(only) {
     const s = state.server || {};
     const acc = [];
@@ -1361,6 +1527,7 @@
       if (s.mm_audio) acc.push('audio/*');
     }
     const inp = $('#fileInput');
+    filePickerDraft = draftFor();
     inp.accept = acc.length ? acc.join(',') : '*/*';
     inp.value = '';
     inp.click();
@@ -1452,9 +1619,12 @@
     const bar = $('#attachBar');
     if (!bar) return;
     bar.innerHTML = '';
-    const a = state.attach;
-    if (!a) { bar.classList.add('hidden'); return; }
+    const draft = draftFor();
+    const a = draft.att;
+    if (!a && !draft.loading) { bar.classList.add('hidden'); return; }
     bar.classList.remove('hidden');
+    if (draft.loading) bar.appendChild(el('span', 'attach-chip', '正在读取附件…'));
+    if (!a) return;
     const chip = el('div', 'attach-chip');
     if (a.kind === 'image' && a.thumb) {
       const im = new Image();
@@ -1473,7 +1643,11 @@
     x.setAttribute('aria-label', '移除附件');
     x.appendChild(iconNode('x', 'i'));
     x.title = '移除';
-    x.onclick = () => { state.attach = null; renderAttach(); };
+    x.onclick = () => {
+      draft.att = null;
+      renderAttach();
+      refreshComposer();
+    };
     chip.appendChild(x);
     bar.appendChild(chip);
   }
@@ -1491,20 +1665,46 @@
   // 以前是发出去让服务端回 400（"当前模型没有视觉塔"），用户看到的是
   // 一条红色错误、附件已经贴在上面了，得自己删掉再换模型 —— 而现在
   // 拖进来的一瞬间就知道不行。
-  async function useAttachment(a) {
+  async function attachFile(file, draft) {
+    if (file.size > 23 * 1024 * 1024) {
+      alert('文件太大，上限 23 MB');
+      return;
+    }
+    const loading = {};
+    draft.loading = loading;
+    renderAttach();
+    refreshComposer();
+    try {
+      const a = await readAttachment(file);
+      if (draft.loading !== loading) return;
+      if (!checkAttachment(a)) return;
+      if (a.kind === 'image') a.thumb = await makeThumb(a.dataUrl);
+      if (draft.loading === loading) draft.att = a;
+    } catch (err) {
+      if (draft.loading === loading) alert('读取文件失败：' + err.message);
+    } finally {
+      if (draft.loading === loading) {
+        draft.loading = null;
+        if (draft === draftFor()) {
+          renderAttach();
+          refreshComposer();
+        }
+      }
+    }
+  }
+
+  function checkAttachment(a) {
     const s = state.server || {};
     if ((a.kind === 'image' || a.kind === 'video') && !s.mm_vision) {
       alert('当前模型没有视觉塔，看不了' + (a.kind === 'video' ? '视频' : '图片') +
             '。换 lfm3-vl 这类带 mmproj 的模型再试。');
-      return;
+      return false;
     }
     if (a.kind === 'audio' && !s.mm_audio) {
       alert('当前模型没有语音塔，听不了音频。换 lfm3-audio 这类带 mmproj 的模型再试。');
-      return;
+      return false;
     }
-    if (a.kind === 'image') a.thumb = await makeThumb(a.dataUrl);
-    state.attach = a;
-    renderAttach();
+    return true;
   }
 
   // ---------------------------------------------------------------- 语音输入
@@ -1578,6 +1778,7 @@
       log('当前模型没有加载语音塔，语音输入用不了。换 lfm3-audio 这类带 mmproj 的模型再试。', 'err');
       return;
     }
+    const draft = draftFor();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
@@ -1595,7 +1796,7 @@
       // ScriptProcessor 不接 destination 就不会被拉 —— 它的输出是静音，
       // 所以这样接不会把麦克风回放出来。
       proc.connect(ctx.destination);
-      rec.on = true; rec.ctx = ctx; rec.stream = stream; rec.proc = proc;
+      rec.on = true; rec.ctx = ctx; rec.stream = stream; rec.proc = proc; rec.draft = draft;
       rec.t0 = performance.now();
       const btn = $('#btnMic');
       if (btn) { btn.classList.add('rec'); btn.title = '再点一下结束录音'; }
@@ -1628,11 +1829,16 @@
     for (const c of rec.chunks) { all.set(c, off); off += c.length; }
     const wav = pcmToWav(downsampleTo(all, rate, 16000), 16000);
     const name = '语音 ' + (ms / 1000).toFixed(1) + 's.wav';
-    state.attach = {
+    const draft = rec.draft;
+    rec.draft = null;
+    draft.att = {
       kind: 'audio', name, mime: 'audio/wav', fmt: 'wav',
       dataUrl: 'data:audio/wav;base64,' + b64Of(wav), bytes: wav.byteLength,
     };
-    renderAttach();
+    if (draft === draftFor()) {
+      renderAttach();
+      refreshComposer();
+    }
     log('已录音 ' + (ms / 1000).toFixed(1) + 's · ' + (wav.byteLength / 1024).toFixed(0) +
         ' KB' + (auto ? '（到 60 秒自动停了）' : ''));
   }
@@ -1643,183 +1849,185 @@
   // 为什么不在这里直接把搜索结果塞进 prompt：那样模型会把搜索摘要当成
   // 用户给的材料，不再引用来源；而走工具调用，卡片上能看到它搜了什么、
   // 搜到几条，用户能判断这个答案值不值得信。
-  function webOn() { return !!state.web; }
-
   // ---------------------------------------------------------------- 发送
-  // opts.tools 可以单次覆盖工具开关。
-  //
-  // Agent 视图需要一次带工具的请求，但它不该把这个选择写进 settings ——
-  // 否则从 Agent 里跑完一次，之后所有普通对话都会带上工具说明。实测
-  // 2B 级模型带着工具说明问"今天天气怎么样"，回的是"我需要调用工具…"，
-  // 一个一次性动作污染了长期配置。
-  // 取一条排队的消息发出去。
-  // send() 读的是 state.current，所以先把对话切过去 —— 用户会看到界面自动
-  // 跳到那条对话，这正是"你排的那条开始发了"的反馈。
-  function drainQueue() {
-    if (state.streaming || !state.queue.length) return;
-    const job = state.queue.shift();
-    const conv = state.convs.find((c) => c.id === job.convId);
-    if (!conv) { drainQueue(); return; }
-    state.current = conv;
-    renderConvList();
-    renderMessages();
-    renderTools();
-    renderCwd();
-    $('#convTitle').textContent = conv.title;
-    log('轮到排队中的消息了，开始发送');
-    setTimeout(() => send(job.text), 80);
+  function renderQueue() {
+    const box = $('#queuedMessages');
+    box.replaceChildren();
+    for (const job of state.queue) {
+      if (job.conv !== state.current) continue;
+      const row = el('div', 'queue-row');
+      row.appendChild(el('span', 'queue-state', '排队中'));
+      const label = el('span', 'queue-text', [job.content, job.att?.name].filter(Boolean).join(' · '));
+      label.title = label.textContent;
+      row.appendChild(label);
+      const cancel = el('button', 'act-btn', '取消');
+      cancel.onclick = () => {
+        const i = state.queue.indexOf(job);
+        if (i < 0) return;
+        state.queue.splice(i, 1);
+        renderQueue();
+        renderConvList();
+        refreshComposer();
+      };
+      row.appendChild(cancel);
+      box.appendChild(row);
+    }
+    box.hidden = !box.childElementCount;
   }
 
-  async function send(text, opts = {}) {
-    if (state.streaming) return;
-    const content = (text != null ? text : $('#input').value).trim();
-    const att = state.attach;
+  function send(text, opts = {}) {
+    const input = $('#input');
+    const fromComposer = text == null;
+    const draft = draftFor();
+    if (fromComposer && draft.loading) return;
+    const content = (fromComposer ? input.value : text).trim();
+    const att = fromComposer ? draft.att : null;
     if (!content && !att) return;
 
-    if (!state.current) newConv();
-    const conv = state.current;
+    const conv = state.current || newConv(fromComposer, fromComposer);
+    state.queue.push({
+      conv, content, att,
+      workspace: conv.cwd || state.server?.workspace,
+      web: state.web, think: state.think,
+      tools: opts.tools ?? state.tools,
+      settings: { ...settings },
+      memory: memoryForConv(conv).map((m) => m.text),
+    });
+    if (fromComposer) {
+      draft.text = input.value = '';
+      draft.att = null;
+      autoGrow();
+      renderAttach();
+    }
+    renderQueue();
+    renderConvList();
+    drainQueue();
+  }
 
-    // 压缩放在最前面：它可能要先跑一次生成（压旧对话），期间不该把
-    // 用户这条消息已经塞进列表里 —— 否则压缩的切片边界会把新消息也算进去。
-    await maybeCompress(conv);
+  async function drainQueue() {
+    if (state.streaming || !state.queue.length) return;
+    const job = state.queue.shift();
+    state.streaming = true;
+    state.genConv = job.conv;
+    state.abort = new AbortController();
+    renderQueue();
+    renderConvList();
+    refreshComposer();
+    try {
+      await runJob(job, state.abort.signal);
+    } catch (e) {
+      log('发送失败：' + e.message, 'err');
+    } finally {
+      state.streaming = false;
+      state.genConv = null;
+      state.abort = null;
+      refreshComposer();
+      drainQueue();
+    }
+  }
 
-    // 文本/代码附件：内容直接并进这一条 user 消息，不走 image_url。
-    //
-    // 为什么用围栏包起来而不是直接拼：模型需要一眼看出"这是文件内容、
-    // 到哪结束"，否则它会顺着文件最后一行的语气继续往下写。文件名放在
-    // 围栏的语言位上也顺便让界面把它渲染成一个带标题的代码块。
+  async function runJob(job, signal) {
+    const { conv, content, att, settings: opts } = job;
     let wire = content;
-    if (att && att.kind === 'text') {
+    if (att?.kind === 'text') {
       const head = att.name.replace(/[`\s]/g, '_');
       wire = '```' + head + '\n' + att.text + '\n```' + (content ? '\n\n' + content : '');
     }
 
+    const previousCount = conv.messages.length;
     const userMsg = { role: 'user', content, id: newMsgId() };
     if (att) userMsg.att = { kind: att.kind, name: att.name, thumb: att.thumb, mime: att.mime, bytes: att.bytes };
-    conv.messages.push(userMsg);
+    const ai = { role: 'assistant', content: '', tools: [], meta: null, streaming: true, id: newMsgId() };
+    conv.messages.push(userMsg, ai);
     if (conv.title === '新对话') {
       const t = content || att.name;
       conv.title = t.slice(0, 24) + (t.length > 24 ? '…' : '');
-      $('#convTitle').textContent = conv.title;
+      if (state.current === conv) $('#convTitle').textContent = conv.title;
     }
-    state.attach = null;
-    renderAttach();
-    $('#input').value = '';
-    autoGrow();
 
-    const ai = { role: 'assistant', content: '', tools: [], meta: null, streaming: true, id: newMsgId() };
-    conv.messages.push(ai);
     state.gen = { tokens: 0, tps: 0, total: 0, ttft: 0 };
     setGauge(0, 0, 0, 0);
     renderMeters(state.server);
-    log('Running inference ...');
 
     const box = $('#messages');
-    const empty = $('#emptyState');
-    if (empty && empty.parentNode) empty.remove();
-    box.appendChild(messageNode(userMsg));
-    // node / body 必须是 let：工具卡片到达时要整块重绘，重绘后这两个引用
-    // 得指向新节点。原来写成 const，重绘那行会抛 TypeError，而且是被
-    // 外层 catch 吞掉的那种 —— 界面上只剩一个永远"生成中"的空气泡，
-    // 控制台一句错都不报，查起来极难。
     let node = messageNode(ai);
-    box.appendChild(node);
     let body = node.querySelector('.body');
     body.classList.add('typing');
-    scrollBottom(true);
-
-    state.streaming = true;
-    state.genConv = conv;
-    setSendEnabled();
-    saveConvs();
+    if (state.current === conv) {
+      emptyState?.remove();
+      box.append(messageNode(userMsg), node);
+      scrollBottom(true);
+    }
+    saveConv(conv);
     renderConvList();
 
-    // 只发"没被折叠"的那一段 + 摘要。折叠掉的原文还在 conv.messages 里
-    // （界面上照样能往上翻），但不再占上下文 —— 这就是压缩真正省下来的东西。
-    const live = conv.messages.slice(conv.folded || 0);
-    const msgs = live
-      .filter((m) => m.role === 'user' || (m.role === 'assistant' && m.content))
-      .map((m) => {
-        if (m === userMsg && att && att.kind !== 'text') {
-          const parts = [attachmentParts(att)];
-          if (content) parts.push({ type: 'text', text: content });
-          return { role: 'user', content: parts };
-        }
-        // 历史消息里的附件只留一行说明：服务端只认最后一条 user 的媒体，
-        // 而且占位符没配特征会让模型看到空 token。
-        const c = m === userMsg ? wire : (m.content || '');
-        return { role: m.role, content: m.att ? (c ? c + '\n' : '') + `[${m.att.kind}: ${m.att.name}]` : c };
-      });
-    // 记忆 → 背景。放在 system 里而不是拼进最后一条 user：拼进 user 会让
-    // 模型把记忆当成"用户刚说的话"，回答时反复复述。
-    const mem = memoryForConv(conv);
-    if (mem.length) {
-      msgs.unshift({
-        role: 'system',
-        content: '以下是用户希望你记住的背景信息（不要逐条复述，只在相关时自然使用）：\n'
-          + mem.map((m, i) => (i + 1) + '. ' + m.text).join('\n'),
-      });
-    }
-    if (conv.summary) {
-      msgs.unshift({
-        role: 'system',
-        content: '以下是本对话更早部分的摘要（原文已折叠，不要假装记得原文细节）：\n' + conv.summary,
-      });
-    }
-    if (settings.system) msgs.unshift({ role: 'system', content: settings.system });
-
-    // 联网搜索开关。
-    //
-    // 只说"先搜再答"不够 —— 小模型会跳过工具直接编。所以要求它把搜到的
-    // 东西落进回答里，并明确禁止编造来源。实测 LFM3-1.7B 在带这句时会先调
-    // 一次 web_search；不带就 3 次里只有 1 次真的搜。
-    if (state.web) {
-      msgs.unshift({
-        role: 'system',
-        content: '用户打开了联网搜索。回答前先用 web_search 工具查一次，'
-          + '把查到的内容作为依据，并在回答里说明信息来自哪里。'
-          + '如果搜索没有返回结果，就直接说没搜到，不要凭记忆编造来源或数字。',
-      });
-    }
-
-    const t0 = performance.now();
+    let t0 = performance.now();
     let tFirst = 0;
 
     try {
-      state.abort = new AbortController();
-      // 带附件时关掉工具说明。
-      //
-      // 小模型（LFM3-VL-2B 这类 2B 级）看到工具说明 + 一张图，很容易把
-      // 整段输出写成 <tool_result>{...}，但它并没有真的调用工具 ——
-      // 结果就是界面上一条"已完成 9 tokens"的空气泡。图片问答本来也不该
-      // 走工具循环，关掉对双方都更省。真要图文 + 工具，用 API 显式传 tools。
-      // 联网搜索开着就必须带工具说明，否则上面那段 system 让模型"用
-      // web_search"，而请求里根本没有这个工具，它只能编。
-      const withTools = ((opts.tools !== undefined ? opts.tools : state.tools) || state.web) && !att;
+      // 保留队列位置直到压缩和生成都结束。摘要只看这次发送前的历史。
+      await maybeCompress(conv, previousCount, signal);
+      signal.throwIfAborted();
+      t0 = performance.now();
+      log('Running inference ...');
+
+      const live = conv.messages.slice(conv.folded || 0);
+      const msgs = live
+        .filter((m) => m.role === 'user' || (m.role === 'assistant' && m.content))
+        .map((m) => {
+          if (m === userMsg && att && att.kind !== 'text') {
+            const parts = [attachmentParts(att)];
+            if (content) parts.push({ type: 'text', text: content });
+            return { role: 'user', content: parts };
+          }
+          // 历史附件只留说明，服务端只对最后一条用户消息处理媒体。
+          const c = m === userMsg ? wire : (m.content || '');
+          return { role: m.role, content: m.att ? (c ? c + '\n' : '') + `[${m.att.kind}: ${m.att.name}]` : c };
+        });
+      if (job.memory.length) {
+        msgs.unshift({
+          role: 'system',
+          content: '以下是用户希望你记住的背景信息（不要逐条复述，只在相关时自然使用）：\n'
+            + job.memory.map((t, i) => (i + 1) + '. ' + t).join('\n'),
+        });
+      }
+      if (conv.summary) {
+        msgs.unshift({
+          role: 'system',
+          content: '以下是本对话更早部分的摘要（原文已折叠，不要假装记得原文细节）：\n' + conv.summary,
+        });
+      }
+      if (opts.system) msgs.unshift({ role: 'system', content: opts.system });
+      if (job.web && !att) {
+        msgs.unshift({
+          role: 'system',
+          content: '用户打开了联网搜索。回答前先用 web_search 工具查一次，'
+            + '把查到的内容作为依据，并在回答里说明信息来自哪里。'
+            + '如果搜索没有返回结果，就直接说没搜到，不要凭记忆编造来源或数字。',
+        });
+      }
+
       const resp = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        signal: state.abort.signal,
+        signal,
         body: JSON.stringify({
           messages: msgs,
           stream: true,
-          temperature: settings.temperature,
-          top_p: settings.top_p,
-          max_tokens: settings.max_tokens,
-          dubhe_tools: withTools,
-          // 深度思考：按请求传，服务端在请求作用域内覆盖启动默认值。
-          // 显式传 false 是有意的 —— 启动参数带 --thinking 时也要能被界面关掉。
-          thinking: !!state.think,
-          // 本对话绑定的项目文件夹。服务端在请求作用域内把它当成工具的根，
-          // 请求结束就恢复 —— 所以两个对话各读各的项目，不会串。
-          workspace: conv.cwd || undefined,
+          temperature: opts.temperature,
+          top_p: opts.top_p,
+          max_tokens: opts.max_tokens,
+          dubhe_tools: (job.tools || job.web) && !att,
+          thinking: job.think,
+          workspace: job.workspace || undefined,
         }),
       });
-      if (!resp.ok) throw new Error(await resp.text());
+      if (!resp.ok) throw new Error(await responseError(resp));
 
       const reader = resp.body.getReader();
       const dec = new TextDecoder();
       let buf = '';
+      let completed = false;
       let raf = null;
       let genTick = 0;
 
@@ -1923,6 +2131,7 @@
         if (thinkRaf) return;
         thinkRaf = requestAnimationFrame(() => {
           thinkRaf = 0;
+          if (!ai.streaming) return;
           if (!node.isConnected && !rebind()) return;
           ensureThink();
           flushThink();
@@ -1959,6 +2168,7 @@
         if (raf) return;
         raf = requestAnimationFrame(() => {
           raf = null;
+          if (!ai.streaming) return;
           // 用户切到别的对话去了：这个 node 已经不在文档里，写进去也没人看。
           // 先把引用接回列表里的新节点；接不回来就这一帧不画，ai.content
           // 仍然在长，切回来时 renderMessages 会一次性画出最新的。
@@ -2007,7 +2217,7 @@
           const line = part.trim();
           if (!line.startsWith('data:')) continue;
           const data = line.slice(5).trim();
-          if (data === '[DONE]') continue;
+          if (data === '[DONE]') { completed = true; continue; }
           let j;
           try { j = JSON.parse(data); } catch (e) { continue; }
 
@@ -2130,6 +2340,9 @@
       // 流结束了，把 rAF 里还没落盘的那一小段补上（通常最后一个 chunk
       // 正好卡在一帧里，不补的话推理末尾会少几个字）。
       flushThink();
+      if (!completed && !ai.errText) {
+        throw new Error('回答中断，已收到的内容仍保留在对话里。');
+      }
     } catch (e) {
       if (e.name === 'AbortError') {
         // 用户主动停止：保留已生成的部分，不报错
@@ -2143,19 +2356,12 @@
         const msg = /load failed|failed to fetch|network ?error|networkconnectionlost/i.test(raw)
           ? '与本地引擎的连接中断了（引擎可能刚意外退出，客户端正在自动重启）。等几秒重新发送即可。'
           : raw;
-        ai.content = (ai.content || '') + `\n\n> ⚠️ 请求失败：${msg}`;
+        ai.errText = msg;
       }
     } finally {
-      state.streaming = false;
-      state.abort = null;
       ai.streaming = false;
       delete ai.queued;    // 状态行用的临时标记，不该跟着会话存下去
       delete ai.noteText;
-      state.genConv = null;
-      setSendEnabled();
-      // 有排队的消息就接着发。放在 finally 里：即使这一轮报错/被中止，
-      // 排队的那条也不会永远卡着。
-      setTimeout(drainQueue, 120);
       const total = (performance.now() - t0) / 1000;
       const tokens = (ai.meta && ai.meta.tokens) || state.gen.tokens || 0;
       state.gen = {
@@ -2171,62 +2377,41 @@
       } else {
         log('Stopped.', 'err');
       }
-      // 收尾一律替换"当前还挂在文档里"的那个节点。
-      // 工具卡片到达时整块重绘过，早期抓到的引用已经脱离文档；对它
-      // replaceWith 等于什么都没做 —— 结果是气泡永远停在"生成中…"，
-      // 正文一个字都渲染不出来。
-      if (!node.isConnected) box.appendChild(node);
-      const finalNode = messageNode(ai);
-      node.replaceWith(finalNode);
-      node = finalNode;
-      body = node.querySelector('.body');
-      body.classList.remove('typing');
-      // "已完成 · 0 tokens"的空气泡比报错更让人困惑：真空了就直说。
-      // 已经有 errText 的时候不要盖掉 —— 那才是真正的原因，"模型直接收尾了"
-      // 会把用户引到错误的方向。
       if (!String(ai.content || '').trim() && !(ai.tools && ai.tools.length) && !ai.errText) {
         ai.content = '（这一轮没有任何输出。可能是上下文放不下，或者模型直接收尾了，换个问法再试。）';
-        const nn = messageNode(ai);
-        node.replaceWith(nn);
-        node = nn;
-        body = node.querySelector('.body');
-        body.classList.remove('typing');
+      }
+      if (state.current === conv) {
+        // 切离再切回时，页面已重画过；只替换现在属于这条回答的节点。
+        const shown = box.querySelector('[data-mid="' + ai.id + '"]');
+        if (shown) shown.replaceWith(messageNode(ai));
+        scrollBottom();
+        renderTools();
       }
       // 桌面版：这一轮真的生成完了，告诉外壳一声（外壳决定要不要弹通知）。
       // 用户主动停止的不算 —— 那说明他正盯着屏幕。
       if (!ai.stopped && !ai.errText) shellPostTurnEnd(ai, tokens);
       delete ai.stopped;          // 只用于刚才那个判断，不该跟着会话存下去
-      saveConvs();
-      // 收尾不强制回底。用户生成到一半往上滑去读前面的内容，这时候把他
-      // 拽回底部，等于"我看了半天的那段又没了"—— stick.on 为真时它照样
-      // 会贴底，为假说明是他自己选择停在上面的。
-      scrollBottom();
-      renderTools();
+      saveConv(conv);
       renderMeters(state.server);
       refreshState();
     }
   }
 
-  // 生成中按钮不能变灰：它要变成"停止"。禁用掉的话，用户只能刷新页面，
-  // 这是流式对话里最反直觉的一个坑。
-  //
-  // 但"停止"只对**正在生成的那个对话**成立。原来只看全局 state.streaming，
-  // 于是切到别的对话后按钮照样是个停止键 —— 那个对话根本没在生成，按下去
-  // 停的是另一条，谁也想不到。现在按对话判断。
   function refreshComposer() {
     const b = $('#send');
-    if (!b) return;
-    const busyHere = state.streaming && state.genConv && state.current &&
-                     state.genConv.id === state.current.id;
-    b.disabled = false;
-    b.classList.toggle('stop', !!busyHere);
-    b.title = busyHere ? '停止生成' : '发送';
-    b.innerHTML = busyHere ? ICON_STOP : ICON_SEND;
-  }
-
-  // 兼容旧调用点：只按当前状态重画，不再自己改 state。
-  function setSendEnabled() {
-    refreshComposer();
+    const d = draftFor();
+    const busyHere = state.streaming && state.genConv === state.current;
+    const hasDraft = Boolean($('#input').value.trim() || d.att || d.loading);
+    const stopOnly = busyHere && !hasDraft;
+    $('#stopGeneration').hidden = !busyHere || stopOnly;
+    b.disabled = Boolean(d.loading);
+    b.classList.toggle('stop', stopOnly);
+    b.title = stopOnly ? '停止生成' : state.streaming ? '加入队列' : '发送';
+    b.setAttribute('aria-label', b.title);
+    if (b.dataset.action !== String(stopOnly)) {
+      b.innerHTML = stopOnly ? ICON_STOP : ICON_SEND;
+      b.dataset.action = String(stopOnly);
+    }
   }
 
   // ---------------------------------------------------------------- 面板
@@ -2269,22 +2454,12 @@
     row(parent, label, desc, wrap);
   }
 
-  function toggle(parent, label, desc, get, set, dis) {
+  function toggle(parent, label, desc, get, set) {
     const sw = el('label', 'switch');
     const cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.checked = get();
     cb.onchange = () => set(cb.checked);
-    // dis：这一项当前**不可能**生效，别让它看起来能拨。
-    //
-    // 命令沙箱就是这种情况：本机 sandbox-exec 套不上时，开关拨到 ON 也没用，
-    // 刷新一下又弹回 OFF —— 用户会以为"开关坏了"，反复点。直接置灰更诚实。
-    if (dis) {
-      cb.disabled = true;
-      cb.checked = false;
-      sw.classList.add('off');
-      sw.title = '本机不支持，无法开启';
-    }
     sw.appendChild(cb);
     sw.appendChild(el('span'));
     row(parent, label, desc, sw);
@@ -2399,6 +2574,16 @@
 
   function openSettings() {
     openSheet('设置', (body) => {
+      if (window.webkit?.messageHandlers?.shell) {
+        body.appendChild(el('div', 'group-title', '版本与更新'));
+        const actions = el('div', 'tbar');
+        for (const [label, type] of [['检查更新', 'checkForUpdates'], ['更新日志', 'showChangelog']]) {
+          const button = el('button', 'vbtn', label);
+          button.onclick = () => shellPost({ type });
+          actions.appendChild(button);
+        }
+        body.appendChild(actions);
+      }
       body.appendChild(el('div', 'group-title', '模型'));
       if (state.server && state.server.info) {
         const i = state.server.info;
@@ -2439,7 +2624,7 @@
       slider(body, '最大输出', '单次回复的 token 上限', 'max_tokens', 128, 16384, 128, (v) => String(v));
 
       body.appendChild(el('div', 'group-title', '工具'));
-      toggle(body, '启用工具调用', '允许模型读取文件、列目录、执行命令', () => settings.tools, (v) => { settings.tools = v; state.tools = v; localStorage.setItem(TOOLS_TOUCHED, '1'); saveSettings(); });
+      toggle(body, '启用工具调用', '允许模型读取文件、列目录、执行命令', () => settings.tools, (v) => { settings.tools = v; state.tools = v; writePreference(TOOLS_TOUCHED, '1'); saveSettings(); });
 
       // ---- 权限
       //
@@ -2465,14 +2650,11 @@
       toggle(body, '联网', '允许 web_search 搜索、fetch_url 抓网页。',
         () => !!srv().net, (v) => setPerm('net', v));
       const sbOff = srv().sandbox_cfg && srv().sandbox === false;
-      toggle(body, '命令沙箱', '命令只能写工作区与 /tmp。关掉就是完全放开。',
-        () => srv().sandbox !== false, (v) => setPerm('sandbox', v), sbOff);
-      // 开关"开着但不生效"是最坏的一种状态：用户以为有隔离，其实命令在裸跑。
-      // 服务端把配置值和实际探测结果分成两个字段，这里把差异说出来。
+      toggle(body, '命令隔离', '启用后，命令只能写入工作区和 /tmp。',
+        () => srv().sandbox_cfg !== false, async (v) => { await setPerm('sandbox', v); openSettings(); });
       if (sbOff) {
         const warn = el('div', 'perm-warn',
-          '本机的 sandbox-exec 套不上（外层已有沙箱或系统限制），命令是未隔离执行的。' +
-          '写盘限制目前不生效 —— 模型自己的 write_file 仍然只写项目内。');
+          '本机暂时无法隔离命令。保持隔离开启时，引擎会拒绝执行命令。');
         body.appendChild(warn);
       }
 
@@ -2688,7 +2870,7 @@
   }
 
   function glassLevel() {
-    return localStorage.getItem(GLASS_KEY) || autoGlass();
+    return readPreference(GLASS_KEY) || autoGlass();
   }
 
   function setGlass(level, persist) {
@@ -2707,16 +2889,29 @@
   // 知识库能真的索引和检索。后端没做的能力（比如自动多步规划）就不假装有。
   // ==========================================================================
 
+  function apiError(data) {
+    const error = data?.error;
+    return (typeof error === 'string' ? error : error?.message) || data?.message || '';
+  }
+
+  async function responseError(r) {
+    const data = await r.json().catch(() => ({}));
+    if (r.status === 413) return '内容超出服务器限制，请缩短消息或换更小的附件。';
+    return apiError(data) || 'HTTP ' + r.status;
+  }
+
   async function vapi(path, opts) {
     const r = await fetch(path, opts);
-    const text = await r.text();
-    let j = null;
-    try { j = JSON.parse(text); } catch (e) { /* 非 JSON 响应 */ }
-    if (!r.ok) throw new Error((j && (j.error || j.message)) || 'HTTP ' + r.status);
-    return j || {};
+    if (!r.ok) {
+      const error = new Error(await responseError(r));
+      error.status = r.status;
+      throw error;
+    }
+    return r.json().catch(() => ({}));
   }
-  const vpost = (p, body) =>
-    vapi(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const vpost = (p, body, signal) =>
+    vapi(p, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}), signal });
 
   function fmtBytes(b) {
     if (!b) return '0 B';
@@ -2926,19 +3121,33 @@
 
   // 可下载区。清单来自 /api/store —— 服务端内置、链接验证过、架构与引擎匹配。
   // 下载是后台 curl（断点续传），这里只负责画进度和轮询。
+  const storeViews = new WeakMap();
+  const activeTransfer = (m) => ['running', 'verifying', 'cancelling'].includes(m.state);
   async function viewStore(host) {
+    if (!host.isConnected || state.view !== 'models') return;
+    let view = storeViews.get(host);
+    if (!view) {
+      view = { request: 0, timer: null, active: new Set(), list: el('div'), mirror: null };
+      host.appendChild(view.list);
+      storeViews.set(host, view);
+    }
+    clearTimeout(view.timer);
+    const request = ++view.request;
     let d;
     try {
       d = await vapi('/api/store');
     } catch (e) {
-      return;   // 商店读不到不影响本地模型列表，静默跳过
+      if (request === view.request && view.active.size) view.timer = setTimeout(() => viewStore(host), 1200);
+      return;
     }
-    host.innerHTML = '';
+    if (request !== view.request || !host.isConnected || state.view !== 'models') return;
+    const installed = d.items?.some(m => m.installed && view.active.has(m.id));
+    view.list.replaceChildren();
     if (!d.items || !d.items.length) return;
+    view.active = new Set(d.items.filter(activeTransfer).map((m) => m.id));
 
-    host.appendChild(el('div', 'vtitle', '可下载'));
+    view.list.appendChild(el('div', 'vtitle', '模型商店'));
     const card = el('div', 'vcard');
-    let polling = false;
     d.items.forEach((m) => {
       const row = el('div', 'vrow');
       const ico = el('div', 'vico');
@@ -2950,52 +3159,71 @@
       nm.appendChild(el('span', 'vtag', m.params + ' · ' + m.quant));
       if (m.installed) nm.appendChild(el('span', 'vtag on', '已下载'));
       main.appendChild(nm);
-      main.appendChild(el('div', 'vmeta', m.note + ' · ' + fmtBytes(m.bytes)));
+      main.appendChild(el('div', 'vmeta', m.note + ' · ' + fmtBytes(m.installed ? m.got || m.bytes : m.bytes)));
       row.appendChild(main);
 
       if (m.installed) {
-        row.appendChild(el('div', 'vmeta', '已就绪'));
+        if (m.translation) {
+          const open = el('button', 'vbtn', '去翻译');
+          open.onclick = () => chooseTranslation(m.id);
+          row.appendChild(open);
+        } else {
+          row.appendChild(el('div', 'vmeta', '已就绪'));
+        }
         card.appendChild(row);
         return;
       }
 
-      const running = m.state === 'running';
-      if (running) {
-        const got = m.got || 0;
-        const pct = m.total ? Math.min(100, Math.round((got / m.total) * 100)) : 0;
-        const bar = el('div', 'pbar');
-        const fill = el('div', 'pfill');
-        fill.style.width = pct + '%';
-        bar.appendChild(fill);
-        const info = el('div', 'vmeta', '下载中 ' + pct + '% · ' + fmtBytes(got) + ' / ' + fmtBytes(m.total));
-        main.appendChild(info);
-        main.appendChild(bar);
-        // 取消：kill 掉 curl，.part 留着 —— 反悔了还能接着下。
-        const cx = el('button', 'vbtn', '取消');
-        cx.onclick = async () => {
-          cx.disabled = true;
-          try { await vpost('/api/store/cancel', { id: m.id }); } catch (e) { /* 忽略 */ }
-          setTimeout(() => viewStore(host), 400);
-        };
-        row.appendChild(cx);
-        polling = true;
+      if (activeTransfer(m)) {
+        if (m.state === 'running') {
+          const got = m.got || 0;
+          const pct = m.total ? Math.min(100, Math.round((got / m.total) * 100)) : 0;
+          const bar = el('div', 'pbar');
+          const fill = el('div', 'pfill');
+          fill.style.width = pct + '%';
+          bar.appendChild(fill);
+          main.appendChild(el('div', 'vmeta', '下载中 ' + pct + '% · ' + fmtBytes(got) + ' / ' + fmtBytes(m.total)));
+          main.appendChild(bar);
+        } else {
+          main.appendChild(el('div', 'vmeta', m.state === 'verifying' ? '正在验证模型文件…' : '正在取消…'));
+        }
+        if (m.state !== 'cancelling') {
+          const cx = el('button', 'vbtn', '取消');
+          cx.onclick = async () => {
+            cx.disabled = true;
+            try {
+              await vpost('/api/store/cancel', { id: m.id });
+              viewStore(host);
+            } catch (e) {
+              cx.disabled = false;
+              if (main.isConnected) main.appendChild(el('div', 'vnote bad', e.message));
+            }
+          };
+          row.appendChild(cx);
+        }
         card.appendChild(row);
         return;
       }
 
-      const b = el('button', 'vbtn', m.state === 'error' ? '重试'
-        : m.state === 'cancelled' ? '继续' : '下载');
+      const action = m.state === 'error' ? '重试' : m.state === 'cancelled' ? '继续' : '下载';
+      const b = el('button', 'vbtn', action);
       b.onclick = async () => {
         b.disabled = true;
         b.textContent = '启动…';
         try {
           await vpost('/api/store/download', { id: m.id });
-          setTimeout(() => viewStore(host), 600);
+          view.active.add(m.id);
+          viewStore(host);
         } catch (e) {
+          if (e.status === 409 && e.message.includes('正在停止')) {
+            b.textContent = '等待下载状态…';
+            viewStore(host);
+            return;
+          }
           b.disabled = false;
-          b.textContent = '下载';
+          b.textContent = action;
           const note = el('div', 'vnote bad', '下载失败：' + e.message);
-          row.parentNode.insertBefore(note, row);
+          if (row.isConnected) row.before(note);
           setTimeout(() => note.remove(), 6000);
         }
       };
@@ -3005,69 +3233,123 @@
       }
       card.appendChild(row);
     });
-    host.appendChild(card);
+    view.list.appendChild(card);
 
-    // 下载源。国内直连 huggingface.co 常常只有几百 KB/s —— 4.7GB 要下两小时。
-    // 换成镜像能快一个数量级，但镜像的可用性不归我们管，所以做成可切换而不是写死。
+    if (!view.mirror) view.mirror = createMirrorSetting(host);
+    view.mirror.refresh(d.mirror || '');
+
+    if (view.active.size) view.timer = setTimeout(() => viewStore(host), 1200);
+    if (installed) viewModels(false);
+  }
+
+  function createMirrorSetting(host) {
     const mrow = el('div', 'vrow');
     const mm = el('div', 'vmain');
     mm.appendChild(el('div', 'vname', '下载源'));
     const inp = document.createElement('input');
     inp.className = 'vsel';
+    inp.setAttribute('aria-label', '模型下载源');
     inp.style.width = '100%';
     inp.placeholder = 'https://hf-mirror.com（留空 = 官方 huggingface.co）';
-    inp.value = d.mirror || '';
     mm.appendChild(inp);
     mm.appendChild(el('div', 'vmeta', '只替换域名，路径不变。改完对之后开始的下载生效。'));
     mrow.appendChild(mm);
     const save = el('button', 'vbtn', '保存');
+    const status = el('div', 'vmeta');
+    status.setAttribute('role', 'status');
+    mm.appendChild(status);
+    inp.oninput = () => { status.textContent = ''; };
+    let savedValue = '';
+    const refresh = (value) => {
+      if (!save.disabled && inp.value === savedValue && document.activeElement !== inp) inp.value = value;
+      savedValue = value;
+    };
     save.onclick = async () => {
+      const value = inp.value.trim();
       save.disabled = true;
+      status.textContent = '';
       try {
-        await vpost('/api/store/mirror', { mirror: inp.value.trim() });
-        save.textContent = '已保存';
-        setTimeout(() => { save.textContent = '保存'; save.disabled = false; }, 1200);
+        const result = await vpost('/api/store/mirror', { mirror: value });
+        savedValue = result.mirror ?? value;
+        if (inp.value.trim() === value) inp.value = savedValue;
+        status.textContent = '已保存';
+        viewStore(host);
       } catch (e) {
+        status.textContent = '保存失败 · ' + e.message;
+      } finally {
         save.disabled = false;
-        save.textContent = '失败';
       }
     };
     mrow.appendChild(save);
     host.appendChild(mrow);
 
-    host.appendChild(el('div', 'vnote',
-      '只列引擎确认能加载的模型（llama 家族 / LFM / Qwen3.5）。'
-      + '下载支持断点续传，中断后点「重试」会接着下；完成后自动出现在上面的列表里。'));
-
-    if (polling && !storeTimer) {
-      storeTimer = setTimeout(() => {
-        storeTimer = 0;
-        viewStore(host);
-      }, 1200);
-    }
+    return { refresh };
   }
-  let storeTimer = 0;
 
   // ---------------------------------------------------------------- 模型
-  async function viewModels() {
+  function confirmModelDeletion(name) {
+    const dialog = el('dialog', 'delete-confirm');
+    const title = el('h3', '', '删除模型？');
+    title.id = 'delete-model-title';
+    dialog.setAttribute('aria-labelledby', title.id);
+    const form = el('form', 'delete-confirm-actions');
+    form.method = 'dialog';
+    const cancel = el('button', 'vbtn', '取消');
+    cancel.value = 'cancel';
+    cancel.autofocus = true;
+    const remove = el('button', 'vbtn', '删除');
+    remove.value = 'delete';
+    form.append(cancel, remove);
+    dialog.append(title, el('p', '', name + ' 将从模型目录移除。'), form);
+    document.body.appendChild(dialog);
+    return new Promise(resolve => {
+      dialog.addEventListener('close', () => {
+        resolve(dialog.returnValue === 'delete');
+        dialog.remove();
+      }, { once: true });
+      dialog.showModal();
+    });
+  }
+
+  let modelsRequest = 0;
+  async function viewModels(refreshStore = true) {
     const body = $('#viewBody');
-    body.innerHTML = '';
-    body.appendChild(el('div', 'vempty', '正在扫描模型目录…'));
+    let local = body.querySelector('.local-models');
+    let storeBox = body.querySelector('.model-store');
+    if (!local) {
+      local = el('div', 'local-models');
+      storeBox = el('div', 'model-store');
+      local.appendChild(el('div', 'vempty', '正在扫描模型目录…'));
+      body.append(local, storeBox);
+    }
+    const request = ++modelsRequest;
     let d;
     try {
       d = await vapi('/api/models');
     } catch (e) {
-      body.innerHTML = '';
-      body.appendChild(el('div', 'vnote bad', '读不到模型清单：' + e.message));
+      if (request !== modelsRequest || !local.isConnected || state.view !== 'models') return;
+      local.replaceChildren(el('div', 'vnote bad', '读不到模型清单：' + e.message));
       return;
     }
-    setViewHead('模型', d.items.length + ' 个 · ' + d.dir, [
-      { label: '刷新', icon: 'restart', on: () => viewModels() },
-    ]);
-    body.innerHTML = '';
+    if (request !== modelsRequest || !local.isConnected || state.view !== 'models') return;
+    const actions = [{ label: '刷新', icon: 'restart', on: () => viewModels() }];
+    if (d.current) actions.push({
+      label: '卸载当前模型',
+      on: async () => {
+        try {
+          await vpost('/api/unload');
+          shellPost({ type: 'modelUnloaded' });
+          await refreshState();
+          if (state.view === 'models') await viewModels();
+        } catch (e) {
+          if (local.isConnected) local.prepend(el('div', 'vnote bad', e.message));
+        }
+      },
+    });
+    setViewHead('模型', d.items.length + ' 个 · ' + d.dir, actions);
+    local.replaceChildren();
     if (!d.items.length) {
-      body.appendChild(vEmpty('模型目录是空的', d.dir + ' 下没有 .gguf 文件。把模型放到这里就能在界面上切换。'));
-      return;
+      local.appendChild(vEmpty('模型目录是空的', d.dir + ' 下没有 .gguf 文件。把模型放到这里就能在界面上切换。'));
     }
     const card = el('div', 'vcard');
     // 速度预估。
@@ -3097,8 +3379,6 @@
       // 已加载的也要标：它同时是"当前"和"多模态"，两个标签不冲突。
       if (m.mmproj) nm.appendChild(el('span', 'vtag', '多模态'));
       if (isMm) nm.appendChild(el('span', 'vtag', '多模态塔'));
-      // MLX 条目：列出来但明说不能加载。装作没有的代价是用户以为
-      // "这软件不支持苹果格式"，而实际上原因和出路都在 note 里。
       if (m.mlx) nm.appendChild(el('span', 'vtag', 'MLX'));
       main.appendChild(nm);
       const bits = [];
@@ -3119,7 +3399,11 @@
       main.appendChild(el('div', 'vmeta', bits.join(' · ')));
       if (m.note) main.appendChild(el('div', 'vnote', m.note));
       row.appendChild(main);
-      if (m.mlx) {
+      if (m.translation) {
+        const use = el('button', 'vbtn', '去翻译');
+        use.onclick = () => chooseTranslation(m.translation);
+        row.appendChild(use);
+      } else if (m.loadable === false) {
         row.classList.add('off');
       } else if (!m.loaded && !isMm) {
         const b = el('button', 'vbtn', '加载');
@@ -3130,256 +3414,511 @@
             const r = await vpost('/api/load', { path: m.path });
             b.textContent = '已加载 ' + Math.round(r.ms) + ' ms';
             await refreshState();
+            if (!card.isConnected || state.view !== 'models') return;
+            await viewModels();
             // 塔加载失败（文件坏了、维度和模型对不上）不该静默吞掉：
             // 结果是"模型能跑但看不了图"，不说清楚用户会以为是图片的问题。
-            if (r.mm_note) {
+            if (r.mm_note && state.view === 'models') {
               const note = el('div', 'vnote bad', '模型已切换，但' + r.mm_note);
-              card.parentNode.insertBefore(note, card);
+              local.prepend(note);
               setTimeout(() => note.remove(), 8000);
             }
-            viewModels();
           } catch (e) {
             b.disabled = false;
             b.textContent = '加载';
             const note = el('div', 'vnote bad', '加载失败：' + e.message);
-            card.parentNode.insertBefore(note, card);
+            if (card.isConnected) card.before(note);
             setTimeout(() => note.remove(), 6000);
           }
         };
         row.appendChild(b);
 
-        // 删除。只有"不是当前加载的"才给这个按钮 —— 删掉正在用的权重，
-        // 引擎手里还攥着已映射的文件，之后任何一次切换都会失败。
-        if (!m.loaded) {
-          const del = el('button', 'vbtn', '删除');
-          del.title = '从磁盘删除这个文件';
-          del.onclick = async () => {
-            if (!window.confirm('删除 ' + m.name + '？\n文件会直接从磁盘移除，不能撤销。')) return;
-            del.disabled = true;
-            try {
-              await vpost('/api/models/delete', { path: m.path });
-              viewModels();
-            } catch (e) {
-              del.disabled = false;
-              del.textContent = '删不掉';
-              const note = el('div', 'vnote bad', '删除失败：' + e.message);
-              card.parentNode.insertBefore(note, card);
-              setTimeout(() => note.remove(), 6000);
-            }
-          };
-          row.appendChild(del);
-        }
+      }
+      if (!m.loaded && !m.mlx && !isMm) {
+        const del = el('button', 'vbtn', '删除');
+        del.onclick = async () => {
+          del.disabled = true;
+          try {
+            if (!await confirmModelDeletion(m.name)) return;
+            await vpost('/api/models/delete', { path: m.path });
+            if (card.isConnected && state.view === 'models') await viewModels();
+          } catch (e) {
+            const note = el('div', 'vnote bad', '删除失败：' + e.message);
+            if (card.isConnected) card.before(note);
+            setTimeout(() => note.remove(), 6000);
+          } finally {
+            del.disabled = false;
+          }
+        };
+        row.appendChild(del);
       }
       card.appendChild(row);
     });
-    body.appendChild(card);
-
-    // ---- 可下载（模型商店的第一版：可信清单 + 直接下载）
-    //
-    // 故意不列"海量仓库"：清单里每个链接都验证过能下、每个架构都是引擎
-    // 真能加载的。宁可只有三条，也不让用户下 20GB 之后卡在"加载失败"。
-    // 取舍见 docs/adr/ADR-0006-模型商店.md。
-    // 单独给商店一个容器：viewStore 每次刷新会清空自己的 host，
-    // 直接传 body 会把上面刚画好的本地模型列表一起清掉（踩过一次）。
-    const storeBox = el('div');
-    body.appendChild(storeBox);
-    viewStore(storeBox);
-
-    body.appendChild(el('div', 'vnote',
-      '切换模型会先卸载当前权重再加载新的，通常 1~2 秒。加载失败会自动装回原来的模型，不会把服务变成没有模型的状态。'));
-    body.appendChild(el('div', 'vnote',
-      '速度是按"内存带宽 ÷ 模型体积"估的，拿当前模型的实测值外推 —— 同一台机器上，'
-      + 'F16 的体积是 Q4_K_M 的三倍，速度也就只有三分之一。觉得慢先换小量化档，换内核没用。'));
+    if (d.items.length) local.appendChild(card);
+    if (refreshStore) viewStore(storeBox);
   }
 
   // ---------------------------------------------------------------- 翻译
   //
-  // 为什么放在客户端：翻译 = 切段 + 逐段请求 + 进度/中断，全是交互层的活。
-  // 服务端再加一个 /api/translate，等于把流式、中止、进度原样再实现一遍。
-  //
-  // 模型可选：引擎一次只加载一个模型，选了别的会先切过去（1~2 秒）。
-  // 界面明写"正在切换模型"，不做无声的重活。
   const LANGS = [
     ['zh', '简体中文'], ['en', 'English'], ['ja', '日本語'],
     ['ko', '한국어'], ['fr', 'Français'], ['de', 'Deutsch'],
   ];
 
-  // 按"块"切，不是按段切。
-  //
-  // 翻译文档时最忌讳把结构切坏：代码块切一半、表格从中间断开、标题和正文
-  // 分到两段，模型就会各翻各的，拼回去格式全乱。所以先按块归组 ——
-  // ``` 围栏、表格、以及"标题 + 紧跟的正文"算一个不可分割的块，
-  // 再把这些块打包到 max 以内。
-  function splitChunks(text, max) {
-    const lines = text.split('\n');
-    const blocks = [];
+  // 围栏和缩进代码原样保留。普通文字按段落拆，长 Markdown 块只在整行边界拆。
+  function translationParts(text, max = 1200) {
+    const lines = text.match(/[^\n]*\n|[^\n]+$/g) || [];
+    const parts = [];
+    const literal = (value) => { if (value) parts.push({ value, translate: false }); };
+    const add = (value) => {
+      const content = value.trim();
+      if (!content) {
+        literal(value);
+        return;
+      }
+      const start = value.indexOf(content);
+      literal(value.slice(0, start));
+      parts.push({ value: content, translate: true });
+      literal(value.slice(start + content.length));
+    };
+    const dequote = (line) => line.replace(/^(?: {0,3}>[ \t]?)+/, '').replace(/\n$/, '');
+    const listPrefix = /^ {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]+/;
+    const heading = (line) => /^ {0,3}#{1,6}(?:[ \t]|$)/.test(dequote(line));
+    const list = (line) => listPrefix.test(dequote(line));
+    const code = (line) => /^(?: {4}|\t)/.test(dequote(line));
+    const fence = (line) => {
+      const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(dequote(line).replace(listPrefix, ''));
+      if (m && (m[1][0] !== '`' || !m[2].includes('`'))) return m[1];
+      return '';
+    };
+    const mathBlock = line => /^[ \t]*([$][$]|\\\[)[ \t]*$/.exec(dequote(line))?.[1];
+    const table = (i) => {
+      if (!lines[i]?.includes('|') || !lines[i + 1]) return false;
+      const rule = lines[i + 1].trim().replace(/^\||\|$/g, '');
+      return rule.split('|').every((cell) => /^\s*:?-+:?\s*$/.test(cell));
+    };
+    const boundary = (i) => !lines[i].trim() || fence(lines[i]) || mathBlock(lines[i]) ||
+      code(lines[i]) || heading(lines[i]) || table(i);
+
+    function split(value, structured) {
+      while (value.trimEnd().length > max) {
+        let cut = value.lastIndexOf('\n', max) + 1;
+        if (!cut || !value.slice(0, cut).trim()) {
+          if (structured) {
+            const next = value.indexOf('\n', max);
+            if (next < 0) break;
+            cut = next + 1;
+          } else {
+            const head = value.slice(0, max);
+            const mark = Array.from(head.matchAll(/[ \t]+|[。！？.!?](?=\s|$)/g)).at(-1);
+            cut = mark && mark.index > max / 2 ? mark.index + mark[0].length : max;
+            // 避免在两个 UTF-16 代理项中间切开一个字符。
+            if (/[\uD800-\uDBFF]/.test(value[cut - 1])) cut--;
+          }
+        }
+        add(value.slice(0, cut));
+        value = value.slice(cut);
+      }
+      add(value);
+    }
+
     let i = 0;
     while (i < lines.length) {
-      const ln = lines[i];
-      // 代码围栏：整块带走，哪怕超长也不切
-      if (/^\s*```/.test(ln)) {
-        const buf = [ln];
+      const start = i++;
+      const line = lines[start];
+      const marker = fence(line);
+      const math = mathBlock(line);
+      if (marker) {
+        const closer = new RegExp('^ {0,3}' + marker[0] + '{' + marker.length + ',}[ \t]*$');
+        while (i < lines.length && !closer.test(dequote(lines[i++]))) {}
+        literal(lines.slice(start, i).join(''));
+      } else if (math) {
+        const end = math === '$$' ? '$$' : '\\]';
+        while (i < lines.length && dequote(lines[i++]).trim() !== end) {}
+        literal(lines.slice(start, i).join(''));
+      } else if (!line.trim() || code(line)) {
+        literal(line);
+      } else if (table(start)) {
         i++;
-        while (i < lines.length && !/^\s*```/.test(lines[i])) buf.push(lines[i++]);
-        if (i < lines.length) buf.push(lines[i++]);
-        blocks.push(buf.join('\n'));
-        continue;
-      }
-      // 表格：连续的 | 开头行
-      if (/^\s*\|/.test(ln)) {
-        const buf = [];
-        while (i < lines.length && /^\s*\|/.test(lines[i])) buf.push(lines[i++]);
-        blocks.push(buf.join('\n'));
-        continue;
-      }
-      // 标题：和后面第一段正文绑在一起
-      if (/^\s*#{1,6}\s/.test(ln)) {
-        const buf = [ln];
-        i++;
-        while (i < lines.length && !lines[i].trim()) i++;
-        while (i < lines.length && lines[i].trim() && !/^\s*(```|\||#{1,6}\s)/.test(lines[i])) {
-          buf.push(lines[i++]);
+        while (i < lines.length && lines[i].includes('|') && !heading(lines[i]) && !fence(lines[i])) i++;
+        split(lines.slice(start, i).join(''), true);
+      } else {
+        const isHeading = heading(line);
+        const isList = list(line);
+        // 标题和紧随的正文放在同一段，保留原有空行。
+        if (isHeading) {
+          let next = i;
+          while (next < lines.length && !lines[next].trim()) next++;
+          if (next < lines.length && !boundary(next) && !list(lines[next])) i = next;
         }
-        blocks.push(buf.join('\n'));
-        continue;
+        while (i < lines.length && !boundary(i) && (isList || !list(lines[i]))) i++;
+        split(lines.slice(start, i).join(''), isList || isHeading);
       }
-      // 普通段落
-      if (!ln.trim()) { i++; continue; }
-      const buf = [];
-      while (i < lines.length && lines[i].trim() &&
-             !/^\s*(```|\||#{1,6}\s)/.test(lines[i])) {
-        buf.push(lines[i++]);
-      }
-      blocks.push(buf.join('\n'));
     }
-
-    const out = [];
-    let cur = '';
-    for (const b of blocks) {
-      if (b.length > max) {
-        if (cur) { out.push(cur); cur = ''; }
-        for (let k = 0; k < b.length; k += max) out.push(b.slice(k, k + max));
-        continue;
-      }
-      if (cur.length + b.length + 2 > max) { out.push(cur); cur = b; }
-      else cur = cur ? cur + '\n\n' + b : b;
-    }
-    if (cur) out.push(cur);
-    return out;
+    return parts;
   }
 
-  // 截图取词的回灌口。外壳（Swift）识别完会调它。
-  let ocrSink = null;
-  window.dubheOcr = (text) => { if (ocrSink) ocrSink(text || ''); };
+  const TRANSLATION_PREFS = 'dubhe.translation.v1';
+  let translationPrefs = { model: 'hy-mt2-18b-q4', source: 'auto', target: 'zh', glossary: '' };
+  try {
+    const saved = JSON.parse(readPreference(TRANSLATION_PREFS));
+    if (saved && typeof saved === 'object') translationPrefs = { ...translationPrefs, ...saved };
+  } catch (e) {}
+  let translationPane;
+  let nativeTranslation;
+  let documentRequestId = 0;
+  const documentRequests = new Map();
 
-  // 划词翻译的回灌口：外壳读到系统里选中的文字，送到这里就切到翻译页并开翻。
-  window.dubheText = (text) => {
-    if (!text) return;
-    openView('translate');
-    // 视图是 async 渲染的，等 textarea 出现再填。
-    let tries = 0;
-    const tick = setInterval(() => {
-      const ta = document.querySelector('#viewBody textarea');
-      if (!ta) { if (++tries > 40) clearInterval(tick); return; }
-      clearInterval(tick);
-      ta.value = text;
-      const go = Array.from(document.querySelectorAll('#viewBody .vbtn'))
-        .find((b) => b.textContent.trim() === '翻译');
-      if (go) go.click();
-    }, 120);
+  window.dubheDocumentComplete = (id, result) => {
+    const pending = documentRequests.get(id);
+    if (!pending) return;
+    documentRequests.delete(id);
+    if (result.error) pending.reject(new Error(result.error));
+    else pending.resolve(result);
   };
 
-  async function viewTranslate() {
-    const body = $('#viewBody');
-    body.innerHTML = '';
-    setViewHead('翻译', '文本 / 文档 · 可指定模型', []);
+  function nativeDocumentRequest(payload) {
+    return new Promise((resolve, reject) => {
+      const handler = window.webkit?.messageHandlers?.shell;
+      if (!handler) { reject(new Error('请在 Dubhe Mac App 中处理 PDF 或 Word。')); return; }
+      const id = ++documentRequestId;
+      documentRequests.set(id, { resolve, reject });
+      try {
+        handler.postMessage({ type: 'translationDocument', id, ...payload });
+      } catch (e) {
+        documentRequests.delete(id);
+        reject(e);
+      }
+    });
+  }
 
-    let items = [];
-    let curPath = '';
+  function documentBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(',', 2)[1]);
+      reader.onerror = () => reject(reader.error || new Error('读不到文件。'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function setTranslationPrefs(changes) {
+    translationPrefs = { ...translationPrefs, ...changes };
+    writePreference(TRANSLATION_PREFS, JSON.stringify(translationPrefs));
+  }
+
+  function chooseTranslation(model) {
+    setTranslationPrefs({ model });
+    openView('translate');
+  }
+
+  function translationGlossary(value) {
+    const pairs = String(value || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    if (pairs.length > 64) throw new Error('术语表最多支持 64 行。');
+    return pairs.map((line, i) => {
+      const pair = /^(.*?)\s*(?:→|=)\s*(.+)$/.exec(line);
+      if (!pair || !pair[1].trim() || !pair[2].trim()) {
+        throw new Error('术语表第 ' + (i + 1) + ' 行请填写「原文 = 译文」。');
+      }
+      return { source: pair[1].trim(), target: pair[2].trim() };
+    });
+  }
+
+  // Protect literal spans before sending text to the model. A changed or
+  // missing marker is a failed segment, never a successfully translated file.
+  const protectedTranslationSpans = new RegExp([
+    /^[ \t]*\|?[ \t]*:?-{3,}:?(?:[ \t]*\|[ \t]*:?-{3,}:?)+[ \t]*\|?[ \t]*(?=\r?$)/.source,
+    /^[ \t]*(?:#{1,6}[ \t]+|(?:>[ \t]?)+|(?:[-+*]|\d+[.)])[ \t]+)/.source,
+    /`+[^`\r\n]+`+|\[\[@[^\]\r\n]+\]\]|\[@[^\]\r\n]+\]|\[\d+(?:[ ,;–−-]+\d+)*\]/.source,
+    /\([^()\r\n]+?et al\.,?[ \t]*(?:19|20)\d\d[a-z]?[^()\r\n]*\)/.source,
+    /[$][$][\s\S]+?[$][$]|\$(?!\s)[^$\r\n]+?(?<!\s)\$|\\\([\s\S]+?\\\)|\\\[[\s\S]+?\\\]/.source,
+    /\]\((?:[^()\r\n]|\([^()\r\n]*\))*\)|https?:\/\/[^\s<>()|\]]+|<[^<>\r\n]+>/.source,
+    /\{\{[^{}\r\n]+\}\}|\$\{[^{}\r\n]+\}|\{(?:[A-Za-z_][\w.-]*|\d+)\}|%[sdif]|\\[^\r\n]/.source,
+    /[+−-]?\d[\d,.]*(?:[eE][+−-]?\d+)?(?:[ \t]*(?:(?:[µμkcm]?[mgsL]|Pa|kPa|MPa|Hz|W|J|h|°[CF])[²³]?(?:\/(?:[µμkcm]?[mgsL]|h|day)[²³]?)?|[%％‰])(?![\p{L}]))?/.source,
+    /\r?\n|\||!?\[|\]|⟦\d+⟧/.source,
+  ].join('|'), 'gmu');
+
+  function protectTranslation(value) {
+    const literals = [];
+    const masked = value.replace(protectedTranslationSpans, span => '⟦' + (literals.push(span) - 1) + '⟧');
+    const restore = (translated) => {
+      let index = 0;
+      let valid = true;
+      const output = translated.replace(/⟦(\d+)⟧/g, (_, id) => {
+        if (id !== String(index) || index >= literals.length) valid = false;
+        return literals[index++] || '';
+      });
+      return valid && index === literals.length ? output : null;
+    };
+    return { masked, literals, restore };
+  }
+
+  function prepareTranslation(text) {
+    const parts = translationParts(text);
+    return { parts, total: parts.filter(p => p.translate).length, next: 0, finished: 0, result: '' };
+  }
+
+  async function translateDocument(draft, prefs, signal, progress, render) {
+    const glossary = translationGlossary(prefs.glossary);
+    const request = async (text, formatted) => {
+      const data = await vpost('/api/translate', {
+        model: prefs.model, source: prefs.source, target: prefs.target, text, formatted, glossary,
+      }, signal);
+      signal.throwIfAborted();
+      if (typeof data.text !== 'string' || !data.text.trim()) {
+        throw new Error('第 ' + (draft.finished + 1) + ' 段没有完整译文。请重试或换一个模型。');
+      }
+      return data.text.trim();
+    };
+    for (; draft.next < draft.parts.length; draft.next++) {
+      signal.throwIfAborted();
+      const p = draft.parts[draft.next];
+      if (!p.translate) {
+        draft.result += p.value;
+        continue;
+      }
+      const part = (draft.finished + 1) + ' / ' + draft.total + ' 段';
+      progress(part);
+      const fragment = protectTranslation(p.value);
+      const reply = /[\p{L}]/u.test(fragment.masked)
+        ? await request(fragment.masked, !!fragment.literals.length) : fragment.masked;
+      let piece = fragment.restore(reply);
+      if (piece === null) {
+        // Translate the text between markers separately if the model moved or
+        // dropped one. The original punctuation, values and layout stay local.
+        progress(part + ' · 恢复格式');
+        piece = '';
+        const spans = fragment.masked.split(/⟦\d+⟧/g);
+        for (let i = 0; i < spans.length; i++) {
+          signal.throwIfAborted();
+          const span = spans[i];
+          if (/[\p{L}]/u.test(span)) {
+            const translated = await request(span.trim(), false);
+            piece += span.match(/^\s*/)[0] + translated.replace(/\r?\n/g, ' ') + span.match(/\s*$/)[0];
+          } else piece += span;
+          if (i < fragment.literals.length) piece += fragment.literals[i];
+        }
+      }
+      draft.result += piece;
+      draft.finished++;
+      render(draft.result);
+    }
+    render(draft.result);
+  }
+
+  async function translateNative(text, source) {
+    nativeTranslation?.abort();
+    if (!text?.trim()) {
+      shellPost({ type: 'overlay', title: '翻译', text: source === 'ocr'
+        ? '选区里没有识别到文字。可以框选更清晰的区域。'
+        : '没有读到选中的文字。请重新选中文字，或用截图翻译。' });
+      return;
+    }
+    const job = new AbortController();
+    nativeTranslation = job;
+    shellPost({ type: 'overlay', title: '翻译中', text: '正在翻译…', source: text });
     try {
-      const d = await vapi('/api/models');
-      items = (d.items || []).filter((x) => x.loadable);
-      curPath = d.current || '';
-    } catch (e) { /* 读不到清单就只留当前模型 */ }
+      const draft = prepareTranslation(text);
+      await translateDocument(draft, translationPrefs, job.signal, () => {}, () => {});
+      if (!job.signal.aborted) shellPost({ type: 'overlay', title: '译文', text: draft.result, source: text });
+    } catch (e) {
+      if (!job.signal.aborted) shellPost({ type: 'overlay', title: '翻译失败', text: e.message, source: text });
+    } finally {
+      if (nativeTranslation === job) nativeTranslation = null;
+    }
+  }
+
+  window.dubheOcr = (text) => translateNative(text, 'ocr');
+  window.dubheOCRLanguage = () => translationPrefs.source;
+  window.dubheText = (text) => translateNative(text, 'selection');
+  window.dubheCancelTranslation = () => nativeTranslation?.abort();
+  window.dubheTranslateLocalSelection = () => {
+    const field = document.activeElement;
+    const text = typeof field?.selectionStart === 'number'
+      ? field.value.slice(field.selectionStart, field.selectionEnd)
+      : window.getSelection()?.toString();
+    translateNative(text, 'selection');
+    return true;
+  };
+
+  function viewTranslate() {
+    setViewHead('翻译', '', [
+      { label: '模型商店', on: () => openView('models') },
+    ]);
+    translationPane ??= createTranslationPane();
+    $('#viewBody').appendChild(translationPane.body);
+    translationPane.refreshModels();
+  }
+
+  function translationBlocks(preview) {
+    return Array.from(preview.children).flatMap(node => {
+      const kind = node.localName;
+      if (kind === 'ul' || kind === 'ol') {
+        return Array.from(node.children).map((item, index) => ({
+          kind: 'li', text: (kind === 'ol' ? (node.start + index) + '. ' : '• ') + item.textContent,
+        }));
+      }
+      if (kind === 'table') return [{
+        kind, text: Array.from(node.rows).map(row =>
+          Array.from(row.cells).map(cell => cell.textContent).join(' │ ')).join('\n'),
+      }];
+      return [{ kind: kind === 'pre' ? 'code' : kind, text: node.textContent }];
+    });
+  }
+
+  function createTranslationPane() {
+    const body = el('div');
+    let catalog;
+    let catalogRequest = 0;
+    let modelError = '';
+    let job = null;
+    let work = null;
 
     const card = el('div', 'vcard');
 
     // 模型 + 目标语言
-    const row1 = el('div', 'vrow');
+    const row1 = el('div', 'vrow translation-settings');
     const m1 = el('div', 'vmain');
-    m1.appendChild(el('div', 'vname', '用哪个模型翻译'));
+    m1.appendChild(el('div', 'vname', '翻译模型'));
     const selM = document.createElement('select');
     selM.className = 'vsel';
-    items.forEach((m) => {
-      const o = document.createElement('option');
-      o.value = m.path;
-      o.textContent = m.name + (m.path === curPath ? '（当前已加载）' : '');
-      if (m.path === curPath) o.selected = true;
-      selM.appendChild(o);
-    });
+    selM.setAttribute('aria-label', '翻译模型');
     m1.appendChild(selM);
-    m1.appendChild(el('div', 'vmeta',
-      '换模型要先加载权重，约 1–2 秒；正在生成的回答会被中断。'));
+    const modelStatus = el('div', 'vmeta');
+    m1.appendChild(modelStatus);
     row1.appendChild(m1);
 
-    const m2 = el('div', 'vmain');
-    m2.appendChild(el('div', 'vname', '译成'));
-    const selL = document.createElement('select');
-    selL.className = 'vsel';
-    LANGS.forEach(([v, t]) => {
-      const o = document.createElement('option');
-      o.value = v;
-      o.textContent = t;
-      if (v === 'en') o.selected = true;
-      selL.appendChild(o);
-    });
-    m2.appendChild(selL);
-    row1.appendChild(m2);
+    function languageField(title, key, options) {
+      const label = el('label', 'vmain');
+      label.appendChild(el('span', 'vname', title));
+      const select = el('select', 'vsel');
+      for (const [value, name] of options) {
+        const option = el('option', '', name);
+        option.value = value;
+        select.appendChild(option);
+      }
+      select.value = translationPrefs[key];
+      select.onchange = () => {
+        setTranslationPrefs({ [key]: select.value });
+        updateControls();
+      };
+      label.appendChild(select);
+      row1.appendChild(label);
+      return select;
+    }
+    const selS = languageField('原文语言', 'source', [['auto', '自动识别'], ...LANGS]);
+    const selL = languageField('目标语言', 'target', LANGS);
     card.appendChild(row1);
     body.appendChild(card);
 
     // 原文
     const ta = document.createElement('textarea');
     ta.className = 'field';
-    ta.rows = 8;
-    ta.placeholder = '把要翻译的文字贴在这里，或点「读文件」选一个 .txt / .md …';
-    const srcCard = el('div', 'vcard');
-    srcCard.appendChild(ta);
-    body.appendChild(srcCard);
+    ta.rows = 12;
+    ta.setAttribute('aria-label', '原文');
+    ta.placeholder = '粘贴要翻译的文字，或读取文件。';
+    ta.oninput = () => updateControls();
+    const workspace = el('div', 'translation-workspace');
+    const srcCard = el('section', 'vcard translation-card');
+    srcCard.append(el('h3', '', '原文'), ta);
+    workspace.appendChild(srcCard);
+    const terms = el('details', 'vcard translation-glossary');
+    terms.appendChild(el('summary', '', '术语表'));
+    const glossary = el('textarea', 'field');
+    glossary.rows = 3;
+    glossary.setAttribute('aria-label', '术语表');
+    glossary.placeholder = '每行一项，例如 留一流域验证 = leave-one-basin-out validation';
+    glossary.value = translationPrefs.glossary;
+    glossary.oninput = () => {
+      setTranslationPrefs({ glossary: glossary.value });
+      updateControls();
+    };
+    terms.appendChild(glossary);
 
     const bar = el('div', 'tbar');
     const fileBtn = el('button', 'vbtn', '读文件');
+    const clearFile = el('button', 'vbtn ghost', '移除文件');
+    clearFile.hidden = true;
+    let sourceFile = null;
+    let fileName = '';
+    let exportedParts = null;
+    let readingFile = false;
+    let exporting = false;
+    let outputReady = false;
     const inputFile = document.createElement('input');
     inputFile.type = 'file';
     inputFile.accept = '.txt,.md,.markdown,.csv,.log';
+    if (window.webkit?.messageHandlers?.shell) inputFile.accept += ',.docx,.pdf';
     inputFile.style.display = 'none';
     fileBtn.onclick = () => inputFile.click();
-    inputFile.onchange = () => {
-      const f = inputFile.files && inputFile.files[0];
-      if (!f) return;
-      const r = new FileReader();
-      r.onload = () => { ta.value = String(r.result || ''); };
-      r.readAsText(f);
+    clearFile.onclick = () => {
+      sourceFile = exportedParts = null;
+      fileName = '';
+      work = null;
+      ta.value = '';
+      setOutput('');
+      copyBtn.disabled = true;
+      clearFile.hidden = true;
+      prog.textContent = '';
+      updateControls();
+    };
+    inputFile.onchange = async () => {
+      const file = inputFile.files?.[0];
+      inputFile.value = '';
+      if (!file || readingFile || job) return;
+      const format = /\.(docx|pdf)$/i.exec(file.name)?.[1].toLowerCase();
+      readingFile = true;
+      updateControls();
+      prog.textContent = '正在读取文件…';
+      try {
+        let next = null;
+        let content;
+        if (format) {
+          if (file.size > 16 * 1024 * 1024) throw new Error('PDF 或 Word 文件请控制在 16 MB 内。');
+          const data = await documentBase64(file);
+          const { paragraphs } = await nativeDocumentRequest({ format, document: data });
+          if (!Array.isArray(paragraphs) || !paragraphs.some(p => p.trim())) {
+            throw new Error('读不到文件中的文本。扫描页可以先用截图取词。');
+          }
+          next = { format, document: data, paragraphs };
+          content = paragraphs.join('\n\n');
+        } else {
+          content = await file.text();
+        }
+        sourceFile = next;
+        fileName = file.name;
+        const extension = fileName.split('.').at(-1).toLowerCase();
+        const defaultFormat = extension === 'markdown' ? 'md' : extension;
+        if ([...exportFormat.options].some(option => option.value === defaultFormat)) {
+          exportFormat.value = defaultFormat;
+        }
+        exportedParts = null;
+        work = null;
+        ta.value = content;
+        clearFile.hidden = false;
+        setOutput('');
+        copyBtn.disabled = true;
+        prog.textContent = file.name + ' 已读取' + (format === 'pdf' ? ' · 导出保留原页并附译文' : '');
+      } catch (e) {
+        prog.textContent = '读取失败 · ' + e.message;
+      } finally {
+        readingFile = false;
+        updateControls();
+      }
     };
     bar.appendChild(fileBtn);
     bar.appendChild(inputFile);
+    bar.appendChild(clearFile);
 
     // 截图取词：框一块屏幕区域，交给外壳里的 Vision 识别，结果回到这里。
     // 走 OCR 而不是把图丢给多模态模型 —— 印刷体的逐字准确率和速度都差一个量级。
-    const shotBtn = el('button', 'vbtn', '截图取词');
+    const shotBtn = el('button', 'vbtn', '截图翻译');
+    shotBtn.title = '全局快捷键 ⌘⌥⇧T';
     shotBtn.onclick = () => {
       const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.shell;
       if (!h) { prog.textContent = '这个能力只在桌面 App 里可用'; return; }
-      prog.textContent = '框选要翻译的区域…';
-      h.postMessage({ type: 'ocr' });
+      shellPost({ type: 'ocr' });
     };
     bar.appendChild(shotBtn);
-
-    ocrSink = (t) => {
-      if (!t) { prog.textContent = '没取到文字（取消了，或没给「屏幕录制」权限）'; return; }
-      ta.value = t;
-      prog.textContent = '已取词 ' + t.length + ' 字';
-    };
 
     // 划词翻译的权限引导。macOS 的辅助功能授权只能在系统设置里点，
     // 程序既不能代点、也不能假装能用 —— 所以给一条明确的路：
@@ -3387,112 +3926,250 @@
     const axBar = el('div', 'tbar');
     const axBtn = el('button', 'vbtn', '检查划词权限');
     const axOpen = el('button', 'vbtn', '打开辅助功能设置');
+    const screenOpen = el('button', 'vbtn', '打开屏幕录制设置');
+    const readClipboard = el('button', 'vbtn', '翻译剪贴板图片');
     const axTip = el('span', 'vmeta',
-      '划词翻译（⌘⇧T）需要「辅助功能」权限；截图取词需要「屏幕录制」权限。');
+      '⌃⇧T 划词翻译 · ⌘⌥⇧T 截图翻译');
+    const shortcutStatus = el('span', 'vmeta');
+    shortcutStatus.setAttribute('role', 'status');
     const post = (t) => {
       const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.shell;
       if (h) h.postMessage({ type: t });
     };
     window.dubheAxStatus = (ok) => {
-      axTip.textContent = ok ? '辅助功能已授权，⌘⇧T 可用。'
-        : '还没授权 —— 点右边按钮，在列表里勾上 Dubhe，然后重启 App。';
+      shortcutStatus.textContent = ok ? '可读取其他应用里的选中文字。'
+        : '跨应用划词需要允许当前这份 Dubhe 使用辅助功能。';
+    };
+    window.dubheTranslationHotKeyStatus = (unavailable) => {
+      if (unavailable.length) shortcutStatus.textContent = '无法注册全局快捷键 · ' + unavailable.join('、');
     };
     axBtn.onclick = () => post('axStatus');
     axOpen.onclick = () => post('openAx');
+    screenOpen.onclick = () => post('openScreenCapture');
+    readClipboard.onclick = () => post('translateClipboardImage');
     axBar.appendChild(axBtn);
     axBar.appendChild(axOpen);
+    axBar.appendChild(screenOpen);
+    axBar.appendChild(readClipboard);
     axBar.appendChild(axTip);
-    body.appendChild(axBar);
+    axBar.appendChild(shortcutStatus);
+    const permissions = el('details', 'translation-permissions');
+    permissions.ontoggle = () => { if (permissions.open) post('translationHotKeyStatus'); };
+    permissions.append(el('summary', '', '划词与截图权限'), axBar);
 
     const go = el('button', 'vbtn pri', '翻译');
     bar.appendChild(go);
     const prog = el('span', 'vmeta', '');
+    prog.setAttribute('role', 'status');
     bar.appendChild(prog);
+    const stop = el('button', 'vbtn', '停止翻译');
+    stop.hidden = true;
+    stop.onclick = () => job?.abort();
+    bar.appendChild(stop);
     body.appendChild(bar);
-
     // 结果
-    const outBox = el('pre', 'code-box');
-    outBox.style.minHeight = '120px';
-    const outCard = el('div', 'vcard');
-    outCard.appendChild(outBox);
+    const outBox = el('pre', 'translation-raw');
+    const preview = el('div', 'translation-preview');
+    const empty = el('p', 'translation-empty', '译文会显示在这里');
+    const outCard = el('section', 'vcard translation-card');
+    const resultHeader = el('div', 'translation-result-head');
+    resultHeader.appendChild(el('h3', '', '译文'));
+    const resultBody = el('div', 'translation-result-body');
+    resultBody.append(outBox, preview, empty);
+    outCard.append(resultHeader, resultBody);
+    const resultActions = el('div', 'translation-result-actions');
     const copyBtn = el('button', 'vbtn', '复制译文');
-    copyBtn.style.marginTop = '8px';
+    copyBtn.disabled = true;
     copyBtn.onclick = async () => {
       try {
         await navigator.clipboard.writeText(outBox.textContent || '');
         copyBtn.textContent = '已复制';
         setTimeout(() => (copyBtn.textContent = '复制译文'), 1500);
-      } catch (e) { /* 剪贴板没权限就算了 */ }
+      } catch (e) { prog.textContent = '复制失败，可以选择译文后手动复制。'; }
     };
-    outCard.appendChild(copyBtn);
-    body.appendChild(outCard);
+    resultActions.appendChild(copyBtn);
+    const exportGroup = el('div', 'translation-export');
+    const exportFormat = el('select', 'vsel');
+    exportFormat.setAttribute('aria-label', '导出格式');
+    for (const [value, label] of [['md', 'Markdown'], ['txt', 'TXT'], ['pdf', 'PDF'], ['docx', 'Word']]) {
+      const option = el('option', '', label);
+      option.value = value;
+      exportFormat.appendChild(option);
+    }
+    const saveDocument = el('button', 'vbtn', '导出');
+    exportGroup.append(exportFormat, saveDocument);
+    resultActions.appendChild(exportGroup);
+    outCard.appendChild(resultActions);
+    workspace.appendChild(outCard);
+    body.append(workspace, terms, permissions);
 
-    go.onclick = async () => {
-      const text = ta.value.trim();
-      if (!text) { prog.textContent = '先贴点东西'; return; }
-      go.disabled = true;
-      copyBtn.disabled = true;
-      outBox.textContent = '';
-      const lang = LANGS.find(([v]) => v === selL.value)[1];
+    function setOutput(text, ready = false) {
+      outBox.textContent = text;
+      outputReady = ready && !!text.trim();
+      outBox.hidden = outputReady || !text;
+      empty.hidden = !!text;
+      preview.hidden = !outputReady;
+      preview.innerHTML = outputReady ? renderMarkdown(text, { codeActions: false, tables: true }) : '';
+    }
 
+    saveDocument.onclick = async () => {
+      const format = exportFormat.value;
+      const name = (fileName ? fileName.replace(/\.[^.]+$/, '') + '-译文' : '译文') + '.' + format;
+      const text = outBox.textContent;
+      const previous = prog.textContent;
+      exporting = true;
+      updateControls();
       try {
-        // 换模型（如果用户选的不是当前加载的那个）
-        if (selM.value && selM.value !== curPath) {
-          prog.textContent = '正在切换模型…';
-          await vpost('/api/load', { path: selM.value });
-          curPath = selM.value;
+        if (!window.webkit?.messageHandlers?.shell) {
+          const type = format === 'md' ? 'text/markdown' : 'text/plain';
+          const url = URL.createObjectURL(new Blob([text], { type: type + ';charset=utf-8' }));
+          const link = el('a');
+          link.href = url;
+          link.download = name;
+          link.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+          prog.textContent = '已导出译文文件';
+          return;
         }
-
-        const chunks = splitChunks(text, 1200);
-        let acc = '';
-        for (let i = 0; i < chunks.length; i++) {
-          prog.textContent = (i + 1) + ' / ' + chunks.length + ' 段';
-          const r = await fetch('/v1/chat/completions', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              messages: [
-                {
-                  role: 'system',
-                  content: '你是专业翻译引擎。只输出译文：不解释、不加引号、'
-                    + '不重复原文、不写"以下是译文"这类前言。'
-                    + '保留原有的 Markdown 结构：标题层级、列表符号、表格竖线、'
-                    + '段落换行都要原样保留。代码块里的代码、URL、路径、命令、'
-                    + '数字、人名一律不翻译。',
-                },
-                { role: 'user', content: '把下面的内容翻译成' + lang + '：\n\n' + chunks[i] },
-              ],
-              stream: false,
-              thinking: false,
-              // 翻译是"照着做"的任务，不需要它先想一遍。
-              // 关掉思考通道后，同样一句中译英从十几秒降到一两秒。
-              no_think: true,
-              temperature: 0.2,
-              // 下限给到 1500：LFM3 这类模型即使不想答，也要先在自己的
-              // 思考通道里走一遍。512 的结果就是"预算全用在推理上"、
-              // 译文一个字没有（实测过）。
-              max_tokens: Math.min(4096, Math.max(1500, Math.round(chunks[i].length * 3))),
-            }),
+        prog.textContent = '正在导出…';
+        let result;
+        if (format === sourceFile?.format && exportedParts) {
+          const { document: translated } = await nativeDocumentRequest({
+            format, document: sourceFile.document, translations: exportedParts,
           });
-          const j = await r.json();
-          const piece = (((j.choices || [])[0] || {}).message || {}).content || '';
-          acc += (acc ? '\n\n' : '') + piece.trim();
-          outBox.textContent = acc;
-          if (i === 0 && !piece.trim()) {
-            outBox.textContent = '（这一段没有输出。多半是模型把预算花在推理上了 —— '
-              + '换一个模型，或在设置里把最大输出调大。）';
-            break;
-          }
+          if (!translated) throw new Error('没有生成译文文件。');
+          result = await nativeDocumentRequest({ action: 'save', format, document: translated, name });
+        } else {
+          const formatted = format === 'pdf' || format === 'docx';
+          result = await nativeDocumentRequest({
+            action: 'export', format, name, text, ...(formatted ? { blocks: translationBlocks(preview) } : {}),
+          });
         }
-        prog.textContent = '完成 · ' + chunks.length + ' 段';
+        prog.textContent = result.saved ? '已保存译文文件' : previous;
       } catch (e) {
-        outBox.textContent += '\n\n⚠️ ' + e.message;
-        prog.textContent = '失败';
+        prog.textContent = '保存失败 · ' + e.message;
       } finally {
-        go.disabled = false;
-        copyBtn.disabled = false;
+        exporting = false;
+        updateControls();
       }
     };
+
+    const settings = () => ({
+      model: selM.value, source: selS.value, target: selL.value, glossary: glossary.value,
+    });
+    const canResume = () => work && (work.translated.length || work.segment?.finished) &&
+      work.file === sourceFile && work.text === ta.value &&
+      Object.entries(settings()).every(([key, value]) => value === work.prefs[key]);
+
+    function updateControls() {
+      const installed = catalog?.models.some(m => m.id === selM.value && m.installed);
+      modelStatus.textContent = modelError || (!catalog ? '正在读取模型列表…'
+        : !installed ? '请在模型商店下载此模型。'
+        : !catalog.runtime_available ? '本机未找到翻译运行时。' : '已下载');
+      go.disabled = Boolean(job || readingFile || exporting || !installed || !catalog?.runtime_available);
+      go.textContent = !job && canResume() ? '继续翻译' : '翻译';
+      stop.hidden = !job;
+      selM.disabled = Boolean(job || !catalog);
+      selS.disabled = selL.disabled = glossary.disabled = Boolean(job);
+      fileBtn.disabled = clearFile.disabled = Boolean(job || readingFile || exporting);
+      ta.readOnly = Boolean(job || sourceFile || readingFile);
+      const native = Boolean(window.webkit?.messageHandlers?.shell);
+      for (const option of exportFormat.options) {
+        option.disabled = !native && (option.value === 'pdf' || option.value === 'docx');
+      }
+      if (exportFormat.selectedOptions[0]?.disabled) exportFormat.value = 'md';
+      exportFormat.disabled = Boolean(job || exporting || readingFile);
+      saveDocument.disabled = Boolean(job || exporting || readingFile || !outputReady);
+    }
+
+    function renderModels() {
+      const selected = job ? selM.value : translationPrefs.model;
+      selM.replaceChildren(...catalog.models.map(m => {
+        const option = el('option', '', m.name + (m.installed ? '' : '（待下载）'));
+        option.value = m.id;
+        return option;
+      }));
+      selM.value = catalog.models.some(m => m.id === selected) ? selected : catalog.default_model;
+    }
+
+    async function refreshModels() {
+      const request = ++catalogRequest;
+      try {
+        const data = await vapi('/api/translate');
+        if (request !== catalogRequest) return;
+        catalog = { ...data, models: data.models || [] };
+        modelError = '';
+        renderModels();
+      } catch (e) {
+        if (request !== catalogRequest) return;
+        modelError = '读不到翻译模型：' + e.message;
+      }
+      updateControls();
+    }
+
+    selM.onchange = () => {
+      setTranslationPrefs({ model: selM.value });
+      updateControls();
+    };
+
+    go.onclick = async () => {
+      const text = ta.value;
+      if (!text.trim()) { prog.textContent = '先输入要翻译的文字。'; return; }
+      const resume = canResume();
+      if (!resume) {
+        work = { text, file: sourceFile, prefs: settings(), translated: [], segment: null };
+        setOutput('');
+      }
+      job = new AbortController();
+      const { signal } = job;
+      updateControls();
+      copyBtn.disabled = true;
+      exportedParts = null;
+      prog.textContent = resume ? '正在继续翻译…' : '准备翻译…';
+      try {
+        const { translated, prefs } = work;
+        const paragraphs = sourceFile?.paragraphs ?? [text];
+        const pdf = sourceFile?.format === 'pdf';
+        const unit = pdf ? '页' : '段';
+        let complete = translated.join('\n\n');
+        let segmentCount = 0;
+        for (let i = translated.length; i < paragraphs.length; i++) {
+          const paragraph = paragraphs[i];
+          const source = pdf
+            ? paragraph.split(/\r?\n[ \t]*\r?\n/).map(block => block.replace(/[ \t]*\r?\n[ \t]*/g, ' ')).join('\n\n')
+            : paragraph;
+          const position = sourceFile ? (i + 1) + ' / ' + paragraphs.length + ' ' + unit : '';
+          const prefix = i ? complete + '\n\n' : '';
+          const segment = work.segment ??= prepareTranslation(source);
+          await translateDocument(segment, prefs, signal,
+            status => { prog.textContent = position || status; },
+            partial => { setOutput(prefix + partial); });
+          translated.push(segment.result);
+          complete = prefix + segment.result;
+          segmentCount = segment.total;
+          work.segment = null;
+        }
+        if (sourceFile) {
+          exportedParts = translated;
+          prog.textContent = '完成 · ' + paragraphs.length + ' ' + unit;
+        } else {
+          prog.textContent = segmentCount ? '完成 · ' + segmentCount + ' 段' : '已原样保留代码';
+        }
+        setOutput(complete, true);
+        work = null;
+      } catch (e) {
+        const partial = outBox.textContent ? '（已保留完成的译文）' : '';
+        prog.textContent = signal.aborted ? '已停止' + partial : '翻译失败' + partial + ' · ' + e.message;
+      } finally {
+        job = null;
+        if (catalog) renderModels();
+        updateControls();
+        copyBtn.disabled = !outBox.textContent;
+      }
+    };
+    setOutput('');
+    updateControls();
+    return { body, refreshModels };
   }
 
   // ---------------------------------------------------------------- 工具
@@ -3927,8 +4604,13 @@
     setGlass(glassLevel(), false);
     bindLight();
     bindSidebar();
+    $('#exportHistory').onclick = exportHistory;
 
-    $('#input').addEventListener('input', autoGrow);
+    $('#input').addEventListener('input', () => {
+      draftFor().text = $('#input').value;
+      autoGrow();
+      refreshComposer();
+    });
     $('#input').addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
     });
@@ -3947,37 +4629,22 @@
     if (cwdChip) {
       cwdChip.onclick = () => {
         if (!state.current) newConv();
-        const cur = state.current.cwd || (state.server && state.server.workspace) || '~';
+        const conv = state.current;
+        const cur = conv.cwd || state.server?.workspace || '~';
         pickDir(cur, (p) => {
-          if (p) state.current.cwd = p;
-          else delete state.current.cwd;
-          saveConvs();
+          if (p) conv.cwd = p;
+          else delete conv.cwd;
+          saveConv(conv);
           renderCwd();
           log(p ? '项目文件夹 → ' + p : '项目文件夹已解绑，跟随默认目录');
         });
       };
     }
 
-    $('#send').onclick = () => {
-      // 正在生成的是**当前这个**对话 → 停止
-      if (state.streaming && state.genConv && state.current &&
-          state.genConv.id === state.current.id) {
-        if (state.abort) state.abort.abort();
-        return;
-      }
-      // 别的对话在生成：引擎是串行的，现在发只会排队。与其拦住用户，
-      // 不如把这条消息排上 —— 当前回答一结束就自动切过去发送。
-      if (state.streaming) {
-        const text = $('#input').value.trim();
-        if (!text) return;
-        state.queue.push({ convId: state.current && state.current.id, text });
-        $('#input').value = '';
-        autoGrow();
-        const t = (state.genConv && state.genConv.title) || '另一个对话';
-        log('已排队：「' + t + '」回答结束后自动发送', '');
-        return;
-      }
-      send();
+    $('#stopGeneration').onclick = () => state.abort?.abort();
+    $('#send').onclick = (e) => {
+      if (e.currentTarget.classList.contains('stop')) state.abort?.abort();
+      else send();
     };
     $('#newChat').onclick = () => { newConv(); closeSidebar(); };
     const nc2 = $('#newChat2');
@@ -4059,22 +4726,18 @@
         return;
       }
       state.think = !state.think;
-      localStorage.setItem('dubhe.think.v1', state.think ? '1' : '0');
+      writePreference(THINK_KEY, state.think ? '1' : '0');
       $('#btnThink').classList.toggle('on', state.think);
       $('#btnThink').setAttribute('aria-pressed', state.think ? 'true' : 'false');
       log(state.think ? '会显示模型的推理过程' : '不显示推理过程（模型仍然会思考）');
     };
     $('#btnThink').classList.toggle('on', state.think);
 
-    $('#fileInput').onchange = async (e) => {
+    $('#fileInput').onchange = (e) => {
       const f = e.target.files && e.target.files[0];
       if (!f) return;
-      if (f.size > 64 * 1024 * 1024) { alert('文件太大，上限 64 MB'); return; }
-      try {
-        await useAttachment(await readAttachment(f));
-      } catch (err) {
-        alert('读取文件失败：' + err.message);
-      }
+      attachFile(f, filePickerDraft || draftFor());
+      filePickerDraft = null;
     };
 
     // 拖文件进窗口。桌面 App 里这条比点按钮更常用 —— 从 Finder 直接拖过来
@@ -4082,7 +4745,7 @@
     let dragDepth = 0;
     const hasFiles = (e) => !!(e.dataTransfer &&
       Array.from(e.dataTransfer.types || []).includes('Files'));
-    const takeFile = async (f) => {
+    const takeFile = (f) => {
       if (!f) return;
       // 模型文件不是附件：把它当图片/文本发过去只会得到一句"不支持这种类型"，
       // 而用户的意图恰恰是"换这个模型"。往模型页引，比报错有用。
@@ -4091,12 +4754,7 @@
               + '或者把 .gguf 直接拖到 Dock 里的 Dubhe 图标上。');
         return;
       }
-      if (f.size > 64 * 1024 * 1024) { alert('文件太大，上限 64 MB'); return; }
-      try {
-        await useAttachment(await readAttachment(f));
-      } catch (err) {
-        alert('读取文件失败：' + err.message);
-      }
+      attachFile(f, draftFor());
     };
     window.addEventListener('dragenter', (e) => {
       if (!hasFiles(e)) return;
@@ -4171,19 +4829,15 @@
 
   // ---------------------------------------------------------------- 启动
   async function boot() {
-    loadConvs();
+    emptyState = $('#emptyState');
+    loadFallbackHistory();
     state.memory = loadMemory();
     bind();
-    await refreshState();
-    if (state.convs.length) {
-      state.current = state.convs[0];
-      $('#convTitle').textContent = state.current.title;
-      renderConvList();
-      renderMessages();
-    } else {
-      renderConvList();
-    }
-    setSendEnabled(true);
+    activateConv(state.convs[0] || null);
+    renderHistoryNotice();
+    syncHistory();
+    const server = await refreshState();
+    if (server?.share_only) { setInterval(refreshState, 8000); return; }
     renderLogs();
     renderTools();
     setGauge(0, 0, 0, 0);

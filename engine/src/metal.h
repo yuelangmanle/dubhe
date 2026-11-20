@@ -156,7 +156,6 @@ struct Q35Spec {
     float rms_eps = 1e-6f;
     float rope_theta = 1e7f;
     int rope_angles = 0;
-    int rope_sections[4] = {0, 0, 0, 0};
     uint64_t off_out_norm = 0, off_out_w = 0;
     uint32_t ty_out_w = 0;
     std::vector<Q35Layer> layers;

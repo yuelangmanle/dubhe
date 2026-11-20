@@ -1,0 +1,70 @@
+plugins {
+    id "com.android.application"
+    id "org.jetbrains.kotlin.plugin.compose"
+}
+
+def vulkanEnabled = providers.gradleProperty("dubheVulkan").map { it.toBoolean() }.orElse(false)
+def versionHeader = layout.projectDirectory.file("../../../engine/include/dubhe/dubhe.h")
+def versionDefines = providers.fileContents(versionHeader).asText.get().readLines()
+def engineVersion = ["MAJOR", "MINOR", "PATCH"].collect { part ->
+    def define = versionDefines.find { it.startsWith("#define DUBHE_VERSION_" + part + " ") }
+    if (define == null) throw new GradleException("Missing Dubhe version component " + part)
+    define.tokenize().last().toInteger()
+}
+abstract class PrepareReleaseNotes extends DefaultTask {
+    @InputFile abstract RegularFileProperty getChangelog()
+    @OutputDirectory abstract DirectoryProperty getAssets()
+
+    @TaskAction void copyChangelog() {
+        def output = assets.file("CHANGELOG.md").get().asFile
+        output.parentFile.mkdirs()
+        output.bytes = changelog.get().asFile.bytes
+    }
+}
+
+def prepareReleaseNotes = tasks.register("prepareReleaseNotes", PrepareReleaseNotes) {
+    changelog.set(layout.projectDirectory.file("../../../CHANGELOG.md"))
+    assets.set(layout.buildDirectory.dir("generated/release-assets"))
+}
+
+android {
+    namespace "dev.dubhe.mobile"
+    compileSdk 36
+    ndkVersion "27.2.12479018"
+
+    defaultConfig {
+        applicationId "dev.dubhe.mobile"
+        minSdk 31
+        targetSdk 36
+        versionCode engineVersion[0] * 1_000_000 + engineVersion[1] * 1_000 + engineVersion[2]
+        versionName engineVersion.join(".")
+        ndk { abiFilters "arm64-v8a" }
+        buildConfigField "boolean", "DUBHE_VULKAN", vulkanEnabled.get().toString()
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildFeatures {
+        compose true
+        buildConfig true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+androidComponents.onVariants(androidComponents.selector().all()) { variant ->
+    variant.sources.assets.addGeneratedSourceDirectory(prepareReleaseNotes) { it.assets }
+}
+
+dependencies {
+    implementation project(":dubhekit")
+    implementation "androidx.activity:activity-compose:1.10.1"
+    implementation "androidx.lifecycle:lifecycle-viewmodel-compose:2.9.1"
+    implementation "androidx.compose.material3:material3:1.3.2"
+    implementation "androidx.compose.ui:ui:1.8.3"
+    implementation "androidx.compose.foundation:foundation:1.8.3"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0"
+    androidTestImplementation "androidx.test.ext:junit:1.2.1"
+    androidTestImplementation "androidx.test:runner:1.6.2"
+}

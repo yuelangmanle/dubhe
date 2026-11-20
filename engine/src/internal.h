@@ -322,8 +322,6 @@ struct ModelConfig {
     // Qwen3.5 的 MRoPE：rope.dimension_sections 把旋转维度切成 4 段
     // （9B 是 [11,11,10,0]，共 32 个角度对）。**频率在每段重新从 base 开始**，
     // 不是连续递增 —— 按连续算会让后 21 对全转错，症状是输出通顺但语义乱。
-    bool    rope_mrope = false;
-    int32_t rope_sections[4] = {0, 0, 0, 0};
     int32_t conv_l_cache = 0;       // ShortConv 的卷积核宽度
     bool    sandwich_norm = false;
     int     n_conv = 0;             // conv 层个数
@@ -391,6 +389,7 @@ public:
     bool has_mm_embeds() const { return mm_embeds_ != nullptr && mm_n_ > 0; }
     // 引擎实际使用的批大小（GPU 不可用时为 1）
     int  batch_size() const;
+    int multi_capacity() const;
     void reset_kv();
 
     // 当前 KV 里已经算好的 token 数
@@ -408,7 +407,7 @@ public:
     int      n_ctx_limit() const { return n_ctx_; }
     int      n_ctx_ceiling() const { return n_ctx_ceiling_; }
     const char* quant_desc() const { return quant_desc_.c_str(); }
-    bool gpu_active() const { return gpu_active_; }
+    bool gpu_active() const { return gpu_active_ || gpu_fused_; }
     const char* gpu_note() const { return gpu_note_.c_str(); }
     bool arch_is_lfm3() const { return cfg_.arch == "lfm3" || cfg_.arch == "lfm2"; }
     bool arch_is_qwen35() const { return cfg_.arch == "qwen35"; }
@@ -446,7 +445,7 @@ private:
     // 整层前向是否由 Metal 融合内核接管。LFM3 还没有对应的融合内核，
     // 但逐算子的 matvec 仍然走 GPU，所以这两个标志必须分开。
     bool gpu_fused_ = false;
-    std::string gpu_note_;              // GPU 状态说明（供 UI / 日志展示）
+    mutable std::string gpu_note_;      // GPU 状态说明（供 UI / 日志展示）
     int  n_ctx_ = 0;    // 当前生效的上下文上限
     // 这台机器装得下的上限（训练上下文与内存两条夹完之后的那个数）。
     // 和 n_ctx_ 的区别：n_ctx_ 是"现在用多少"，这个是"最多能给多少"。

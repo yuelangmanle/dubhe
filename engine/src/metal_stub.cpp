@@ -45,6 +45,22 @@ int fwd_batch_max() { return 1; }
 void fwd_reset_conv() {}
 bool fwd_copy_x(float*, int) { return false; }
 
+bool q35_init(const Q35Spec&, std::string* err) {
+    if (err) *err = "Metal 不可用";
+    return false;
+}
+bool q35_token(const float*, int, float*, std::string* err) {
+    if (err) *err = "Metal 不可用";
+    return false;
+}
+bool q35_prefill(const float*, int, int, float*, std::string* err) {
+    if (err) *err = "Metal 不可用";
+    return false;
+}
+bool q35_prefill_ok() { return false; }
+int q35_kv_cap() { return 0; }
+void q35_reset() {}
+
 }  // namespace metal
 }  // namespace dubhe
 

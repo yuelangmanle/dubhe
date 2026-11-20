@@ -32,6 +32,7 @@ struct dubhe_engine {
     std::vector<float> mm_embeds;
     int32_t mm_n = 0;
     int32_t mm_at = -1;
+    std::vector<std::string> filter_pieces;
     // 多模态投影器（mmproj GGUF）。独立于语言模型加载，一张图只跑一次。
     // 视觉塔和语音塔是两个不同的 mmproj 文件，所以各留一个指针。
     std::unique_ptr<MmProj> mmproj;
@@ -58,9 +59,9 @@ int32_t sample_token(float* logits, int n_vocab, const dubhe_sampling& sp,
     }
 
     if (sp.temperature <= 0.f) {
-        int best = 0;
-        for (int i = 1; i < n_vocab; i++)
-            if (logits[i] > logits[best]) best = i;
+        int best = -1;
+        for (int i = 0; i < n_vocab; i++)
+            if (std::isfinite(logits[i]) && (best < 0 || logits[i] > logits[best])) best = i;
         return best;
     }
 
@@ -84,6 +85,7 @@ int32_t sample_token(float* logits, int n_vocab, const dubhe_sampling& sp,
         const auto cmp = [](const auto& a, const auto& b) { return a.first > b.first; };
         for (int i = 0; i < n_vocab; i++) {
             const float v = logits[i] * inv_t;
+            if (!std::isfinite(v)) continue;
             if ((int)cand.size() < k) {
                 cand.emplace_back(v, i);
                 std::push_heap(cand.begin(), cand.end(), cmp);
@@ -97,12 +99,16 @@ int32_t sample_token(float* logits, int n_vocab, const dubhe_sampling& sp,
     } else {
         // top_k 没设或大于词表：只能全量排。这条路径在默认参数下不会走到。
         cand.reserve((size_t)n_vocab);
-        for (int i = 0; i < n_vocab; i++) cand.emplace_back(logits[i] * inv_t, i);
+        for (int i = 0; i < n_vocab; i++) {
+            const float v = logits[i] * inv_t;
+            if (std::isfinite(v)) cand.emplace_back(v, i);
+        }
         std::sort(cand.begin(), cand.end(),
                   [](const auto& a, const auto& b) { return a.first > b.first; });
     }
 
     // softmax
+    if (cand.empty()) return -1;
     const float maxl = cand.front().first;
     float sum = 0.f;
     for (auto& c : cand) { c.first = std::exp(c.first - maxl); sum += c.first; }
@@ -155,6 +161,8 @@ void dubhe_destroy(dubhe_engine* e) { delete e; }
 
 int dubhe_load_model(dubhe_engine* e, const char* path) {
     if (!e || !path) { set_err("参数为空"); return DUBHE_ERR_INVALID_ARG; }
+    std::lock_guard<std::mutex> lock(e->mu);
+    e->filter_pieces.clear();
     std::string err;
     if (!e->model.load(path, e->cfg.n_ctx, e->cfg.use_gpu != 0, &err)) {
         set_err(err);
@@ -163,7 +171,12 @@ int dubhe_load_model(dubhe_engine* e, const char* path) {
     return DUBHE_OK;
 }
 
-void dubhe_unload_model(dubhe_engine* e) { if (e) e->model.unload(); }
+void dubhe_unload_model(dubhe_engine* e) {
+    if (!e) return;
+    std::lock_guard<std::mutex> lock(e->mu);
+    e->filter_pieces.clear();
+    e->model.unload();
+}
 
 int dubhe_model_info_get(const dubhe_engine* e, dubhe_model_info* out) {
     if (!e || !out) return DUBHE_ERR_INVALID_ARG;
@@ -484,8 +497,14 @@ int dubhe_generate(dubhe_engine* e,
                    dubhe_stop_cb should_stop,
                    void* ud,
                    dubhe_stats* stats) {
+    return dubhe_generate_filtered(e, prompt, n_prompt, sp, nullptr, on_token, should_stop, ud, stats);
+}
+
+int dubhe_generate_filtered(dubhe_engine* e, const int32_t* prompt, int32_t n_prompt,
+                            const dubhe_sampling* sp, dubhe_token_filter filter,
+                            dubhe_token_cb on_token, dubhe_stop_cb should_stop,
+                            void* ud, dubhe_stats* stats) {
     if (!e || !prompt || n_prompt <= 0) { set_err("空 prompt"); return DUBHE_ERR_INVALID_ARG; }
-    if (!e->model.loaded()) { set_err("模型未加载"); return DUBHE_ERR_STATE; }
 
     dubhe_sampling s{};
     if (sp) s = *sp;
@@ -493,7 +512,10 @@ int dubhe_generate(dubhe_engine* e,
     if (s.repeat_last_n <= 0) s.repeat_last_n = 64;
 
     std::lock_guard<std::mutex> lock(e->mu);
+    if (!e->model.loaded()) { set_err("模型未加载"); return DUBHE_ERR_STATE; }
     e->abort = false;
+    set_err("");
+    auto stopped = [&] { return e->abort.load() || (should_stop && should_stop(ud)); };
 
     // ---- 前缀复用：多轮对话不该每轮都从头 prefill
     //
@@ -588,6 +610,10 @@ int dubhe_generate(dubhe_engine* e,
             }
         }
         for (int32_t i = start; i < n_prompt; ) {
+            if (stopped()) {
+                e->model.reset_kv();
+                return DUBHE_ERR_CANCELLED;
+            }
             const int take = std::min<int>(nb, n_prompt - i);
             if (!e->model.forward_batch(prompt + i, take, i, logits.data(), &err)) {
                 set_err(err);
@@ -599,15 +625,42 @@ int dubhe_generate(dubhe_engine* e,
     const double t1 = now_ms();
 
     const int eos = e->model.tok().eos_id();
+    if (filter && e->filter_pieces.empty()) {
+        e->filter_pieces.resize((size_t)n_vocab);
+        for (int i = 0; i < n_vocab; ++i)
+            if (i != eos && !e->model.tok().is_control(i))
+                e->filter_pieces[i] = e->model.tok().decode_piece(i);
+    }
     int32_t n_gen = 0;
     int32_t pos = n_prompt;
     const int n_ctx = e->model.n_ctx_limit();
 
+    int result = DUBHE_OK;
     while (n_gen < s.max_tokens) {
-        if (e->abort.load()) break;
-        if (should_stop && should_stop(ud)) break;
+        if (stopped()) { result = DUBHE_ERR_CANCELLED; break; }
 
+        if (filter) {
+            bool found = false;
+            for (int i = 0; i < n_vocab; i++) {
+                const auto& piece = e->filter_pieces[i];
+                const bool allowed = std::isfinite(logits[i]) &&
+                    (i == eos ? filter(ud, i, nullptr, 0) :
+                     !piece.empty() && filter(ud, i, piece.data(), (int32_t)piece.size()));
+                if (!allowed) logits[i] = -INFINITY;
+                found |= allowed;
+            }
+            if (!found) {
+                set_err("约束无法匹配下一个 token");
+                result = DUBHE_ERR_STATE;
+                break;
+            }
+        }
         int32_t tok = sample_token(logits.data(), n_vocab, s, hist, rng);
+        if (tok < 0) {
+            set_err("没有可用的采样候选");
+            result = DUBHE_ERR_STATE;
+            break;
+        }
         hist.push_back(tok);
 
         // EOS 与 <|im_start|> 这类控制 token 不能当成正文吐给用户。
@@ -627,6 +680,7 @@ int dubhe_generate(dubhe_engine* e,
 
         if (!e->model.forward(tok, pos, logits.data(), &err)) {
             set_err(err);
+            result = DUBHE_ERR_STATE;
             break;
         }
         pos++;
@@ -645,6 +699,132 @@ int dubhe_generate(dubhe_engine* e,
         stats->decode_tps = (t2 - t1) > 0 ? std::max(0, n_gen - 1) / ((t2 - t1) / 1000.0) : 0.0;
         stats->n_reused = start;
     }
+    return result;
+}
+
+int32_t dubhe_batch_capacity(const dubhe_engine* e) {
+    return e && e->model.loaded() ? e->model.multi_capacity() : 0;
+}
+
+int dubhe_generate_batch(dubhe_engine* e, dubhe_batch_item* items, int32_t count) {
+    if (!e || !items || count < 2) return DUBHE_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(e->mu);
+    if (count > dubhe_batch_capacity(e) || e->mm_n > 0) return DUBHE_ERR_UNSUPPORTED;
+    e->abort = false;
+    set_err("");
+    const int vocab = e->model.cfg().n_vocab, eos = e->model.tok().eos_id();
+    struct Lane {
+        uint64_t slab = 0;
+        int32_t pos = 0, next = 0, left = 0;
+        std::vector<int32_t> history;
+        std::mt19937 rng;
+        double started = 0;
+        bool active = true;
+    };
+    std::vector<Lane> lanes((size_t)count);
+    int64_t reserved = 0;
+    for (int i = 0; i < count; ++i) {
+        auto& item = items[i];
+        if (!item.prompt || item.n_prompt <= 0 || item.sampling.max_tokens <= 0 ||
+            std::any_of(item.prompt, item.prompt + item.n_prompt,
+                        [&](int32_t tok) { return tok < 0 || tok >= vocab; }))
+            return DUBHE_ERR_INVALID_ARG;
+        auto& lane = lanes[i];
+        lane.slab = reserved;
+        reserved += (int64_t)item.n_prompt + item.sampling.max_tokens;
+        if (reserved > e->model.n_ctx_limit()) return DUBHE_ERR_INVALID_ARG;
+        lane.pos = item.n_prompt;
+        lane.left = item.sampling.max_tokens;
+        lane.history.assign(item.prompt, item.prompt + item.n_prompt);
+        lane.rng.seed(item.sampling.seed ? (uint32_t)item.sampling.seed : std::random_device{}());
+        item.stats = {};
+        item.stats.n_prompt = item.n_prompt;
+        item.result = DUBHE_OK;
+        item.length_limited = 0;
+    }
+
+    e->model.reset_kv();
+    struct Reset { Model& model; ~Reset() { model.reset_kv(); } } reset{e->model};
+    std::string error;
+    std::vector<float> logits((size_t)count * vocab);
+    auto stopped = [&](const dubhe_batch_item& item) {
+        return e->abort.load() || (item.should_stop && item.should_stop(item.user_data));
+    };
+    auto sample = [&](int i, float* row) {
+        auto& item = items[i];
+        auto& lane = lanes[i];
+        if (stopped(item)) {
+            item.result = DUBHE_ERR_CANCELLED;
+            lane.active = false;
+            return;
+        }
+        const int token = sample_token(row, vocab, item.sampling, lane.history, lane.rng);
+        if (token < 0 || token == eos) {
+            if (token < 0) item.result = DUBHE_ERR_STATE;
+            lane.active = false;
+            return;
+        }
+        lane.next = token;
+        lane.history.push_back(token);
+        if (!e->model.tok().is_control(token)) {
+            const std::string piece = e->model.tok().decode_piece(token);
+            if (item.on_token) item.on_token(item.user_data, token, piece.c_str());
+            item.stats.n_generated++;
+        }
+        lane.active = --lane.left > 0;
+        item.length_limited = !lane.active;
+    };
+    for (int i = 0; i < count; ++i) {
+        auto& lane = lanes[i];
+        auto& item = items[i];
+        const double start = now_ms();
+        float* row = logits.data() + (size_t)i * vocab;
+        for (int pos = 0; pos < item.n_prompt;) {
+            if (stopped(item)) { item.result = DUBHE_ERR_CANCELLED; lane.active = false; break; }
+            const int take = std::min(e->model.batch_size(), item.n_prompt - pos);
+            if (!e->model.forward_batch(item.prompt + pos, take, pos, row, &error, lane.slab, i)) {
+                set_err(error);
+                return DUBHE_ERR_STATE;
+            }
+            pos += take;
+        }
+        lane.started = now_ms();
+        item.stats.t_prompt_ms = lane.started - start;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (lanes[i].active) sample(i, logits.data() + (size_t)i * vocab);
+    }
+    for (;;) {
+        int32_t tokens[8], positions[8], indices[8];
+        uint64_t slabs[8], slots[8];
+        int used = 0;
+        for (int i = 0; i < count; ++i) {
+            auto& lane = lanes[i];
+            if (!lane.active) continue;
+            if (stopped(items[i])) {
+                items[i].result = DUBHE_ERR_CANCELLED;
+                lane.active = false;
+                continue;
+            }
+            tokens[used] = lane.next;
+            positions[used] = lane.pos++;
+            slabs[used] = lane.slab;
+            slots[used] = i;
+            indices[used++] = i;
+        }
+        if (!used) break;
+        if (!e->model.forward_multi(tokens, used, positions, slabs, slots, logits.data(), &error)) {
+            set_err(error);
+            return DUBHE_ERR_STATE;
+        }
+        for (int row = 0; row < used; ++row) sample(indices[row], logits.data() + (size_t)row * vocab);
+    }
+    const double end = now_ms();
+    for (int i = 0; i < count; ++i) {
+        auto& stats = items[i].stats;
+        stats.t_gen_ms = end - lanes[i].started;
+        if (stats.t_gen_ms > 0) stats.decode_tps = 1000.0 * stats.n_generated / stats.t_gen_ms;
+    }
     return DUBHE_OK;
 }
 
@@ -653,10 +833,9 @@ void dubhe_request_abort(dubhe_engine* e) { if (e) e->abort = true; }
 const char* dubhe_last_error(void) { return g_err.c_str(); }
 
 const char* dubhe_version(void) {
-    static char v[32];
-    std::snprintf(v, sizeof(v), "%d.%d.%d", DUBHE_VERSION_MAJOR, DUBHE_VERSION_MINOR,
-                  DUBHE_VERSION_PATCH);
-    return v;
+    static const std::string version = std::to_string(DUBHE_VERSION_MAJOR) + "." +
+        std::to_string(DUBHE_VERSION_MINOR) + "." + std::to_string(DUBHE_VERSION_PATCH);
+    return version.c_str();
 }
 
 const char* dubhe_hardware_info(void) {

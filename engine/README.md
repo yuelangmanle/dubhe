@@ -1,36 +1,13 @@
-# engine/ · Dubhe Engine
+# Dubhe Engine
 
-推理内核。许可：闭源（Proprietary，见根目录 LICENSE）。技术规格见 [DUBHE-DEV-001](../docs/01-推理引擎开发书-索引.md)。
+原生引擎读取 GGUF，供 CLI、HTTP 服务与 SDK 使用。公开 API 位于 \`include/dubhe/dubhe.h\`。运行 \`make library\` 得到 \`build/libdubhe.a\`。
 
-## 边界
+- \`src/gguf.cpp\` 与 \`src/tokenizer.cpp\` 处理模型权重和分词。
+- \`src/model.cpp\` 与 \`src/engine.cpp\` 处理模型执行、生成、前缀复用及取消。
+- Apple Silicon 支持 Metal 与 NEON CPU。Android 支持 NEON CPU，可选 Vulkan Q4_K 矩阵乘。
+- Metal 多序列接口使用分开的 KV 槽位。HTTP 服务可将多个普通文本请求合为一个小批。
+- 视觉与音频使用和语言权重配套的 mmproj。Mac 走系统媒体解码。Android SDK 用 Android 解码器提供像素或 PCM。
 
-**负责**：模型加载（GGUF / MLX / safetensors）、IR 构建、调度、执行、采样、约束解码、推测解码、序列状态管理、Kernel 规划与自动调优。
+macOS HTTP 服务可用独立运行时打开 MLX 目录和部分 Gemma/MoE GGUF。原生 C 接口面向 Dubhe 自己实现的 GGUF 路径。
 
-**不负责**：UI、模型下载、鉴权、计费、会话持久化的产品逻辑（这些在 `sdk/` 与 `apps/`）。
-
-## 目录
-
-```
-include/dubhe/     公开 C ABI（唯一对外接口）
-src/
-  runtime/          scheduler · state · execution · sampler · constrained · speculative
-  model/            ir · gguf · mlx · safetensors · tokenizer
-  quant/            schemes · calibrate
-  backends/         metal · vulkan · arm · qnn · mediatek
-  autotune/         database · profiler
-tests/              单测 · 数值 parity · fuzz
-```
-
-## 三条不可违反的约束
-
-1. **公开头文件里不出现 C++ 类型、STL 容器、异常。** 所有错误通过 `ae_status_t`。
-2. **decode hot path 不穿过 Python，也不做逐 token 的跨进程回调。**
-3. **任何 Kernel 变更必须附 DubheBench 前后对比**，否则 review 打回。
-
-## 状态
-
-M0 阶段：只有目录与 schema 设计，无可构建产物。
-
-## 上游参考
-
-llama.cpp（GGUF/量化/CPU-Metal 参考）、MLX（Apple 原生与数值 oracle）、Locals（small-M Kernel 与 agent cache 思路）、vLLM Metal（paged state 与 scheduler）、MNN（ARM 低比特）。复用边界与 provenance 记录见 `THIRD_PARTY_NOTICES.md`。
+改动执行内核后运行 \`make test\` 和 \`make check\`。有多模态模型时也运行相应探针。需离线检查 Metal 源码时可用 \`make shader-check\`，它要求 Xcode 的 Metal Toolchain 组件。

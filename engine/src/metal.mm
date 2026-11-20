@@ -1438,7 +1438,8 @@ bool q35_init(const Q35Spec& s, std::string* err) {
     g_q35_beta   = make_buf((size_t)s.ssm_nv * F);
     g_q35_alpha  = make_buf((size_t)s.ssm_nv * F);
     g_q35_o      = make_buf((size_t)s.ssm_vdim * F);
-    g_q35_att    = make_buf((size_t)s.n_embd * F);
+    // The attention output holds all query heads before projection to n_embd.
+    g_q35_att    = make_buf((size_t)std::max(s.n_embd, q_dim) * F);
     g_q35_qg     = make_buf((size_t)2 * q_dim * F);
     g_q35_q      = make_buf((size_t)q_dim * F);
     g_q35_gate   = make_buf((size_t)gate_sz * F);
@@ -1502,7 +1503,7 @@ bool q35_init(const Q35Spec& s, std::string* err) {
     const int wide = std::max(std::max(s.n_ff, cdim), 2 * q_dim);
     g_q35_px   = make_buf(CH * (size_t)s.n_embd * F);
     g_q35_pxb  = make_buf(CH * (size_t)s.n_embd * F);
-    g_q35_po   = make_buf(CH * (size_t)s.n_embd * F);
+    g_q35_po   = make_buf(CH * (size_t)std::max({s.n_embd, q_dim, s.ssm_vdim}) * F);
     g_q35_pa   = make_buf(CH * (size_t)wide * F);
     g_q35_pb   = make_buf(CH * (size_t)wide * F);
     g_q35_pz   = make_buf(CH * (size_t)s.ssm_vdim * F);
@@ -1514,7 +1515,7 @@ bool q35_init(const Q35Spec& s, std::string* err) {
     g_q35_pv   = make_buf(CH * (size_t)kv_dim * F);
     g_q35_pal  = make_buf(CH * (size_t)s.ssm_nv * F);
     g_q35_pbe  = make_buf(CH * (size_t)s.ssm_nv * F);
-    g_q35_pxt  = make_buf(CH * (size_t)std::max(s.n_ff, s.n_embd) * F);
+    g_q35_pxt  = make_buf(CH * (size_t)std::max({s.n_ff, s.n_embd, q_dim, s.ssm_vdim}) * F);
 
     // 批量 prefill 能不能用，取决于**每一层**的每个矩阵有没有 MMA 内核。
     // 缺一个就整条路径作废 —— 悄悄跳过某个 gemm 只会得到通顺的胡话。
@@ -1769,10 +1770,7 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err) {
                 float th = s.rope_theta;
                 uint32_t ang = (uint32_t)s.rope_angles;
                 uint32_t nrot = (uint32_t)(s.rope_angles * 2);
-                uint32_t s0 = (uint32_t)s.rope_sections[0], s1 = (uint32_t)s.rope_sections[1];
-                uint32_t s2 = (uint32_t)s.rope_sections[2], s3 = (uint32_t)s.rope_sections[3];
-                if (std::getenv("DUBHE_NO_MROPE")) s0 = s1 = s2 = s3 = 0;
-                const NSUInteger tot = (NSUInteger)((nh + nkv) * (s.rope_angles));
+                const NSUInteger tot = (NSUInteger)((nh + nkv) * (hd - s.rope_angles));
                 [en setComputePipelineState:g_q35pipe[Q_ROPE]];
                 [en setBuffer:g_q35_q offset:0 atIndex:0];
                 [en setBuffer:g_q35_k offset:0 atIndex:1];
@@ -1785,10 +1783,6 @@ bool q35_token(const float* x0, int pos, float* logits, std::string* err) {
                 [en setBytes:&th length:4 atIndex:8];
                 [en setBytes:&ang length:4 atIndex:9];
                 [en setBytes:&nrot length:4 atIndex:10];
-                [en setBytes:&s0 length:4 atIndex:11];
-                [en setBytes:&s1 length:4 atIndex:12];
-                [en setBytes:&s2 length:4 atIndex:13];
-                [en setBytes:&s3 length:4 atIndex:14];
                 [en dispatchThreads:MTLSizeMake(tot, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
@@ -2178,13 +2172,10 @@ bool q35_prefill(const float* x0, int nrow, int pos0, float* logits, std::string
                                   (uint64_t)kv_dim * 2u;
             {
                 uint32_t nrot = (uint32_t)(s.rope_angles * 2);
-                const uint32_t hh = (uint32_t)(nrot >> 1);
                 uint32_t a = (uint32_t)nh, b = (uint32_t)nkv, c = (uint32_t)hd;
                 uint32_t p0 = (uint32_t)pos0;
                 float th = s.rope_theta;
                 uint32_t ang = (uint32_t)s.rope_angles;
-                uint32_t s0 = (uint32_t)s.rope_sections[0], s1 = (uint32_t)s.rope_sections[1];
-                uint32_t s2 = (uint32_t)s.rope_sections[2], s3 = (uint32_t)s.rope_sections[3];
                 [en setComputePipelineState:g_q35pipe[Q_ROPE_B]];
                 [en setBuffer:g_q35_pq offset:0 atIndex:0];
                 [en setBuffer:g_q35_pk offset:0 atIndex:1];
@@ -2197,11 +2188,7 @@ bool q35_prefill(const float* x0, int nrow, int pos0, float* logits, std::string
                 [en setBytes:&th length:4 atIndex:8];
                 [en setBytes:&ang length:4 atIndex:9];
                 [en setBytes:&nrot length:4 atIndex:10];
-                [en setBytes:&s0 length:4 atIndex:11];
-                [en setBytes:&s1 length:4 atIndex:12];
-                [en setBytes:&s2 length:4 atIndex:13];
-                [en setBytes:&s3 length:4 atIndex:14];
-                [en dispatchThreads:MTLSizeMake((NSUInteger)hh,
+                [en dispatchThreads:MTLSizeMake((NSUInteger)(hd - s.rope_angles),
                                                 (NSUInteger)(nh + nkv), (NSUInteger)nrow)
                     threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             }

@@ -23,9 +23,9 @@
 ```
 
 其他参数：`--port` `--host` `--web` `-c/--ctx` `-t/--threads` `--allow-shell`
-`--no-gpu` `--api-key` `--tmp-dir` `--model-dir`。
+`--no-gpu` `--api-key` `--tmp-dir` `--model-dir` `--data-dir` `--parallel`。
 
-`--model-dir` 默认 `~/.dubhe/models`，UI 的「模型」视图扫这个目录。
+`--data-dir`（也可设 `DUBHE_DATA_DIR`）默认是 `~/.dubhe`，用于保存历史、设置和知识库清单。未指定 `--model-dir` 时，「模型」视图扫描数据目录下的 `models`。
 
 ## 接口
 
@@ -35,7 +35,14 @@ GET  /app.js /app.css /favicon.svg
 GET  /healthz
 GET  /api/state               运行时状态（硬件、模型、多模态能力、统计）
 GET  /api/models              本地模型清单（扫描 --model-dir）
+GET  /api/history             读取本机对话
+POST /api/history             按对话更新、移除或导入旧记录
+GET  /api/store               可下载的模型和进度
+POST /api/store/download|cancel 下载或取消
+GET  /api/translate           离线翻译模型和安装状态
+POST /api/translate           使用独立模型翻译文字
 POST /api/load                切换模型（卸载 → 加载 → 失败自动装回旧的）
+POST /api/unload              卸载当前聊天模型
 GET  /api/files?path=         列目录（JSON，目录在前）
 GET  /api/files/read?path=    读文本文件（512 KB 上限）
 GET  /api/tools               工具清单 + 是否启用
@@ -48,7 +55,23 @@ GET  /v1/models
 POST /v1/chat/completions     OpenAI 兼容（stream / 非 stream / tools）
 ```
 
-`/api/*` 在设了 `--api-key` 时只允许本机免鉴权，外部访问要带 key。
+局域网客户端通过 `Authorization: Bearer <key>` 调用 `/v1/models` 和 `/v1/chat/completions`。文件、工具、历史和模型管理需要从本机打开。局域网的 `/api/state` 只返回基本服务状态。
+
+### 结构化响应
+
+原生 GGUF 文本对话可在 `response_format` 指定 `{"type":"json_object"}`，或使用 `type: "json_schema"` 并在 `json_schema.schema` 提供结构。支持基本类型、`properties`、`required`、数组及长度、字符串长度、`const`、`enum` 和 `anyOf`。声明字段的对象只生成这些字段，请显式指定 `additionalProperties: false`。超出支持范围会报错。
+
+### Metal 并跑
+
+`--parallel` 接受 1–8，默认 4。支持多序列的 Metal 模型可将短时间内到达的普通文本请求组成一批。`--parallel 1` 始终逐个处理。多模态、工具、思考、约束输出和超过批量上下文容量的请求走单路。
+
+### macOS 可选模型运行时
+
+MLX 权重通过安装了 `mlx-lm` 的 Python 读取。启动服务时可用 `DUBHE_MLX_PYTHON` 指定该解释器。Gemma 和部分 MoE GGUF 使用本机的 `llama-server`，可用 `DUBHE_LLAMA_SERVER` 指定可执行文件路径。直接启动 App 可执行文件时，App 会把这些环境变量传给服务。加载后支持普通和流式文本对话。
+
+### 离线翻译
+
+Hy-MT2 1.8B 与 Index-Translate 2B 通过模型商店下载。macOS 翻译使用独立的 llama.cpp 进程，聊天模型可同时使用。服务接受目标语言、原文和可选术语表。例如 `{"model":"hy-mt2-18b-q4","source":"auto","target":"en","text":"水文年","glossary":[{"source":"水文年","target":"water year"}]}`。翻译适配器需要本机 Python 3，优先查找安装包中的 llama.cpp。
 
 ### 路径安全
 
@@ -81,9 +104,9 @@ POST /v1/chat/completions     OpenAI 兼容（stream / 非 stream / tools）
 {"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}
 ```
 
-- `url` 支持 data URL 和本机绝对路径；**不抓 http(s)**，避免把网关变成 SSRF 入口。
+- `url` 支持 data URL，本机请求也可使用绝对路径。
 - 一次请求只接受一个媒体（`dubhe_set_mm_embeds` 只保存一段区间）。
-- 只给音频、不给文字时自动走续写（转写模式）；`"dubhe_raw": true` 可显式强制。
+- 向支持转写的 LFM3 音频模型只发音频时，服务自动构造转写提示。`"dubhe_raw": true` 仍可显式选择原始续写。
 - 塔能加载不等于模态能用 —— 占位 token 在**语言模型词表**里。VL 模型挂音频塔
   会返回"这个语言模型的词表里没有 `<|audio|>`"。
 
@@ -104,6 +127,6 @@ POST /v1/chat/completions     OpenAI 兼容（stream / 非 stream / tools）
 
 - 复用引擎，不复制逻辑；HTTP 层只做协议转换与限流。
 - 单进程多线程，不引异步框架。
-- 只监听 127.0.0.1，默认无鉴权；对外必须显式 `--share` 或 `--host` + `--api-key`。
-- 流式响应走 chunked，不做 SSE 二次缓冲（避免首 token 被拖慢）。
+- 默认只监听 127.0.0.1。显式启用 `--share` 或绑定外部网卡时需要推理密钥，省略密钥会自动生成。
+- 流式响应使用 chunked SSE。批量生成由各请求线程分别写入连接。
 - 媒体落临时文件（`--tmp-dir`，默认 `/tmp`），编码完立刻删。

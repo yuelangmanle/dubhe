@@ -4,6 +4,7 @@ build-android-*/
 *.d
 *.gguf
 .DS_Store
+__pycache__/
 
 # WorkBuddy 的项目内状态（本机记忆、任务缓存），不进仓库
 .workbuddy/

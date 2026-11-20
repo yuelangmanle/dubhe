@@ -1,0 +1,54 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Weights { uint words[]; } weights;
+layout(set = 0, binding = 1, std430) readonly buffer Input { float values[]; } input_vec;
+layout(set = 0, binding = 2, std430) writeonly buffer Output { float values[]; } output_vec;
+layout(push_constant) uniform Dimensions { uint rows; uint columns; } shape;
+
+shared float partial[64];
+
+uint weight_byte(uint offset) {
+    return (weights.words[offset / 4] >> ((offset % 4) * 8)) & 255u;
+}
+
+// Q4_K 的 12 个字节头存 8 对 6-bit scale/min。前 4 对直接取低 6 位，
+// 后 4 对的高 2 位与前 4 对共用字节，低 4 位放在最后 4 个字节。
+uvec2 scale_min(uint header, uint group) {
+    if (group < 4) {
+        return uvec2(weight_byte(header + group) & 63u,
+                     weight_byte(header + group + 4) & 63u);
+    }
+    const uint low = weight_byte(header + group + 4);
+    return uvec2((low & 15u) | ((weight_byte(header + group - 4) >> 6) << 4),
+                 (low >> 4) | ((weight_byte(header + group) >> 6) << 4));
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (row >= shape.rows) return;
+
+    const uint lane = gl_LocalInvocationID.x;
+    const uint blocks = shape.columns / 256;
+    float sum = 0.0;
+    for (uint block = 0; block < blocks; ++block) {
+        const uint start = (row * blocks + block) * 144;
+        const vec2 factors = unpackHalf2x16(weights.words[start / 4]);
+        // 相邻的两个 32 元素子块共享同一组量化字节，各取低/高半字节。
+        for (uint group = lane / 32; group < 8; group += 2) {
+            const uint packed = weight_byte(start + 16 + (group / 2) * 32 + lane % 32);
+            const uint value = (packed >> ((group % 2) * 4)) & 15u;
+            const vec2 scale = vec2(scale_min(start + 4, group)) * factors;
+            const float weight = scale.x * float(value) - scale.y;
+            sum += weight * input_vec.values[block * 256 + group * 32 + lane % 32];
+        }
+    }
+
+    partial[lane] = sum;
+    barrier();
+    for (uint step = 32; step > 0; step /= 2) {
+        if (lane < step) partial[lane] += partial[lane + step];
+        barrier();
+    }
+    if (lane == 0) output_vec.values[row] = partial[0];
+}

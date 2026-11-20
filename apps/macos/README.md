@@ -70,6 +70,20 @@ Developer ID + 公证。
 
 ## 构建
 
+离线翻译使用本机 Python 3 与 llama.cpp。打包时可将官方 macOS llama.cpp 解压目录传给 `DUBHE_LLAMA_RUNTIME_DIR`，将 `llama-server`、依赖库和许可证纳入 DMG。模型仍由应用内商店按需下载。
+
+在翻译页用「读文件」导入不超过 16 MB 的 PDF 或 DOCX。PDF 导出将原页与译文并排，长译文可续页。只有图像的扫描件需要先做 OCR。Word 导出保留段落、表格、样式、图片与公式，分页会随译文长度变化。绘图、文本框和批注保留原文。
+
+翻译完成后可导出 Markdown、TXT、PDF 或 Word。Markdown 和 TXT 以 UTF-8 保存译文。粘贴的文本和纯文本文件导出为 PDF 或 Word 时，按标题、段落和列表排版。翻译时可切去其他页面，回来后可以查看进度。从失败或手动停止的位置继续时，会复用已经完成的段落。
+
+Dubhe 运行时，可以在其他应用中按 **⌃⇧T** 翻译选中文字，或按 **⌘⌥⇧T** 打开截图框选。跨应用读取选中文字需要辅助功能权限。指定原文语言后，截图会按该语言识别。在浮窗里切换「原文」「译文」可核对识别结果，并复制当前内容。
+
+系统拒绝直接截图时，可以用 macOS 的 **⌃⌘⇧4** 框选到剪贴板，再从「翻译」菜单选择「翻译剪贴板图片」。重新打包的临时签名版本可能需要重新授权。开发时可在 `DUBHE_SIGN_IDENTITY` 指定已有的 Apple Development 证书，让同一签名身份用于后续构建。
+
+```sh
+DUBHE_LLAMA_RUNTIME_DIR=/path/to/llama-macos-arm64 make dmg
+```
+
 ```bash
 ./apps/macos/build.sh            # 出 build/Dubhe.app
 ./apps/macos/build.sh --run      # 出完直接打开
@@ -80,7 +94,7 @@ Developer ID + 公证。
 
 ```
 build/Dubhe.app/Contents/MacOS/Dubhe          外壳（swiftc 编，~200 KB）
-build/Dubhe.app/Contents/Resources/dubhed     引擎
+build/Dubhe.app/Contents/Helpers/dubhed     引擎
 build/Dubhe.app/Contents/Resources/web/       Web UI
 build/Dubhe.app/Contents/Resources/AppIcon.icns
 ```

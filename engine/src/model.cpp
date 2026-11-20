@@ -9,6 +9,10 @@
 #include "metal.h"
 #include "parallel.h"
 #include "sysinfo.h"
+#if defined(DUBHE_VULKAN)
+#include "vulkan_matvec.h"
+#include <limits>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -153,15 +157,12 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
         // q/k 转错维度（症状是输出通顺但答非所问）。
         const int32_t n_rot = (int32_t)file_.get_u32(p + "rope.dimension_count", cfg_.head_dim);
         cfg_.n_rot = n_rot > 0 ? n_rot : cfg_.head_dim;
+        if (cfg_.n_rot > cfg_.head_dim || cfg_.n_rot % 2 != 0) {
+            if (err) *err = "Qwen3.5 的 RoPE 维度无效";
+            return false;
+        }
         cfg_.rope_angles = cfg_.n_rot / 2;
         cfg_.rope_pair_nrot = true;
-        if (const auto* sec = file_.get_arr_i32(p + "rope.dimension_sections")) {
-            if (sec->size() >= 4) {
-                for (int k = 0; k < 4; k++) cfg_.rope_sections[k] = (*sec)[(size_t)k];
-                cfg_.rope_mrope = (cfg_.rope_sections[0] + cfg_.rope_sections[1] +
-                                   cfg_.rope_sections[2] + cfg_.rope_sections[3]) > 0;
-            }
-        }
 
         if (const auto* rec = file_.get_arr_u8(p + "attention.recurrent_layers")) {
             cfg_.recurrent_layers.assign(rec->begin(), rec->end());
@@ -278,7 +279,7 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
     q_.assign((size_t)cfg_.n_head * cfg_.head_dim, 0.f);
     k_.assign(kv_dim, 0.f);
     v_.assign(kv_dim, 0.f);
-    attn_out_.assign(cfg_.n_embd, 0.f);
+    attn_out_.assign((size_t)std::max(cfg_.n_embd, cfg_.n_head * cfg_.head_dim), 0.f);
     gate_.assign(cfg_.n_ff, 0.f);
     up_.assign(cfg_.n_ff, 0.f);
     ffn_out_.assign(cfg_.n_ff, 0.f);
@@ -342,6 +343,27 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
 // 用真实权重跑一遍 GPU vs CPU 基准，误差超阈值就整体退回 CPU。
 bool Model::enable_gpu(std::string* err) {
     gpu_active_ = false;
+#if defined(DUBHE_VULKAN)
+    const char* device = vulkan::device_name();
+    if (!device) {
+        gpu_note_ = "CPU · 没有可用的 Vulkan 计算设备";
+        if (err) *err = gpu_note_;
+        return false;
+    }
+    const auto& tensors = file_.tensors();
+    gpu_active_ = std::any_of(tensors.begin(), tensors.end(), [](const TensorInfo& t) {
+        return t.type == T_Q4_K && t.n_dims == 2 && t.ne[0] > 0 && t.ne[1] > 0 &&
+               t.ne[0] <= std::numeric_limits<int>::max() && t.ne[1] <= std::numeric_limits<int>::max() &&
+               t.ne[0] * t.ne[1] >= kGpuMinMac && vulkan::supports((int)t.ne[1], (int)t.ne[0]);
+    });
+    if (!gpu_active_) {
+        gpu_note_ = "CPU · 模型没有适合 Vulkan 的 Q4_K 矩阵";
+        if (err) *err = gpu_note_;
+        return false;
+    }
+    gpu_note_ = std::string("Vulkan · ") + device + "（Q4_K 矩阵乘）";
+    return true;
+#else
     // Qwen3.5 还没有 Metal 内核：整层融合的 spec 只认识 conv / 滑窗 / 全注意力
     // 三种层，DeltaNet 会被错当成 full attention 去跑，结果是"能出字但全错"。
     // 在补上 Metal 之前，宁可明确走 CPU，也不做一半的加速。
@@ -389,7 +411,6 @@ bool Model::enable_gpu(std::string* err) {
         s.rms_eps = cfg_.rms_eps;
         s.rope_theta = cfg_.rope_theta;
         s.rope_angles = cfg_.rope_angles;
-        for (int i = 0; i < 4; i++) s.rope_sections[i] = cfg_.rope_sections[i];
         s.off_out_norm = off(out_norm_);
         s.off_out_w = off(out_w_);
         s.ty_out_w = out_w_.type;
@@ -812,6 +833,7 @@ bool Model::enable_gpu(std::string* err) {
         }
     }
     return true;
+#endif
 }
 
 bool Model::load_weights(std::string* err) {
@@ -1029,6 +1051,7 @@ void Model::unload() {
     loaded_ = false;
     gpu_active_ = false;
     gpu_fused_ = false;
+    gpu_note_.clear();
     // 必须在 file_.close() 之前释放：MTLBuffer 引用的就是那块 mmap
     metal::unbind_weights();
     layers_.clear();
@@ -1152,6 +1175,15 @@ void Model::matvec(float* out, const float* x, const TensorInfo& w, int n_out, i
     // f32_ref_ 打开时强制走纯 f32 点积。CPU 的默认路径会把激活量化成
     // Q8（快 2~4 倍，但有 ~1e-3 的相对误差），所以校验 GPU 数值时必须关掉它，
     // 否则量的是 CPU 自己的近似误差，不是 GPU 的。
+#if defined(DUBHE_VULKAN)
+    if (gpu_active_ && w.type == T_Q4_K && (int64_t)n_out * n_in >= kGpuMinMac &&
+        vulkan::supports(n_out, n_in)) {
+        if (vulkan::matvec_q4_k(file_.tensor_data(w), x, out, n_out, n_in)) return;
+        gpu_active_ = false;
+        gpu_note_ = "CPU · Vulkan 矩阵乘失败";
+        std::fprintf(stderr, "[dubhe] Vulkan 矩阵乘失败，已回退 CPU\n");
+    }
+#else
     if (gpu_active_ && (int64_t)n_out * n_in >= kGpuMinMac && metal::supports(w.type, n_in)) {
         const uint64_t woff =
             (uint64_t)((const char*)file_.tensor_data(w) - (const char*)file_.mapping());
@@ -1160,6 +1192,7 @@ void Model::matvec(float* out, const float* x, const TensorInfo& w, int n_out, i
         gpu_active_ = false;
         std::fprintf(stderr, "[dubhe] GPU 矩阵乘失败，已回退 CPU：%s\n", metal::last_error());
     }
+#endif
     if (!f32_ref_ && act_q8_supported(w.type)) {
         // 激活只量化一次，所有行共用
         aq_.resize(act_q8_bytes(w.type, n_in));
@@ -1399,20 +1432,9 @@ void Model::rope(float* q, float* k, int n_head, int n_head_kv, int head_dim, in
         float* v = (h < n_head) ? (q + (size_t)h * head_dim)
                                 : (k + (size_t)(h - n_head) * head_dim);
         for (int i = 0; i < angles; i++) {
-            // MRoPE：频率**按 section 重置**。9B 的 [11,11,10,0] 意味着
-            // 第 0-10 对用 base^(0..10·2/64)，第 11-21 对又从 base^0 开始。
-            // 文本输入下三个 section 的位置相同，所以只是频率重复，不需要
-            // 真的维护三套位置 —— 但重不重置差别很大，不能省。
-            int j = i;
-            if (cfg_.rope_mrope) {
-                int base = 0;
-                for (int k = 0; k < 4; k++) {
-                    const int n = cfg_.rope_sections[k];
-                    if (i < base + n) { j = i - base; break; }
-                    base += n;
-                }
-            }
-            const float freq = 1.f / std::pow(theta, (float)(2 * j) / (float)denom);
+            // Text uses the same position on every MRoPE axis. The frequency
+            // advances through the axis boundaries just as it does for RoPE.
+            const float freq = 1.f / std::pow(theta, (float)(2 * i) / (float)denom);
             const float a = pos * freq;
             const float c = std::cos(a), s = std::sin(a);
             const float x0 = v[i], x1 = v[i + half];
@@ -1428,6 +1450,11 @@ int Model::batch_size() const {
     // 没有 MMA 内核时退回 1，走逐 token。
     if (arch_is_qwen35()) return metal::q35_prefill_ok() ? 32 : 1;
     return metal::fwd_batch_max();
+}
+
+int Model::multi_capacity() const {
+    if (!gpu_fused_ || arch_is_qwen35() || std::getenv("DUBHE_ATTN_WRAP")) return 0;
+    return std::min(8, batch_size());
 }
 
 // prefill 批处理。GPU 可用时一次提交算完 n 个 token；否则退化成 n 次
@@ -1722,7 +1749,7 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
             }
 
             // 3) attention 输出投影
-            matvec(xb2_.data(), attn_out_.data(), L.attn_output, n_embd, n_embd);
+            matvec(xb2_.data(), attn_out_.data(), L.attn_output, n_embd, n_head * hd);
             std::memcpy(attn_out_.data(), xb2_.data(), sizeof(float) * n_embd);
         }
 

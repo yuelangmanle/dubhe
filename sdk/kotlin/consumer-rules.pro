@@ -1,0 +1,6 @@
+-keep class dev.dubhe.sdk.DubheNative { *; }
+-keep class dev.dubhe.sdk.NativeGenerationCallbacks { *; }
+-keep class dev.dubhe.sdk.DubheException { <init>(int, java.lang.String); }
+-keep class dev.dubhe.sdk.ModelInfo { <init>(...); }
+-keep class dev.dubhe.sdk.GenerationStats { <init>(...); }
+-keep class dev.dubhe.sdk.AndroidMedia { *; }

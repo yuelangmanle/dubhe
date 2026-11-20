@@ -17,7 +17,7 @@ extern "C" {
 #endif
 
 #define DUBHE_VERSION_MAJOR 0
-#define DUBHE_VERSION_MINOR 27
+#define DUBHE_VERSION_MINOR 30
 #define DUBHE_VERSION_PATCH 0
 
 typedef struct dubhe_engine dubhe_engine;
@@ -92,6 +92,8 @@ typedef struct {
 typedef void (*dubhe_token_cb)(void* ud, int32_t token, const char* piece);
 /* 返回非 0 表示请求中止生成。 */
 typedef int (*dubhe_stop_cb)(void* ud);
+/* 约束采样用。piece 为 NULL 表示结束标记，其他情况 len 是原始字节数。 */
+typedef int (*dubhe_token_filter)(void* ud, int32_t token, const char* piece, int32_t len);
 
 /* ---------- 生命周期 ---------- */
 dubhe_engine* dubhe_create(const dubhe_config* cfg);
@@ -166,6 +168,30 @@ int dubhe_generate(dubhe_engine* e,
                    dubhe_stop_cb  should_stop,
                    void* ud,
                    dubhe_stats* stats);
+
+/* 与 dubhe_generate 相同，但采样时只选取 filter 允许的候选。回调不得重入 e。 */
+int dubhe_generate_filtered(dubhe_engine* e, const int32_t* prompt, int32_t n_prompt,
+                            const dubhe_sampling* sp, dubhe_token_filter filter,
+                            dubhe_token_cb on_token, dubhe_stop_cb should_stop,
+                            void* ud, dubhe_stats* stats);
+
+typedef struct {
+    const int32_t* prompt;
+    int32_t n_prompt;
+    dubhe_sampling sampling;
+    dubhe_token_cb on_token;
+    dubhe_stop_cb should_stop;
+    void* user_data;
+    dubhe_stats stats;
+    int32_t result;
+    int32_t length_limited;
+} dubhe_batch_item;
+
+/* Maximum number of independent sequences supported by the loaded backend.
+ * A result of zero means use dubhe_generate. The combined token budget must
+ * fit n_ctx_limit. Each item receives its own cancellation status. */
+int32_t dubhe_batch_capacity(const dubhe_engine* e);
+int dubhe_generate_batch(dubhe_engine* e, dubhe_batch_item* items, int32_t count);
 
 /* 中止当前生成（可从其他线程调用）。 */
 void dubhe_request_abort(dubhe_engine* e);

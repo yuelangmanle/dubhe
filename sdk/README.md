@@ -1,27 +1,46 @@
-# sdk/ · DubheKit
+# DubheKit
 
-引擎对外的稳定接口层。许可：闭源（Proprietary，见根目录 LICENSE）。
+Swift 和 Kotlin SDK 直接使用 Dubhe 的 C ABI。公开头文件 `sdk/include/dubhe.h` 链到引擎的同一份头文件。
 
-## 组成
+## Swift
 
-| 目录 | 内容 |
-| --- | --- |
-| `include/dubhe.h` | 稳定 C ABI（与 `engine/include/dubhe/` 同源，此处为发布快照） |
-| `swift/` | Swift Package：`DubheKit`，供 macOS 宿主与第三方 App 使用 |
-| `kotlin/` | Android AAR：JNI 封装 + Kotlin 协程接口 |
-| `tests/abi/` | ABI 兼容性测试（`abi-compliance-checker`） |
+`sdk/swift` 是可在本地引用的 Swift Package，提供 `DubheKit` 库。它在 macOS 13 及以上编译仓库里的 C++ 和 Metal 源码。通过 `.package(path: "sdk/swift")` 加入 SwiftPM 项目，或在 Xcode 中添加本地软件包。
 
-## 版本策略
+```swift
+import DubheKit
+import Foundation
 
-- 跟随引擎 MINOR 版本发布；**ABI 破坏性变更必须升 MAJOR 并写 ADR**。
-- 每个发布版本在 `sdk/abi-baseline/` 存一份 ABI dump，CI 与之比对。
+let engine = try DubheEngine(contextSize: 2048)
+defer { engine.close() }
+let model = try await engine.loadModel(at: URL(fileURLWithPath: "/path/to/model.gguf"))
+let result = try await engine.generate("<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n") { text in
+    print(text, terminator: "")
+}
+```
 
-## 设计原则
+运行验证：
 
-1. **薄**：不做业务逻辑，只做生命周期、错误映射、内存管理、线程调度封装。
-2. **不隐藏代价**：所有可能阻塞的调用都是 `async` 或显式标注；不做"看起来同步"的假封装。
-3. **可诊断**：暴露性能计数器与错误上下文，让上层能回答"为什么慢了"。
+```sh
+DUBHE_TEST_MODEL=/path/to/small-chatml.gguf swift test --package-path sdk/swift
+```
 
-## 状态
+## Kotlin
 
-M0：接口草案讨论中，未发布。
+在仓库根目录运行 `./apps/android/gradlew -p apps/android :dubhekit:assembleRelease`，产物是 `sdk/kotlin/build/outputs/aar/dubhekit-release.aar`。AAR 支持 Android 12 及以上的 arm64 设备。使用本地 AAR 时，同时加入 `org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0`。
+
+```kotlin
+import dev.dubhe.sdk.DubheEngine
+import java.io.File
+
+// 在协程里运行
+DubheEngine(contextSize = 2048).use { engine ->
+    val model = engine.loadModel(File("/path/to/model.gguf"))
+    val result = engine.generate("<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n") { text ->
+        print(text)
+    }
+}
+```
+
+Kotlin SDK 还能加载配套的 `mmproj`。先调用 `loadProjector`，再给 `generate` 传入 `Attachment`。提示词中要有对应的 `AttachmentKind.token`，SDK 会把占位符替换成附件特征。
+
+两个 SDK 都在专用工作线程上运行模型调用。可以从另一线程调用 `cancelGeneration()` 请求停止，或取消等待生成的 Swift Task 和 Kotlin 协程。文本回调运行在工作线程，更新 UI 时请切回主线程。通过 `close()` 释放引擎。提示词应使用模型对应的模板，示例使用 ChatML。

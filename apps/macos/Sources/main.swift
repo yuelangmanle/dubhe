@@ -15,6 +15,7 @@
 // 等 M5 真正做原生 UI 时，这一层换成 SwiftUI + XPC（ADR-0005），
 // 但"起引擎、等就绪、杀进程"这三件事的代码可以原样搬过去。
 import Cocoa
+import Carbon.HIToolbox
 import UserNotifications
 import UniformTypeIdentifiers
 import WebKit
@@ -52,11 +53,10 @@ private func portIsFree(_ port: UInt16) -> Bool {
 
 // ---------------------------------------------------------------- 找 dubhed
 //
-// 优先用 App 包里的（build.sh 会把二进制和 web/ 一起塞进 Contents/Resources），
-// 其次看 DUBHE_BIN，最后退回开发时的 build/dubhed。
+// 新包把引擎放在 Contents/Helpers。也兼容旧包、DUBHE_BIN 和开发构建。
 private func resolveEngine() -> String? {
     let fm = FileManager.default
-    var candidates: [String] = []
+    var candidates = [Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/dubhed").path]
     if let res = Bundle.main.resourcePath {
         candidates.append(res + "/dubhed")
     }
@@ -85,7 +85,9 @@ private func resolveWebRoot() -> String? {
 private func engineLogURL() -> URL {
     let base = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
         ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library")
-    let dir = base.appendingPathComponent("Logs/Dubhe", isDirectory: true)
+    let custom = ProcessInfo.processInfo.environment["DUBHE_DATA_DIR"] ?? ""
+    let dir = custom.isEmpty ? base.appendingPathComponent("Logs/Dubhe", isDirectory: true)
+        : URL(fileURLWithPath: custom, isDirectory: true).appendingPathComponent("logs", isDirectory: true)
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir.appendingPathComponent("engine.log")
 }
@@ -219,6 +221,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // 第 2 次以后会被误判成启动失败，计数永远涨不到上限。
     private var everLoadedUI = false
     private var notifyAllowed = false
+    private var checkingForUpdate = false
+    private var translationHotKeyHandler: EventHandlerRef?
+    private var translationHotKeys: [EventHotKeyRef] = []
+    private var unavailableTranslationHotKeys: [String] = []
+    private var capture: Process?
+    private var recognizingScreenshot = false
+    private var overlay: NSPanel?
+    private var overlayText: NSTextView?
+    private var overlayTabs: NSSegmentedControl?
+    private var overlayCopy: NSButton?
+    private var overlayScreenSettings: NSButton?
+    private var overlayClipboard: NSButton?
+    private var overlaySource = ""
+    private var overlayResult = ""
+    private var overlayHasTranslation = false
+    private var overlayTranslating = false
 
     // 上次在界面里加载过的模型。存路径而不是名字：同名模型可能在两个目录里。
     private static let lastModelKey = "lastModelPath"
@@ -258,6 +276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         setupNotifications()
         buildMenu()
         buildWindow()
+        registerTranslationHotKeys()
         // 由"打开 .gguf"触发启动时，第一个要加载的就是它，别再先用
         // 记住的那个起一遍再重启。
         if let u = pendingModelURL {
@@ -366,6 +385,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func applicationWillTerminate(_ note: Notification) {
         shuttingDown = true
+        translationHotKeys.forEach { UnregisterEventHotKey($0) }
+        if let translationHotKeyHandler { RemoveEventHandler(translationHotKeyHandler) }
+        if capture?.isRunning == true { capture?.terminate() }
         stopEngine()
     }
 
@@ -379,6 +401,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "关于 Dubhe", action: #selector(showAbout), keyEquivalent: "")
+        appMenu.addItem(withTitle: "检查更新…", action: #selector(checkForUpdates), keyEquivalent: "").target = self
+        appMenu.addItem(withTitle: "更新日志", action: #selector(showChangelog), keyEquivalent: "").target = self
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "隐藏 Dubhe",
                         action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
@@ -419,6 +443,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         edit.addItem(withTitle: "全选", action: NSSelectorFromString("selectAll:"), keyEquivalent: "a")
         editItem.submenu = edit
         main.addItem(editItem)
+
+        let translationItem = NSMenuItem()
+        let translation = NSMenu(title: "翻译")
+        let selection = translation.addItem(withTitle: "翻译选中文字", action: #selector(translateSelection),
+                                            keyEquivalent: "t")
+        selection.keyEquivalentModifierMask = [.control, .shift]
+        selection.target = self
+        let screenshot = translation.addItem(withTitle: "截图翻译…", action: #selector(captureAndOCR),
+                                             keyEquivalent: "t")
+        screenshot.keyEquivalentModifierMask = [.command, .shift, .option]
+        screenshot.target = self
+        let clipboard = translation.addItem(withTitle: "翻译剪贴板图片", action: #selector(translateClipboardImage),
+                                            keyEquivalent: "")
+        clipboard.target = self
+        translationItem.submenu = translation
+        main.addItem(translationItem)
 
         let viewItem = NSMenuItem()
         let view = NSMenu(title: "显示")
@@ -519,6 +559,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         NSApp.orderFrontStandardAboutPanel(options: [.credits: lines.joined(separator: "\n")])
     }
 
+    @objc private func checkForUpdates() {
+        guard !checkingForUpdate else { return }
+        checkingForUpdate = true
+        Task { @MainActor in
+            defer { checkingForUpdate = false }
+            let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+            let alert = NSAlert()
+            var showRelease = false
+            do {
+                let release = try await ReleaseUpdates.latest()
+                if let version = try release.newerVersion(than: current) {
+                    alert.messageText = "Dubhe \(version) 可更新"
+                    alert.informativeText = "当前版本 \(current)。可在 GitHub 下载新版 macOS 安装包。"
+                    showRelease = true
+                } else {
+                    alert.messageText = "已是最新版本"
+                    alert.informativeText = "当前版本 \(current)。"
+                }
+            } catch {
+                alert.messageText = "未能完成更新检查"
+                alert.informativeText = error.localizedDescription
+                showRelease = true
+            }
+            if showRelease { alert.addButton(withTitle: "打开 GitHub") }
+            alert.addButton(withTitle: "关闭")
+            alert.beginSheetModal(for: window) { result in
+                if showRelease && result == .alertFirstButtonReturn { NSWorkspace.shared.open(ReleaseUpdates.page) }
+            }
+        }
+    }
+
+    @objc private func showChangelog() {
+        let alert = NSAlert()
+        alert.messageText = "更新日志"
+        if let url = Bundle.main.url(forResource: "CHANGELOG", withExtension: "md"),
+           let content = try? String(contentsOf: url, encoding: .utf8) {
+            let scroll = NSTextView.scrollableTextView()
+            scroll.frame = NSRect(x: 0, y: 0, width: 570, height: 365)
+            if let text = scroll.documentView as? NSTextView {
+                text.isEditable = false
+                text.font = .systemFont(ofSize: 13)
+                text.textContainerInset = NSSize(width: 8, height: 8)
+                text.string = content
+            }
+            alert.accessoryView = scroll
+        } else {
+            alert.informativeText = "无法读取随应用提供的更新日志。"
+        }
+        alert.addButton(withTitle: "关闭")
+        alert.beginSheetModal(for: window)
+    }
+
     private func buildWindow() {
         let rect = NSRect(x: 0, y: 0, width: 1100, height: 760)
         window = NSWindow(contentRect: rect,
@@ -560,22 +652,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
-        // ⌘⇧T：把当前选中的文字送去翻译。
-        // 全局监听本身也要辅助功能权限；没授权时收不到按键，但不会崩，
-        // 也不会影响其它快捷键。真正的权限提示在 translateSelection 里。
-        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            let mods = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            guard mods.contains([.command, .shift]),
-                  e.charactersIgnoringModifiers?.lowercased() == "t" else { return }
-            self?.translateSelection()
-        }
-
         showSplash("正在启动本地引擎…")
+    }
+
+    private func registerTranslationHotKeys() {
+        let shortcuts = [
+            (id: UInt32(1), modifiers: UInt32(controlKey | shiftKey), label: "⌃⇧T 划词翻译"),
+            (id: UInt32(2), modifiers: UInt32(cmdKey | optionKey | shiftKey), label: "⌘⌥⇧T 截图翻译"),
+        ]
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let signature: OSType = 0x44425452 // DBTR
+        let target = GetApplicationEventTarget()
+        let status = InstallEventHandler(target, { _, event, context in
+            guard let event, let context else { return OSStatus(eventNotHandledErr) }
+            var key = EventHotKeyID()
+            guard GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                    nil, MemoryLayout<EventHotKeyID>.size, nil, &key) == noErr,
+                  key.signature == 0x44425452 else { return OSStatus(eventNotHandledErr) }
+            let app = Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue()
+            switch key.id {
+            case 1: app.translateSelection()
+            case 2: app.captureAndOCR()
+            default: return OSStatus(eventNotHandledErr)
+            }
+            return noErr
+        }, 1, &eventType, Unmanaged.passUnretained(self).toOpaque(), &translationHotKeyHandler)
+        guard status == noErr else {
+            unavailableTranslationHotKeys = shortcuts.map(\.label)
+            dbg("global translation shortcut handler failed: \(status)")
+            return
+        }
+        for shortcut in shortcuts {
+            var ref: EventHotKeyRef?
+            let result = RegisterEventHotKey(UInt32(kVK_ANSI_T), shortcut.modifiers,
+                                             EventHotKeyID(signature: signature, id: shortcut.id),
+                                             target, UInt32(kEventHotKeyExclusive), &ref)
+            if result == noErr, let ref { translationHotKeys.append(ref) }
+            else { unavailableTranslationHotKeys.append(shortcut.label) }
+            dbg("registered translation shortcut \(shortcut.id): \(result)")
+        }
     }
 
     // retry = true 时多给两个按钮：重试、看日志。出错的页面不该只有一个
     // 转不完的圈 —— 用户能做的最合理动作就是"再来一次"，其次是"看看为什么"。
     private func showSplash(_ text: String, retry: Bool = false) {
+        if overlayTranslating {
+            showOverlay("本地引擎连接中断。引擎恢复后可以重试。", title: "翻译失败", source: overlaySource)
+        }
         let buttons = retry ? """
         <div class="row">
           <button onclick="post('retry')">重试</button>
@@ -787,7 +910,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // 语义"的动作，不能变成网页随意调 Swift 的入口。
     func userContentController(_ ucc: WKUserContentController,
                                didReceive message: WKScriptMessage) {
-        guard message.name == "shell" else { return }
+        guard message.name == "shell", message.frameInfo.isMainFrame else { return }
         if let cmd = message.body as? String {
             dbg("shell message \(cmd)")
             switch cmd {
@@ -797,10 +920,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             }
             return
         }
-        guard let obj = message.body as? [String: Any],
+        let origin = message.frameInfo.securityOrigin
+        guard uiLoaded, origin.protocol == "http", origin.host == "127.0.0.1",
+              origin.port == Int(port),
+              let obj = message.body as? [String: Any],
               let type = obj["type"] as? String else { return }
         dbg("shell event \(type)")
         switch type {
+        case "checkForUpdates":
+            checkForUpdates()
+        case "showChangelog":
+            showChangelog()
         case "turnEnd":
             notifyTurnEnd((obj["body"] as? String) ?? "回答已生成")
         case "ocr":
@@ -817,6 +947,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             let ok = AXIsProcessTrusted()
             webView.evaluateJavaScript(
                 "window.dubheAxStatus && window.dubheAxStatus(\(ok ? "true" : "false"))") { _, _ in }
+        case "openScreenCapture":
+            openScreenCaptureSettings()
+        case "translateClipboardImage":
+            translateClipboardImage()
+        case "translationHotKeyStatus":
+            webView.callAsyncJavaScript("window.dubheTranslationHotKeyStatus?.(unavailable)",
+                                       arguments: ["unavailable": unavailableTranslationHotKeys],
+                                       in: nil, in: .page, completionHandler: nil)
+        case "overlay":
+            if capture == nil, !recognizingScreenshot, let text = obj["text"] as? String {
+                showOverlay(text, title: (obj["title"] as? String) ?? "译文", source: obj["source"] as? String ?? "")
+            }
+        case "historyExport":
+            if let text = obj["text"] as? String { saveHistory(text) }
+        case "modelUnloaded":
+            usedRememberedModel = false
+            UserDefaults.standard.removeObject(forKey: Self.lastModelKey)
+        case "translationDocument":
+            handleTranslationDocument(obj)
         default:
             break
         }
@@ -827,60 +976,152 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // 为什么必须在外壳里：网页拿不到屏幕。截屏和文字识别（Vision）都是
     // 原生框架，只有 App 进程能调。
     //
-    // 用 -i 交互选区：框一块就识别。识别结果回灌给页面里的 window.dubheOcr，
-    // 由翻译页填进输入框 —— 这里不做翻译，只负责"把图上的字变成文本"。
-    private func captureAndOCR() {
-        let tmp = NSTemporaryDirectory() + "dubhe-ocr.png"
+    // 框选后识别文字，交给页面翻译，结果再回到原生浮窗。
+    @objc private func captureAndOCR() {
+        dbg("screenshot translation requested")
+        withOCRLanguage { [weak self] language in self?.beginScreenshot(language: language) }
+    }
+
+    private func withOCRLanguage(_ action: @escaping (String) -> Void) {
+        guard uiLoaded else {
+            showOverlay("等本地引擎启动后再试。", title: "截图翻译")
+            return
+        }
+        webView.evaluateJavaScript("window.dubheOCRLanguage?.()") { value, _ in
+            action(value as? String ?? "auto")
+        }
+    }
+
+    private func beginScreenshot(language: String) {
+        guard capture == nil, !recognizingScreenshot else { return }
         // 调试口：给一张现成的图，跳过交互选区直接识别。
         // 没有这个，验证 OCR 只能靠人手框选，没法自动化。
         if let fixed = ProcessInfo.processInfo.environment["DUBHE_OCR_FILE"], !fixed.isEmpty {
-            ocrFile(fixed)
+            overlay?.close()
+            ocrFile(fixed, language: language)
             return
         }
-        try? FileManager.default.removeItem(atPath: tmp)
+        overlay?.close()
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dubhe-ocr-\(UUID().uuidString).png")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        p.arguments = ["-i", "-x", tmp]     // -x：不播快门声
+        p.arguments = ["-i", "-s", "-x", tmp.path]
+        let errors = Pipe()
+        p.standardError = errors
+        p.terminationHandler = { [weak self] process in
+            let message = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async {
+                defer { try? FileManager.default.removeItem(at: tmp) }
+                guard let self else { return }
+                self.capture = nil
+                if process.terminationStatus == 0, FileManager.default.fileExists(atPath: tmp.path) {
+                    self.ocrFile(tmp.path, language: language)
+                } else if !message.isEmpty || process.terminationStatus > 1 {
+                    dbg("interactive screenshot failed (\(process.terminationStatus)): \(message)")
+                    if !CGPreflightScreenCaptureAccess() {
+                        self.showScreenCapturePermission()
+                    } else {
+                        self.showOverlay("系统未能生成这张截图，可以重新框选。", title: "截图失败")
+                    }
+                }
+            }
+        }
         do {
             try p.run()
+            capture = p
         } catch {
-            ocrReply("")
-            return
+            showOverlay("无法启动截图工具。", title: "截图失败")
         }
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else { ocrReply(""); return }
-        ocrFile(tmp)
     }
 
-    private func ocrFile(_ path: String) {
+    @objc private func openScreenCaptureSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func showScreenCapturePermission() {
+        let location = Bundle.main.bundleURL.path
+        showOverlay(
+            """
+            macOS 没有允许当前这份 Dubhe 截图。请在系统设置中选择下面这个应用，然后退出并重新打开。
+
+            \(location)
+
+            也可以按 ⌃⌘⇧4 用 macOS 框选并复制截图，再点「翻译剪贴板图片」。
+            """, title: "截图权限")
+    }
+
+    @objc private func translateClipboardImage() {
+        withOCRLanguage { [weak self] language in
+            guard let self, self.capture == nil, !self.recognizingScreenshot else { return }
+            guard let image = NSImage(pasteboard: .general),
+                  let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                self.showOverlay("剪贴板里没有图片。按 ⌃⌘⇧4 框选截图后再试。", title: "翻译剪贴板图片")
+                return
+            }
+            self.overlay?.close()
+            self.recognizeScreenshot(cg, language: language)
+        }
+    }
+
+    private func ocrFile(_ path: String, language: String) {
         guard let img = NSImage(contentsOfFile: path),
               let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            ocrReply("")
+            showOverlay("无法读取刚截取的图片。", title: "截图失败")
             return
         }
-        let req = VNRecognizeTextRequest { r, _ in
-            var lines: [String] = []
-            let obs = (r.results as? [VNRecognizedTextObservation]) ?? []
-            for o in obs {
-                if let t = o.topCandidates(1).first?.string { lines.append(t) }
-            }
-            DispatchQueue.main.async {
-                dbg("ocr -> \(lines.count) 行 / \(lines.joined(separator: "\n").count) 字")
-                self.ocrReply(lines.joined(separator: "\n"))
-            }
-        }
-        req.recognitionLevel = .accurate
-        req.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
-        req.usesLanguageCorrection = true
+        recognizeScreenshot(cg, language: language)
+    }
+
+    private func recognizeScreenshot(_ cg: CGImage, language: String) {
+        recognizingScreenshot = true
+        showOverlay("正在从截图中识别文字…", title: "识别中")
         DispatchQueue.global(qos: .userInitiated).async {
-            do {
+            let byLanguage = [
+                "zh": ["zh-Hans", "zh-Hant"], "en": ["en-US"], "ja": ["ja-JP"],
+                "ko": ["ko-KR"], "fr": ["fr-FR"], "de": ["de-DE"],
+            ]
+            let automatic = byLanguage[language] == nil
+            let languages = byLanguage[language] ?? ["en-US", "zh-Hans", "zh-Hant", "ja-JP", "ko-KR", "fr-FR", "de-DE"]
+            // Vision's quick recognizer covers printed English, French and German.
+            // Use its multilingual accurate recognizer for CJK and mixed screenshots.
+            let level: VNRequestTextRecognitionLevel = ["en", "fr", "de"].contains(language) ? .fast : .accurate
+            func recognize(_ level: VNRequestTextRecognitionLevel) throws -> String {
+                let req = VNRecognizeTextRequest()
+                req.recognitionLevel = level
+                if let supported = try? req.supportedRecognitionLanguages() {
+                    req.recognitionLanguages = languages.filter(supported.contains)
+                }
+                req.automaticallyDetectsLanguage = automatic
+                req.usesLanguageCorrection = true
                 try VNImageRequestHandler(cgImage: cg, options: [:]).perform([req])
-            } catch {
-                // 别用 try? 吞掉：perform 抛错时 completion 根本不会回调，
-                // 表现就是"点了没反应"，一句日志都没有。
+                return (req.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+            }
+            do {
+                let text: String
+                do {
+                    text = try recognize(level)
+                } catch {
+                    guard automatic else { throw error }
+                    dbg("accurate OCR failed, trying the quick recognizer: \(error)")
+                    text = try recognize(.fast)
+                    if text.isEmpty { throw error }
+                }
+                dbg("ocr recognized \(text.count) characters")
                 DispatchQueue.main.async {
-                    dbg("ocr perform failed: \(error)")
-                    self.ocrReply("")
+                    self.recognizingScreenshot = false
+                    guard self.overlay?.title == "识别中" else { return }
+                    self.requestTranslation(text, callback: "dubheOcr")
+                }
+            } catch {
+                dbg("ocr perform failed: \(error)")
+                DispatchQueue.main.async {
+                    self.recognizingScreenshot = false
+                    guard self.overlay?.title == "识别中" else { return }
+                    self.showOverlay("文字识别失败，请重新截取清晰的文字区域。", title: "识别失败")
                 }
             }
         }
@@ -895,49 +1136,334 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // 它需要用户在系统设置里授予「辅助功能」权限 —— 不给就是读不到，
     // 而且 macOS 不会报错，只会返回 -25211。所以第一次调用前先
     // AXIsProcessTrusted()，未授权就弹系统引导，别让用户以为程序坏了。
-    private func translateSelection() {
+    @objc private func translateSelection() {
+        dbg("selection translation requested")
+        guard capture == nil, !recognizingScreenshot else { return }
+        if NSApp.isActive {
+            dbg("local translation shortcut")
+            guard uiLoaded else {
+                showOverlay("等本地引擎启动后再试。", title: "翻译")
+                return
+            }
+            webView.evaluateJavaScript("window.dubheTranslateLocalSelection?.()") { [weak self] value, _ in
+                if value as? Bool != true {
+                    self?.showOverlay("翻译还没有就绪，请稍后再试。", title: "翻译")
+                }
+            }
+            return
+        }
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         guard AXIsProcessTrustedWithOptions(opts as CFDictionary) else {
             dbg("accessibility 未授权")
+            showOverlay("请在「辅助功能」里允许当前这份 Dubhe：\n\n\(Bundle.main.bundleURL.path)",
+                        title: "划词权限")
             return
         }
         let sys = AXUIElementCreateSystemWide()
         var focused: CFTypeRef?
         guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString,
                                             &focused) == .success,
-              let el = focused else {
-            dbg("ax: 拿不到焦点控件")
+              let element = focused, CFGetTypeID(element) == AXUIElementGetTypeID() else {
+            requestTranslation("", callback: "dubheText")
             return
         }
-        var sel: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el as! AXUIElement,
-                                            kAXSelectedTextAttribute as CFString,
-                                            &sel) == .success,
-              let text = sel as? String, !text.isEmpty else {
-            dbg("ax: 没有选中文本")
-            return
-        }
+        let text = selectedText(in: element as! AXUIElement) ?? ""
         dbg("ax 选中 \(text.count) 字")
-        pushTextToPage(text)
+        requestTranslation(text, callback: "dubheText")
     }
 
-    private func pushTextToPage(_ text: String) {
-        guard let data = try? JSONSerialization.data(withJSONObject: [text]),
-              let s = String(data: data, encoding: .utf8) else { return }
-        let lit = String(s.dropFirst().dropLast())
-        DispatchQueue.main.async {
-            self.webView.evaluateJavaScript(
-                "window.dubheText && window.dubheText(\(lit))") { _, _ in }
+    private func selectedText(in element: AXUIElement) -> String? {
+        var sel: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &sel) == .success,
+           let text = sel as? String, !text.isEmpty {
+            return text
+        }
+        var savedRange: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &savedRange) == .success,
+              let savedRange, CFGetTypeID(savedRange) == AXValueGetTypeID() else { return nil }
+        let value = savedRange as! AXValue
+        var range = CFRange()
+        guard AXValueGetValue(value, .cfRange, &range), range.length > 0,
+              AXUIElementCopyParameterizedAttributeValue(element, kAXStringForRangeParameterizedAttribute as CFString,
+                                                         value, &sel) == .success else { return nil }
+        return sel as? String
+    }
+
+    private func showOverlay(_ text: String, title: String, source: String = "") {
+        dbg("overlay \(title): original \(source.count) chars, output \(text.count) chars")
+        let p: NSPanel
+        if let existing = overlay {
+            p = existing
+        } else {
+            let mouse = NSEvent.mouseLocation
+            let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
+            let visible = screen?.visibleFrame
+            let size = NSSize(width: min(460, (visible?.width ?? 476) - 16),
+                              height: min(280, (visible?.height ?? 296) - 16))
+            p = NSPanel(contentRect: NSRect(origin: .zero, size: size),
+                        styleMask: [.titled, .closable, .resizable, .utilityWindow, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+            p.delegate = self
+            p.isReleasedWhenClosed = false
+            p.isFloatingPanel = true
+            p.hidesOnDeactivate = false
+            p.becomesKeyOnlyIfNeeded = true
+            p.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            p.minSize = NSSize(width: 220, height: 140)
+
+            let scroll = NSTextView.scrollableTextView()
+            let tv = scroll.documentView as? NSTextView
+            tv?.isEditable = false
+            tv?.isSelectable = true
+            tv?.font = .systemFont(ofSize: 13)
+            tv?.textContainerInset = NSSize(width: 12, height: 12)
+            let tabs = NSSegmentedControl(labels: ["译文", "原文"], trackingMode: .selectOne,
+                                          target: self, action: #selector(refreshOverlayText))
+            tabs.selectedSegment = 0
+            let copy = NSButton(title: "复制", target: self, action: #selector(copyOverlayText))
+            let screenSettings = NSButton(title: "打开系统设置", target: self, action: #selector(openScreenCaptureSettings))
+            let clipboard = NSButton(title: "翻译剪贴板图片", target: self, action: #selector(translateClipboardImage))
+            let controls = NSStackView(views: [tabs, copy, screenSettings, clipboard])
+            controls.spacing = 8
+            let content = NSView()
+            for subview in [controls, scroll] as [NSView] {
+                subview.translatesAutoresizingMaskIntoConstraints = false
+                content.addSubview(subview)
+            }
+            p.contentView = content
+            NSLayoutConstraint.activate([
+                controls.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
+                controls.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+                scroll.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 6),
+                scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+                scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            ])
+            overlay = p
+            overlayText = tv
+            overlayTabs = tabs
+            overlayCopy = copy
+            overlayScreenSettings = screenSettings
+            overlayClipboard = clipboard
+
+            // 浮窗跟着鼠标所在的屏幕，边缘留出关闭按钮。
+            let frameSize = p.frame.size
+            let bounds = visible?.insetBy(dx: 8, dy: 8)
+            let x = mouse.x + 16, y = mouse.y - frameSize.height - 16
+            if let bounds {
+                p.setFrameOrigin(NSPoint(x: max(bounds.minX, min(x, bounds.maxX - frameSize.width)),
+                                         y: max(bounds.minY, min(y, bounds.maxY - frameSize.height))))
+            } else {
+                p.setFrameOrigin(NSPoint(x: x, y: y))
+            }
+        }
+        p.title = title
+        let screenPermission = title == "截图权限"
+        overlayTabs?.isHidden = screenPermission
+        overlayCopy?.isHidden = screenPermission
+        overlayScreenSettings?.isHidden = !screenPermission
+        overlayClipboard?.isHidden = !screenPermission
+        overlayTranslating = title == "翻译中"
+        overlayHasTranslation = title == "译文"
+        if overlaySource != source { overlayTabs?.selectedSegment = 0 }
+        overlaySource = source
+        overlayResult = text
+        refreshOverlayText()
+        p.orderFrontRegardless()
+    }
+
+    @objc private func refreshOverlayText() {
+        overlayTabs?.setEnabled(!overlaySource.isEmpty, forSegment: 1)
+        let original = overlayTabs?.selectedSegment == 1
+        overlayText?.string = original ? overlaySource : overlayResult
+        overlayText?.scrollRangeToVisible(NSRange(location: 0, length: 0))
+        overlayCopy?.isEnabled = original || overlayHasTranslation
+        overlayCopy?.title = "复制"
+    }
+
+    @objc private func copyOverlayText() {
+        guard let text = overlayText?.string, !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        if NSPasteboard.general.setString(text, forType: .string) { overlayCopy?.title = "已复制" }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let closed = notification.object as? NSWindow else { return }
+        if closed === window { overlay?.close() }
+        guard closed === overlay else { return }
+        if overlayTranslating {
+            webView.evaluateJavaScript("window.dubheCancelTranslation?.()") { _, _ in }
+        }
+        overlayTranslating = false
+        overlay = nil
+        overlayText = nil
+        overlayTabs = nil
+        overlayCopy = nil
+        overlayScreenSettings = nil
+        overlayClipboard = nil
+        overlaySource = ""
+        overlayResult = ""
+    }
+
+    private func requestTranslation(_ text: String, callback: String) {
+        guard uiLoaded else {
+            showOverlay("等本地引擎启动后再试。", title: "翻译")
+            return
+        }
+        guard let data = try? JSONEncoder().encode([callback, text]),
+              let args = String(data: data, encoding: .utf8) else { return }
+        webView.evaluateJavaScript("""
+            (([callback, text]) => {
+                const translate = window[callback];
+                if (typeof translate !== 'function') return false;
+                translate(text);
+                return true;
+            })(\(args))
+            """) { [weak self] value, _ in
+            if value as? Bool == true { return }
+            self?.showOverlay("翻译还没有就绪，请稍后再试。", title: "翻译")
         }
     }
 
-    private func ocrReply(_ text: String) {
-        // 用 JSONSerialization 转义，别自己拼引号：识别出来的文本里
-        // 换行、引号、反斜杠都有，手拼必然漏。
-        guard let data = try? JSONSerialization.data(withJSONObject: [text]),
-              let s = String(data: data, encoding: .utf8) else { return }
-        let lit = String(s.dropFirst().dropLast())   // 去掉外层方括号
-        webView.evaluateJavaScript("window.dubheOcr && window.dubheOcr(\(lit))") { _, _ in }
+    private func saveHistory(_ text: String) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "Dubhe-history.json"
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK, let url = panel.url else { return }
+            do {
+                try Data(text.utf8).write(to: url, options: .atomic)
+            } catch {
+                let alert = NSAlert(error: error)
+                alert.beginSheetModal(for: self.window)
+            }
+        }
+    }
+
+    private func handleTranslationDocument(_ message: [String: Any]) {
+        guard let id = message["id"] as? Int else { return }
+        let reply: ([String: Any]) -> Void = { [weak self] result in
+            guard let self else { return }
+            self.webView.callAsyncJavaScript(
+                "window.dubheDocumentComplete(id, result)",
+                arguments: ["id": id, "result": result], in: nil, in: .page, completionHandler: nil
+            )
+        }
+        let action = message["action"] as? String
+        if action == "export" {
+            guard let format = message["format"] as? String, ["md", "txt", "pdf", "docx"].contains(format),
+                  let text = message["text"] as? String, !text.isEmpty, text.utf8.count <= 24 * 1024 * 1024 else {
+                reply(["error": "译文为空、过大或导出格式无效。"])
+                return
+            }
+            let name = (message["name"] as? String) ?? "译文." + format
+            let save: (Data) -> Void = { [weak self] data in
+                self?.saveTranslation(data, format: format, name: name, reply: reply)
+            }
+            if format == "md" || format == "txt" {
+                save(Data(text.utf8))
+            } else {
+                let blocks = message["blocks"] as? [[String: String]] ?? [["kind": "p", "text": text]]
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let data = try TranslationExport.render(format: format, blocks: blocks)
+                        DispatchQueue.main.async { save(data) }
+                    } catch {
+                        DispatchQueue.main.async { reply(["error": error.localizedDescription]) }
+                    }
+                }
+            }
+            return
+        }
+        let saving = action == "save"
+        let encodedLimit = (saving ? 64 : 24) * 1024 * 1024
+        guard let format = message["format"] as? String, ["docx", "pdf"].contains(format),
+              let encoded = message["document"] as? String, encoded.utf8.count <= encodedLimit else {
+            reply(["error": saving ? "导出的文件过大或格式无效。" : "请选择不超过 16 MB 的 PDF 或 Word 文件。"])
+            return
+        }
+        if saving {
+            guard let data = Data(base64Encoded: encoded) else {
+                reply(["error": "译文文件格式无效。"])
+                return
+            }
+            saveTranslation(data, format: format, name: (message["name"] as? String) ?? "译文." + format, reply: reply)
+            return
+        }
+        let translations = message["translations"] as? [String]
+        let bundledWordTool = Bundle.main.url(forResource: "translation_docx", withExtension: "py",
+                                                subdirectory: "backends")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result: [String: Any]
+            do {
+                if format == "pdf" {
+                    guard let data = Data(base64Encoded: encoded) else {
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    if let translations {
+                        let rendered = try TranslationPDF.rebuild(data, translations: translations)
+                        result = ["document": rendered.base64EncodedString()]
+                    } else {
+                        result = ["paragraphs": try TranslationPDF.paragraphs(data)]
+                    }
+                } else {
+                    result = try Self.processWordDocument(encoded, translations: translations, tool: bundledWordTool)
+                }
+            } catch {
+                DispatchQueue.main.async { reply(["error": error.localizedDescription]) }
+                return
+            }
+            DispatchQueue.main.async { reply(result) }
+        }
+    }
+
+    private func saveTranslation(_ data: Data, format: String, name: String, reply: @escaping ([String: Any]) -> Void) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: format, conformingTo: .data) ?? .data]
+        panel.nameFieldStringValue = name
+        panel.beginSheetModal(for: window) { result in
+            guard result == .OK, let url = panel.url else { reply(["saved": false]); return }
+            do {
+                try data.write(to: url, options: .atomic)
+                reply(["saved": true])
+            } catch {
+                reply(["error": "保存译文失败：" + error.localizedDescription])
+            }
+        }
+    }
+
+    private static func processWordDocument(_ document: String, translations: [String]?,
+                                            tool: URL?) throws -> [String: Any] {
+        guard let tool else { return ["error": "安装包缺少 Word 文档组件。"] }
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory.appendingPathComponent("dubhe-docx-" + UUID().uuidString)
+        try fm.createDirectory(at: tmp, withIntermediateDirectories: false,
+                               attributes: [.posixPermissions: 0o700])
+        defer { try? fm.removeItem(at: tmp) }
+        var data: [String: Any] = ["document": document]
+        if let translations { data["translations"] = translations }
+        let source = tmp.appendingPathComponent("request.json")
+        try JSONSerialization.data(withJSONObject: data).write(to: source, options: .atomic)
+        let input = try FileHandle(forReadingFrom: source)
+        defer { try? input.close() }
+        let output = Pipe()
+        let task = Process()
+        let preferred = ProcessInfo.processInfo.environment["DUBHE_BACKEND_PYTHON"] ?? ""
+        let python = preferred.isEmpty ? "python3" : preferred
+        let absolute = python.hasPrefix("/")
+        task.executableURL = URL(fileURLWithPath: absolute ? python : "/usr/bin/env")
+        task.arguments = (absolute ? [] : [python]) + ["-I", tool.path]
+        task.standardInput = input
+        task.standardOutput = output
+        task.standardError = FileHandle.nullDevice
+        try task.run()
+        let response = output.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0,
+              let result = try JSONSerialization.jsonObject(with: response) as? [String: Any] else {
+            return ["error": "无法处理 Word 文件。请检查本机 Python 3 和文件格式。"]
+        }
+        return result
     }
 
     // ------------------------------------------------------------ 等就绪

@@ -5,14 +5,18 @@
 #pragma once
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -102,7 +106,6 @@ public:
         std::string h = "HTTP/1.1 " + std::to_string(status) + " " + reason(status) + "\r\n";
         h += "Content-Type: " + content_type + "\r\n";
         h += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-        h += "Access-Control-Allow-Origin: *\r\n";
         h += "Cache-Control: no-store\r\n";
         for (auto& e : extra) h += e.first + ": " + e.second + "\r\n";
         h += "Connection: close\r\n\r\n";
@@ -117,7 +120,6 @@ public:
         std::string h = "HTTP/1.1 200 OK\r\n";
         h += "Content-Type: " + content_type + "\r\n";
         h += "Transfer-Encoding: chunked\r\n";
-        h += "Access-Control-Allow-Origin: *\r\n";
         h += "Cache-Control: no-cache\r\n";
         h += "Connection: close\r\n\r\n";
         write_all(h);
@@ -175,6 +177,7 @@ private:
         size_t off = 0;
         while (off < s.size()) {
             ssize_t n = ::send(fd_, s.data() + off, s.size() - off, 0);
+            if (n < 0 && errno == EINTR) continue;
             if (n <= 0) { broken_ = true; return; }
             off += (size_t)n;
         }
@@ -184,9 +187,16 @@ private:
             case 200: return "OK";
             case 204: return "No Content";
             case 400: return "Bad Request";
+            case 401: return "Unauthorized";
+            case 403: return "Forbidden";
             case 404: return "Not Found";
             case 405: return "Method Not Allowed";
+            case 409: return "Conflict";
+            case 413: return "Content Too Large";
+            case 431: return "Request Header Fields Too Large";
             case 500: return "Internal Server Error";
+            case 503: return "Service Unavailable";
+            case 507: return "Insufficient Storage";
             default:  return "OK";
         }
     }
@@ -194,22 +204,25 @@ private:
     int fd_;
     bool sent_header_ = false;
     bool chunked_ = false;
-    bool broken_ = false;
+    std::atomic<bool> broken_{false};
 };
 
 class Server {
 public:
     using Handler = std::function<void(const Request&, Conn&)>;
+    using Filter = std::function<bool(const Request&, Conn&)>;
 
     void get(const std::string& p, Handler h) { routes_["GET " + p] = std::move(h); }
     void post(const std::string& p, Handler h) { routes_["POST " + p] = std::move(h); }
 
     // 未命中任何路由时调用。用于静态资源通配，避免为每个文件注册一条路由。
     void set_fallback(Handler h) { fallback_ = std::move(h); }
+    void set_filter(Filter f) { filter_ = std::move(f); }
 
     bool listen(const std::string& host, int port) {
         fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd_ < 0) return false;
+        fcntl(fd_, F_SETFD, FD_CLOEXEC);
         int one = 1;
         setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
@@ -236,11 +249,30 @@ public:
                 continue;
             }
             int one = 1;
+            fcntl(cfd, F_SETFD, FD_CLOEXEC);
             setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            const timeval timeout{15, 0};
+            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
             char ipbuf[64] = {0};
             inet_ntop(AF_INET, &cli.sin_addr, ipbuf, sizeof(ipbuf));
             const std::string peer = ipbuf;
-            std::thread([this, cfd, peer] { handle(cfd, peer); }).detach();
+            if (active_.fetch_add(1) >= 64) {
+                active_.fetch_sub(1);
+                Conn(cfd).send(503, "application/json", "{\"error\":\"连接已满，请稍后重试\"}");
+                ::close(cfd);
+                continue;
+            }
+            try {
+                std::thread([this, cfd, peer] {
+                    handle(cfd, peer);
+                    ::close(cfd);
+                    active_.fetch_sub(1);
+                }).detach();
+            } catch (const std::system_error&) {
+                active_.fetch_sub(1);
+                ::close(cfd);
+            }
         }
     }
 
@@ -252,102 +284,104 @@ public:
 
 private:
     void handle(int cfd, const std::string& peer) {
-        std::string raw;
-        char buf[8192];
-        size_t header_end = std::string::npos;
-        size_t content_len = 0;
-        bool have_len = false;
-
-        while (true) {
-            ssize_t n = ::recv(cfd, buf, sizeof(buf), 0);
-            if (n <= 0) { ::close(cfd); return; }
-            raw.append(buf, (size_t)n);
-            if (header_end == std::string::npos) {
-                header_end = raw.find("\r\n\r\n");
-                if (header_end != std::string::npos) {
-                    // 解析 Content-Length
-                    std::string head = raw.substr(0, header_end);
-                    size_t p = head.find("Content-Length:");
-                    if (p == std::string::npos) p = head.find("content-length:");
-                    if (p != std::string::npos) {
-                        content_len = (size_t)std::strtoul(head.c_str() + p + 15, nullptr, 10);
-                        have_len = true;
-                    }
-                }
-            }
-            if (header_end != std::string::npos) {
-                size_t body_have = raw.size() - (header_end + 4);
-                if (!have_len || body_have >= content_len) break;
-            }
-            if (raw.size() > 32u * 1024 * 1024) break;  // 32MB 上限
-        }
-
+        Conn conn(cfd);
         Request req;
         req.remote = peer;
-        size_t line_end = raw.find("\r\n");
-        std::string line = raw.substr(0, line_end);
-        {
-            size_t sp1 = line.find(' ');
-            size_t sp2 = line.find(' ', sp1 + 1);
-            if (sp1 != std::string::npos) {
-                req.method = line.substr(0, sp1);
-                std::string target = (sp2 == std::string::npos) ? line.substr(sp1 + 1)
-                                                                : line.substr(sp1 + 1, sp2 - sp1 - 1);
-                size_t q = target.find('?');
-                if (q == std::string::npos) {
-                    req.path = target;
-                } else {
-                    req.path = target.substr(0, q);
-                    req.query = target.substr(q + 1);
-                }
-            }
-        }
-        size_t p = line_end + 2;
-        while (p < header_end) {
-            size_t e = raw.find("\r\n", p);
-            if (e == std::string::npos || e > header_end) break;
-            std::string h = raw.substr(p, e - p);
-            size_t c = h.find(':');
-            if (c != std::string::npos) {
-                std::string k = h.substr(0, c), v = h.substr(c + 1);
-                while (!v.empty() && v[0] == ' ') v.erase(v.begin());
-                req.headers[k] = v;
-            }
-            p = e + 2;
-        }
-        if (header_end != std::string::npos && have_len) {
-            size_t start = header_end + 4;
-            req.body = raw.substr(start, content_len);
-        }
-
-        Conn conn(cfd);
-        auto it = routes_.find(req.method + " " + req.path);
-        if (it == routes_.end()) {
-            // 兜底：静态资源用一条通配路由接住，不必为每个 .png / .svg 单独注册。
-            // 没有兜底时仍然返回 404 JSON，行为与以前一致。
-            if (fallback_) {
-                try {
-                    fallback_(req, conn);
-                } catch (const std::exception& e) {
-                    conn.send(500, "application/json",
-                              std::string("{\"error\":\"") + e.what() + "\"}");
-                }
-            } else {
-                conn.send(404, "application/json", "{\"error\":\"not found\"}");
-            }
-        } else {
-            try {
-                it->second(req, conn);
-            } catch (const std::exception& e) {
-                conn.send(500, "application/json",
-                          std::string("{\"error\":\"") + e.what() + "\"}");
-            }
+        if (!read_request(cfd, &req, conn)) return;
+        try {
+            if (filter_ && !filter_(req, conn)) return;
+            auto it = routes_.find(req.method + " " + req.path);
+            if (it != routes_.end()) it->second(req, conn);
+            else if (fallback_) fallback_(req, conn);
+            else conn.send(404, "application/json", "{\"error\":\"not found\"}");
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[dubhed] HTTP 请求失败: %s\n", e.what());
+            conn.send(500, "application/json", "{\"error\":\"服务端无法处理该请求\"}");
         }
         conn.end_stream();
-        ::close(cfd);
+    }
+
+    static bool read_request(int fd, Request* req, Conn& conn) {
+        static constexpr size_t kHeadersLimit = 64 * 1024;
+        static constexpr size_t kBodyLimit = 32 * 1024 * 1024;
+        std::string raw;
+        char buffer[8192];
+        auto receive = [&](size_t max_read) {
+            ssize_t n;
+            do { n = recv(fd, buffer, max_read, 0); } while (n < 0 && errno == EINTR);
+            if (n > 0) raw.append(buffer, (size_t)n);
+            return n > 0;
+        };
+        auto bad_request = [&] {
+            conn.send(400, "application/json", "{\"error\":\"请求头或正文长度无效\"}");
+            return false;
+        };
+
+        size_t header_end;
+        while ((header_end = raw.find("\r\n\r\n")) == std::string::npos) {
+            if (raw.size() >= kHeadersLimit) {
+                conn.send(431, "application/json", "{\"error\":\"请求头过大\"}");
+                return false;
+            }
+            if (!receive(sizeof(buffer))) return false;
+        }
+        if (header_end > kHeadersLimit) {
+            conn.send(431, "application/json", "{\"error\":\"请求头过大\"}");
+            return false;
+        }
+
+        const size_t line_end = raw.find("\r\n");
+        const size_t first_space = raw.find(' ');
+        const size_t second_space = raw.find(' ', first_space + 1);
+        if (first_space >= line_end || second_space >= line_end || second_space <= first_space + 1)
+            return bad_request();
+        req->method = raw.substr(0, first_space);
+        const std::string target = raw.substr(first_space + 1, second_space - first_space - 1);
+        if (target.front() != '/') return bad_request();
+        const size_t question = target.find('?');
+        req->path = target.substr(0, question);
+        if (question != std::string::npos) req->query = target.substr(question + 1);
+
+        for (size_t pos = line_end + 2; pos < header_end;) {
+            const size_t end = raw.find("\r\n", pos);
+            const size_t colon = raw.find(':', pos);
+            if (colon == pos || colon >= end) return bad_request();
+            std::string key = raw.substr(pos, colon - pos);
+            for (auto& ch : key) ch = (char)std::tolower((unsigned char)ch);
+            std::string value = raw.substr(colon + 1, end - colon - 1);
+            const size_t start = value.find_first_not_of(" \t");
+            const size_t last = value.find_last_not_of(" \t");
+            value = start == std::string::npos ? "" : value.substr(start, last - start + 1);
+            const bool inserted = req->headers.emplace(key, value).second;
+            if (!inserted && (key == "host" || key == "content-length" || key == "authorization"))
+                return bad_request();
+            pos = end + 2;
+        }
+
+        if (!req->header("transfer-encoding").empty()) return bad_request();
+        const auto length = req->headers.find("content-length");
+        size_t bytes = 0;
+        if (length != req->headers.end()) {
+            const auto& value = length->second;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), bytes);
+            if (result.ec != std::errc() || result.ptr != value.data() + value.size()) return bad_request();
+        }
+        if (bytes > kBodyLimit) {
+            conn.send(413, "application/json", "{\"error\":\"请求正文超过 32 MiB，请缩小附件\"}");
+            return false;
+        }
+        const size_t body_start = header_end + 4;
+        const size_t body_end = body_start + bytes;
+        while (raw.size() < body_end) {
+            if (!receive(std::min(sizeof(buffer), body_end - raw.size()))) return false;
+        }
+        req->body = raw.substr(body_start, bytes);
+        return true;
     }
 
     int fd_ = -1;
+    std::atomic<int> active_{0};
+    Filter filter_;
     std::atomic<bool> running_{false};
     std::map<std::string, Handler> routes_;
     Handler fallback_;

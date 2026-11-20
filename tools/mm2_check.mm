@@ -9,10 +9,12 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -92,6 +94,11 @@ static void cmp(const char* name, const std::vector<float>& ref, const std::vect
     double mx = 0, scale = 0;
     int at = 0;
     for (size_t i = 0; i < ref.size(); i++) {
+        if (!std::isfinite(ref[i]) || !std::isfinite(got[i])) {
+            std::printf("  %-10s ✗ 非有限值 @%zu  ref=%.6f got=%.6f\n", name, i, ref[i], got[i]);
+            g_fail++;
+            return;
+        }
         const double d = std::fabs((double)ref[i] - (double)got[i]);
         scale = std::max(scale, std::fabs((double)ref[i]));
         if (d > mx) { mx = d; at = (int)i; }
@@ -116,6 +123,7 @@ int main(int argc, char** argv) {
         g_dev = MTLCreateSystemDefaultDevice();
         if (!g_dev) { std::printf("没有 Metal 设备\n"); return 1; }
         g_q = [g_dev newCommandQueue];
+        if (!g_q) { std::fprintf(stderr, "无法创建 Metal 命令队列\n"); return 1; }
         NSError* e = nil;
         g_lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:kDubheMSL]
                                     options:[MTLCompileOptions new]
@@ -276,8 +284,10 @@ int main(int argc, char** argv) {
             std::memcpy([bw contents], W.data(), wbytes);
             id<MTLBuffer> yold = buf((size_t)n_out * kBmax * 4);
             id<MTLBuffer> ynew = buf((size_t)n_out * kBmax * 4);
-            std::memset([yold contents], 0, (size_t)n_out * kBmax * 4);
-            std::memset([ynew contents], 0, (size_t)n_out * kBmax * 4);
+            if (!yold || !ynew) { std::fprintf(stderr, "无法分配 Metal 输出缓冲区\n"); return 1; }
+            const float unwritten = std::numeric_limits<float>::quiet_NaN();
+            std::fill_n(static_cast<float*>(yold.contents), (size_t)n_out * kBmax, unwritten);
+            std::fill_n(static_cast<float*>(ynew.contents), (size_t)n_out * kBmax, unwritten);
 
             uint32_t nin = n_in, nout = n_out, nr = nrow;
             uint64_t woff = 0;
@@ -315,6 +325,12 @@ int main(int argc, char** argv) {
             [en endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) {
+                NSError* error = cb.error;
+                std::fprintf(stderr, "  %s 的 Metal 命令执行失败: %s\n", c.newk,
+                             error ? error.localizedDescription.UTF8String : "无可用的命令缓冲区");
+                return 1;
+            }
 
             std::vector<float> a((size_t)n_out * kBmax), b((size_t)n_out * kBmax);
             std::memcpy(a.data(), [yold contents], a.size() * 4);

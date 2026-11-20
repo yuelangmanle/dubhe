@@ -881,6 +881,11 @@
      三块都是独立浮起的玻璃板，中间留缝 —— 这样"三个功能区"在视觉上
      就是三件事，而不是一整块被竖线切开的白板。
      ============================================================ -->
+<main id="shareNotice" class="pane share-notice" hidden>
+  <h1>Dubhe 远程推理</h1>
+  <p id="shareModel" role="status"></p>
+  <p>在 API 客户端使用 <code>/v1</code>，并填写此服务的 API 密钥。</p>
+</main>
 <div id="app" class="desk">
   <div class="scrim" id="scrim"></div>
 
@@ -949,9 +954,12 @@
     <div class="nav-group">
       <div class="nav-group-head">
         <span>工作空间</span>
-        <button id="newChat" class="icon-btn xs" title="新对话" aria-label="新对话">
-          <svg class="i" viewBox="0 0 24 24"><use href="#i-plus"/></svg>
-        </button>
+        <div class="nav-group-actions">
+          <button id="exportHistory" class="act-btn" type="button">导出历史</button>
+          <button id="newChat" class="icon-btn xs" title="新对话" aria-label="新对话">
+            <svg class="i" viewBox="0 0 24 24"><use href="#i-plus"/></svg>
+          </button>
+        </div>
       </div>
       <div id="convList" class="conv-list"></div>
     </div>
@@ -1027,6 +1035,8 @@
     </div>
 
     <div class="composer-wrap">
+      <div id="historyNotice" class="history-notice" role="status" hidden></div>
+      <div id="queuedMessages" class="queued-messages" aria-live="polite" hidden></div>
       <div class="attach-bar hidden" id="attachBar"></div>
       <div class="composer" id="composer">
         <textarea id="input" rows="1" placeholder="输入问题，或拖入文件、图片、视频…" enterkeyhint="send"></textarea>
@@ -1055,6 +1065,9 @@
           </button>
           <button class="cmode" id="btnMode">
             <span>智能模式</span> <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-chevron"/></svg>
+          </button>
+          <button class="send-btn stop" id="stopGeneration" title="停止生成" aria-label="停止生成" hidden>
+            <svg class="i" viewBox="0 0 24 24"><use href="#i-stop"/></svg>
           </button>
           <button class="send-btn" id="send" title="发送" aria-label="发送">
             <svg class="i" viewBox="0 0 24 24"><use href="#i-send"/></svg>

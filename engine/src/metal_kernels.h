@@ -3043,9 +3043,8 @@ kernel void k_gated_rmsnorm(device float* x        [[buffer(0)]],  // [nv][S] �
     }
 }
 
-// MRoPE：和 k_rope 只差一处 —— 频率按 section 重置。
-// [11,11,10,0] 意味着第 11-22 对又从 base^0 开始，不是连续递增。
-// 文本输入下三个 section 的位置相同，所以不需要真的维护三套位置。
+// Text MRoPE uses one position on every axis. Rotate the prefix and
+// copy the rest of each key into the cache without changing it.
 kernel void k_rope_mrope(device float* q        [[buffer(0)]],
                          device const float* k  [[buffer(1)]],
                          device half* kc        [[buffer(2)]],
@@ -3057,24 +3056,23 @@ kernel void k_rope_mrope(device float* q        [[buffer(0)]],
                          constant float& theta  [[buffer(8)]],
                          constant uint& angles  [[buffer(9)]],
                          constant uint& n_rot   [[buffer(10)]],
-                         constant uint& s0      [[buffer(11)]],
-                         constant uint& s1      [[buffer(12)]],
-                         constant uint& s2      [[buffer(13)]],
-                         constant uint& s3      [[buffer(14)]],
                          uint2 gid [[thread_position_in_grid]])
 {
     const uint hh = n_rot >> 1;
-    if (gid.x >= (n_head + n_kvh) * hh) return;
-    const uint h = gid.x / hh;
-    const uint i = gid.x - h * hh;
-    uint j = i;
-    if (i >= s0 && i < s0 + s1) j = i - s0;
-    else if (i >= s0 + s1 && i < s0 + s1 + s2) j = i - s0 - s1;
-    else if (i >= s0 + s1 + s2) j = i - s0 - s1 - s2;
-    const float freq = (i < angles) ? (1.0f / pow(theta, float(2u * j) / float(n_rot))) : 0.0f;
+    const uint width = hd - hh;
+    if (gid.x >= (n_head + n_kvh) * width) return;
+    const uint h = gid.x / width;
+    const uint i = gid.x - h * width;
+    if (i >= hh) {
+        if (h >= n_head) {
+            const uint d = (h - n_head) * hd + i + hh;
+            ((device half*)((device uchar*)kc + koff))[d] = half(k[d]);
+        }
+        return;
+    }
+    const float freq = (i < angles) ? (1.0f / pow(theta, float(2u * i) / float(n_rot))) : 0.0f;
     const float a = float(pos) * freq;
     const float c = cos(a), s = sin(a);
-    const uint qdim = n_head * hd, kdim = n_kvh * hd;
     if (h < n_head) {
         device float* v = q + (ulong)h * hd;
         const float x0 = v[i], x1 = v[i + hh];
@@ -3259,23 +3257,23 @@ kernel void k_rope_mrope_b(device float* q          [[buffer(0)]],
                            constant float& theta    [[buffer(8)]],
                            constant uint& angles    [[buffer(9)]],
                            constant uint& n_rot     [[buffer(10)]],
-                           constant uint& s0        [[buffer(11)]],
-                           constant uint& s1        [[buffer(12)]],
-                           constant uint& s2        [[buffer(13)]],
-                           constant uint& s3        [[buffer(14)]],
                            uint3 gid [[thread_position_in_grid]])   // (i, h, row)
 {
     const uint hh = n_rot >> 1;
     const uint i = gid.x, h = gid.y, r = gid.z;
-    if (i >= hh) return;
-    uint j = i;
-    if (i >= s0 && i < s0 + s1) j = i - s0;
-    else if (i >= s0 + s1 && i < s0 + s1 + s2) j = i - s0 - s1;
-    else if (i >= s0 + s1 + s2) j = i - s0 - s1 - s2;
-    const float freq = (i < angles) ? (1.0f / pow(theta, float(2u * j) / float(n_rot))) : 0.0f;
+    const uint kdim = n_kvh * hd;
+    if (i >= hh) {
+        if (i < hd - hh && h >= n_head) {
+            const uint d = (h - n_head) * hd + i + hh;
+            ((device half*)((device uchar*)kc + coff))[(ulong)(pos0 + r) * kdim + d] =
+                half(k[(ulong)r * kdim + d]);
+        }
+        return;
+    }
+    const float freq = (i < angles) ? (1.0f / pow(theta, float(2u * i) / float(n_rot))) : 0.0f;
     const float a = float(pos0 + r) * freq;
     const float c = cos(a), s = sin(a);
-    const uint qdim = n_head * hd, kdim = n_kvh * hd;
+    const uint qdim = n_head * hd;
     if (h < n_head) {
         device float* v = q + (ulong)r * qdim + (ulong)h * hd;
         const float x0 = v[i], x1 = v[i + hh];

@@ -73,8 +73,13 @@ private:
         skip();
         if (p_ >= s_.size()) return fail("unexpected end");
         char c = s_[p_];
-        if (c == '{') return object(v);
-        if (c == '[') return array(v);
+        if (c == '{' || c == '[') {
+            if (depth_ >= 128) return fail("too many nested values");
+            ++depth_;
+            const bool ok = c == '{' ? object(v) : array(v);
+            --depth_;
+            return ok;
+        }
         if (c == '"') { v->type = Value::STR; return string(&v->str); }
         if (c == 't' || c == 'f') return boolean(v);
         if (c == 'n') return null_value(v);
@@ -90,13 +95,29 @@ private:
         return fail("bad bool");
     }
     bool number(Value* v) {
-        size_t start = p_;
-        if (p_ < s_.size() && (s_[p_] == '-' || s_[p_] == '+')) p_++;
-        while (p_ < s_.size() && (isdigit((unsigned char)s_[p_]) || s_[p_] == '.' || s_[p_] == 'e' ||
-                                  s_[p_] == 'E' || s_[p_] == '-' || s_[p_] == '+')) p_++;
-        if (p_ == start) return fail("bad number");
+        const size_t start = p_;
+        if (s_[p_] == '-') ++p_;
+        auto digits = [&] {
+            const size_t first = p_;
+            while (p_ < s_.size() && s_[p_] >= '0' && s_[p_] <= '9') ++p_;
+            return p_ > first;
+        };
+        if (p_ < s_.size() && s_[p_] == '0') ++p_;
+        else if (!digits()) return fail("bad number");
+        if (p_ < s_.size() && s_[p_] == '.') {
+            ++p_;
+            if (!digits()) return fail("bad fraction");
+        }
+        if (p_ < s_.size() && (s_[p_] == 'e' || s_[p_] == 'E')) {
+            ++p_;
+            if (p_ < s_.size() && (s_[p_] == '+' || s_[p_] == '-')) ++p_;
+            if (!digits()) return fail("bad exponent");
+        }
+        // Preserve the original decimal for round-trip serialization and schema constants.
+        v->str = s_.substr(start, p_ - start);
+        v->num = std::strtod(v->str.c_str(), nullptr);
+        if (!std::isfinite(v->num)) return fail("number outside supported range");
         v->type = Value::NUM;
-        v->num = std::strtod(s_.substr(start, p_ - start).c_str(), nullptr);
         return true;
     }
     bool string(std::string* out) {
@@ -105,6 +126,7 @@ private:
         while (p_ < s_.size()) {
             char c = s_[p_++];
             if (c == '"') return true;
+            if ((unsigned char)c < 0x20) return fail("unescaped control character");
             if (c != '\\') { *out += c; continue; }
             if (p_ >= s_.size()) break;
             char e = s_[p_++];
@@ -177,6 +199,7 @@ private:
 
     const std::string& s_;
     size_t p_ = 0;
+    int depth_ = 0;
     std::string err_;
 };
 
@@ -234,10 +257,14 @@ inline void dump_to(std::string* o, const Value& v) {
         case Value::NUL: *o += "null"; break;
         case Value::BOOL: *o += v.b ? "true" : "false"; break;
         case Value::NUM: {
-            if (std::isfinite(v.num) && v.num == (long long)v.num && std::fabs(v.num) < 1e15) {
+            if (!v.str.empty()) {
+                *o += v.str;
+            } else if (!std::isfinite(v.num)) {
+                *o += "null";
+            } else if (std::fabs(v.num) < 1e15 && v.num == (long long)v.num) {
                 char b[32]; std::snprintf(b, sizeof(b), "%lld", (long long)v.num); *o += b;
             } else {
-                char b[64]; std::snprintf(b, sizeof(b), "%.6g", v.num); *o += b;
+                char b[64]; std::snprintf(b, sizeof(b), "%.17g", v.num); *o += b;
             }
             break;
         }

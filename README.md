@@ -1,8 +1,8 @@
 # 天枢 · Dubhe
 
-> Apple Silicon MacBook 与 Android 手机上的本地大模型推理引擎。GGUF 原生直读，单路与多路都不掉速。
+Apple Silicon 和 Android 上的本地模型运行工具。原生引擎读取 GGUF，包含命令行、HTTP 服务和 macOS 客户端。
 
-状态：**v0.25.0** · M0 已交付（引擎 + CLI + HTTP + Web UI 全链路可跑）· **M1 性能收敛**（prefill 追平 MLX，decode 贴着带宽墙）· **Qwen3.5 混合架构**（Gated DeltaNet + 176K 上下文，decode 15 tok/s / prefill 113 tok/s）· macOS 客户端（双击即开、拖 gguf 换模型、生成完成通知）已落地 · 闭源 · 私有仓库
+当前版本 **0.30.0**。macOS 提供模型商店、对话历史、离线翻译、截图翻译和多模态输入。Android 提供 arm64 原生客户端和 Kotlin SDK。两个客户端的安装包见 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。
 
 ---
 
@@ -11,7 +11,9 @@
 ```bash
 make                        # 零外部依赖，只需要 Xcode 命令行工具
 make check                  # 一条命令自检：加载 → 分词 → 前向 → 生成（GPU + CPU 双路径）
-make optest                 # 7 个 Metal 融合算子逐个和 C 参考实现对拍
+make test                   # 量化、C 接口、下载校验和 Metal 数值对拍
+make integration-test      # HTTP 和真实浏览器回归
+make dmg                   # 本地签名的 macOS 安装包
 
 # 命令行对话
 ./build/dubhe chat -m ~/.dubhe/models/qwen2.5-0.5b-instruct/qwen2.5-0.5b-instruct-q4_k_m.gguf
@@ -19,7 +21,7 @@ make optest                 # 7 个 Metal 融合算子逐个和 C 参考实现�
 # 带 UI 的本地服务（浏览器打开 http://127.0.0.1:7777）
 ./build/dubhed -m <model.gguf>
 
-# 分享给手机 / 局域网（自动生成 API Key）
+# 局域网推理接口（自动生成 API Key）
 ./build/dubhed -m <model.gguf> --share
 ```
 
@@ -174,40 +176,25 @@ HTTP 端到端：图像 6.8 s / 视频 13.1 s / 语音 4.3 s（decode 50–60 to
 
 ## Android
 
-引擎在 Android 上走纯 CPU（NEON + 自建线程池），Metal 换成 stub，
-图像/音频解码暂时也是 stub。交叉编译：
+在 Android 12 及以上 arm64 设备上，可安装原生 App 并通过系统文件选择器导入 GGUF。文件保存在应用目录，引擎在独立进程运行。配套视觉塔与语音塔支持图片、视频和音频输入。
 
 ```bash
-# 一次性：装 NDK
-~/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager "ndk;27.2.12479018"
-
-make PLATFORM=android            # → build-android-arm64-v8a/dubhe（ELF aarch64）
-make PLATFORM=android ANDROID_ABI=armeabi-v7a
+./apps/android/gradlew -p apps/android :app:assembleDebug
+make PLATFORM=android
 ```
 
-产物与本机 `build/` 完全隔离。线程数可用 `DUBHE_THREADS` 覆盖：
-
-```bash
-adb push build-android-arm64-v8a/dubhe /data/local/tmp/
-adb shell chmod 755 /data/local/tmp/dubhe
-adb shell DUBHE_THREADS=4 /data/local/tmp/dubhe run -m model.gguf -p "你好" --stats
-```
-
-模拟器（Android 13 / arm64-v8a / 3 核）实测 0.5B Q4_K_M decode 19.8–25.5 tok/s、
-输出连贯中文 —— **这只证明能跑且正确，性能必须真机重测**。
+APK 位于 `apps/android/app/build/outputs/apk/debug/app-debug.apk`。默认使用 NEON CPU 路径。可通过 `-PdubheVulkan=true` 构建带 Vulkan Q4_K 算子的 APK，或用 `make PLATFORM=android ENABLE_VULKAN=1 test` 编译对应的 NDK 测试。真实设备上的长时间发热和吞吐需要独立测量。
 
 ## 一句话
 
 让个人设备把大模型真正跑起来、跑得久、跑得省，并且不要求用户"先转换一下"。
 
-## 核心主张
+## 当前能力
 
-| 别人的问题 | 我们的做法 |
-| --- | --- |
-| 单路快就多路慢，多路快就单路慢 | 双工况调度（ADRS）+ 分形状 Kernel，两条曲线同时压住 |
-| 手机跑 10 分钟就降频，benchmark 只测前 60 秒 | 热感知控制器，持续 tokens/J 是正式指标 |
-| Mac 上 GGUF 与 MLX 是两套世界 | 三图 IR（Compute / Quant / State），两种格式原生直读 |
-| 只能二选一：速度或正确 | 先过 parity 门禁，再谈性能；过不了就不许提交 |
+- `dubhed --parallel 4` 可把短时间内到达的普通文本请求组成小批，在支持多序列的 Metal 模型上并跑。同一批内的请求各自保存上下文、采样和停止状态。工具、长上下文和不支持的模型继续使用单路。
+- 原生服务器支持 JSON 对象和 JSON Schema 约束输出，采样时就限制输出格式。支持范围见服务说明。
+- 对话历史按条保存在服务数据目录中，端口变化后可继续访问。原浏览器历史会在第一次打开时导入。
+- 模型商店在安装前验证文件大小和 SHA-256。局域网密钥限于推理，文件与工具管理留在本机。
 
 ## 交付物
 
@@ -224,9 +211,9 @@ adb shell DUBHE_THREADS=4 /data/local/tmp/dubhe run -m model.gguf -p "你好" --
 | 批处理 prefill | 权重读一遍喂 8 个 token，激活转置成 `[n_in][8]` 用 `float4` 取 | ✅ M1 |
 | split-K 注意力 | 长上下文按 key 区间切 8 段并行，combine 归并 | ✅ M1 |
 | LFM3 tri-hybrid | ShortConv / QK RMSNorm / sigmoid 输出门 / zero-tail partial RoPE / 滑窗注意力，CPU + Metal 双路径 | ✅ M1 |
-| 苹果 MLX 参考实现 | `tools/mlx_lfm3.py` 补上 mlx-lm 缺失的 lfm3，用于交叉验证与基准 | ✅ M1 |
-| Android | NDK + NEON + NPU | M4 |
-| 双端原生 App | SwiftUI / Compose | M5 |
+| 可选模型后端 | Mac HTTP 服务直读 MLX，Gemma/MoE 经 llama.cpp | 文本对话 |
+| Android | Kotlin/Compose、NDK、NEON，可选 Vulkan Q4_K | APK 和 SDK |
+| macOS App | AppKit + WebKit，App / DMG | 本机打包 |
 
 ## 已实现的量化内核
 
@@ -238,10 +225,9 @@ adb shell DUBHE_THREADS=4 /data/local/tmp/dubhe run -m model.gguf -p "你好" --
 | Q5_0 / Q5_1 | ✅ | ✅ | ✅ | ✅ / — |
 | Q8_0 | ✅ | ✅ | ✅ | ✅ |
 | Q4_K / Q6_K | ✅ | ✅ | ✅ | ✅ |
-| Q5_K | ✅ | ✅ | 待补 | 待补 |
+| Q5_K | ✅ | ✅ | ✅ | ✅ |
 
-全部通过 `tests/test_quant.cpp` 的位解包自检（相对误差 ≤ 1.6e-7）
-与整数路径一致性自检（≤ 9.1e-4，属激活量化噪声）。
+`make test` 对照浮点参考检查位解包，并在 ARM NEON 上检查整数点积。整数测试同时比较相同量化激活的计算误差，并单独度量激活量化造成的偏差。
 
 ## 技术栈
 

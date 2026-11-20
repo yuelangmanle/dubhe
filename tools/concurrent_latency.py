@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import threading
 import time
 import urllib.request
@@ -42,6 +43,7 @@ def one(port: int, prompt: str, idx: int, out: list) -> None:
         "model": "dubhe",
         "stream": True,
         "max_tokens": 60,
+        "temperature": 0,
         "messages": [{"role": "user", "content": prompt}],
     }
     req = urllib.request.Request(
@@ -50,7 +52,7 @@ def one(port: int, prompt: str, idx: int, out: list) -> None:
         headers={"content-type": "application/json"},
     )
     rec = {"idx": idx, "t0": time.time(), "t1": None, "t2": None, "t3": None, "t4": None,
-           "text": "", "err": None}
+           "text": "", "err": None, "tokens": 0, "batch": 0}
     out.append(rec)
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
@@ -68,11 +70,14 @@ def one(port: int, prompt: str, idx: int, out: list) -> None:
                     continue
                 d = j.get("dubhe")
                 if d:
+                    rec["batch"] = max(rec["batch"], d.get("batch_size", 0))
                     if d.get("type") == "queued" and rec["t2"] is None:
                         rec["t2"] = time.time()
                     elif d.get("type") == "error":
                         rec["err"] = d.get("message")
                 ch = j.get("choices") or []
+                if j.get("usage"):
+                    rec["tokens"] = j["usage"].get("completion_tokens", 0)
                 if ch and ch[0].get("delta", {}).get("content"):
                     if rec["t3"] is None:
                         rec["t3"] = time.time()
@@ -102,24 +107,28 @@ def main() -> int:
 
     print(f"{args.n} 个请求同时发出，墙钟 {wall:.0f} ms\n")
     print(f"{'#':>2} {'头':>8} {'排队':>8} {'首字':>8} {'总':>8}  {'空等':>8}  回答")
-    work = 0.0
+    first_token = []
     for r in sorted(out, key=lambda x: x["idx"]):
         t0 = r["t0"]
         head = (r["t1"] - t0) * 1000 if r["t1"] else -1
         queued = (r["t2"] - t0) * 1000 if r["t2"] else None
         ttft = (r["t3"] - t0) * 1000 if r["t3"] else -1
         total = (r["t4"] - t0) * 1000
-        gen = (r["t4"] - r["t3"]) * 1000 if r["t3"] else 0
-        work += gen
+        if r["t3"] is not None:
+            first_token.append(ttft)
         q = f"{queued:.0f}" if queued is not None else "—"
         print(f"{r['idx']:>2} {head:>8.0f} {q:>8} {ttft:>8.0f} {total:>8.0f}  {ttft:>8.0f}  "
               f"{(r['text'] or r['err'] or '')[:34]}")
 
-    print(f"\n真正在生成的时间合计 {work:.0f} ms / 墙钟 {wall:.0f} ms"
-          f" → 并发度 {work / wall:.2f}x")
-    print("并发度 ≈ 1.0 表示完全串行（引擎只有一套 KV，这是预期）；"
-          "> 1 说明多个请求真的在同时解码。")
-    return 0
+    first_token.sort()
+    if first_token:
+        p95 = first_token[math.ceil(len(first_token) * 0.95) - 1]
+        print(f"\n首字 p95 {p95:.0f} ms")
+    tokens = sum(r["tokens"] for r in out)
+    maximum_batch = max((r["batch"] for r in out), default=0)
+    print(f"总输出 {tokens} tokens，吞吐 {tokens * 1000 / wall:.1f} tok/s，"
+          f"最大批次 {max(1, maximum_batch)}")
+    return int(any(r["err"] for r in out))
 
 
 if __name__ == "__main__":

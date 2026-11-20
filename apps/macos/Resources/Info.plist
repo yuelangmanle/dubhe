@@ -40,6 +40,8 @@
     </array>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Dubhe 识别并翻译你框选的截图。</string>
     <key>NSHumanReadableCopyright</key>
     <string>© 2026 Dubhe. All rights reserved.</string>
     <!-- 外壳连的是 http://127.0.0.1。ATS 对 loopback 通常放行，但不同系统

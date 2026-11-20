@@ -89,6 +89,7 @@ bool Tokenizer::init(const GgufFile& f, std::string* err) {
     std::string model = f.get_str("tokenizer.ggml.model", "gpt2");
     is_spm_ = (model == "llama" || model == "spm");
 
+    merges_.clear();
     if (auto* m = f.get("tokenizer.ggml.merges"); m) {
         for (auto& s : m->arr_str) {
             auto sp = s.find(' ');
@@ -102,6 +103,7 @@ bool Tokenizer::init(const GgufFile& f, std::string* err) {
     // 两个用途不一样，分开记：
     //   编码时  两种都要整段匹配，不然 "<tool_call>" 会被拆成散字节
     //   解码时  只有 CONTROL 该剔掉；USER_DEFINED 是内容，必须原样吐出来
+    specials_.clear();
     special_flag_.assign(id_to_token_.size(), 0);
     control_flag_.assign(id_to_token_.size(), 0);
     if (auto* tt = f.get("tokenizer.ggml.token_type"); tt) {
@@ -127,10 +129,8 @@ bool Tokenizer::init(const GgufFile& f, std::string* err) {
                ? (int32_t)f.get_u32("tokenizer.ggml.eos_token_id", 0) : -1;
     add_bos_ = f.get_u32("tokenizer.ggml.add_bos_token", 0) != 0;
 
-    auto it = token_to_id_.find("<|im_start|>");
-    if (it != token_to_id_.end()) im_start_ = it->second;
-    it = token_to_id_.find("<|im_end|>");
-    if (it != token_to_id_.end()) im_end_ = it->second;
+    im_start_ = token_id("<|im_start|>");
+    im_end_ = token_id("<|im_end|>");
 
     return true;
 }
@@ -211,7 +211,16 @@ void Tokenizer::pretokenize(const std::string& text, std::vector<std::string>* o
 
         if (c0 == C_SPACE) {
             size_t j = i;
-            while (j < n && cl(j) == C_SPACE) j += step(j);
+            size_t after_newline = i;
+            while (j < n && cl(j) == C_SPACE) {
+                if (text[j] == '\n' || text[j] == '\r') after_newline = j + 1;
+                j += step(j);
+            }
+            if (after_newline != i) {
+                out->emplace_back(text.substr(i, after_newline - i));
+                i = after_newline;
+                continue;
+            }
             if (j < n) {
                 CharClass c1 = cl(j);
                 if (c1 == C_LETTER || c1 == C_DIGIT) {

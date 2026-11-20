@@ -21,7 +21,12 @@
 
 #include "http.h"
 #include "json.h"
+#include "json_grammar.h"
 #include "calc.h"
+#include "storage.h"
+#include "store.h"
+#include "translation.h"
+#include "model_worker.h"
 
 #include <ifaddrs.h>
 #include <dirent.h>
@@ -47,6 +52,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -56,49 +62,46 @@
 
 namespace {
 
+struct ToolPolicy {
+    std::string workspace;
+    bool allow_shell = true;
+    bool allow_write = true;
+    bool allow_net = true;
+    bool sandbox = true;
+    bool allow_write_outside = false;
+    int max_tool_rounds = 6;
+    int shell_timeout_ms = 20000;
+};
+
+struct ModelStatus {
+    std::string path, id, mmproj;
+    dubhe_model_info info{};
+    int caps = 0;
+    int parallel = 0;
+    bool thinking = false;
+};
+
 struct AppState {
     dubhe_engine* engine = nullptr;
+    std::unique_ptr<ModelWorker> worker;
+    int context = 0, threads = 0, parallel = 4;
     std::string model_path;
     std::string model_id;     // 对外暴露的短模型名
     std::string model_dir;
+    std::string data_dir;
     std::string web_root;
-    std::string workspace;
     std::string api_key;      // 为空表示不校验（仅建议本机使用）
     std::string lan_url;      // 局域网可访问的 base url
     std::string mmproj_path;  // 视觉/语音塔；空表示不支持多模态
     std::string tmp_dir;      // 多模态请求的落地目录
-    // ---- 权限位
-    //
-    // 这几项以前只有"启动参数决定、之后就定死"这一种形态。用户想开终端
-    // 就得重启进程、还得记住 --allow-shell 这个只有源码里才知道的名字 ——
-    // 实际上等于没有权限设置。现在它们可以在运行期从 UI 改，改完立刻生效。
-    //
-    // 默认值改了：shell / net 默认**开**。理由是这是个本机单用户工具，
-    // "模型说我没有执行命令的权限、而界面上又找不到地方能开"是用户实际
-    // 报上来的问题；真正的风险由 sandbox 兜（写盘只允许落在工作区与 /tmp，
-    // 命令有超时和输出上限）。要收紧就在设置里关掉，或者启动时用
-    // --no-shell / --no-net 强制关。
-    bool allow_shell = true;    // 执行 shell 命令
-    bool allow_write = true;    // 写文件 / 改文件
-    bool allow_net = true;      // 联网（web_search / fetch_url）
-    bool sandbox = true;        // shell 用 seatbelt 限制写盘范围
-    // 一次提问里最多跑几轮工具。
-    //
-    // 原来是写死的 2。2 轮只够"读文件 → 回答"，而实际任务经常是
-    // "grep 找位置 → 读那一处 → 再读一个相关文件 → 改 → 回答"，第三轮就被
-    // 掐断，用户拿到的是"已达 2 轮上限"加一坨没消化完的材料。上限本身是必要
-    // 的（2B 模型看到工具结果会反复要工具），但 2 太紧；改成可调，默认 6，
-    // 同时保留"同一个工具同样的参数连调两次就停"的原地打转保护。
-    int max_tool_rounds = 6;
+    ToolPolicy policy;
+    std::mutex policy_mu;
+    ModelStatus model_status;
+    std::mutex model_status_mu;
+    bool force_no_shell = false, force_no_write = false, force_no_net = false;
     // 纯算式短路（见 try_arith）。默认开：算术有唯一正确答案，交给模型算
     // 只会得到"自信的错"。真要看模型怎么算，用 --no-arith 关掉。
     int no_arith_fastpath = 0;
-    // 写域默认只到当前项目文件夹。读可以看整个家目录（模型权重就在
-    // ~/.dubhe 下，读不到等于残废），但"能读"和"能改"不该是同一个范围 ——
-    // 这是 DeepSeek Harness 的 workspace-write 默认值，也是用户把文件夹
-    // 绑成项目文件夹时预期的语义。要放开就在设置里打开。
-    bool allow_write_outside = false;
-    int  shell_timeout_ms = 20000;
     // ---- 逐次审批
     //
     // 工具循环里遇到 gate() 的 Ask，要停下来等用户点"允许/拒绝"。
@@ -113,12 +116,52 @@ struct AppState {
     std::atomic<long long> ask_seq{0};
     std::mutex mu;
     std::atomic<bool> busy{false};
-    long long total_requests = 0;
-    long long total_tokens = 0;
-    double last_decode_tps = 0;
+    std::atomic<long long> total_requests{0};
+    std::atomic<long long> total_tokens{0};
+    std::atomic<double> last_decode_tps{0};
 };
 
 AppState g;
+thread_local ToolPolicy request_policy;
+thread_local bool request_is_local = false;
+
+void capture_policy() {
+    std::lock_guard<std::mutex> lock(g.policy_mu);
+    request_policy = g.policy;
+}
+
+void read_policy(const json::Value& data, ToolPolicy* policy) {
+    policy->allow_shell = data.flag("shell", policy->allow_shell);
+    policy->allow_write = data.flag("write", policy->allow_write);
+    policy->allow_net = data.flag("net", policy->allow_net);
+    policy->sandbox = data.flag("sandbox", policy->sandbox);
+    policy->allow_write_outside = data.flag("write_outside", policy->allow_write_outside);
+    const double timeout = data.n("shell_timeout_s", 0);
+    if (timeout >= 1 && timeout <= 600) policy->shell_timeout_ms = (int)(1000 * timeout);
+    const double rounds = data.n("tool_rounds", 0);
+    if (rounds >= 1 && rounds <= 24) policy->max_tool_rounds = (int)rounds;
+    policy->allow_shell = policy->allow_shell && !g.force_no_shell;
+    policy->allow_write = policy->allow_write && !g.force_no_write;
+    policy->allow_net = policy->allow_net && !g.force_no_net;
+}
+
+json::Value policy_json(const ToolPolicy& policy) {
+    json::Value out = json::Value::make_obj();
+    out.set("workspace", json::Value::make_str(policy.workspace));
+    out.set("shell", json::Value::make_bool(policy.allow_shell));
+    out.set("write", json::Value::make_bool(policy.allow_write));
+    out.set("net", json::Value::make_bool(policy.allow_net));
+    out.set("sandbox", json::Value::make_bool(policy.sandbox));
+    out.set("write_outside", json::Value::make_bool(policy.allow_write_outside));
+    out.set("shell_timeout_s", json::Value::make_num(policy.shell_timeout_ms / 1000.0));
+    out.set("tool_rounds", json::Value::make_num(policy.max_tool_rounds));
+    return out;
+}
+
+ModelStatus model_status() {
+    std::lock_guard<std::mutex> lock(g.model_status_mu);
+    return g.model_status;
+}
 
 // 取本机局域网 IPv4（用于"分享给手机用"）
 std::string lan_ip() {
@@ -185,13 +228,13 @@ std::string path_dir(const std::string& p) {
 
 // 相对路径按工作区解析；~ 展开成家目录
 std::string path_abs(const std::string& p) {
-    if (p.empty() || p == "." || p == "./") return g.workspace;
+    if (p.empty() || p == "." || p == "./") return request_policy.workspace;
     if (p[0] == '~') {
         const char* h = getenv("HOME");
         return std::string(h ? h : "") + p.substr(1);
     }
     if (p[0] == '/') return p;
-    return path_join(g.workspace, p);
+    return path_join(request_policy.workspace, p);
 }
 
 // 白名单根：工作区、模型目录、家目录下的 .dubhe。realpath 之后比较。
@@ -207,12 +250,13 @@ bool path_allowed(const std::string& p) {
         else return false;
     }
     const char* h = getenv("HOME");
-    std::vector<std::string> roots = {g.workspace};
+    std::vector<std::string> roots = {request_policy.workspace};
     if (h) {
         roots.push_back(std::string(h));
         roots.push_back(std::string(h) + "/.dubhe");
     }
     if (!g.model_dir.empty()) roots.push_back(g.model_dir);
+    if (!g.data_dir.empty()) roots.push_back(g.data_dir);
     if (!g.tmp_dir.empty()) roots.push_back(g.tmp_dir);
     for (const auto& r : roots) {
         if (r.empty()) continue;
@@ -311,7 +355,7 @@ std::unordered_map<std::string, std::vector<std::pair<int, int>>> g_kb_post;  //
 double g_kb_avg = 1.0;
 std::mutex g_kb_mu;
 bool g_kb_loaded = false;
-bool g_kb_rag = true;   // 是否把检索结果自动注入对话
+std::atomic<bool> g_kb_rag{true};   // 是否把检索结果自动注入对话
 
 std::vector<std::string> kb_tokenize(const std::string& s) {
     std::vector<std::string> out;
@@ -383,8 +427,7 @@ std::vector<std::pair<size_t, std::string>> kb_split(const std::string& text) {
 }
 
 std::string kb_manifest_path() {
-    const char* h = getenv("HOME");
-    return std::string(h ? h : "/tmp") + "/.dubhe/kb/docs.tsv";
+    return g.data_dir + "/kb/docs.tsv";
 }
 
 void kb_save_manifest() {
@@ -636,7 +679,7 @@ std::string kb_context_for(const std::string& q, int topk) {
 
 std::string random_key() {
     static const char* cs = "abcdefghijkmnopqrstuvwxyz23456789";
-    std::mt19937_64 rng(std::random_device{}());
+    std::random_device rng;
     std::uniform_int_distribution<int> d(0, 31);
     std::string s = "sk-dubhe-";
     for (int i = 0; i < 24; i++) s += cs[d(rng)];
@@ -757,20 +800,18 @@ bool seatbelt_works() {
         if (!ok) {
             std::fprintf(stderr,
                          "[dubhe] seatbelt 不可用（sandbox_apply 被拒绝），"
-                         "shell 将裸跑，写盘限制不生效\n");
+                         "要求隔离的命令将被拒绝\n");
         }
     });
     return ok;
 }
 
 // 实际生效的沙箱状态 = 用户开了 且 本机套得上。给 /api/state 和工具用同一个口径。
-bool sandbox_active() { return g.sandbox && seatbelt_works(); }
+bool sandbox_active() { return request_policy.sandbox && seatbelt_works(); }
 
 ProcOut run_proc(const std::string& cmd, const std::string& cwd,
                  int timeout_ms, size_t max_bytes, bool sandbox_writes) {
     ProcOut r;
-    int fds[2];
-    if (pipe(fds) != 0) { r.out = "无法创建管道"; return r; }
 
     // 沙箱：只允许写工作区与临时目录。
     //
@@ -778,33 +819,40 @@ ProcOut run_proc(const std::string& cmd, const std::string& cwd,
     // 额外安装的写盘隔离手段。deny default 太脆（连 dylib 都读不到），
     // 所以这里保留全盘可读、只收紧写 —— 对"模型把用户文件改坏"这一类
     // 事故是有效的，对"模型读到敏感文件"无效。想连读也收紧就自己改 profile。
-    std::string wrapped = cmd;
+    std::string wrapped = "/bin/sh -c " + shell_quote(cmd);
+    struct Profile {
+        char path[32] = "/tmp/dubhe-sb-XXXXXX";
+        bool exists = false;
+        ~Profile() { if (exists) unlink(path); }
+    } profile;
     if (sandbox_writes) {
-        char tmpl[] = "/tmp/dubhe-sb-XXXXXX";
-        const int fd = mkstemp(tmpl);
-        if (fd >= 0) {
-            const std::string prof =
-                "(version 1)\n(allow default)\n"
-                "(deny file-write*)\n"
-                "(allow file-write* (subpath \"" + g.workspace + "\"))\n"
-                "(allow file-write* (subpath \"" + (g.tmp_dir.empty() ? "/tmp" : g.tmp_dir) + "\"))\n"
-                "(allow file-write* (subpath \"/private/tmp\"))\n"
-                "(allow file-write* (subpath \"/private/var/folders\"))\n";
-            if (write(fd, prof.data(), prof.size()) == (ssize_t)prof.size()) {
-                close(fd);
-                wrapped = "/usr/bin/sandbox-exec -f " + std::string(tmpl) + " /bin/sh -c " +
-                          shell_quote(cmd);
-            } else {
-                close(fd);
-                unlink(tmpl);
-                wrapped = "/bin/sh -c " + shell_quote(cmd);
-            }
-        } else {
-            wrapped = "/bin/sh -c " + shell_quote(cmd);
+        if (!seatbelt_works()) { r.out = "命令隔离不可用，已停止执行"; return r; }
+        const int fd = mkstemp(profile.path);
+        if (fd < 0) { r.out = "无法初始化命令隔离"; return r; }
+        profile.exists = true;
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+        auto quoted = [](const std::string& path) {
+            return json::dump(json::Value::make_str(path));
+        };
+        const std::string prof =
+            "(version 1)\n(allow default)\n"
+            "(deny file-write*)\n"
+            "(allow file-write* (subpath " + quoted(request_policy.workspace) + "))\n"
+            "(allow file-write* (subpath " + quoted(g.tmp_dir) + "))\n"
+            "(allow file-write* (subpath \"/private/tmp\"))\n"
+            "(allow file-write* (subpath \"/private/var/folders\"))\n";
+        const bool written = write(fd, prof.data(), prof.size()) == (ssize_t)prof.size();
+        close(fd);
+        if (!written) {
+            r.out = "无法写入命令隔离配置";
+            return r;
         }
-    } else {
-        wrapped = "/bin/sh -c " + shell_quote(cmd);
+        wrapped = "/usr/bin/sandbox-exec -f " + shell_quote(profile.path) + " " + wrapped;
     }
+    int fds[2];
+    if (pipe(fds) != 0) { r.out = "无法创建管道"; return r; }
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
 
     // 环境变量只留必要的。把服务端进程的全部环境（包括 --api-key、各种
     // token）交给模型生成的命令，等于把密钥交给一段自己看不懂的文本。
@@ -814,7 +862,7 @@ ProcOut run_proc(const std::string& cmd, const std::string& cwd,
         "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         "LANG=en_US.UTF-8",
         "TERM=dumb",
-        "DUBHE_SANDBOXED=1",
+        sandbox_writes ? "DUBHE_SANDBOXED=1" : "DUBHE_SANDBOXED=0",
     };
     if (!home.empty()) envs.push_back("HOME=" + home);
     std::vector<char*> sh_argv;
@@ -836,7 +884,7 @@ ProcOut run_proc(const std::string& cmd, const std::string& cwd,
         dup2(fds[1], STDOUT_FILENO);
         dup2(fds[1], STDERR_FILENO);   // 错误也要能看到，否则失败信息全丢
         close(fds[1]);
-        if (!cwd.empty()) { if (chdir(cwd.c_str()) != 0) { /* 落回继承的 cwd */ } }
+        if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(126);
         // 注意：fork 之后**不能**再做堆分配。这是个多线程服务，别的线程
         // 可能正握着 malloc 的锁，子进程一分配就会永久卡住。所以环境数组
         // 在 fork 之前就拼好（见上面的 envs/envp）。
@@ -895,7 +943,6 @@ ProcOut run_proc(const std::string& cmd, const std::string& cwd,
     close(fds[0]);
     if (WIFEXITED(status)) r.exit_code = WEXITSTATUS(status);
     else if (WIFSIGNALED(status)) r.exit_code = 128 + WTERMSIG(status);
-    if (sandbox_writes) { /* 临时 profile 由系统回收，/tmp 下的残留无害 */ }
     return r;
 }
 
@@ -1025,7 +1072,7 @@ std::vector<WebHit> web_search_hits(const std::string& q, int n) {
     const std::string url = "https://html.duckduckgo.com/html/?q=" + qs;
     ProcOut po = run_proc("curl -sSL --compressed -m 20 -A 'Mozilla/5.0 (Macintosh)' " +
                               shell_quote(url),
-                          g.workspace, 25000, 2 * 1024 * 1024, false);
+                          request_policy.workspace, 25000, 2 * 1024 * 1024, false);
     std::vector<WebHit> hits;
     if (po.out.empty()) return hits;
 
@@ -1117,7 +1164,7 @@ std::string localize_query(std::string q) {
 std::string fetch_page_text(const std::string& url, size_t limit) {
     const std::string cmd =
         "curl -sSL --compressed -m 12 -A 'Mozilla/5.0 (Dubhe)' " + shell_quote(url);
-    ProcOut po = run_proc(cmd, g.workspace, 15000, 512 * 1024, false);
+    ProcOut po = run_proc(cmd, request_policy.workspace, 15000, 512 * 1024, false);
     std::string t = html_to_text(po.out);
 
     // 丢掉导航栏。
@@ -1244,11 +1291,11 @@ GateOut gate(const std::string& name, const json::Value& args, bool approved = f
                                 name == "edit_file");
 
     // ---- 权限位
-    if (is_write && !g.allow_write)
+    if (is_write && !request_policy.allow_write)
         return gate_deny("写文件权限已关闭（设置 → 权限 → 允许写文件）");
-    if (name == "shell" && !g.allow_shell)
+    if (name == "shell" && !request_policy.allow_shell)
         return gate_deny("shell 工具未启用。在界面「设置 → 权限」里打开「允许执行命令」即可。");
-    if ((name == "fetch_url" || name == "web_search") && !g.allow_net)
+    if ((name == "fetch_url" || name == "web_search") && !request_policy.allow_net)
         return gate_deny("联网权限已关闭（设置 → 权限 → 允许联网）");
 
     // ---- 必填键
@@ -1310,11 +1357,11 @@ GateOut gate(const std::string& name, const json::Value& args, bool approved = f
 
     // ---- 路径域
     if (has_path) {
-        const std::string p = path_abs(args.s("path", g.workspace));
+        const std::string p = path_abs(args.s("path", request_policy.workspace));
         if (p.find("..") != std::string::npos) return gate_deny("路径里不能有 ..");
         if (!path_allowed(p)) return gate_deny("路径不在允许范围内: " + p);
-        if (is_write && !g.allow_write_outside) {
-            bool ok = under_root(p, g.workspace);
+        if (is_write && !request_policy.allow_write_outside) {
+            bool ok = under_root(p, request_policy.workspace);
             if (!ok) {
                 const char* h = getenv("HOME");
                 // ~/.dubhe 是应用自己的目录（配置、临时落地），写它不算越界
@@ -1438,7 +1485,7 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
     if (name == "list_dir") {
         // 不再 shell 出去调 ls：一是没开 shell 权限时它就不该依赖 shell，
         // 二是 `ls -la "路径"` 里路径带双引号、反引号就能注入。
-        std::string p = path_abs(args.s("path", g.workspace));
+        std::string p = path_abs(args.s("path", request_policy.workspace));
         DIR* d = opendir(p.c_str());
         if (!d) { r.output = "无法打开目录: " + p; return r; }
         std::vector<std::string> dirs, files;
@@ -1519,14 +1566,14 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
         // 递归文本搜索。用 /usr/bin/grep 而不是自己写：它已经处理了二进制
         // 检测、编码、正则方言，自己写只会更慢更错。
         const std::string pat = args.s("pattern");
-        std::string base = path_abs(args.s("path", g.workspace));
+        std::string base = path_abs(args.s("path", request_policy.workspace));
         int limit = (int)args.n("limit", 60);
         if (limit <= 0) limit = 60;
         std::string cmd = "grep -rnI --exclude-dir=.git --exclude-dir=node_modules "
                           "--exclude-dir=build --exclude-dir=.build "
                           "-m " + std::to_string(limit) + " -e " + shell_quote(pat) + " " +
                           shell_quote(base) + " 2>&1 | head -" + std::to_string(limit);
-        ProcOut po = run_proc(cmd, g.workspace, 15000, 48 * 1024, false);
+        ProcOut po = run_proc(cmd, request_policy.workspace, 15000, 48 * 1024, false);
         r.ok = true;
         r.output = po.out.empty() ? ("没有匹配: " + pat) : po.out;
         int hits = 0;
@@ -1541,7 +1588,7 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
     }
     if (name == "glob") {
         const std::string pat = args.s("pattern");
-        std::string base = path_abs(args.s("path", g.workspace));
+        std::string base = path_abs(args.s("path", request_policy.workspace));
         // find -name 只支持 glob，不支持 **。这里把 ** 折成"任意深度"，
         // 也就是去掉路径前缀里的 **/，剩下的交给 -name。
         std::string name_pat = pat;
@@ -1550,7 +1597,7 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
         std::string cmd = "find " + shell_quote(base) +
                           " -maxdepth 6 -type f -name " + shell_quote(name_pat) +
                           " 2>/dev/null | head -200";
-        ProcOut po = run_proc(cmd, g.workspace, 15000, 48 * 1024, false);
+        ProcOut po = run_proc(cmd, request_policy.workspace, 15000, 48 * 1024, false);
         r.ok = true;
         r.output = po.out.empty() ? ("没有匹配的文件: " + pat) : po.out;
         int hits = 0;
@@ -1607,7 +1654,7 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
         // -L 跟随跳转，-m 限时，--compressed 省流量。
         std::string cmd = "curl -sSL --compressed -m 20 -A 'Mozilla/5.0 (Dubhe)' " +
                           shell_quote(url);
-        ProcOut po = run_proc(cmd, g.workspace, 25000, 512 * 1024, false);
+        ProcOut po = run_proc(cmd, request_policy.workspace, 25000, 512 * 1024, false);
         r.ok = po.exit_code == 0;
         r.output = html_to_text(po.out);
         if (r.output.empty()) r.output = "抓取失败或内容为空";
@@ -1668,26 +1715,20 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
     }
     if (name == "shell" || name == "bash" || name == "terminal") {
         const std::string cmd = args.s("command");
-        const std::string cwd = args.s("cwd", g.workspace);
-        const bool sb = sandbox_active();   // 探过一次就缓存，不再每条命令 fork 两次
-        ProcOut po = run_proc(cmd, cwd.empty() ? g.workspace : cwd,
-                              g.shell_timeout_ms, 96 * 1024, sb);
-        // 探测说套得上、真跑时却还是 71 —— 说明这个 profile 本身被拒（例如
-        // workspace 路径里有沙箱解析不了的东西）。这时候命令没执行，退一步
-        // 裸跑，并把"未隔离"记到 meta 里让界面显示。
-        bool no_sandbox = !sb;
-        if (sb && po.exit_code == 71 && po.out.find("sandbox_apply") != std::string::npos) {
-            po = run_proc(cmd, cwd.empty() ? g.workspace : cwd,
-                          g.shell_timeout_ms, 96 * 1024, false);
-            no_sandbox = true;
+        const std::string cwd = path_abs(args.s("cwd", request_policy.workspace));
+        if (!is_dir_p(cwd) || !path_allowed(cwd)) {
+            r.output = "命令的工作目录不存在或不在允许的范围内";
+            return r;
         }
+        const bool sb = request_policy.sandbox;
+        ProcOut po = run_proc(cmd, cwd, request_policy.shell_timeout_ms, 96 * 1024, sb);
         r.ok = (po.exit_code == 0) && !po.timed_out;
         r.output = po.out;
         // 不再把这句提示塞进 output。output 是模型眼里的 stdout，前面挂一段
         // 中文告警会让它把告警当成命令输出的一部分（实测它会引用"当前环境
         // 不支持…"来回答"这条命令输出了什么"）。隔离状态走 meta，界面画徽章。
         if (po.timed_out) {
-            r.output += "\n[超时] 命令超过 " + std::to_string(g.shell_timeout_ms / 1000) +
+            r.output += "\n[超时] 命令超过 " + std::to_string(request_policy.shell_timeout_ms / 1000) +
                         " 秒被终止。拆小一点，或者只跑必要的那一步。";
         }
         if (po.truncated) r.output += "\n[截断] 输出超过 96 KB，只保留了前面部分。";
@@ -1695,11 +1736,11 @@ ToolResult run_tool(const std::string& name, const json::Value& args, bool appro
         else if (!po.out.empty()) r.output += "\n[退出码 " + std::to_string(po.exit_code) + "]";
         r.card = "terminal";
         r.meta.set("command", json::Value::make_str(cmd));
-        r.meta.set("cwd", json::Value::make_str(cwd.empty() ? g.workspace : cwd));
+        r.meta.set("cwd", json::Value::make_str(cwd));
         r.meta.set("exit", json::Value::make_num(po.exit_code));
         r.meta.set("timed_out", json::Value::make_bool(po.timed_out));
         r.meta.set("truncated", json::Value::make_bool(po.truncated));
-        r.meta.set("no_sandbox", json::Value::make_bool(no_sandbox));
+        r.meta.set("no_sandbox", json::Value::make_bool(!sb));
         return r;
     }
     r.output = "未知工具: " + name;
@@ -1786,8 +1827,8 @@ std::string tool_prompt() {
         // 必须明确"逐字照抄、不许改写"，小模型才可能照做。
         "工具返回里的数字、日期、时间、路径必须**逐字照抄**到回答中，"
         "一个字符都不许改；不确定就原样引用，不要转述。";
-    if (!g.workspace.empty()) {
-        s += "\n当前工作目录是 " + g.workspace + "，相对路径都以它为根。";
+    if (!request_policy.workspace.empty()) {
+        s += "\n当前工作目录是 " + request_policy.workspace + "，相对路径都以它为根。";
     }
     return s;
 }
@@ -2039,11 +2080,16 @@ bool load_media(const std::string& url, std::string* bytes, std::string* ext,
         if (bytes->empty()) { if (err) *err = "data URL 里没有数据"; return false; }
         return true;
     }
-    std::ifstream f(url, std::ios::binary);
+    const std::string full = path_abs(url);
+    if (!request_is_local || !path_allowed(full) || !is_file_p(full)) {
+        if (err) *err = "媒体文件不可读，请直接上传附件";
+        return false;
+    }
+    std::ifstream f(full, std::ios::binary);
     if (!f) { if (err) *err = "读不了这个路径: " + url; return false; }
     bytes->assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-    const size_t dot = url.find_last_of('.');
-    *ext = dot == std::string::npos ? ".bin" : url.substr(dot);
+    const size_t dot = full.find_last_of('.');
+    *ext = dot == std::string::npos ? ".bin" : full.substr(dot);
     return !bytes->empty();
 }
 
@@ -2214,7 +2260,9 @@ struct GgufReader {
     }
 };
 
-std::string gguf_meta_string(const std::string& path, const std::string& key) {
+std::string gguf_meta_string(const std::string& path, const std::string& key,
+                             bool* positive_count = nullptr) {
+    if (positive_count) *positive_count = false;
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return {};
     std::string out;
@@ -2241,8 +2289,16 @@ std::string gguf_meta_string(const std::string& path, const std::string& key) {
         uint32_t t = 0;
         if (!r.str(&k)) break;
         if (!r.rd(&t, 4)) break;
-        if (k == key && t == 8) {
-            r.str(&out);
+        if (k == key) {
+            if (t == 8) r.str(&out);
+            if (positive_count && (t == 4 || t == 5)) {
+                uint32_t count = 0;
+                *positive_count = r.rd(&count, sizeof(count)) && count > 0;
+            }
+            if (positive_count && (t == 10 || t == 11)) {
+                uint64_t count = 0;
+                *positive_count = r.rd(&count, sizeof(count)) && count > 0;
+            }
             break;
         }
         if (!r.skip(t)) break;
@@ -2773,8 +2829,12 @@ static PromptCache g_pcache;
 // force_raw：不加 chat 模板，直接续写。语音模型特别吃这一套 —— 见下面的判定。
 bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, bool with_tools,
                   bool force_raw, std::vector<int32_t>* toks, MmCache* cache,
-                  std::string* err) {
+                  std::string* err, bool* transcribing = nullptr) {
     std::vector<MediaPart> media;
+    struct TempMedia {
+        const std::vector<MediaPart>& items;
+        ~TempMedia() { for (const auto& item : items) unlink(item.path.c_str()); }
+    } cleanup{media};
     json::Value flat = flatten_messages(messages, &media, err);
     if (flat.type != json::Value::ARR) return false;
 
@@ -2801,27 +2861,27 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
         }
     }
 
-    // 只给了一段音频、一个字都没打 —— 用户要的就是转写。
-    // 这时候走 chat 模板反而害事：LFM3-Audio 进了对话状态后会把音频当成
-    // "待推理的问题"，输出 "We need to answer the question: …" 这种分析过程，
-    // 转写被埋在里面。不加模板直接续写，第一句就是转写正文。
-    bool raw = force_raw;
-    if (!raw && media.size() == 1 && media[0].kind == "audio") {
-        std::string t;
-        for (auto& m : flat.arr)
-            if (m.s("role") == "user") t = m.s("content");
-        for (const char* ph : {"<|audio|>", "<|image|>", "<|video|>"}) {
-            size_t p;
-            while ((p = t.find(ph)) != std::string::npos) t.erase(p, std::strlen(ph));
+    // 只上传音频视为转写。LFM3-Audio 的整段输入使用它的 ASR 对话模式；
+    // 媒体不附指令时直接续写裸占位符会产生与录音无关的文本。
+    bool asr = false;
+    if (!force_raw && chatml && media.size() == 1 && media[0].kind == "audio") {
+        for (const auto& message : flat.arr) {
+            if (message.s("role") != "user") continue;
+            std::string text = message.s("content");
+            const size_t marker = text.find("<|audio|>");
+            if (marker != std::string::npos) text.erase(marker, sizeof("<|audio|>") - 1);
+            asr = text.find_first_not_of(" \t\r\n") == std::string::npos;
         }
-        const size_t a = t.find_first_not_of(" \t\r\n");
-        raw = (a == std::string::npos);
     }
-
+    if (transcribing) *transcribing = asr;
+    const bool raw = force_raw || asr;
     std::string prompt;
-    if (raw) {
-        for (auto& m : flat.arr)
-            if (m.s("role") == "user") prompt = m.s("content");
+    if (asr) {
+        prompt = "<|im_start|>system\nPerform ASR.<|im_end|>\n"
+                 "<|im_start|>user\n<|audio|><|im_end|>\n<|im_start|>assistant\n";
+    } else if (force_raw) {
+        for (const auto& message : flat.arr)
+            if (message.s("role") == "user") prompt = message.s("content");
     } else {
         // ---- 知识库：把检索到的片段拼在**最后一条用户消息前面**。
         // 只在纯文本 + 非 raw 时做 —— 多模态的 prompt 里带 <|image|> 占位符，
@@ -2838,7 +2898,7 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
         // 当成任务，回的是"我们需要执行 read_file……"然后一个工具都不调；
         // 关掉 RAG 同一句话 1.45 秒就正确调用。1.7B 这种规模一次只能抓住
         // 一个意图，而工具模式下"去读真实内容"本来就比"复述旧片段"更对。
-        if (g_kb_rag && media.empty() && !with_tools) {
+        if (request_is_local && g_kb_rag && media.empty() && !with_tools) {
             std::string last_user;
             size_t last_idx = 0;
             bool has_last = false;
@@ -2948,9 +3008,6 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
         cache->valid = true;
         dubhe_free_embeds(emb);
     }
-    // 特征已经拷进内存，临时文件可以删了（base64 的图动辄几 MB，不删会攒满 /tmp）
-    for (auto& mp : media) std::remove(mp.path.c_str());
-
     const char* ph = (cache->kind == "image") ? "<|image|>"
                      : (cache->kind == "video" ? "<|video|>" : "<|audio|>");
     int32_t at = 0;
@@ -3056,6 +3113,90 @@ void emit_delta(StreamCtx* x, const std::string& delta) {
     x->first = false;
     x->visible += delta.size();
 }
+
+class CompletionReply {
+public:
+    CompletionReply(http::Conn& conn, std::string id, std::string model, long long created,
+                    bool stream, int parallel = 0)
+        : conn_(conn), id_(std::move(id)), model_(std::move(model)), created_(created),
+          stream_(stream), parallel_(parallel) {}
+
+    void append(std::string_view bytes) {
+        pending_ += bytes;
+        const size_t keep = utf8_incomplete_tail(pending_);
+        const auto text = pending_.substr(0, pending_.size() - keep);
+        pending_.erase(0, text.size());
+        if (text.empty()) return;
+        if (!stream_) { output_ += text; return; }
+        ensure_stream();
+        json::Value delta = json::Value::make_obj();
+        delta.set("content", json::Value::make_str(text));
+        json::Value choice = json::Value::make_obj();
+        choice.set("index", json::Value::make_num(0));
+        choice.set("finish_reason", json::Value{});
+        choice.set("delta", std::move(delta));
+        emit(std::move(choice), nullptr);
+    }
+
+    void finish(const std::string& reason, const dubhe_stats& stats) {
+        g.last_decode_tps = stats.decode_tps;
+        g.total_requests++;
+        g.total_tokens += stats.n_generated;
+        json::Value choice = json::Value::make_obj();
+        choice.set("index", json::Value::make_num(0));
+        choice.set("finish_reason", json::Value::make_str(reason));
+        if (stream_) {
+            ensure_stream();
+            choice.set("delta", json::Value::make_obj());
+        } else {
+            json::Value msg = json::Value::make_obj();
+            msg.set("role", json::Value::make_str("assistant"));
+            msg.set("content", json::Value::make_str(std::move(output_)));
+            choice.set("message", std::move(msg));
+        }
+        json::Value usage = json::Value::make_obj();
+        usage.set("prompt_tokens", json::Value::make_num(stats.n_prompt));
+        usage.set("completion_tokens", json::Value::make_num(stats.n_generated));
+        usage.set("total_tokens", json::Value::make_num((double)stats.n_prompt + stats.n_generated));
+        usage.set("decode_tps", json::Value::make_num(stats.decode_tps));
+        emit(std::move(choice), &usage);
+        if (stream_) {
+            conn_.write_chunk("data: [DONE]\n\n");
+            conn_.end_stream();
+        }
+    }
+
+    bool cancelled() const { return conn_.peer_gone(); }
+
+private:
+    void ensure_stream() { if (!conn_.header_sent()) conn_.begin_stream(); }
+    void emit(json::Value choice, const json::Value* usage) {
+        json::Value root = json::Value::make_obj();
+        root.set("id", json::Value::make_str(id_));
+        root.set("object", json::Value::make_str(stream_ ? "chat.completion.chunk" : "chat.completion"));
+        root.set("created", json::Value::make_num((double)created_));
+        root.set("model", json::Value::make_str(model_));
+        json::Value choices = json::Value::make_arr();
+        choices.arr.push_back(std::move(choice));
+        root.set("choices", std::move(choices));
+        if (usage) root.set("usage", *usage);
+        if (parallel_ > 1) {
+            json::Value extension = json::Value::make_obj();
+            extension.set("batch_size", json::Value::make_num(parallel_));
+            root.set("dubhe", std::move(extension));
+        }
+        const std::string body = json::dump(root);
+        if (stream_) conn_.write_chunk("data: " + body + "\n\n");
+        else conn_.send(200, "application/json", body);
+    }
+
+    http::Conn& conn_;
+    std::string id_, model_;
+    long long created_;
+    bool stream_;
+    int parallel_;
+    std::string output_, pending_;
+};
 
 // 按 OpenAI 的流式协议把工具调用发出去。
 //
@@ -3233,26 +3374,292 @@ void flush_pending(StreamCtx* x) {
     }
 }
 
-// /v1/* 的鉴权：设了 key 就必须带 Authorization: Bearer <key>
-// 本机回环访问免鉴权——自己电脑上的 UI 不该再让人粘贴一次密钥。
-bool authorized(const http::Request& req) {
-    if (g.api_key.empty()) return true;
-    if (req.remote == "127.0.0.1" || req.remote == "::1" || req.remote.empty()) return true;
-    std::string h = req.header("authorization");
-    const std::string p = "Bearer ";
-    if (h.size() > p.size() && h.compare(0, p.size(), p) == 0) h = h.substr(p.size());
-    else if (h.empty()) h = req.param("api_key");
-    return h == g.api_key;
+bool is_local(const http::Request& req) {
+    return req.remote == "127.0.0.1" || req.remote == "::1";
 }
 
-// /api/state 里的密钥只给本机看
-bool is_local(const http::Request& req) {
-    return req.remote == "127.0.0.1" || req.remote == "::1" || req.remote.empty();
+bool authorized(const http::Request& req) {
+    return is_local(req) ||
+           (!g.api_key.empty() && req.header("authorization") == "Bearer " + g.api_key);
+}
+
+void send_error(http::Conn& conn, int status, const std::string& message) {
+    json::Value response = json::Value::make_obj();
+    response.set("error", json::Value::make_str(message));
+    conn.send(status, "application/json", json::dump(response));
+}
+
+bool request_allowed(const http::Request& req, http::Conn& conn, int port) {
+    if (is_local(req)) {
+        const std::string host = req.header("host");
+        const std::string suffix = ":" + std::to_string(port);
+        const bool loopback = host == "localhost" + suffix || host == "127.0.0.1" + suffix ||
+            (port == 80 && (host == "localhost" || host == "127.0.0.1"));
+        const std::string origin = req.header("origin");
+        const std::string site = req.header("sec-fetch-site");
+        if (!loopback || (!origin.empty() && origin != "http://" + host) ||
+            (!site.empty() && site != "same-origin" && site != "none")) {
+            send_error(conn, 403, "此请求需要从 Dubhe 本机页面发起");
+            return false;
+        }
+    } else if (req.path.rfind("/api/", 0) == 0 && req.path != "/api/state") {
+        send_error(conn, 403, "局域网密钥只用于推理。此操作需要在运行 Dubhe 的设备上完成");
+        return false;
+    }
+    request_is_local = is_local(req);
+    capture_policy();
+    return true;
+}
+
+bool load_language_model(const std::string& path, std::string* error) {
+    g.worker.reset();
+    const bool mlx = is_dir_p(path);
+    const std::string arch = mlx ? "" : gguf_meta_string(path, "general.architecture");
+    bool has_experts = false;
+    if (!arch.empty()) gguf_meta_string(path, arch + ".expert_count", &has_experts);
+    const bool needs_llama = arch.starts_with("gemma") || arch.ends_with("moe") ||
+        arch == "mixtral" || has_experts;
+    if (mlx || needs_llama) {
+        const auto script = ModelWorker::script_for(g.web_root);
+        if (script.empty()) { *error = "找不到可选模型运行时适配器"; return false; }
+        dubhe_unload_model(g.engine);
+        auto worker = std::make_unique<ModelWorker>(script, mlx ? "mlx" : "llama", path,
+            g.context > 0 ? g.context : 4096, g.threads > 0 ? g.threads : 4);
+        if (!worker->start(error)) return false;
+        g.worker = std::move(worker);
+        g_think_style = 0;
+        return true;
+    }
+    if (dubhe_load_model(g.engine, path.c_str()) != DUBHE_OK) {
+        *error = dubhe_last_error();
+        return false;
+    }
+    refresh_model_markers(path);
+    return true;
+}
+
+int current_model_info(dubhe_model_info* info) {
+    if (!g.worker) return dubhe_model_info_get(g.engine, info);
+    *info = dubhe_model_info{};
+    const auto& backend = g.worker->info();
+    std::snprintf(info->arch, sizeof(info->arch), "%s", backend.s("arch").c_str());
+    std::snprintf(info->backend, sizeof(info->backend), "%s", backend.s("backend").c_str());
+    std::snprintf(info->quant_desc, sizeof(info->quant_desc), "%s",
+                  backend.s("backend") == "MLX" ? "MLX" : "GGUF");
+    info->n_ctx_limit = info->n_ctx_ceiling = info->n_ctx_train = (int)backend.n("context");
+    info->n_params = (uint64_t)backend.n("params");
+    info->is_gpu = backend.s("backend") == "MLX";
+    const auto bytes = store::file_size(g.model_path);
+    if (bytes > 0) info->file_size = (uint64_t)bytes;
+    return DUBHE_OK;
+}
+
+void publish_model_status() {
+    ModelStatus status;
+    status.path = g.model_path;
+    status.id = g.model_id;
+    status.mmproj = g.mmproj_path;
+    if (!status.path.empty()) current_model_info(&status.info);
+    status.caps = dubhe_mm_caps(g.engine);
+    status.thinking = g_think_style != 0;
+    status.parallel = g.worker ? 0 : std::min(g.parallel, (int)dubhe_batch_capacity(g.engine));
+    std::lock_guard<std::mutex> lock(g.model_status_mu);
+    g.model_status = std::move(status);
 }
 
 std::string now_id() {
     static std::atomic<long long> n{0};
     return "chatcmpl-" + std::to_string((long long)time(nullptr)) + "-" + std::to_string(n++);
+}
+
+struct InferenceJob {
+    InferenceJob(const json::Value& body, const json::Value& msgs, http::Conn& connection)
+        : request(body), messages(msgs), conn(connection), local(request_is_local) {}
+    const json::Value& request;
+    const json::Value& messages;
+    http::Conn& conn;
+    bool local;
+    std::vector<int32_t> tokens;
+
+    std::mutex mu;
+    std::condition_variable changed;
+    std::string pending, error;
+    dubhe_stats stats{};
+    int parallel = 0;
+    bool ready = false, handled = false, length_limited = false, sent_text = false;
+};
+
+void run_cohort(const std::vector<InferenceJob*>& jobs, const ModelStatus& expected) {
+    std::unique_lock lock(g.mu, std::try_to_lock);
+    if (!lock || g.worker || g.model_path != expected.path ||
+        (int)jobs.size() > dubhe_batch_capacity(g.engine)) return;
+    std::vector<InferenceJob*> requests;
+    std::vector<dubhe_batch_item> items;
+    struct RequestScope {
+        bool local = request_is_local;
+        bool no_think = t_no_think;
+        ~RequestScope() { request_is_local = local; t_no_think = no_think; }
+    } scope;
+    const auto context = expected.info.n_ctx_limit;
+    int reserved = 0;
+    for (auto* job : jobs) {
+        if (job->conn.peer_gone()) { job->handled = true; continue; }
+        request_is_local = job->local;
+        t_no_think = job->request.flag("no_think", false);
+        MmCache cache;
+        std::string error;
+        if (!build_tokens(g.engine, job->messages, expected.info.has_chat_template != 0,
+                          false, false, &job->tokens, &cache, &error)) continue;
+        const int output = (int)job->request.n("max_tokens", 512);
+        if (job->tokens.empty() || job->tokens.size() + (size_t)output > (size_t)(context - reserved))
+            continue;
+        reserved += (int)job->tokens.size() + output;
+        dubhe_batch_item item{};
+        item.prompt = job->tokens.data();
+        item.n_prompt = (int)job->tokens.size();
+        item.sampling.max_tokens = output;
+        item.sampling.temperature = (float)job->request.n("temperature", 0.7);
+        item.sampling.top_p = (float)job->request.n("top_p", 0.95);
+        item.sampling.top_k = (int)job->request.n("top_k", 40);
+        item.sampling.repeat_penalty = (float)job->request.n("repeat_penalty", 1.1);
+        item.sampling.repeat_last_n = 64;
+        item.user_data = job;
+        item.on_token = [](void* ptr, int32_t, const char* piece) {
+            auto& job = *static_cast<InferenceJob*>(ptr);
+            std::lock_guard lock(job.mu);
+            job.pending += piece;
+            job.sent_text = true;
+            job.changed.notify_one();
+        };
+        item.should_stop = [](void* ptr) -> int { return static_cast<InferenceJob*>(ptr)->conn.peer_gone(); };
+        requests.push_back(job);
+        items.push_back(item);
+    }
+    g_pcache.clear();
+    if (items.size() < 2) return;
+    for (auto* job : requests) {
+        std::lock_guard reply_lock(job->mu);
+        job->parallel = (int)items.size();
+    }
+    g.busy = true;
+    struct FinishBatch { ~FinishBatch() { g.busy = false; } } busy;
+    const int result = dubhe_generate_batch(g.engine, items.data(), (int32_t)items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        auto& job = *requests[i];
+        const auto& item = items[i];
+        std::lock_guard reply_lock(job.mu);
+        if (result != DUBHE_OK || item.result == DUBHE_ERR_STATE) {
+            if (job.sent_text) {
+                job.handled = true;
+                job.error = "批量生成失败";
+            }
+        } else {
+            job.handled = true;
+            job.stats = item.stats;
+            job.length_limited = item.length_limited;
+        }
+    }
+}
+
+bool respond_to_cohort(InferenceJob& job, const std::string& model) {
+    std::optional<CompletionReply> reply;
+    for (;;) {
+        std::string delta;
+        bool done;
+        {
+            std::unique_lock lock(job.mu);
+            job.changed.wait(lock, [&] { return job.ready || !job.pending.empty(); });
+            done = job.ready;
+            delta.swap(job.pending);
+            if (done && !job.handled) return false;
+            if (!reply && (!delta.empty() || done))
+                reply.emplace(job.conn, now_id(), model, (long long)time(nullptr),
+                              job.request.flag("stream", false), job.parallel);
+        }
+        if (reply && !job.conn.peer_gone()) reply->append(delta);
+        if (!done) continue;
+        if (reply && !job.conn.peer_gone()) {
+            if (job.error.empty()) reply->finish(job.length_limited ? "length" : "stop", job.stats);
+            else if (!job.conn.header_sent()) send_error(job.conn, 500, job.error);
+            else {
+                job.conn.write_chunk("data: {\"dubhe\":{\"type\":\"error\",\"message\":" +
+                                     json_escape(job.error) + "}}\n\n");
+                job.conn.write_chunk("data: [DONE]\n\n");
+                job.conn.end_stream();
+            }
+        }
+        return true;
+    }
+}
+
+bool maybe_batch(const json::Value& body, const json::Value& messages,
+                 http::Conn& conn, bool with_tools) {
+    const ModelStatus status = model_status();
+    const double output = body.n("max_tokens", 512);
+    if (status.parallel < 2 || status.thinking || with_tools || body.get("response_format") ||
+        body.get("dubhe_model_path") || body.get("workspace") || body.flag("dubhe_raw") ||
+        !(output >= 1 && output <= 2048) || std::floor(output) != output) return false;
+    size_t bytes = 0;
+    for (const auto& message : messages.arr) {
+        const auto* content = message.get("content");
+        if (!content || content->type != json::Value::STR || message.s("role") == "tool") return false;
+        bytes += content->str.size();
+    }
+    if (bytes > 32768) return false;
+    std::string quick;
+    if (g.no_arith_fastpath == 0 && try_quick_answer(last_user_text(messages), &quick)) return false;
+
+    static std::mutex mu;
+    static std::condition_variable changed;
+    static std::vector<InferenceJob*> waiting;
+    InferenceJob job(body, messages, conn);
+    std::unique_lock lock(mu);
+    const bool leader = waiting.empty();
+    waiting.push_back(&job);
+    changed.notify_all();
+    if (leader) {
+        changed.wait_for(lock, std::chrono::milliseconds(8),
+                         [&] { return (int)waiting.size() >= status.parallel; });
+        std::vector<InferenceJob*> group;
+        group.swap(waiting);
+        lock.unlock();
+        auto finish = [](const std::vector<InferenceJob*>& group) {
+            for (auto* item : group) {
+                std::lock_guard lock(item->mu);
+                item->ready = true;
+                item->changed.notify_one();
+            }
+        };
+        if (group.size() < 2) finish(group);
+        else {
+            try {
+                std::thread([group, status, finish] {
+                    try {
+                        const size_t count = std::min(group.size(), (size_t)status.parallel);
+                        run_cohort({group.begin(), group.begin() + count}, status);
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "[dubhed] 批量请求失败: %s\n", e.what());
+                        for (auto* item : group) {
+                            std::lock_guard lock(item->mu);
+                            if (item->sent_text && !item->handled) {
+                                item->handled = true;
+                                item->error = "批量生成失败";
+                            }
+                        }
+                    }
+                    finish(group);
+                }).detach();
+            } catch (const std::exception&) { finish(group); }
+        }
+    } else lock.unlock();
+    struct WaitForProducer {
+        InferenceJob& job;
+        ~WaitForProducer() {
+            std::unique_lock lock(job.mu);
+            job.changed.wait(lock, [&] { return job.ready; });
+        }
+    } wait{job};
+    return respond_to_cohort(job, status.id);
 }
 
 // ---------------------------------------------------------------- 模型清单
@@ -3460,12 +3867,12 @@ json::Value tools_json() {
     add("list_dir", "列出目录内容", "path", true);
     add("grep", "在目录里递归搜索文本（正则）", "pattern, path, limit", true);
     add("glob", "按文件名通配符找文件", "pattern, path", true);
-    add("write_file", "写入文件（覆盖）", "path, content", g.allow_write);
-    add("edit_file", "精确替换文件里的一段原文（只改一处，要求唯一）", "path, old, new", g.allow_write);
-    add("shell", "执行 shell 命令（有超时与写盘沙箱）", "command, cwd", g.allow_shell);
-    add("web_search", "联网搜索；会自动抓取前几条正文摘录", "query, n, read", g.allow_net);
+    add("write_file", "写入文件（覆盖）", "path, content", request_policy.allow_write);
+    add("edit_file", "精确替换文件里的一段原文（只改一处，要求唯一）", "path, old, new", request_policy.allow_write);
+    add("shell", "执行 shell 命令（有超时与写盘沙箱）", "command, cwd", request_policy.allow_shell);
+    add("web_search", "联网搜索；会自动抓取前几条正文摘录", "query, n, read", request_policy.allow_net);
     add("kb_search", "在本地知识库（项目文档）里检索相关片段", "query, k", true);
-    add("fetch_url", "抓取网页并转成纯文本", "url", g.allow_net);
+    add("fetch_url", "抓取网页并转成纯文本", "url", request_policy.allow_net);
     return arr;
 }
 
@@ -3503,6 +3910,8 @@ int main(int argc, char** argv) {
     int threads = 0;
     bool no_gpu = false;
     bool no_mmproj = false;
+    bool enable_shell = false;
+    bool disable_sandbox = false;
     std::vector<std::string> mmprojs;
 
     for (int i = 1; i < argc; i++) {
@@ -3511,14 +3920,16 @@ int main(int argc, char** argv) {
         if (a == "-m" || a == "--model") model = next();
         else if (a == "--port") port = atoi(next().c_str());
         else if (a == "--host") host = next();
+        else if (a == "--parallel") g.parallel = std::clamp(atoi(next().c_str()), 1, 8);
         else if (a == "--web") web_root = next();
         else if (a == "-c" || a == "--ctx") ctx = atoi(next().c_str());
         else if (a == "-t" || a == "--threads") threads = atoi(next().c_str());
-        else if (a == "--allow-shell") g.allow_shell = true;
-        else if (a == "--no-shell") g.allow_shell = false;
-        else if (a == "--no-net") g.allow_net = false;
-        else if (a == "--no-sandbox") g.sandbox = false;
-        else if (a == "--no-write") g.allow_write = false;
+        else if (a == "--allow-shell") enable_shell = true;
+        else if (a == "--no-shell") g.force_no_shell = true;
+        else if (a == "--no-net") g.force_no_net = true;
+        else if (a == "--no-sandbox") disable_sandbox = true;
+        else if (a == "--no-write") g.force_no_write = true;
+        else if (a == "--data-dir") g.data_dir = next();
         else if (a == "--model-dir") g.model_dir = next();
         else if (a == "--no-gpu") no_gpu = true;
         else if (a == "--thinking") g_think_enabled = true;
@@ -3542,7 +3953,8 @@ int main(int argc, char** argv) {
                 "  --mmproj P     加载视觉塔或语音塔（可给多次，Omni 模型两个都要）\n"
                 "                 不给的话，模型同目录下的 mmproj*.gguf 会自动挂上\n"
                 "  --no-mmproj    不自动挂塔，纯文本启动\n"
-                "  --share        监听 0.0.0.0 并自动生成 API Key（手机/其他设备可接入）\n"
+                "  --data-dir P   保存对话、权限和下载设置（默认 ~/.dubhe）\n"
+                "  --share        监听 0.0.0.0 并生成只用于推理的 API Key\n"
                 "  --api-key K    指定 API Key（/v1/* 需要 Authorization: Bearer K）\n",
                 dubhe_version());
             return 0;
@@ -3560,53 +3972,70 @@ int main(int argc, char** argv) {
     }
 
     g.web_root = web_root;
-    g.workspace = ".";
+    g.policy.workspace = ".";
     // DUBHE_THINKING=1 让支持思考块的模型先推理再答；默认仍关闭
     if (const char* th = std::getenv("DUBHE_THINKING")) g_think_enabled = std::string(th) == "1";
     char cwd[1024];
-    if (getcwd(cwd, sizeof(cwd))) g.workspace = cwd;
+    if (getcwd(cwd, sizeof(cwd))) g.policy.workspace = cwd;
 
-    // 模型目录默认 ~/.dubhe/models（CLI 下载模型就放这儿）。
-    // UI 的「模型」视图靠它扫描，没指定时给个合理默认，否则那个视图永远是空的。
-    if (g.model_dir.empty()) {
-        const char* home = getenv("HOME");
-        if (home) g.model_dir = std::string(home) + "/.dubhe/models";
+    if (host == "localhost") host = "127.0.0.1";
+    if (port <= 0 || port > 65535) {
+        std::fprintf(stderr, "无效的监听端口\n");
+        return 1;
     }
+    if (g.data_dir.empty()) {
+        const char* dir = getenv("DUBHE_DATA_DIR");
+        g.data_dir = dir && *dir ? dir : path_join(home_dir(), ".dubhe");
+    }
+    g.data_dir = std::filesystem::absolute(g.data_dir).lexically_normal().string();
+    if (g.model_dir.empty()) g.model_dir = path_join(g.data_dir, "models");
+    g.model_dir = std::filesystem::absolute(g.model_dir).lexically_normal().string();
+    if (g.tmp_dir.empty()) g.tmp_dir = "/tmp";
+
+    json::Value prior;
+    if (storage::read_json(path_join(g.data_dir, "settings.json"), &prior)) {
+        read_policy(prior, &g.policy);
+        const std::string workspace = prior.s("workspace");
+        if (!workspace.empty() && is_dir_p(workspace)) g.policy.workspace = workspace;
+    }
+    if (enable_shell && !g.force_no_shell) g.policy.allow_shell = true;
+    if (disable_sandbox) g.policy.sandbox = false;
+    read_policy(json::Value{}, &g.policy);
+    capture_policy();
 
     dubhe_config cfg{};
-    cfg.n_threads = threads;
-    cfg.n_ctx = ctx;
+    cfg.n_threads = g.threads = threads;
+    cfg.n_ctx = g.context = ctx;
     cfg.use_gpu = no_gpu ? 0 : 1;
     g.engine = dubhe_create(&cfg);
     if (!g.engine) { std::fprintf(stderr, "引擎创建失败\n"); return 1; }
 
     if (!model.empty()) {
+        model = std::filesystem::absolute(model).lexically_normal().string();
         std::fprintf(stderr, "加载模型 %s …\n", model.c_str());
         auto t0 = std::chrono::steady_clock::now();
-        if (dubhe_load_model(g.engine, model.c_str()) != DUBHE_OK) {
-            std::fprintf(stderr, "加载失败: %s\n", dubhe_last_error());
+        std::string error;
+        if (!load_language_model(model, &error)) {
+            std::fprintf(stderr, "加载失败: %s\n", error.c_str());
             return 1;
         }
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - t0).count();
         g.model_path = model;
         g.model_id = model_id_of(model);
-        refresh_model_markers(model);
         dubhe_model_info mi{};
-        dubhe_model_info_get(g.engine, &mi);
+        current_model_info(&mi);
         std::fprintf(stderr, "就绪 %.0f ms · %s · %s · %.2fB\n", (double)ms, mi.arch, mi.quant_desc,
                      (double)mi.n_params / 1e9);
     } else {
         std::fprintf(stderr, "未指定模型，UI 中可加载。\n");
     }
 
-    if (g.tmp_dir.empty()) g.tmp_dir = "/tmp";
-
     // 没显式给 --mmproj 时，看模型旁边有没有塔，有就自动挂上。
     // 规则和 /api/load 一致：同一个目录 = 同一套东西。这样
     // `dubhed -m ~/.dubhe/models/lfm3-vl-2b/xxx.gguf` 直接就能看图，
     // 不用再把塔的路径也背一遍。要纯文本启动就加 --no-mmproj。
-    if (mmprojs.empty() && !no_mmproj && !model.empty()) {
+    if (!g.worker && mmprojs.empty() && !no_mmproj && !model.empty()) {
         const std::string sib = find_sibling_mmproj(model);
         if (!sib.empty()) {
             std::fprintf(stderr, "模型旁边有配套的塔，自动加载 %s（纯文本启动用 --no-mmproj）\n",
@@ -3618,6 +4047,7 @@ int main(int argc, char** argv) {
     // 多模态塔加载失败不该让整个服务起不来：纯文本照常可用，只是 UI 上
     // 不显示附件入口（/api/state 的 mm 字段会是 0）。
     // --mmproj 可以给多次：Omni 模型是视觉塔 + 语音塔两个独立文件。
+    if (g.worker) mmprojs.clear();
     for (const auto& mp : mmprojs) {
         std::fprintf(stderr, "加载多模态塔 %s …\n", mp.c_str());
         auto t0 = std::chrono::steady_clock::now();
@@ -3646,7 +4076,11 @@ int main(int argc, char** argv) {
         g.mmproj_path += mp;
     }
 
+    publish_model_status();
     http::Server srv;
+    srv.set_filter([port](const http::Request& req, http::Conn& conn) {
+        return request_allowed(req, conn, port);
+    });
 
     // ---- 静态资源
     auto serve_file = [](const http::Request& req, http::Conn& c, const std::string& root) {
@@ -3729,429 +4163,254 @@ int main(int argc, char** argv) {
         c.send(200, "application/json", "{\"ok\":true}");
     });
 
-    srv.get("/api/state", [](const http::Request& req, http::Conn& c) {
-        json::Value o = json::Value::make_obj();
-        o.set("hardware", json::Value::make_str(dubhe_hardware_info()));
-        o.set("version", json::Value::make_str(dubhe_version()));
-        o.set("model", json::Value::make_str(g.model_path));
-        o.set("model_id", json::Value::make_str(g.model_id.empty() ? "dubhe" : g.model_id));
-        o.set("loaded", json::Value::make_bool(!g.model_path.empty()));
-        o.set("workspace", json::Value::make_str(g.workspace));
-        o.set("shell", json::Value::make_bool(g.allow_shell));
-        o.set("write", json::Value::make_bool(g.allow_write));
-        o.set("net", json::Value::make_bool(g.allow_net));
-        o.set("sandbox", json::Value::make_bool(sandbox_active()));
-        // 配置值单列一个字段：sandbox=false 且 sandbox_cfg=true，说明用户开了
-        // 但本机套不上（外层沙箱/CI 容器），界面据此给一句解释而不是静默失效。
-        o.set("sandbox_cfg", json::Value::make_bool(g.sandbox));
-        o.set("write_outside", json::Value::make_bool(g.allow_write_outside));
-        o.set("shell_timeout_s", json::Value::make_num(g.shell_timeout_ms / 1000.0));
-        o.set("tool_rounds", json::Value::make_num(g.max_tool_rounds));
-        o.set("api_key", json::Value::make_str(is_local(req) ? g.api_key : ""));
-        o.set("lan_url", json::Value::make_str(g.lan_url));
-        o.set("auth", json::Value::make_bool(!g.api_key.empty()));
-        o.set("requests", json::Value::make_num((double)g.total_requests));
-        o.set("tokens", json::Value::make_num((double)g.total_tokens));
-        o.set("decode_tps", json::Value::make_num(g.last_decode_tps));
-        // 多模态能力：0 无 / 1 图像+视频 / 2 语音 / 3 两者都有
-        const int caps = dubhe_mm_caps(g.engine);
-        o.set("mm", json::Value::make_num(caps));
-        o.set("mm_vision", json::Value::make_bool((caps & 1) != 0));
-        o.set("mm_audio", json::Value::make_bool((caps & 2) != 0));
-        o.set("mmproj", json::Value::make_str(g.mmproj_path));
-        // 真实占用：进程常驻内存 + 模型文件体积。
-        // 前端右栏的"内存"条靠这两个值，不做估算 —— 估算出来的数字
-        // 一旦和 Activity Monitor 对不上，用户就不信这块面板了。
-        {
-            struct stat st {};
-            double model_bytes = 0;
-            if (!g.model_path.empty() && stat(g.model_path.c_str(), &st) == 0) {
-                model_bytes += (double)st.st_size;
-            }
-            if (!g.mmproj_path.empty() && stat(g.mmproj_path.c_str(), &st) == 0) {
-                model_bytes += (double)st.st_size;
-            }
-            o.set("model_bytes", json::Value::make_num(model_bytes));
+    srv.get("/api/state", [](const http::Request& req, http::Conn& conn) {
+        const ModelStatus model = model_status();
+        const bool local = is_local(req);
+        json::Value out = local ? policy_json(request_policy) : json::Value::make_obj();
+        out.set("version", json::Value::make_str(dubhe_version()));
+        out.set("model_id", json::Value::make_str(model.id.empty() ? "dubhe" : model.id));
+        out.set("loaded", json::Value::make_bool(!model.path.empty()));
+        out.set("auth", json::Value::make_bool(!g.api_key.empty()));
+        out.set("share_only", json::Value::make_bool(!local));
+        if (!local) {
+            conn.send(200, "application/json", json::dump(out));
+            return;
+        }
 
-            struct rusage ru {};
-            double rss = 0;
-            if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        out.set("hardware", json::Value::make_str(dubhe_hardware_info()));
+        out.set("model", json::Value::make_str(model.path));
+        out.set("api_key", json::Value::make_str(g.api_key));
+        out.set("lan_url", json::Value::make_str(g.lan_url));
+        out.set("sandbox_cfg", json::Value::make_bool(request_policy.sandbox));
+        out.set("sandbox", json::Value::make_bool(sandbox_active()));
+        out.set("requests", json::Value::make_num((double)g.total_requests.load()));
+        out.set("tokens", json::Value::make_num((double)g.total_tokens.load()));
+        out.set("decode_tps", json::Value::make_num(g.last_decode_tps.load()));
+        out.set("mm", json::Value::make_num(model.caps));
+        out.set("parallel", json::Value::make_num(model.parallel));
+        out.set("mm_vision", json::Value::make_bool((model.caps & 1) != 0));
+        out.set("mm_audio", json::Value::make_bool((model.caps & 2) != 0));
+        out.set("mmproj", json::Value::make_str(model.mmproj));
+
+        const auto& info = model.info;
+        double bytes = (double)info.file_size;
+        std::istringstream towers(model.mmproj);
+        for (std::string path; std::getline(towers, path, ',');) {
+            struct stat st{};
+            if (stat(path.c_str(), &st) == 0) bytes += (double)st.st_size;
+        }
+        out.set("model_bytes", json::Value::make_num(bytes));
+        struct rusage ru{};
+        double peak = 0;
+        if (getrusage(RUSAGE_SELF, &ru) == 0) {
 #ifdef __APPLE__
-                rss = (double)ru.ru_maxrss;            // macOS: 字节
+            peak = (double)ru.ru_maxrss;
 #else
-                rss = (double)ru.ru_maxrss * 1024.0;   // Linux: KB
+            peak = (double)ru.ru_maxrss * 1024.0;
 #endif
-            }
-            o.set("rss_bytes", json::Value::make_num(rss));
         }
-        if (!g.model_path.empty()) {
-            dubhe_model_info mi{};
-            if (dubhe_model_info_get(g.engine, &mi) == DUBHE_OK) {
-                json::Value m = json::Value::make_obj();
-                m.set("arch", json::Value::make_str(mi.arch));
-                m.set("params", json::Value::make_num((double)mi.n_params));
-                m.set("quant", json::Value::make_str(mi.quant_desc));
-                m.set("n_ctx", json::Value::make_num(mi.n_ctx_limit));
-                m.set("n_ctx_train", json::Value::make_num(mi.n_ctx_train));
-                // 这台机器装得下的上限。前端拿它去画"上下文用量条"的满格，
-                // 拿 n_ctx 当"这次能用多少"，两者不再混为一谈。
-                m.set("n_ctx_ceiling", json::Value::make_num(mi.n_ctx_ceiling));
-                m.set("n_layer", json::Value::make_num(mi.n_layer));
-                m.set("n_embd", json::Value::make_num(mi.n_embd));
-                m.set("n_vocab", json::Value::make_num(mi.n_vocab));
-                m.set("chatml", json::Value::make_bool(mi.has_chat_template != 0));
-                m.set("gpu", json::Value::make_bool(mi.is_gpu != 0));
-                // 这个模型的对话模板里到底有没有思考通道。没有的话界面上
-                // 那个「深度思考」按钮要灰掉 —— 放着能点却毫无反应，
-                // 比直接告诉用户"这个模型不支持"更让人困惑。
-                m.set("think", json::Value::make_bool(g_think_style != 0));
-                o.set("info", m);
-            }
+        out.set("rss_bytes", json::Value::make_num(peak));
+        if (!model.path.empty()) {
+            json::Value details = json::Value::make_obj();
+            details.set("arch", json::Value::make_str(info.arch));
+            details.set("params", json::Value::make_num((double)info.n_params));
+            details.set("quant", json::Value::make_str(info.quant_desc));
+            details.set("n_ctx", json::Value::make_num(info.n_ctx_limit));
+            details.set("n_ctx_train", json::Value::make_num(info.n_ctx_train));
+            details.set("n_ctx_ceiling", json::Value::make_num(info.n_ctx_ceiling));
+            details.set("n_layer", json::Value::make_num(info.n_layer));
+            details.set("n_embd", json::Value::make_num(info.n_embd));
+            details.set("n_vocab", json::Value::make_num(info.n_vocab));
+            details.set("chatml", json::Value::make_bool(info.has_chat_template != 0));
+            details.set("gpu", json::Value::make_bool(info.is_gpu != 0));
+            details.set("backend", json::Value::make_str(info.backend));
+            details.set("think", json::Value::make_bool(model.thinking));
+            out.set("info", std::move(details));
         }
-        c.send(200, "application/json", json::dump(o));
+        conn.send(200, "application/json", json::dump(out));
     });
 
-    // ---- 模型清单：UI 的「模型」视图靠它列出本地所有 gguf。
-    // 只 stat 文件、不读 GGUF 头 —— 一个目录几十个模型时读头要好几百毫秒，
-    // 而名字里已经带了量化和参数量。真正加载时才读头。
-    // ---------------------------------------------------------------- 模型商店
-    //
-    // 只列引擎真能加载的架构（llama 家族 / lfm2 / lfm3 / qwen35），并且每个
-    // 链接的 content-length 都验证过。清单里出现一个下下来跑不起来的模型，
-    // 比商店空着更伤信任 —— 用户会花二十分钟下载，然后得到一个"加载失败"。
-    // 设计取舍见 docs/adr/ADR-0006-模型商店.md。
-    struct StoreEntry {
-        const char* id;
-        const char* name;
-        const char* params;
-        const char* quant;
-        long long bytes;
-        const char* file;
-        const char* url;
-        const char* note;
-    };
-    static const StoreEntry kStore[] = {
-        {"qwen35-9b-q4", "Qwen3.5-9B Instruct", "9B", "Q4_K_M", 5680522464LL,
-         "Qwen3.5-9B-Q4_K_M.gguf",
-         "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
-         "最新一代，引擎有专属内核（Gated DeltaNet）；24GB 上约 10–12 tok/s"},
-        {"qwen35-4b-q4", "Qwen3.5-4B Instruct", "4B", "Q4_K_M", 2740937888LL,
-         "Qwen3.5-4B-Q4_K_M.gguf",
-         "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
-         "质量与速度的平衡点，比 1.7B 明显聪明，速度还有 20 tok/s 上下"},
-        {"lfm25-26b-q4", "LFM2.5-2.6B", "2.6B", "Q4_K_M", 1674455040LL,
-         "LFM2.5-2.6B-Q4_K_M.gguf",
-         "https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF/resolve/main/LFM2.5-2.6B-Q4_K_M.gguf",
-         "LiquidAI 新一代端侧模型，多语言好、延迟低"},
-        {"lfm25-12b-q4", "LFM2.5-1.2B Instruct", "1.2B", "Q4_K_M", 730895168LL,
-         "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
-         "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/main/"
-         "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
-         "最小最快，适合分类、打标、翻译这类高频杂活"},
-        // 千问 3.8 目前只有 27B 一个尺寸（另两个是 MoE 巨兽）。架构名仍然是
-        // qwen35，引擎能加载；但 16.5 GB 塞进 24GB 机器后剩不下多少给 KV，
-        // 上下文会很短、速度掉到个位数。列出来是为了有据可查，不是推荐。
-        {"qwen38-27b-q4", "Qwen3.8-27B（大，24GB 吃紧）", "27B", "UD-Q4_K_M",
-         16564259744LL, "Qwen3.8-27B-UD-Q4_K_M.gguf",
-         "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-UD-Q4_K_M.gguf",
-         "最新旗舰，但 16.5 GB 在 24GB 机器上只剩很少上下文，约 4–5 tok/s；"
-         "想试可以，不建议日常用"},
-    };
-
-    struct DlJob {
-        std::string id, file;
-        long long total = 0;
-        std::string state = "running";   // running / done / error / cancelled
-        std::string error;
-        pid_t pid = 0;                   // curl 的进程号，取消时要 kill 它
-        std::thread th;
-    };
-    auto dl_mu = std::make_shared<std::mutex>();
-    auto dl_jobs = std::make_shared<std::map<std::string, std::shared_ptr<DlJob>>>();
-
-    // 下载源。国内直连 huggingface.co 常常只有几百 KB/s，一个 4.7GB 的模型
-    // 要下两个小时。换成 hf-mirror.com 这类镜像能快一个数量级。
-    // 存在 ~/.dubhe/store.json 里，重启后仍然生效。
-    auto mirror = std::make_shared<std::string>();
-    {
-        const std::string cfg = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.dubhe/store.json";
-        FILE* f = std::fopen(cfg.c_str(), "rb");
-        if (f) {
-            std::string s;
-            char buf[512];
-            size_t n;
-            while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
-            std::fclose(f);
-            json::Value v;
-            if (json::parse(s, &v)) *mirror = v.s("mirror");
-        }
-    }
-    auto save_mirror = [mirror]() {
-        const std::string cfg = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.dubhe/store.json";
-        json::Value v = json::Value::make_obj();
-        v.set("mirror", json::Value::make_str(*mirror));
-        FILE* f = std::fopen(cfg.c_str(), "wb");
-        if (f) { std::fputs(json::dump(v).c_str(), f); std::fclose(f); }
-    };
-
-
-    srv.get("/api/store", [dl_mu, dl_jobs, mirror](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+    const storage::History history(g.data_dir);
+    srv.get("/api/history", [&history](const http::Request&, http::Conn& conn) {
+        json::Value result;
+        if (!history.read(&result)) {
+            send_error(conn, 500, "无法读取对话文件，已有记录仍保留在磁盘上");
             return;
         }
-        json::Value root = json::Value::make_obj();
-        root.set("dir", json::Value::make_str(g.model_dir));
-        root.set("mirror", json::Value::make_str(*mirror));
-        json::Value arr = json::Value::make_arr();
-        for (const auto& e : kStore) {
-            json::Value o = json::Value::make_obj();
-            const std::string target = g.model_dir + "/" + e.file;
-            o.set("id", json::Value::make_str(e.id));
-            o.set("name", json::Value::make_str(e.name));
-            o.set("params", json::Value::make_str(e.params));
-            o.set("quant", json::Value::make_str(e.quant));
-            o.set("bytes", json::Value::make_num((double)e.bytes));
-            o.set("note", json::Value::make_str(e.note));
-            o.set("installed", json::Value::make_bool(is_file_p(target)));
-            {
-                std::lock_guard<std::mutex> lk(*dl_mu);
-                auto it = dl_jobs->find(e.id);
-                if (it != dl_jobs->end()) {
-                    auto& j = *it->second;
-                    o.set("state", json::Value::make_str(j.state));
-                    o.set("total", json::Value::make_num((double)j.total));
-                    long long got = 0;
-                    struct stat st {};
-                    if (::stat((target + ".part").c_str(), &st) == 0) got = (long long)st.st_size;
-                    o.set("got", json::Value::make_num((double)got));
-                    if (!j.error.empty())
-                        o.set("error", json::Value::make_str(j.error));
-                }
-            }
-            arr.arr.push_back(o);
+        conn.send(200, "application/json", json::dump(result));
+    });
+    srv.post("/api/history", [&history](const http::Request& req, http::Conn& conn) {
+        json::Value body;
+        if (!json::parse(req.body, &body)) {
+            send_error(conn, 400, "对话数据格式无效");
+            return;
         }
-        root.set("items", arr);
-        c.send(200, "application/json", json::dump(root));
+        switch (history.apply(body)) {
+            case storage::History::OK:
+                conn.send(200, "application/json", "{\"ok\":true}");
+                break;
+            case storage::History::INVALID:
+                send_error(conn, 400, "对话数据格式无效");
+                break;
+            case storage::History::IO:
+                send_error(conn, 507, "无法保存对话，请检查磁盘空间和文件权限");
+                break;
+        }
     });
 
-    srv.post("/api/store/download", [dl_mu, dl_jobs, mirror](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
+    store::Downloads downloads(g.model_dir, path_join(g.data_dir, "store.json"));
+    translation::Service translator(g.model_dir, ModelWorker::script_for(g.web_root));
+    srv.get("/api/translate", [&translator](const http::Request&, http::Conn& conn) {
+        conn.send(200, "application/json", json::dump(translator.options()));
+    });
+    srv.post("/api/translate", [&translator](const http::Request& req, http::Conn& conn) {
+        json::Value body;
+        if (!json::parse(req.body, &body) || body.type != json::Value::OBJ) {
+            send_error(conn, 400, "翻译请求格式无效");
             return;
         }
+        const auto result = translator.translate(body, [&conn] { return conn.peer_gone(); });
+        if (result.status == 499) return;
+        if (result.status != 200) { send_error(conn, result.status, result.text); return; }
+        auto out = json::Value::make_obj();
+        out.set("text", json::Value::make_str(result.text));
+        conn.send(200, "application/json", json::dump(out));
+    });
+    srv.get("/api/store", [&downloads](const http::Request&, http::Conn& conn) {
+        conn.send(200, "application/json", json::dump(downloads.status()));
+    });
+    srv.post("/api/store/download", [&downloads](const http::Request& req, http::Conn& conn) {
         json::Value body;
         std::string id = req.param("id");
         if (id.empty() && json::parse(req.body, &body)) id = body.s("id");
-        const StoreEntry* e = nullptr;
-        for (const auto& s : kStore) if (id == s.id) { e = &s; break; }
-        if (!e) {
-            c.send(400, "application/json", "{\"error\":\"没有这个模型\"}");
-            return;
-        }
-        if (g.model_dir.empty()) {
-            c.send(400, "application/json", "{\"error\":\"模型目录未配置\"}");
-            return;
-        }
-        const std::string target = g.model_dir + "/" + e->file;
-        const std::string part = target + ".part";
-        {
-            std::lock_guard<std::mutex> lk(*dl_mu);
-            auto it = dl_jobs->find(id);
-            if (it != dl_jobs->end() && it->second->state == "running") {
-                c.send(200, "application/json", "{\"ok\":true,\"state\":\"running\"}");
-                return;
-            }
-            auto job = std::make_shared<DlJob>();
-            job->id = id;
-            job->file = e->file;
-            job->total = e->bytes;
-            std::string url = e->url;
-            // 镜像只在 host 层面替换，路径一个字节都不动 —— 镜像站用的
-            // 就是同一套路径，改别的反而会 404。
-            static const std::string kHf = "https://huggingface.co";
-            if (!mirror->empty() && url.rfind(kHf, 0) == 0)
-                url = *mirror + url.substr(kHf.size());
-            job->th = std::thread([job, url, part, target, dl_mu]() {
-                // 用 fork/exec 而不是 std::system：
-                // 取消下载必须能拿到 curl 的 pid 去 kill，而 system() 只返回
-                // 一个退出码 —— 拿到退出码的时候 curl 已经跑完了，停不下来。
-                pid_t pid = fork();
-                if (pid == 0) {
-                    // -C - 断点续传；下载完再改名，避免半个文件被扫进清单。
-                    execl("/usr/bin/curl", "curl", "-fL", "--retry", "3",
-                          "--retry-delay", "2", "-C", "-", "-o", part.c_str(),
-                          url.c_str(), (char*)nullptr);
-                    _exit(127);
-                }
-                if (pid < 0) {
-                    job->state = "error";
-                    job->error = "无法启动下载进程";
-                    return;
-                }
-                job->pid = pid;
-                int st = 0;
-                while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-                {
-                    std::lock_guard<std::mutex> lk2(*dl_mu);
-                    if (job->state == "cancelled") {
-                        // 用户取消：半截 .part 留着，下次「重试」能接着下。
-                        return;
-                    }
-                }
-                if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
-                    if (std::rename(part.c_str(), target.c_str()) == 0) {
-                        job->state = "done";
-                    } else {
-                        job->state = "error";
-                        job->error = "下载完成但改名失败";
-                    }
-                } else {
-                    job->state = "error";
-                    job->error = "下载失败（网络或磁盘），已保留 .part 可续传";
-                }
-            });
-            job->th.detach();
-            (*dl_jobs)[id] = job;
-        }
-        c.send(200, "application/json", "{\"ok\":true,\"state\":\"running\"}");
+        const auto result = downloads.download(id);
+        if (!result.error.empty()) { send_error(conn, result.status, result.error); return; }
+        json::Value out = json::Value::make_obj();
+        out.set("ok", json::Value::make_bool(true));
+        out.set("state", json::Value::make_str(result.state));
+        conn.send(result.status, "application/json", json::dump(out));
     });
-
-    // 导入：把用户自己的 .gguf 软链进模型目录。
-    // 不复制 —— 一个 5GB 的文件复制一份，磁盘直接少 5GB。
-    srv.post("/api/models/import", [](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
+    srv.post("/api/store/cancel", [&downloads](const http::Request& req, http::Conn& conn) {
         json::Value body;
-        std::string p = req.param("path");
-        if (p.empty() && json::parse(req.body, &body)) p = body.s("path");
-        if (p.empty()) {
-            c.send(400, "application/json", "{\"error\":\"缺少 path\"}");
+        std::string id = req.param("id");
+        if (id.empty() && json::parse(req.body, &body)) id = body.s("id");
+        json::Value out = json::Value::make_obj();
+        out.set("ok", json::Value::make_bool(true));
+        out.set("state", json::Value::make_str(downloads.cancel(id)));
+        conn.send(200, "application/json", json::dump(out));
+    });
+    srv.get("/api/store/mirror", [&downloads](const http::Request&, http::Conn& conn) {
+        json::Value out = json::Value::make_obj();
+        out.set("mirror", json::Value::make_str(downloads.mirror()));
+        conn.send(200, "application/json", json::dump(out));
+    });
+    srv.post("/api/store/mirror", [&downloads](const http::Request& req, http::Conn& conn) {
+        json::Value body;
+        if (!json::parse(req.body, &body)) { send_error(conn, 400, "镜像设置格式无效"); return; }
+        const auto* value = body.get("mirror");
+        if (!value || value->type != json::Value::STR) {
+            send_error(conn, 400, "缺少镜像地址");
             return;
         }
-        const std::string full = path_abs(p);
-        if (!is_file_p(full)) {
-            c.send(400, "application/json", "{\"error\":\"文件不存在\"}");
+        std::string mirror = value->str;
+        if (!store::normalize_mirror(&mirror)) {
+            send_error(conn, 400, "请填写 http 或 https 镜像站的地址，地址末尾不带路径");
             return;
         }
-        const std::string name = full.substr(full.find_last_of('/') + 1);
-        const std::string link = g.model_dir + "/" + name;
+        if (!downloads.save_mirror(mirror)) { send_error(conn, 507, "无法保存下载源"); return; }
+        json::Value out = json::Value::make_obj();
+        out.set("ok", json::Value::make_bool(true));
+        out.set("mirror", json::Value::make_str(mirror));
+        conn.send(200, "application/json", json::dump(out));
+    });
+    srv.post("/api/models/import", [](const http::Request& req, http::Conn& conn) {
+        json::Value body;
+        std::string path = req.param("path");
+        if (path.empty() && json::parse(req.body, &body)) path = body.s("path");
+        if (path.empty()) { send_error(conn, 400, "缺少模型文件路径"); return; }
+        const std::string full = std::filesystem::path(path_abs(path)).lexically_normal().string();
+        if (!full.ends_with(".gguf") || !is_file_p(full) || !store::gguf_header(full)) {
+            send_error(conn, 400, "请选择有效的 GGUF 文件");
+            return;
+        }
+        if (!storage::ensure_dir(g.model_dir)) {
+            send_error(conn, 507, "无法创建模型目录");
+            return;
+        }
+        const std::string name = path_base(full);
+        const std::string target = path_join(g.model_dir, name);
         std::error_code ec;
-        std::filesystem::create_symlink(full, link, ec);
-        if (ec) {
-            c.send(400, "application/json",
-                   "{\"error\":\"建链接失败：" + json_escape(ec.message()) + "\"}");
-            return;
-        }
-        json::Value r = json::Value::make_obj();
-        r.set("ok", json::Value::make_bool(true));
-        r.set("name", json::Value::make_str(name));
-        c.send(200, "application/json", json::dump(r));
-    });
-
-    // 取消下载。kill 掉 curl，把状态标成 cancelled 并保留 .part ——
-    // 用户点了取消之后又想要，还能接着下，不用从头来。
-    srv.post("/api/store/cancel", [dl_mu, dl_jobs](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
-        json::Value body;
-        std::string id = req.param("id");
-        if (id.empty() && json::parse(req.body, &body)) id = body.s("id");
-        {
-            std::lock_guard<std::mutex> lk(*dl_mu);
-            auto it = dl_jobs->find(id);
-            if (it != dl_jobs->end() && it->second->state == "running") {
-                it->second->state = "cancelled";
-                if (it->second->pid > 0) ::kill(it->second->pid, SIGTERM);
-                c.send(200, "application/json", "{\"ok\":true,\"state\":\"cancelled\"}");
+        if (!std::filesystem::equivalent(full, target, ec)) {
+            std::filesystem::create_symlink(full, target, ec);
+            std::error_code equivalent_error;
+            if (ec && !std::filesystem::equivalent(full, target, equivalent_error)) {
+                send_error(conn, 409, "无法导入模型：" + ec.message());
                 return;
             }
         }
-        c.send(200, "application/json", "{\"ok\":true,\"state\":\"idle\"}");
+        json::Value out = json::Value::make_obj();
+        out.set("ok", json::Value::make_bool(true));
+        out.set("name", json::Value::make_str(name));
+        conn.send(200, "application/json", json::dump(out));
+    });
+    srv.post("/api/models/delete", [&translator](const http::Request& req, http::Conn& conn) {
+        json::Value body;
+        std::string path = req.param("path");
+        if (path.empty() && json::parse(req.body, &body)) path = body.s("path");
+        if (path.empty()) { send_error(conn, 400, "缺少模型文件路径"); return; }
+        const std::string full = std::filesystem::path(path_abs(path)).lexically_normal().string();
+        struct stat entry{};
+        if (!full.ends_with(".gguf") || !under_root(path_dir(full), g.model_dir)) {
+            send_error(conn, 400, "只能删除模型目录中的 GGUF 文件");
+            return;
+        }
+        if (lstat(full.c_str(), &entry) != 0 ||
+            (!S_ISREG(entry.st_mode) && !S_ISLNK(entry.st_mode))) {
+            send_error(conn, 404, "模型文件不存在");
+            return;
+        }
+        std::unique_lock<std::mutex> lock(g.mu, std::try_to_lock);
+        if (!lock.owns_lock()) { send_error(conn, 409, "模型正在使用，请稍后重试"); return; }
+        auto same_file = [&](const std::string& other) {
+            std::error_code ec;
+            return !other.empty() && (full == other || std::filesystem::equivalent(full, other, ec));
+        };
+        std::istringstream towers(g.mmproj_path);
+        bool in_use = same_file(g.model_path);
+        for (std::string tower; std::getline(towers, tower, ',');) in_use |= same_file(tower);
+        if (in_use) { send_error(conn, 409, "这是当前模型的文件，请先卸载或切换模型"); return; }
+        int result = 0;
+        if (!translator.remove_file(full, [&] { result = unlink(full.c_str()); })) {
+            send_error(conn, 409, "翻译正在使用此模型，请稍后再删除");
+            return;
+        }
+        if (result != 0) { send_error(conn, 400, "无法删除模型文件，请检查模型目录权限"); return; }
+        conn.send(200, "application/json", "{\"ok\":true}");
     });
 
-    // 删除模型。只允许删模型目录里的文件，且不能删当前正在加载的那个 ——
-    // 删了它，引擎手里还攥着已映射的权重，之后任何一次切换都会失败。
-    srv.post("/api/models/delete", [](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
-        json::Value body;
-        std::string p = req.param("path");
-        if (p.empty() && json::parse(req.body, &body)) p = body.s("path");
-        if (p.empty()) {
-            c.send(400, "application/json", "{\"error\":\"缺少 path\"}");
-            return;
-        }
-        const std::string full = path_abs(p);
-        if (g.model_dir.empty() || full.rfind(path_abs(g.model_dir) + "/", 0) != 0) {
-            c.send(400, "application/json", "{\"error\":\"只能删模型目录里的文件\"}");
-            return;
-        }
-        if (full == path_abs(g.model_path)) {
-            c.send(400, "application/json",
-                   "{\"error\":\"这是当前加载的模型，先切到别的再删\"}");
-            return;
-        }
-        if (!is_file_p(full)) {
-            c.send(404, "application/json", "{\"error\":\"文件不存在\"}");
-            return;
-        }
-        if (std::remove(full.c_str()) != 0) {
-            c.send(400, "application/json", "{\"error\":\"删除失败，可能没有权限\"}");
-            return;
-        }
-        c.send(200, "application/json", "{\"ok\":true}");
-    });
-
-    // 下载源。空字符串 = 官方 huggingface.co。
-    srv.get("/api/store/mirror", [mirror](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
-        json::Value r = json::Value::make_obj();
-        r.set("mirror", json::Value::make_str(*mirror));
-        c.send(200, "application/json", json::dump(r));
-    });
-    srv.post("/api/store/mirror", [mirror, save_mirror](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
-        json::Value body;
-        std::string m;
-        if (json::parse(req.body, &body)) m = body.s("mirror");
-        if (!m.empty() && m.rfind("http", 0) != 0) {
-            c.send(400, "application/json", "{\"error\":\"镜像地址要以 http 开头\"}");
-            return;
-        }
-        while (!m.empty() && m.back() == '/') m.pop_back();
-        *mirror = m;
-        save_mirror();
-        json::Value r = json::Value::make_obj();
-        r.set("ok", json::Value::make_bool(true));
-        r.set("mirror", json::Value::make_str(*mirror));
-        c.send(200, "application/json", json::dump(r));
+    srv.post("/api/unload", [](const http::Request&, http::Conn& conn) {
+        std::unique_lock lock(g.mu, std::try_to_lock);
+        if (!lock.owns_lock()) { send_error(conn, 409, "模型正在使用，请稍后卸载"); return; }
+        g.worker.reset();
+        dubhe_unload_mmproj(g.engine);
+        dubhe_unload_model(g.engine);
+        g.mmproj_path.clear();
+        g.model_path.clear();
+        g.model_id.clear();
+        g_pcache.clear();
+        publish_model_status();
+        conn.send(200, "application/json", "{\"ok\":true}");
     });
 
     srv.get("/api/models", [](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
+        const ModelStatus current = model_status();
         std::vector<ModelEntry> ms;
         if (!g.model_dir.empty()) scan_models(g.model_dir, &ms, 0);
         std::sort(ms.begin(), ms.end(),
                   [](const ModelEntry& a, const ModelEntry& b) { return a.name < b.name; });
         json::Value root = json::Value::make_obj();
         root.set("dir", json::Value::make_str(g.model_dir));
-        root.set("current", json::Value::make_str(g.model_path));
+        root.set("current", json::Value::make_str(current.path));
         for (auto& m : ms) if (!m.mlx) m.mmproj = find_sibling_mmproj(m.path);
         json::Value arr = json::Value::make_arr();
         for (const auto& m : ms) {
@@ -4165,20 +4424,25 @@ int main(int argc, char** argv) {
             // "4.0B · 928 MB" 的自相矛盾条目（4B 的 4bit 模型不可能只有 928 MB）。
             o.set("quant", json::Value::make_str(m.mlx ? "" : guess_quant(m.name)));
             o.set("params", json::Value::make_num(m.mlx ? 0 : guess_params(m.name)));
-            o.set("loaded", json::Value::make_bool(m.path == g.model_path));
+            o.set("loaded", json::Value::make_bool(m.path == current.path));
             // 有配套塔就能看图/听音。这里只报"有没有塔"和塔的路径，
             // 不报具体是视觉还是语音 —— 那要读塔的 GGUF 头，而几十个模型
             // 逐个读头是几百毫秒。真正的 caps 在 /api/state 里，加载后自然知道。
             o.set("mmproj", json::Value::make_str(m.mmproj));
-            // MLX 条目只报"看得见、用不了"，不假装能加载。loadable=false
-            // 的项前端会画成灰的并给一句原因，而不是让用户点下去等一个报错。
             o.set("mlx", json::Value::make_bool(m.mlx));
-            o.set("loadable", json::Value::make_bool(!m.mlx));
-            if (m.mlx) {
-                o.set("note", json::Value::make_str(
-                    "MLX 格式（safetensors 目录），当前引擎只加载 GGUF。"
-                    "想跑它需要 MLX 运行时，这里只把它列出来免得你以为丢了。"));
+            if (const auto* entry = store::translation_file(path_base(m.path))) {
+                o.set("translation", json::Value::make_str(entry->id));
+                o.set("loadable", json::Value::make_bool(false));
+                o.set("note", json::Value::make_str("专用模型 · 在翻译页使用"));
+                arr.arr.push_back(std::move(o));
+                continue;
             }
+#ifdef __APPLE__
+            o.set("loadable", json::Value::make_bool(true));
+            if (m.mlx) o.set("note", json::Value::make_str("通过本机的可选 MLX 运行时直读"));
+#else
+            o.set("loadable", json::Value::make_bool(!m.mlx));
+#endif
             arr.arr.push_back(o);
         }
         root.set("items", arr);
@@ -4189,10 +4453,6 @@ int main(int argc, char** argv) {
     // 只能弹一句"还在开发中"。补上：卸载 → 加载 → 更新 model_id。
     // 加载失败要把旧模型装回去，否则一次误操作就让服务变成没有模型的状态。
     srv.post("/api/load", [](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         json::Value body;
         std::string p = req.param("path");
         if (p.empty() && json::parse(req.body, &body)) p = body.s("path");
@@ -4201,17 +4461,14 @@ int main(int argc, char** argv) {
             return;
         }
         const std::string full = path_abs(p);
-        // MLX 是目录 + safetensors，引擎只认 GGUF。在这里挡下来并说清楚，
-        // 否则会走到 dubhe_load_model，报一句"magic 不是 GGUF"，用户完全
-        // 看不懂那是什么意思。
-        if (is_dir_p(full)) {
-            c.send(400, "application/json",
-                   "{\"error\":\"这是目录形式的模型（MLX / safetensors），"
-                   "当前引擎只加载 GGUF 单文件。\"}");
+        if (store::translation_file(path_base(full))) {
+            send_error(c, 400, "这是翻译模型，请到翻译页使用");
             return;
         }
-        if (!path_allowed(full) || !is_file_p(full)) {
-            c.send(400, "application/json", "{\"error\":\"路径不允许或文件不存在\"}");
+        const bool model_exists = (full.ends_with(".gguf") && is_file_p(full)) ||
+            (is_dir_p(full) && has_safetensors(full));
+        if (!model_exists || (!path_allowed(full) && !under_root(path_dir(full), g.model_dir))) {
+            send_error(c, 400, "模型文件不存在或路径不允许");
             return;
         }
         if (g.busy.load()) {
@@ -4230,17 +4487,17 @@ int main(int argc, char** argv) {
         g.mmproj_path.clear();
 
         dubhe_unload_model(g.engine);
-        if (dubhe_load_model(g.engine, full.c_str()) != DUBHE_OK) {
-            const std::string err = dubhe_last_error();
+        std::string err;
+        if (!load_language_model(full, &err)) {
             g.model_path.clear();
             g.model_id.clear();
             // 装回旧模型，并把旧模型原来的塔也装回去 —— 否则一次误操作
             // 会让服务从"能看图"退化成"不能看图"，而且没有任何提示。
             if (!old.empty()) {
-                if (dubhe_load_model(g.engine, old.c_str()) == DUBHE_OK) {
+                std::string restore_error;
+                if (load_language_model(old, &restore_error)) {
                     g.model_path = old;
                     g.model_id = model_id_of(old);
-                    refresh_model_markers(old);
                     std::string tmp = old_mm;
                     size_t p = 0;
                     while (p <= tmp.size() && !tmp.empty()) {
@@ -4257,6 +4514,7 @@ int main(int argc, char** argv) {
             }
             json::Value e = json::Value::make_obj();
             e.set("error", json::Value::make_str("加载失败: " + err));
+            publish_model_status();
             e.set("restored", json::Value::make_str(g.model_path));
             e.set("mm", json::Value::make_num(dubhe_mm_caps(g.engine)));
             c.send(500, "application/json", json::dump(e));
@@ -4269,10 +4527,11 @@ int main(int argc, char** argv) {
         // 拿错塔不会报错，只会静默输出垃圾，所以这里宁可卸载也不将就。
         std::string want_mm = body.s("mmproj");
         if (want_mm.empty()) want_mm = req.param("mmproj");
-        if (want_mm.empty()) want_mm = find_sibling_mmproj(full);
+        if (want_mm.empty() && !g.worker) want_mm = find_sibling_mmproj(full);
         std::string mm_note;
         if (!want_mm.empty()) {
-            if (!is_file_p(want_mm) || !path_allowed(want_mm)) {
+            if (g.worker) mm_note = "此模型运行时当前支持文本";
+            else if (!is_file_p(want_mm) || !path_allowed(want_mm)) {
                 mm_note = "塔文件不存在或路径不允许: " + want_mm;
             } else if (dubhe_load_mmproj(g.engine, want_mm.c_str()) != DUBHE_OK) {
                 mm_note = std::string("塔加载失败: ") + dubhe_last_error();
@@ -4294,7 +4553,7 @@ int main(int argc, char** argv) {
                             std::chrono::steady_clock::now() - t0).count();
         g.model_path = full;
         g.model_id = model_id_of(full);
-        refresh_model_markers(full);
+        publish_model_status();
         // 换了模型，上一段 prompt 的 token 和 KV 全部作废
         g_pcache.clear();
         json::Value o = json::Value::make_obj();
@@ -4306,7 +4565,7 @@ int main(int argc, char** argv) {
         o.set("mmproj", json::Value::make_str(g.mmproj_path));
         if (!mm_note.empty()) o.set("mm_note", json::Value::make_str(mm_note));
         dubhe_model_info mi{};
-        if (dubhe_model_info_get(g.engine, &mi) == DUBHE_OK) {
+        if (current_model_info(&mi) == DUBHE_OK) {
             o.set("arch", json::Value::make_str(mi.arch));
             o.set("quant", json::Value::make_str(mi.quant_desc));
             o.set("params", json::Value::make_num((double)mi.n_params));
@@ -4316,10 +4575,6 @@ int main(int argc, char** argv) {
 
     // ---- 文件浏览
     srv.get("/api/files", [](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         const std::string full = path_abs(req.param("path"));
         if (!is_dir_p(full)) {
             c.send(404, "application/json", "{\"error\":\"目录不存在\"}");
@@ -4333,10 +4588,6 @@ int main(int argc, char** argv) {
     });
 
     srv.get("/api/files/read", [](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         const std::string full = path_abs(req.param("path"));
         if (!is_file_p(full)) {
             c.send(404, "application/json", "{\"error\":\"文件不存在\"}");
@@ -4358,66 +4609,38 @@ int main(int argc, char** argv) {
         c.send(200, "application/json", json::dump(o));
     });
 
-    // ---- 工具：清单 + 手动执行（给 UI 的调试面板用，不必绕一圈模型）
-    // 运行期权限开关。
-    //
-    // 这些位以前只能由启动参数决定，改了要重启进程 —— 用户实际体验就是
-    // "没有权限设置"：模型说"我没有执行命令的能力"，界面上也找不到任何
-    // 地方能开。现在放进 /api/settings，UI 改完立刻生效，下一次工具调用
-    // 就用新值。
-    //
-    // 只接受本机请求：把 shell 权限开放给局域网里任何一台机器，等于把
-    // 这台 Mac 的终端交出去。
-    srv.post("/api/settings", [](const http::Request& req, http::Conn& c) {
-        if (!is_local(req)) {
-            c.send(403, "application/json", "{\"error\":\"权限设置只允许本机修改\"}");
-            return;
-        }
+    srv.post("/api/settings", [](const http::Request& req, http::Conn& conn) {
         json::Value body;
-        if (!json::parse(req.body, &body)) {
-            c.send(400, "application/json", "{\"error\":\"JSON 解析失败\"}");
+        if (!json::parse(req.body, &body) || body.type != json::Value::OBJ) {
+            send_error(conn, 400, "设置格式无效");
             return;
         }
+        ToolPolicy next;
         {
-            std::lock_guard<std::mutex> lk(g.mu);
-            if (body.get("shell")) g.allow_shell = body.flag("shell", g.allow_shell);
-            if (body.get("write")) g.allow_write = body.flag("write", g.allow_write);
-            if (body.get("net")) g.allow_net = body.flag("net", g.allow_net);
-            if (body.get("sandbox")) g.sandbox = body.flag("sandbox", g.sandbox);
-            if (body.get("write_outside"))
-                g.allow_write_outside = body.flag("write_outside", g.allow_write_outside);
-            const double t = body.n("shell_timeout_s", 0);
-            if (t >= 1 && t <= 600) g.shell_timeout_ms = (int)(t * 1000);
-            const double tr = body.n("tool_rounds", 0);
-            if (tr >= 1 && tr <= 24) g.max_tool_rounds = (int)tr;
-            // 工作目录：必须是已存在的目录，且落在白名单根之内
-            const std::string wd = body.s("workspace");
-            if (!wd.empty()) {
-                const std::string full = path_abs(wd);
-                if (!is_dir_p(full)) {
-                    c.send(400, "application/json", "{\"error\":\"目录不存在\"}");
+            std::lock_guard<std::mutex> lock(g.policy_mu);
+            next = g.policy;
+            read_policy(body, &next);
+            const std::string workspace = body.s("workspace");
+            if (!workspace.empty()) {
+                const std::string full = path_abs(workspace);
+                if (!is_dir_p(full) || !path_allowed(full)) {
+                    send_error(conn, 400, "工作目录不存在或不在允许的范围内");
                     return;
                 }
-                if (!path_allowed(full)) {
-                    c.send(403, "application/json", "{\"error\":\"目录不在允许的范围内\"}");
-                    return;
-                }
-                g.workspace = full;
+                next.workspace = std::filesystem::canonical(full).string();
             }
+            if (!storage::ensure_dir(g.data_dir) ||
+                !storage::write_json(path_join(g.data_dir, "settings.json"), policy_json(next))) {
+                send_error(conn, 507, "无法保存设置，请检查数据目录");
+                return;
+            }
+            g.policy = next;
         }
-        json::Value o = json::Value::make_obj();
-        o.set("shell", json::Value::make_bool(g.allow_shell));
-        o.set("write", json::Value::make_bool(g.allow_write));
-        o.set("net", json::Value::make_bool(g.allow_net));
-        o.set("sandbox", json::Value::make_bool(sandbox_active()));
-        // 配置值单列一个字段：sandbox=false 且 sandbox_cfg=true，说明用户开了
-        // 但本机套不上（外层沙箱/CI 容器），界面据此给一句解释而不是静默失效。
-        o.set("sandbox_cfg", json::Value::make_bool(g.sandbox));
-        o.set("write_outside", json::Value::make_bool(g.allow_write_outside));
-        o.set("shell_timeout_s", json::Value::make_num(g.shell_timeout_ms / 1000.0));
-        o.set("tool_rounds", json::Value::make_num(g.max_tool_rounds));
-        o.set("workspace", json::Value::make_str(g.workspace));
-        c.send(200, "application/json", json::dump(o));
+        request_policy = next;
+        json::Value response = policy_json(next);
+        response.set("sandbox_cfg", json::Value::make_bool(next.sandbox));
+        response.set("sandbox", json::Value::make_bool(sandbox_active()));
+        conn.send(200, "application/json", json::dump(response));
     });
 
     // ---- 逐次审批的应答口
@@ -4454,26 +4677,18 @@ int main(int argc, char** argv) {
     });
 
     srv.get("/api/tools", [](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         json::Value root = json::Value::make_obj();
         root.set("items", tools_json());
-        root.set("workspace", json::Value::make_str(g.workspace));
-        root.set("shell", json::Value::make_bool(g.allow_shell));
-        root.set("write", json::Value::make_bool(g.allow_write));
-        root.set("net", json::Value::make_bool(g.allow_net));
+        root.set("workspace", json::Value::make_str(request_policy.workspace));
+        root.set("shell", json::Value::make_bool(request_policy.allow_shell));
+        root.set("write", json::Value::make_bool(request_policy.allow_write));
+        root.set("net", json::Value::make_bool(request_policy.allow_net));
         root.set("sandbox", json::Value::make_bool(sandbox_active()));
-        root.set("sandbox_cfg", json::Value::make_bool(g.sandbox));
+        root.set("sandbox_cfg", json::Value::make_bool(request_policy.sandbox));
         c.send(200, "application/json", json::dump(root));
     });
 
     srv.post("/api/tools/run", [](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         json::Value body;
         if (!json::parse(req.body, &body)) {
             c.send(400, "application/json", "{\"error\":\"JSON 解析失败\"}");
@@ -4574,10 +4789,6 @@ int main(int argc, char** argv) {
     };
 
     srv.get("/api/kb", [&](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         std::lock_guard<std::mutex> lk(g_kb_mu);
         if (!g_kb_loaded) {
             kb_load_manifest();
@@ -4589,10 +4800,6 @@ int main(int argc, char** argv) {
 
     // 递归收集文本文件（索引一个目录时用）
     srv.post("/api/kb/add", [&](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         json::Value body;
         std::string p = req.param("path");
         if (p.empty() && json::parse(req.body, &body)) p = body.s("path");
@@ -4661,10 +4868,6 @@ int main(int argc, char** argv) {
     });
 
     srv.post("/api/kb/remove", [&](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         json::Value body;
         std::string p = req.param("path");
         if (p.empty() && json::parse(req.body, &body)) p = body.s("path");
@@ -4682,10 +4885,6 @@ int main(int argc, char** argv) {
     });
 
     srv.post("/api/kb/clear", [&](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         std::lock_guard<std::mutex> lk(g_kb_mu);
         g_kb_docs.clear();
         kb_rebuild();
@@ -4694,10 +4893,6 @@ int main(int argc, char** argv) {
     });
 
     srv.post("/api/kb/rag", [&](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         json::Value body;
         if (json::parse(req.body, &body)) g_kb_rag = body.flag("on", g_kb_rag);
         std::lock_guard<std::mutex> lk(g_kb_mu);
@@ -4706,10 +4901,6 @@ int main(int argc, char** argv) {
     });
 
     srv.post("/api/kb/search", [&](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         json::Value body;
         if (!json::parse(req.body, &body)) {
             c.send(400, "application/json", "{\"error\":\"JSON 解析失败\"}");
@@ -4746,10 +4937,6 @@ int main(int argc, char** argv) {
     // 这样服务端不需要知道会话结构，也不用持久化任何对话 —— 隐私面上
     // 更干净：对话始终只存在浏览器里。
     srv.post("/api/summarize", [](const http::Request& req, http::Conn& c) {
-        if (!is_local(req) && !authorized(req)) {
-            c.send(401, "application/json", "{\"error\":\"未授权\"}");
-            return;
-        }
         json::Value body;
         if (!json::parse(req.body, &body)) {
             c.send(400, "application/json", "{\"error\":\"JSON 解析失败\"}");
@@ -4787,6 +4974,29 @@ int main(int argc, char** argv) {
         std::unique_lock<std::mutex> lk(g.mu, std::defer_lock);
         if (!lk.try_lock()) {
             c.send(409, "application/json", "{\"error\":\"引擎正在生成，稍后再试\"}");
+            return;
+        }
+        if (g.worker) {
+            json::Value user = json::Value::make_obj();
+            user.set("role", json::Value::make_str("user"));
+            user.set("content", json::Value::make_str(ask));
+            json::Value messages = json::Value::make_arr();
+            messages.arr.push_back(std::move(user));
+            json::Value request = json::Value::make_obj();
+            request.set("messages", std::move(messages));
+            request.set("max_tokens", json::Value::make_num(400));
+            request.set("temperature", json::Value::make_num(0));
+            std::string summary, reason, error;
+            dubhe_stats stats{};
+            if (!g.worker->generate(request, [&](const std::string& chunk) { summary += chunk; },
+                                    [&] { return c.peer_gone(); }, &stats, &reason, &error)) {
+                if (!c.peer_gone()) send_error(c, 500, error);
+                return;
+            }
+            json::Value result = json::Value::make_obj();
+            result.set("summary", json::Value::make_str(summary));
+            result.set("tokens", json::Value::make_num(stats.n_generated));
+            c.send(200, "application/json", json::dump(result));
             return;
         }
         dubhe_model_info mi{};
@@ -4848,7 +5058,8 @@ int main(int argc, char** argv) {
         root.set("object", json::Value::make_str("list"));
         json::Value arr = json::Value::make_arr();
         json::Value m = json::Value::make_obj();
-        m.set("id", json::Value::make_str(g.model_id.empty() ? "dubhe" : g.model_id));
+        const ModelStatus status = model_status();
+        m.set("id", json::Value::make_str(status.id.empty() ? "dubhe" : status.id));
         m.set("object", json::Value::make_str("model"));
         m.set("owned_by", json::Value::make_str("dubhe"));
         arr.arr.push_back(m);
@@ -4859,10 +5070,6 @@ int main(int argc, char** argv) {
     // ---- 核心：chat completions
     srv.post("/v1/chat/completions", [](const http::Request& req, http::Conn& c) {
         if (!authorized(req)) { c.send(401, "application/json", "{\"error\":{\"message\":\"无效的 API Key\",\"type\":\"invalid_request_error\"}}"); return; }
-        if (g.model_path.empty()) {
-            c.send(400, "application/json", "{\"error\":\"未加载模型\"}");
-            return;
-        }
         json::Value body;
         if (!json::parse(req.body, &body)) {
             c.send(400, "application/json", "{\"error\":\"JSON 解析失败\"}");
@@ -4874,7 +5081,14 @@ int main(int argc, char** argv) {
             return;
         }
         const bool stream = body.flag("stream", false);
-        bool with_tools = body.get("tools") != nullptr || body.flag("dubhe_tools", false);
+        bool with_tools = body.s("tool_choice") != "none" &&
+            (body.get("tools") != nullptr || body.flag("dubhe_tools", false));
+        if (!is_local(req) && with_tools) {
+            send_error(c, 403, "局域网共享只允许推理，工具请在运行 Dubhe 的设备上使用");
+            return;
+        }
+
+        if (maybe_batch(body, *msgs, c, with_tools)) return;
 
         // ---- 串行化：整条请求（含多模态编码和工具两轮）放进同一把锁
         //
@@ -4979,42 +5193,102 @@ int main(int argc, char** argv) {
             }
         };
 
-        // 请求级工作目录。
-        //
-        // 前端每个对话可以绑定一个"项目文件夹"，工具的相对路径就以它为根。
-        // 改的是 g.workspace 这个全局量，看起来危险 —— 但整条请求是串行化
-        // 在 g.mu 上的（上面刚拿到锁），同一时刻只可能有一个请求在跑，
-        // 而且用 RAII 恢复，异常路径也不会漏。换成请求上下文对象当然更干净，
-        // 但那要把 workspace 一路传进 run_tool / path_abs 的每个调用点，
-        // 改动面大得多，收益只有"并发时不互相影响"—— 而这里本来就不并发。
-        struct WsScope {
-            std::string old;
-            bool active = false;
-            ~WsScope() { if (active) g.workspace = old; }
-        } ws_scope;
-        {
-            const std::string want = body.s("workspace");
-            if (!want.empty()) {
-                const std::string full = path_abs(want);
-                if (is_dir_p(full) && path_allowed(full) && full != g.workspace) {
-                    ws_scope.old = g.workspace;
-                    ws_scope.active = true;
-                    g.workspace = full;
-                }
+        if (g.model_path.empty()) {
+            fail("未加载模型");
+            return;
+        }
+        const std::string requested = body.s("dubhe_model_path");
+        std::error_code model_path_error;
+        if (!requested.empty() && path_abs(requested) != g.model_path &&
+            !std::filesystem::equivalent(path_abs(requested), g.model_path, model_path_error)) {
+            const std::string message = "当前模型已改变，请重新选择模型";
+            if (c.header_sent()) fail(message);
+            else c.send(409, "application/json", "{\"error\":{\"message\":" +
+                    json_escape(message) + "}}");
+            return;
+        }
+
+        const std::string workspace = body.s("workspace");
+        if (is_local(req) && !workspace.empty()) {
+            const std::string full = path_abs(workspace);
+            if (!is_dir_p(full) || !path_allowed(full)) {
+                fail("对话的工作目录不存在或不在允许的范围内");
+                return;
             }
+            request_policy.workspace = std::filesystem::canonical(full).string();
         }
 
         dubhe_model_info mi{};
-        dubhe_model_info_get(g.engine, &mi);
+        current_model_info(&mi);
         const bool chatml = mi.has_chat_template != 0;
 
         dubhe_sampling sp{};
-        sp.max_tokens = (int)body.n("max_tokens", 512);
+        const double limit = body.n("max_tokens", 512);
+        if (!(limit >= 1 && limit <= 1048576) || std::floor(limit) != limit) {
+            fail("max_tokens 必须是正整数");
+            return;
+        }
+        sp.max_tokens = (int)limit;
         sp.temperature = (float)body.n("temperature", 0.7);
         sp.top_k = (int)body.n("top_k", 40);
         sp.top_p = (float)body.n("top_p", 0.95);
         sp.repeat_penalty = (float)body.n("repeat_penalty", 1.1);
         sp.repeat_last_n = 64;
+
+        std::optional<json_grammar::Program> grammar;
+        json::Value structured_messages;
+        if (const auto* format = body.get("response_format")) {
+            const std::string type = format->s("type");
+            if (type != "text") {
+                json::Value schema = json_grammar::Program::object_format();
+                if (type == "json_schema") {
+                    const auto* spec = format->get("json_schema");
+                    const auto* constraint = spec ? spec->get("schema") : nullptr;
+                    if (!constraint) { fail("response_format 缺少 JSON Schema"); return; }
+                    schema = *constraint;
+                } else if (type != "json_object") {
+                    fail("不支持的 response_format 类型");
+                    return;
+                }
+                if (with_tools || body.flag("dubhe_raw", false)) {
+                    fail("结构化输出需要使用普通对话模式");
+                    return;
+                }
+                try { grammar.emplace(schema); }
+                catch (const std::invalid_argument& e) { fail(e.what()); return; }
+                t_no_think = true;
+                structured_messages = *msgs;
+                json::Value instruction = json::Value::make_obj();
+                instruction.set("role", json::Value::make_str("system"));
+                instruction.set("content", json::Value::make_str("直接按以下结构输出 JSON。\n" +
+                                                                json::dump(schema)));
+                structured_messages.arr.insert(structured_messages.arr.begin(), std::move(instruction));
+            }
+        }
+
+        if (g.worker) {
+            if (with_tools || grammar || body.flag("dubhe_raw", false)) {
+                fail("此模型运行时当前支持普通文本对话");
+                return;
+            }
+            for (const auto& message : msgs->arr) {
+                const auto* content = message.get("content");
+                if (!content || content->type != json::Value::STR) {
+                    fail("此模型运行时需要字符串形式的消息内容");
+                    return;
+                }
+            }
+            CompletionReply reply(c, now_id(), g.model_id, (long long)time(nullptr), stream);
+            std::string reason, error;
+            dubhe_stats stats{};
+            if (!g.worker->generate(body, [&](const std::string& chunk) { reply.append(chunk); },
+                                    [&] { return reply.cancelled(); }, &stats, &reason, &error)) {
+                if (!reply.cancelled()) fail(error);
+                return;
+            }
+            reply.finish(reason, stats);
+            return;
+        }
 
         // 只允许一个媒体：视觉塔和语音塔是两个独立的 mmproj，一次注入两段特征
         // 需要两套前缀，留到 Omni 那一轮再做。
@@ -5022,7 +5296,9 @@ int main(int argc, char** argv) {
         std::vector<int32_t> toks;
         std::string berr;
         const bool force_raw = body.flag("dubhe_raw", false);
-        if (!build_tokens(g.engine, *msgs, chatml, with_tools, force_raw, &toks, &mcache, &berr)) {
+        bool transcribing = false;
+        if (!build_tokens(g.engine, grammar ? structured_messages : *msgs, chatml, with_tools,
+                          force_raw, &toks, &mcache, &berr, &transcribing)) {
             fail(berr);
             return;
         }
@@ -5041,6 +5317,31 @@ int main(int argc, char** argv) {
 
         const std::string id = now_id();
         long long created = (long long)time(nullptr);
+
+        if (grammar) {
+            CompletionReply reply(c, id, g.model_id, created, stream);
+            struct StructuredOutput {
+                json_grammar::Program::Cursor cursor;
+                CompletionReply& reply;
+            } output{json_grammar::Program::Cursor(*grammar), reply};
+            dubhe_stats stats{};
+            const int rc = dubhe_generate_filtered(g.engine, toks.data(), n, &sp,
+                [](void* ptr, int32_t, const char* bytes, int32_t len) -> int {
+                    auto& cursor = static_cast<StructuredOutput*>(ptr)->cursor;
+                    return bytes ? cursor.allows(std::string_view(bytes, (size_t)len)) : cursor.complete();
+                },
+                [](void* ptr, int32_t, const char* piece) {
+                    auto& state = *static_cast<StructuredOutput*>(ptr);
+                    state.cursor.consume(piece);
+                    state.reply.append(piece);
+                },
+                [](void* ptr) -> int { return static_cast<StructuredOutput*>(ptr)->reply.cancelled(); },
+                &output, &stats);
+            if (rc == DUBHE_ERR_CANCELLED) return;
+            if (rc != DUBHE_OK) { fail(dubhe_last_error()); return; }
+            reply.finish(output.cursor.complete() ? "stop" : "length", stats);
+            return;
+        }
 
         // ---- 纯算式直接给答案，不经过模型 ----
         //
@@ -5069,6 +5370,7 @@ int main(int argc, char** argv) {
                     root.set("id", json::Value::make_str(id));
                     root.set("object", json::Value::make_str("chat.completion"));
                     root.set("created", json::Value::make_num((double)created));
+                    root.set("model", json::Value::make_str(g.model_id));
                     json::Value choices = json::Value::make_arr();
                     json::Value ch = json::Value::make_obj();
                     ch.set("index", json::Value::make_num(0));
@@ -5121,11 +5423,11 @@ int main(int argc, char** argv) {
             ctx.created = created;
             // 开了深度思考就把推理过程推给界面（单独一条 think 事件，
             // 由前端折进"思考过程"块）；关着就照旧当垃圾丢掉。
-            ctx.think_emit = g_think_enabled && g_think_style;
+            ctx.think_emit = !transcribing && g_think_enabled && g_think_style;
 
             dubhe_stats st{};
 
-            // 调用方自己跑循环时服务端一轮都不执行；否则最多跑 g.max_tool_rounds 轮。
+            // 调用方自己跑循环时服务端一轮都不执行；否则最多跑 request_policy.max_tool_rounds 轮。
             //
             // 上限本身是必要的：2B 级别的模型看到工具结果后经常又吐一次
             // tool_call（尤其结果里有代码/JSON 时），不设上限会来回打转。
@@ -5133,7 +5435,7 @@ int main(int argc, char** argv) {
             // 回答"这种最普通的组合第三轮就被掐断。现在默认 6，可调，
             // 并且保留下面那个"同样的调用连做两次就停"的保护。
             const bool client_drives = has_tool_result(*msgs);
-            const int max_rounds = client_drives ? 0 : std::max(1, g.max_tool_rounds);
+            const int max_rounds = client_drives ? 0 : std::max(1, request_policy.max_tool_rounds);
             int rounds = 0;
             std::vector<int32_t> cur = toks;
             // 这一轮请求里跑过的所有工具签名。用"见过没有"而不是"和上一次比"，
@@ -5188,7 +5490,7 @@ int main(int argc, char** argv) {
                 // <think> 出来，扫描器必须一开始就处于 in_think。
                 // 原来这里写 false，结果整段推理被当成正文直接吐出去，
                 // 就是"关了开关反而更难读"的原因。
-                ctx.in_think = (g_think_style != 0 && !t_no_think);
+                ctx.in_think = !transcribing && !force_raw && g_think_style != 0 && !t_no_think;
                 ctx.think_buf.clear();
                 ctx.think_scan.clear();
                 ctx.visible = 0;
@@ -5198,9 +5500,13 @@ int main(int argc, char** argv) {
                 ctx.no_suppress = !with_tools;
 
                 dubhe_stats s{};
-                dubhe_generate(g.engine, cur.data(), (int32_t)cur.size(), &sp, on_piece,
-                               conn_gone_cb, &ctx, &s);
+                const int generated = dubhe_generate(g.engine, cur.data(), (int32_t)cur.size(), &sp,
+                                                     on_piece, conn_gone_cb, &ctx, &s);
+                if (generated == DUBHE_ERR_CANCELLED) break;
+                if (generated != DUBHE_OK) { fail(dubhe_last_error()); return; }
                 flush_pending(&ctx);
+                finish = (s.n_generated >= sp.max_tokens ||
+                          s.n_prompt + s.n_generated >= lim.n_ctx_limit) ? "length" : "stop";
 
                 // 客户端走了就别再往下走：不要跑工具（可能是个写文件/shell），
                 // 也不要再开下一轮生成。这一步省下的不只是算力 —— 工具是有
@@ -5527,14 +5833,17 @@ int main(int argc, char** argv) {
         // 非流式
         std::string acc;
         dubhe_stats st{};
-        struct Ctx2 { std::string* acc; } ctx2{&acc};
-        dubhe_generate(
+        struct Ctx2 { std::string* acc; http::Conn* conn; } ctx2{&acc, &c};
+        const int generated = dubhe_generate(
             g.engine, toks.data(), n, &sp,
             [](void* ud, int32_t, const char* piece) {
                 auto* x = (Ctx2*)ud;
                 if (piece) x->acc->append(piece);
             },
-            nullptr, &ctx2, &st);
+            [](void* ud) -> int { return static_cast<Ctx2*>(ud)->conn->peer_gone(); },
+            &ctx2, &st);
+        if (generated == DUBHE_ERR_CANCELLED) return;
+        if (generated != DUBHE_OK) { fail(dubhe_last_error()); return; }
 
         g.last_decode_tps = st.decode_tps;
         g.total_requests++;
@@ -5544,6 +5853,7 @@ int main(int argc, char** argv) {
         root.set("id", json::Value::make_str(id));
         root.set("object", json::Value::make_str("chat.completion"));
         root.set("created", json::Value::make_num((double)created));
+        root.set("model", json::Value::make_str(g.model_id));
         json::Value choices = json::Value::make_arr();
         json::Value ch = json::Value::make_obj();
         ch.set("index", json::Value::make_num(0));
@@ -5573,14 +5883,16 @@ int main(int argc, char** argv) {
             // "<推理…</think>答案" 这种结构 —— 流式通道有 feed_think 分流，
             // 这里没有，于是同一条请求 stream=true 干净、stream=false 满屏
             // 自言自语。scrub 一下，两条路给的东西保持一致。
-            const bool truncated = sp.max_tokens > 0 && st.n_generated >= sp.max_tokens;
-            std::string shown = scrub_history(strip_think_block(acc, truncated, g_think_style != 0));
+            const bool truncated = (sp.max_tokens > 0 && st.n_generated >= sp.max_tokens) ||
+                st.n_prompt + st.n_generated >= lim.n_ctx_limit;
+            const bool thought_open = !transcribing && !force_raw && !t_no_think && g_think_style != 0;
+            std::string shown = scrub_history(strip_think_block(acc, truncated, thought_open));
             if (shown.empty() && !acc.empty()) {
                 shown = "（模型把全部输出预算都用在了内部推理上，没有留下答案。"
                         "可以把最大生成长度调大，或打开「思考过程」看看它想了什么。）";
             }
             msg.set("content", json::Value::make_str(shown));
-            ch.set("finish_reason", json::Value::make_str("stop"));
+            ch.set("finish_reason", json::Value::make_str(truncated ? "length" : "stop"));
         }
         ch.set("message", msg);
         choices.arr.push_back(ch);

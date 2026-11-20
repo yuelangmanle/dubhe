@@ -1,0 +1,68 @@
+plugins {
+    id "com.android.library"
+}
+
+def vulkanEnabled = providers.gradleProperty("dubheVulkan").map { it.toBoolean() }.orElse(false)
+def shaderSource = layout.projectDirectory.file("../../engine/src/vulkan_q4_k.comp")
+def shaderHeader = layout.buildDirectory.file("generated/vulkan/vulkan_q4_k.inc")
+
+android {
+    namespace "dev.dubhe.sdk"
+    compileSdk 36
+    ndkVersion "27.2.12479018"
+
+    defaultConfig {
+        minSdk 31
+        ndk { abiFilters "arm64-v8a" }
+        consumerProguardFiles "consumer-rules.pro"
+        if (vulkanEnabled.get()) {
+            externalNativeBuild {
+                ndkBuild {
+                    arguments "DUBHE_ENABLE_VULKAN=1",
+                        "DUBHE_VULKAN_SHADER_DIR=" + shaderHeader.get().asFile.parentFile.absolutePath
+                }
+            }
+        }
+    }
+
+    externalNativeBuild {
+        ndkBuild { path "src/main/jni/Android.mk" }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0"
+}
+
+if (vulkanEnabled.get()) {
+    def shaderCompiler = androidComponents.sdkComponents.ndkDirectory.map { ndk ->
+        def hostCompilers = ndk.dir("shader-tools").asFile.listFiles()?.collectMany { host ->
+            [new File(host, "glslc"), new File(host, "glslc.exe")].findAll { it.isFile() }
+        } ?: []
+        if (hostCompilers.size() != 1) {
+            throw new GradleException("Could not locate the NDK shader compiler.")
+        }
+        hostCompilers.first()
+    }
+    def compileVulkanShader = tasks.register("compileVulkanShader", Exec) {
+        inputs.file(shaderSource)
+        inputs.file(shaderCompiler)
+        outputs.file(shaderHeader)
+        doFirst {
+            def output = shaderHeader.get().asFile
+            output.parentFile.mkdirs()
+            commandLine shaderCompiler.get(), "--target-env=vulkan1.0", "-O", "-mfmt=num",
+                shaderSource.asFile, "-o", output
+        }
+    }
+    tasks.configureEach {
+        if (name.startsWith("configureNdkBuild") || name.startsWith("buildNdkBuild")) {
+            dependsOn(compileVulkanShader)
+        }
+    }
+}

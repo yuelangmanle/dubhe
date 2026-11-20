@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <type_traits>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -45,14 +46,18 @@ void quantize_row_q8_0(const float* x, block_q8_0* y, int64_t n) {
 }  // namespace
 
 bool act_q8_supported(uint32_t wtype) {
+#if defined(DUBHE_NEON)
     switch (wtype) {
         case T_Q4_0: case T_Q4_1: case T_Q5_0: case T_Q5_1:
-        case T_Q8_0: case T_Q4_K: case T_Q6_K:
+        case T_Q8_0: case T_Q4_K: case T_Q5_K: case T_Q6_K:
             return true;
-        // TODO(M1): Q5_K 的整数内核尚未实现，先走 f32 路径，避免静默算错
         default:
             return false;
     }
+#else
+    (void)wtype;
+    return false;
+#endif
 }
 
 size_t act_q8_bytes(uint32_t wtype, int64_t n) {
@@ -103,6 +108,50 @@ inline void spread_qh(uint32_t qh, int8x16_t sh, uint8x16_t one, uint8x16_t* lo,
                                           vdup_n_u8((uint8_t)((qh >> 24) & 0xFF)));
     *lo = vshlq_n_u8(vandq_u8(vshlq_u8(lo_src, sh), one), 4);
     *hi = vshlq_n_u8(vandq_u8(vshlq_u8(hi_src, sh), one), 4);
+}
+
+template <typename Block>
+float dot_k_affine(const block_q8_0* a, const Block* b, int64_t n) {
+    const uint8x16_t nibble = vdupq_n_u8(0x0F);
+    const uint8x16_t fifth_bit = vdupq_n_u8(0x10);
+    float sum = 0.f;
+    for (int64_t i = 0; i < n / 256; i++) {
+        const float d = fp16_to_fp32(b[i].d);
+        const float dm = fp16_to_fp32(b[i].dmin);
+        const block_q8_0* ag = a + i * 8;
+        float bsum = 0.f;
+        for (int j = 0; j < 4; j++) {
+            const uint8x16_t qa = vld1q_u8(b[i].qs + j * 32);
+            const uint8x16_t qb = vld1q_u8(b[i].qs + j * 32 + 16);
+            uint8x16_t lo_a = vandq_u8(qa, nibble), lo_b = vandq_u8(qb, nibble);
+            uint8x16_t hi_a = vshrq_n_u8(qa, 4), hi_b = vshrq_n_u8(qb, 4);
+            if constexpr (std::is_same_v<Block, block_q5_K>) {
+                // qh packs the fifth bit of all eight 32-element groups per lane.
+                const uint8x16_t qh_a = vld1q_u8(b[i].qh);
+                const uint8x16_t qh_b = vld1q_u8(b[i].qh + 16);
+                const int8x16_t lo_shift = vdupq_n_s8(4 - 2 * j);
+                const int8x16_t hi_shift = vdupq_n_s8(3 - 2 * j);
+                lo_a = vorrq_u8(lo_a, vandq_u8(vshlq_u8(qh_a, lo_shift), fifth_bit));
+                lo_b = vorrq_u8(lo_b, vandq_u8(vshlq_u8(qh_b, lo_shift), fifth_bit));
+                hi_a = vorrq_u8(hi_a, vandq_u8(vshlq_u8(qh_a, hi_shift), fifth_bit));
+                hi_b = vorrq_u8(hi_b, vandq_u8(vshlq_u8(qh_b, hi_shift), fifth_bit));
+            }
+
+            uint8_t sc0, m0, sc1, m1;
+            get_scale_min_k4(2 * j, b[i].scales, &sc0, &m0);
+            get_scale_min_k4(2 * j + 1, b[i].scales, &sc1, &m1);
+            const block_q8_0* a0 = ag + 2 * j;
+            const block_q8_0* a1 = a0 + 1;
+            int32x4_t c0 = dot16(vdupq_n_s32(0), vreinterpretq_s8_u8(lo_a), vld1q_s8(a0->qs));
+            c0 = dot16(c0, vreinterpretq_s8_u8(lo_b), vld1q_s8(a0->qs + 16));
+            int32x4_t c1 = dot16(vdupq_n_s32(0), vreinterpretq_s8_u8(hi_a), vld1q_s8(a1->qs));
+            c1 = dot16(c1, vreinterpretq_s8_u8(hi_b), vld1q_s8(a1->qs + 16));
+            bsum += fp16_to_fp32(a0->d) * (d * sc0 * hsum_s32(c0) - dm * m0 * sum32(a0));
+            bsum += fp16_to_fp32(a1->d) * (d * sc1 * hsum_s32(c1) - dm * m1 * sum32(a1));
+        }
+        sum += bsum;
+    }
+    return sum;
 }
 
 }  // namespace
@@ -256,46 +305,10 @@ float vec_dot_q8(uint32_t wtype, const void* xq, const void* row, int64_t n) {
             }
             return sum;
         }
-        case T_Q4_K: {
-            // 256 个元素 = 4 个 64 组；每组低半字节 32 个 + 高半字节 32 个，
-            // 各自一个 (scale, min)，正好各占一个 32 元激活块。
-            const block_q4_K* b = (const block_q4_K*)row;
-            const uint8x16_t m4b = vdupq_n_u8(0x0F);
-            for (int64_t i = 0; i < n / 256; i++) {
-                const float d = fp16_to_fp32(b[i].d);
-                const float dm = fp16_to_fp32(b[i].dmin);
-                const block_q8_0* ag = a + i * 8;
-                float bsum = 0.f;
-                for (int j = 0; j < 4; j++) {
-                    uint8_t sc1, m1, sc2, m2;
-                    get_scale_min_k4(2 * j + 0, b[i].scales, &sc1, &m1);
-                    get_scale_min_k4(2 * j + 1, b[i].scales, &sc2, &m2);
-                    const uint8x16_t qa = vld1q_u8(b[i].qs + j * 32);
-                    const uint8x16_t qb = vld1q_u8(b[i].qs + j * 32 + 16);
-                    const int8x16_t lo_a = vreinterpretq_s8_u8(vandq_u8(qa, m4b));
-                    const int8x16_t lo_b = vreinterpretq_s8_u8(vandq_u8(qb, m4b));
-                    const int8x16_t hi_a = vreinterpretq_s8_u8(vshrq_n_u8(qa, 4));
-                    const int8x16_t hi_b = vreinterpretq_s8_u8(vshrq_n_u8(qb, 4));
-
-                    const block_q8_0* a0 = ag + 2 * j + 0;
-                    const block_q8_0* a1 = ag + 2 * j + 1;
-                    int32x4_t c0 = vdupq_n_s32(0), c1 = vdupq_n_s32(0);
-                    c0 = dot16(c0, lo_a, vld1q_s8(a0->qs));
-                    c0 = dot16(c0, lo_b, vld1q_s8(a0->qs + 16));
-                    c1 = dot16(c1, hi_a, vld1q_s8(a1->qs));
-                    c1 = dot16(c1, hi_b, vld1q_s8(a1->qs + 16));
-
-                    const float da0 = fp16_to_fp32(a0->d);
-                    const float da1 = fp16_to_fp32(a1->d);
-                    bsum += da0 * (d * (float)sc1 * (float)hsum_s32(c0) -
-                                   dm * (float)m1 * (float)sum32(a0));
-                    bsum += da1 * (d * (float)sc2 * (float)hsum_s32(c1) -
-                                   dm * (float)m2 * (float)sum32(a1));
-                }
-                sum += bsum;
-            }
-            return sum;
-        }
+        case T_Q4_K:
+            return dot_k_affine(a, (const block_q4_K*)row, n);
+        case T_Q5_K:
+            return dot_k_affine(a, (const block_q5_K*)row, n);
         default:
             return 0.f;
     }
