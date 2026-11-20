@@ -38,6 +38,7 @@ class EngineService : Service() {
     private var generationReply: Messenger? = null
     private var model: ModelInfo? = null
     private var modelFile: File? = null
+    private var chatResident = false
     private var projector: ProjectorCapabilities? = null
     private var projectorFile: File? = null
     private val power by lazy { requireNotNull(getSystemService(PowerManager::class.java)) }
@@ -87,10 +88,24 @@ class EngineService : Service() {
                 when (action) {
                     EngineProtocol.LoadModel -> loadModel(File(requireNotNull(data.getString("path"))), id, reply)
                     EngineProtocol.LoadProjector -> loadProjector(File(requireNotNull(data.getString("path"))), id, reply)
+                    EngineProtocol.UnloadModel -> {
+                        engine.unloadModel()
+                        model = null
+                        modelFile = null
+                        projector = null
+                        projectorFile = null
+                        chatResident = false
+                        reply.post(EngineProtocol.ModelUnloaded, id, Bundle())
+                    }
                     EngineProtocol.Generate -> {
                         check(!overheated) { "设备温度过高，降温后再试。" }
                         generationReply = reply
                         generate(data, id, reply)
+                    }
+                    EngineProtocol.Translate -> {
+                        check(!overheated) { "设备温度过高，降温后再试。" }
+                        generationReply = reply
+                        translate(data, id, reply)
                     }
                 }
             } catch (cancelled: CancellationException) {
@@ -118,6 +133,7 @@ class EngineService : Service() {
         modelFile = null
         projector = null
         projectorFile = null
+        chatResident = false
         val loaded = try {
             engine.loadModel(file)
         } catch (failure: Exception) {
@@ -126,6 +142,7 @@ class EngineService : Service() {
                 try {
                     model = engine.loadModel(previous)
                     modelFile = previous
+                    chatResident = true
                     restoreProjector(previousProjector)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -137,6 +154,7 @@ class EngineService : Service() {
         }
         model = loaded
         modelFile = file
+        chatResident = true
         reply.post(EngineProtocol.ModelReady, id, Bundle().apply {
             putString("backend", loaded.backend)
             putString("quantization", loaded.quantization)
@@ -145,6 +163,7 @@ class EngineService : Service() {
     }
 
     private suspend fun loadProjector(file: File, id: Int, reply: Messenger) {
+        ensureChatModel()
         val previous = projectorFile
         projectorFile = null
         projector = null
@@ -175,8 +194,22 @@ class EngineService : Service() {
         }
     }
 
+    private suspend fun ensureChatModel(): ModelInfo {
+        if (chatResident) return checkNotNull(model)
+        val file = modelFile ?: error("请先在模型库加载一个对话模型。")
+        val previousProjector = projectorFile
+        model = null
+        projector = null
+        projectorFile = null
+        val loaded = engine.loadModel(file)
+        model = loaded
+        chatResident = true
+        restoreProjector(previousProjector)
+        return loaded
+    }
+
     private suspend fun generate(data: Bundle, id: Int, reply: Messenger) {
-        val info = model ?: error("请先导入模型。")
+        val info = ensureChatModel()
         val allMessages = requireNotNull(data.getStringArrayList("messages"))
         val attachment = data.getString("attachmentPath")?.let { path ->
             Attachment(File(path), AttachmentKind.valueOf(requireNotNull(data.getString("attachmentKind"))))
@@ -216,6 +249,54 @@ class EngineService : Service() {
             putBoolean("cancelled", response.cancelled)
             putBoolean("thermal", response.cancelled && thermalStop)
             putDouble("speed", response.stats.decodeTokensPerSecond)
+        })
+    }
+
+    private suspend fun translate(data: Bundle, id: Int, reply: Messenger) {
+        val source = requireNotNull(data.getString("source"))
+        val from = Language.valueOf(requireNotNull(data.getString("from")))
+        val to = Language.valueOf(requireNotNull(data.getString("to")))
+        val dedicated = data.getString("modelPath")?.let(::File)
+        require(source.isNotBlank() && source.length <= translationLimit)
+        if (dedicated != null) {
+            engine.unloadModel()
+            chatResident = false
+        }
+        try {
+            val info = if (dedicated == null) ensureChatModel() else engine.loadModel(dedicated)
+            val blocks = translationBlocks(source)
+            val total = blocks.count { it.isNotBlank() }
+            var completed = 0
+            for (block in blocks) {
+                if (stopRequested) break
+                if (block.isBlank()) {
+                    reply.post(EngineProtocol.Text, id, Bundle().apply { putString("text", block) })
+                    continue
+                }
+                val instruction = translationPrompt(block, from, to, dedicated != null)
+                val prompt = if (dedicated != null) instruction else renderPrompt(info, listOf(instruction), null)
+                    .let { if (info.architecture == "qwen35") "$it<think>\n\n</think>\n\n" else it }
+                val tokens = engine.tokenize(prompt, addSpecial = dedicated == null)
+                if (stopRequested) break
+                val budget = minOf(1024, info.contextSize - tokens.size)
+                check(budget >= 32) { "这段原文超出了模型可处理的长度。" }
+                val result = engine.generate(tokens, Sampling(maxTokens = budget, temperature = 0f, repeatPenalty = 1f))
+                if (result.cancelled || stopRequested) break
+                check(result.stats.generatedTokens < budget) { "译文达到长度上限，请缩短这段原文后重试。" }
+                val translated = result.text.replace(Regex("<think>[\\s\\S]*?</think>"), "").trim()
+                check(translated.isNotEmpty()) { "模型没有输出译文。" }
+                reply.post(EngineProtocol.Text, id, Bundle().apply {
+                    putString("text", translated)
+                    putInt("completed", ++completed)
+                    putInt("total", total)
+                })
+            }
+        } finally {
+            if (dedicated != null) engine.unloadModel()
+        }
+        reply.post(EngineProtocol.Complete, id, Bundle().apply {
+            putBoolean("cancelled", stopRequested)
+            putBoolean("thermal", thermalStop)
         })
     }
 

@@ -82,6 +82,31 @@ def conversation(key):
 
 class ServiceTest(unittest.TestCase):
     @unittest.skipUnless(QWEN35_MODEL, "DUBHE_TEST_QWEN35_MODEL is unset")
+    def test_qwen35_search_uses_one_short_tool_prompt(self):
+        body = {
+            "messages": [
+                {"role": "system", "content": "你是聊天助手。"},
+                {"role": "system", "content": "用一句话回答。"},
+                {"role": "user", "content": "你是谁？"},
+            ],
+            "temperature": 0, "max_tokens": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp, server(
+            Path(tmp), "-m", QWEN35_MODEL, "--no-mmproj", "-c", "4096",
+        ) as base:
+            def prompt_tokens(extra):
+                status, result = request(base, "/v1/chat/completions", {**body, **extra}, timeout=90)
+                self.assertEqual(status, 200, result)
+                return result["usage"]["prompt_tokens"]
+
+            plain = prompt_tokens({})
+            search = prompt_tokens({"dubhe_search": True})
+            general = prompt_tokens({"dubhe_tools": True})
+            self.assertLess(50, search - plain, "search must reach the model")
+            self.assertLess(search - plain, 240, "search must not repeat tool descriptions")
+            self.assertLess(search, general, "search must not send unrelated tools")
+
+    @unittest.skipUnless(QWEN35_MODEL, "DUBHE_TEST_QWEN35_MODEL is unset")
     def test_qwen35_translates_with_native_cpu_and_metal(self):
         body = {
             "messages": [

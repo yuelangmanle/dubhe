@@ -84,7 +84,8 @@ swiftc -O -whole-module-optimization \
        -o "$CONTENTS/MacOS/$NAME" \
        apps/macos/Sources/main.swift apps/macos/Sources/ReleaseUpdates.swift \
        apps/macos/Sources/TranslationPDF.swift apps/macos/Sources/TranslationExport.swift \
-       -framework Cocoa -framework Carbon -framework WebKit -framework PDFKit -framework CoreText
+       apps/macos/Sources/OneShotScreenCapture.swift \
+       -framework Cocoa -framework Carbon -framework WebKit -framework PDFKit -framework CoreText -framework ScreenCaptureKit
 
 echo "==> 组装包内容"
 cp "$PLIST" "$CONTENTS/Info.plist"

@@ -90,12 +90,9 @@
     // 普通对话被污染的成本远大于偶尔能自动读个文件的收益。
     // 要用就走 Agent 视图（单次开启），或者在设置里显式打开。
     tools: false,
-    // 联网搜索：只在本次会话有效。打开后每个问题前面会加一句"先搜再答"，
-    // 并临时打开工具（否则模型没有 web_search 可用，开关等于摆设）。
+    // 联网搜索：只在本次会话有效，按问题需要调用搜索工具。
     web: false,
-    // 是否显示模型的推理过程。默认关 —— 它只控制"看不着得见"，
-    // 不控制"想不想"：支持的模型（LFM3 这类）本来就会先想一遍，
-    // 关掉这个开关也拦不住，只会让推理漏进正文。
+    // 关掉时，支持直答的模型会跳过思考。其他模型只隐藏推理过程。
     think: readPreference(THINK_KEY) === '1',
     drafts: new Map(),
     logs: [],       // 右栏系统日志：只记真实事件，不编
@@ -1273,9 +1270,12 @@
       if (bw) {
         bw.disabled = !s.net;
         bw.classList.toggle('dim', !s.net);
-        bw.title = s.net ? '联网搜索（先搜再答）' : '联网权限已关闭（设置 → 权限）';
+        bw.title = s.net ? '联网搜索（需要查证时使用）' : '联网权限已关闭（设置 → 权限）';
         if (!s.net && state.web) { state.web = false; bw.classList.remove('on'); }
       }
+      const bt = $('#btnThink');
+      if (bt) bt.title = s.info?.direct_answer
+        ? '思考过程（关闭后直接回答）' : '显示模型的推理过程';
       if (first) {
         log(s.loaded ? 'Model loaded successfully.' : 'No model loaded.', s.loaded ? '' : 'err');
         if (s.info && s.info.gpu) log('Using Metal (GPU) ...');
@@ -1937,7 +1937,8 @@
     const previousCount = conv.messages.length;
     const userMsg = { role: 'user', content, id: newMsgId() };
     if (att) userMsg.att = { kind: att.kind, name: att.name, thumb: att.thumb, mime: att.mime, bytes: att.bytes };
-    const ai = { role: 'assistant', content: '', tools: [], meta: null, streaming: true, id: newMsgId() };
+    const ai = { role: 'assistant', content: '', tools: [], meta: null, streaming: true,
+      noteText: '正在准备回答…', id: newMsgId() };
     conv.messages.push(userMsg, ai);
     if (conv.title === '新对话') {
       const t = content || att.name;
@@ -1961,14 +1962,21 @@
     saveConv(conv);
     renderConvList();
 
-    let t0 = performance.now();
+    const t0 = performance.now();
     let tFirst = 0;
+    const updateGauge = () => {
+      const elapsed = (performance.now() - t0) / 1000;
+      const decoding = tFirst ? Math.max((performance.now() - tFirst) / 1000, 0.001) : 0;
+      state.gen.total = elapsed;
+      setGauge(decoding > 0 ? Math.max(0, state.gen.tokens - 1) / decoding : 0,
+        state.gen.tokens, elapsed, state.gen.ttft);
+    };
+    const clock = setInterval(updateGauge, 500);
 
     try {
       // 保留队列位置直到压缩和生成都结束。摘要只看这次发送前的历史。
       await maybeCompress(conv, previousCount, signal);
       signal.throwIfAborted();
-      t0 = performance.now();
       log('Running inference ...');
 
       const live = conv.messages.slice(conv.folded || 0);
@@ -1998,15 +2006,6 @@
         });
       }
       if (opts.system) msgs.unshift({ role: 'system', content: opts.system });
-      if (job.web && !att) {
-        msgs.unshift({
-          role: 'system',
-          content: '用户打开了联网搜索。回答前先用 web_search 工具查一次，'
-            + '把查到的内容作为依据，并在回答里说明信息来自哪里。'
-            + '如果搜索没有返回结果，就直接说没搜到，不要凭记忆编造来源或数字。',
-        });
-      }
-
       const resp = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2017,7 +2016,8 @@
           temperature: opts.temperature,
           top_p: opts.top_p,
           max_tokens: opts.max_tokens,
-          dubhe_tools: (job.tools || job.web) && !att,
+          dubhe_tools: job.tools && !att,
+          dubhe_search: job.web && !att,
           thinking: job.think,
           workspace: job.workspace || undefined,
         }),
@@ -2029,7 +2029,6 @@
       let buf = '';
       let completed = false;
       let raf = null;
-      let genTick = 0;
 
       // 流式渲染拆成"已定型"和"还在长"两段。
       //
@@ -2207,6 +2206,15 @@
         return true;
       };
 
+      const setStage = (label) => {
+        if (!ai.queued && ai.noteText === label) return false;
+        ai.queued = false;
+        if (label) ai.noteText = label;
+        else delete ai.noteText;
+        reswap();
+        return true;
+      };
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -2225,10 +2233,12 @@
             if (j.dubhe.type === 'tool_call') {
               ai.tools.push({ name: j.dubhe.name, args: j.dubhe.arguments, ok: true, t0: performance.now() });
               log('Tool call: ' + j.dubhe.name);
+              setStage(j.dubhe.name === 'web_search' ? '正在联网搜索…' : '正在使用工具…');
               renderTools();
             } else if (j.dubhe.type === 'think') {
               // 推理过程逐段追加到已有的折叠块里，不重建节点 —— 重建会把
               // 用户收起的块重新弹开，还会让气泡一直重播入场动画。
+              setStage('正在思考…');
               appendThink(j.dubhe.text || '');
             } else if (j.dubhe.type === 'queued') {
               // 引擎一次只答一个，第二个请求在服务端排队。排队时它一个字节都
@@ -2248,7 +2258,7 @@
               // 的时候把它顶到状态行上 —— 大输入预填充要一分钟，只写日志
               // 等于没说。
               log(j.dubhe.message || '');
-              if (!ai.content) { ai.noteText = j.dubhe.message || ''; reswap(); }
+              if (!ai.content) setStage(j.dubhe.message || '');
             } else if (j.dubhe.type === 'tool_ask') {
               // 需要用户点头的调用。卡片上两个按钮，点完 POST /api/approve。
               // 服务端在等（最多 90 秒），所以这张卡必须显眼、必须可点。
@@ -2268,7 +2278,7 @@
               }
               log('需要确认：' + (j.dubhe.detail || j.dubhe.name));
               renderTools();
-              reswap();
+              setStage('等待确认…');
               scrollBottom();
             } else if (j.dubhe.type === 'tool_ask_done') {
               const t = ai.tools.find((x) => x.askId === j.dubhe.id);
@@ -2278,7 +2288,7 @@
                 t.askTimeout = j.dubhe.timeout === true;
               }
               renderTools();
-              reswap();
+              if (!setStage(t?.askAllow ? '正在使用工具…' : '正在准备回答…')) reswap();
               scrollBottom();
             } else if (j.dubhe.type === 'tool_result') {
               const last = ai.tools[ai.tools.length - 1];
@@ -2297,7 +2307,7 @@
                 if (last.askId) { delete last.askId; last.askPending = false; }
               }
               renderTools();
-              reswap();
+              if (!setStage('正在准备回答…')) reswap();
             }
             continue;
           }
@@ -2310,11 +2320,7 @@
             }
             // 排到队了 / 预填充完了：状态行换回"生成中"。只在这一帧重画一次，
             // 不能每来一个 token 都 reswap —— 那等于把整块 DOM 每秒重建几十次。
-            if (ai.queued || ai.noteText) {
-              ai.queued = false;
-              delete ai.noteText;
-              reswap();
-            }
+            if (ai.queued || ai.noteText) setStage(null);
             ai.content += delta.content;
             // 每片算一个 token。这个服务端是按 token 逐个 on_piece 推的，
             // 所以计数是准的；最后那份 usage 还会再校正一次。
@@ -2323,12 +2329,6 @@
             // 明明字在往外冒，仪表却是死的，看着就像界面卡住了。
             state.gen.tokens = (state.gen.tokens || 0) + 1;
             paint();
-            // 生成中每 12 帧刷一次仪表，别让 DOM 写操作拖慢解码
-            if (++genTick % 12 === 0) {
-              const el2 = (performance.now() - t0) / 1000;
-              state.gen.total = el2;
-              setGauge(state.gen.tokens / Math.max(el2, 0.001), state.gen.tokens, el2, state.gen.ttft);
-            }
           }
           if (j.usage) {
             ai.meta = { tps: j.usage.decode_tps, tokens: j.usage.completion_tokens };
@@ -2359,6 +2359,7 @@
         ai.errText = msg;
       }
     } finally {
+      clearInterval(clock);
       ai.streaming = false;
       delete ai.queued;    // 状态行用的临时标记，不该跟着会话存下去
       delete ai.noteText;
@@ -3022,6 +3023,7 @@
     const v = VIEWS[name];
     if (!v) return;
     state.view = name;
+    $('#app').dataset.view = name;
     $('#views').hidden = false;
     $('#viewBody').innerHTML = '';
     setViewHead(v.title, '', []);
@@ -3034,6 +3036,7 @@
 
   function closeView() {
     state.view = null;
+    delete $('#app').dataset.view;
     $('#views').hidden = true;
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
     document.querySelectorAll('.nav-item[data-view]').forEach((x) =>
@@ -4713,7 +4716,7 @@
       if (!s.net) { log('联网权限已关闭（设置 → 权限 → 联网）', 'err'); return; }
       state.web = !state.web;
       $('#btnWeb').classList.toggle('on', state.web);
-      log(state.web ? '联网搜索已开：下一个问题会先搜再答' : '联网搜索已关');
+      log(state.web ? '联网搜索已开：需要查证时会搜索' : '联网搜索已关');
     };
     // 深度思考。模型没有思考通道时按钮灰掉 —— 能点却毫无反应最让人困惑。
     // 服务器把这件事报在 /api/state 的 model.think 上（refresh_model_markers
@@ -4729,7 +4732,8 @@
       writePreference(THINK_KEY, state.think ? '1' : '0');
       $('#btnThink').classList.toggle('on', state.think);
       $('#btnThink').setAttribute('aria-pressed', state.think ? 'true' : 'false');
-      log(state.think ? '会显示模型的推理过程' : '不显示推理过程（模型仍然会思考）');
+      log(state.think ? '会显示模型的推理过程'
+        : s.info?.direct_answer ? '模型会直接回答' : '不显示推理过程');
     };
     $('#btnThink').classList.toggle('on', state.think);
 

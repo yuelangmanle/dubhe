@@ -2,7 +2,7 @@
 
 Apple Silicon 和 Android 上的本地模型运行工具。原生引擎读取 GGUF，包含命令行、HTTP 服务和 macOS 客户端。
 
-当前版本 **0.30.0**。macOS 提供模型商店、对话历史、离线翻译、截图翻译和多模态输入。Android 提供 arm64 原生客户端和 Kotlin SDK。两个客户端的安装包见 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。
+当前版本 **0.31.0**。macOS 和 Android 均提供模型商店、对话历史、离线翻译和多模态输入。两个客户端的安装包见 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。
 
 ---
 
@@ -165,7 +165,7 @@ HTTP 端到端：图像 6.8 s / 视频 13.1 s / 语音 4.3 s（decode 50–60 to
 | --- | --- | --- |
 | 思考过程 | 把模型内部的推理折成可折叠块显示 | **推理照旧进行**，只是不显示 |
 | 工具调用 | 允许读文件、跑命令、算术 | 只能靠模型自己的知识回答 |
-| 联网搜索 | 先搜再答（需要联网权限） | 只用训练时记住的东西 |
+| 联网搜索 | 需要查证时搜索（需要联网权限） | 只用模型和本地资料 |
 
 有思考通道的模型（LFM3 这类）无论如何都会先想一遍，所以「思考过程」控制的是
 “给不给你看”，不是“想不想”。关掉时推理会被丢弃、正文只留答案；如果它把全部
@@ -176,7 +176,7 @@ HTTP 端到端：图像 6.8 s / 视频 13.1 s / 语音 4.3 s（decode 50–60 to
 
 ## Android
 
-在 Android 12 及以上 arm64 设备上，可安装原生 App 并通过系统文件选择器导入 GGUF。文件保存在应用目录，引擎在独立进程运行。配套视觉塔与语音塔支持图片、视频和音频输入。
+在 Android 12 及以上 arm64 设备上，可以在模型商店下载模型，或通过系统文件选择器导入 GGUF。对话和模型保存在本机，引擎在独立进程运行。翻译页接受文字、截图和 UTF-8 文本文件，可导出 Markdown、TXT、PDF 或 Word。配套视觉塔与语音塔支持图片、视频和音频对话输入。
 
 ```bash
 ./apps/android/gradlew -p apps/android :app:assembleDebug

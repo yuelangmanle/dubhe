@@ -79,6 +79,7 @@ struct ModelStatus {
     int caps = 0;
     int parallel = 0;
     bool thinking = false;
+    bool direct_answer = false;
 };
 
 struct AppState {
@@ -1772,64 +1773,37 @@ static std::string g_tool_close = "</tool_result>";
 // 一次都调不到工具，而且看起来像解码器坏了。
 static int g_tool_fmt = 0;
 
-std::string tool_prompt() {
-    std::string s =
-        "\n\n以下事情**必须调用工具，不许猜、不许心算**：\n"
-        "- 任何算术（加减乘除、百分比、幂、日期差、单位换算）→ calc\n"
-        "- 当前时间、日期、星期几、系统信息 → shell\n"
-        "- 可能记错的事实、新闻、价格、版本号 → web_search\n"
-        "算错比慢一点糟得多。哪怕你觉得“这个我会算”，也必须调工具。\n\n"
-        "需要读文件、列目录、写文件或执行命令时，调用工具。格式严格如下：\n";
+enum class ToolMode { None, Search, All };
+
+std::string tool_prompt(ToolMode mode) {
+    const bool search_only = mode == ToolMode::Search;
+    const char* name = search_only ? "web_search" : "read_file";
+    const char* param = search_only ? "query" : "path";
+    const char* value = search_only ? "最新新闻" : "a.txt";
+    std::string s = "\n\n每轮最多调用一个工具。需要工具时只输出调用，格式如下：\n";
     if (g_tool_fmt == 1) {
-        s +=
-            "<tool_call>\n<function=工具名>\n<parameter=参数名>\n参数值\n</parameter>\n"
-            "</function>\n</tool_call>\n"
-            "例如读取 a.txt，你这一轮就只输出：\n"
-            "<tool_call>\n<function=read_file>\n<parameter=path>\na.txt\n</parameter>\n"
-            "</function>\n</tool_call>\n";
+        s += std::string("<tool_call>\n<function=") + name + ">\n<parameter=" + param + ">" +
+             value + "\n</parameter>\n</function>\n</tool_call>\n";
     } else {
-        s +=
-            "<tool_call>{\"name\":\"工具名\",\"arguments\":{...}}</tool_call>\n"
-            "例如读取 a.txt，你这一轮就只输出：\n"
-            "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}</tool_call>\n";
+        s += std::string("<tool_call>{\"name\":\"") + name + "\",\"arguments\":{\"" + param + "\":\"" +
+             value + "\"}}</tool_call>\n";
     }
-    s +=
-        // 这里原来有"工具名必须严格从列表里选"这类提醒，实测 0.5B 把它
-        // 理解成"写出工具名就行"，输出 calc("376*49") 这种伪函数调用，
-        // 连 <tool_call> 都不吐了。名字纠正放在服务端做别名，别教模型。
-        "一次只调用一个工具。可用工具：\n"
-        "- calc(expr): 精确算术，支持 + - * / % ^ 和括号，以及 sqrt/abs/round/floor/ceil/pow/min/max。\n"
-        "  例：expr=\"376*49\"。**所有算术都用它，不要自己算。**\n"
-        "- read_file(path, offset, limit): 读取文本文件，默认给前 120 行。\n"
-        "  文件很长时先读开头；需要后面的内容再用 offset=121 往下翻。\n"
-        "- list_dir(path): 列出目录内容\n"
-        "- grep(pattern, path): 在目录里递归搜索文本，pattern 是正则\n"
-        "- glob(pattern, path): 按文件名找文件，例如 *.md\n"
-        "- write_file(path, content): 写入文件（覆盖）\n"
-        "- edit_file(path, old, new): 把文件里一段原文替换掉。old 必须唯一。\n"
-        "- shell(command, cwd): 执行 shell 命令\n"
-        "- kb_search(query, k): 在本地知识库（项目文档）里检索相关片段。\n"
-        "  问“这个项目怎么设计的”这类问题时先用它，比 grep 更懂语义。\n"
-        "- web_search(query, n, read): 联网搜索。返回标题、链接、摘要，"
-        "并自动附上前 read 条（默认 2）的网页正文摘录 —— 直接据此归纳就行，"
-        "不要只把标题和链接抄一遍。\n"
-        "  查新闻/时事时把用户说的“今天”换成年月日再搜，"
-        "例如 query=\"2026年11月18日 新闻\"。\n"
-        "- fetch_url(url): 抓取网页正文\n"
-        "不需要工具时直接回答。不要描述你打算怎么做，直接输出工具调用。"
-        "不要自己写工具返回块（" + g_tool_open + "），那是系统给你的，不是你输出的。"
-        // 实测 1.7B 会把"我知道工作目录是什么"讲成"我执行了 pwd，返回…"。
-        // 工作目录确实在下面那句里给了它，所以它没编内容，只是把"知道"
-        // 说成了"做过"。用户看到的是"它跑了命令"，而界面上一条工具卡都没有。
-        "没有真的调用过工具时，不要说\"我已经执行了\"，只说你知道什么。"
-        // 截图里工具返回 2026-11-03，模型最终回答写 2026-01-03 —— 数字
-        // 就在上下文里，它还是自己编了一个。泛泛说"基于结果回答"不够，
-        // 必须明确"逐字照抄、不许改写"，小模型才可能照做。
-        "工具返回里的数字、日期、时间、路径必须**逐字照抄**到回答中，"
-        "一个字符都不许改；不确定就原样引用，不要转述。";
-    if (!request_policy.workspace.empty()) {
-        s += "\n当前工作目录是 " + request_policy.workspace + "，相对路径都以它为根。";
+    s += "需要时效信息、外部事实或用户要求查证时，用 web_search(query, n, read)。"
+         "查“今天”时在 query 里写明日期，回答中注明来源。普通闲聊或自我介绍直接回答。\n";
+    if (!search_only) {
+        s += "其他可用工具：\n"
+             "- calc(expr)：精确计算，所有算式都调用它。\n"
+             "- read_file(path, offset, limit)：读取文件，默认 120 行。\n"
+             "- list_dir(path)、grep(pattern, path)、glob(pattern, path)：查找目录、内容或文件名。\n"
+             "- write_file(path, content)、edit_file(path, old, new)：覆盖写入或替换唯一的 old。\n"
+             "- shell(command, cwd)：执行命令或获取当前时间、日期、系统信息。\n"
+             "- kb_search(query, k)：搜索本地项目知识库。\n"
+             "- fetch_url(url)：获取网页正文。\n";
+        if (!request_policy.workspace.empty()) {
+            s += "当前工作目录：" + request_policy.workspace + "\n";
+        }
     }
+    s += "不要伪造工具结果。引用时保留返回的数字、日期、时间和路径。";
     return s;
 }
 
@@ -2310,23 +2284,18 @@ std::string gguf_meta_string(const std::string& path, const std::string& key,
 // 当前模型的"工具返回"标记。换模型时跟着换 —— 模板变了标记就得变。
 // （g_tool_open / g_tool_close 在 tool_prompt 之前就声明了。）
 
-// 思考块。LFM3 的模板里有 enable_thinking，默认 true：
-//   <|im_start|>assistant\n<think>      ← 想了再答
-//   <|im_start|>assistant\n<think></think>  ← 直接答
-// 开着的时候模型会把整段推理写进正文，界面上看到的就是
-// "用户要求我使用 read_file 工具……我需要先调用……"，答案被埋在最后。
-// 对话产品要的是答案，所以统一走"不想"那条路。
-static int g_think_style = 0;   // 0 = 模板没有思考标记；1 = LFM3 系
-// 上面的注释说"对话产品要的是答案，所以统一不想"——那是 2026-11-03 的决定。
-// 现在做成可配：DUBHE_THINKING=1 时保留 <think> 开洞，让模型先推理再答。
-// 对外行为不变（默认仍是关闭），只是给了难题一条出路。
+// 根据模型模板识别思考标记。thinking 控制是否把推理送到界面；
+// 提供空思考块格式的 Qwen3.5 也能用它选择直接回答。
+static int g_think_style = 0;
 static bool g_think_enabled = false;
+static std::string_view g_direct_think_suffix;
 
-void refresh_model_markers(const std::string& model_path) {
+void refresh_model_markers(const std::string& model_path, std::string_view arch) {
     g_tool_open = "<tool_result>";
     g_tool_close = "</tool_result>";
     g_think_style = 0;
     g_tool_fmt = 0;
+    g_direct_think_suffix = {};
     const std::string tpl = gguf_meta_string(model_path, "tokenizer.chat_template");
     if (tpl.empty()) {
         std::fprintf(stderr, "  模板: 模型没带 chat_template，用通用写法（%s）\n", g_tool_open.c_str());
@@ -2342,6 +2311,13 @@ void refresh_model_markers(const std::string& model_path) {
     if (tpl.find("enable_thinking") != std::string::npos &&
         tpl.find("<think>") != std::string::npos) {
         g_think_style = 1;
+        if (arch == "qwen35") {
+            if (tpl.find(R"(<think>\n\n</think>\n\n)") != std::string::npos) {
+                g_direct_think_suffix = "<think>\n\n</think>\n\n";
+            } else if (tpl.find("<think></think>") != std::string::npos) {
+                g_direct_think_suffix = "<think></think>";
+            }
+        }
     }
     // <function=name> 是 LFM3 系 render_tool_calls 的写法，和 JSON 完全不同
     if (tpl.find("<function=") != std::string::npos) g_tool_fmt = 1;
@@ -2672,7 +2648,7 @@ std::string now_stamp() {
 // 每个请求在自己的线程上跑，进 handler 时设置、结束自然回收。
 static thread_local bool t_no_think = false;
 
-std::string build_prompt(const json::Value& messages, bool chatml, bool with_tools) {
+std::string build_prompt(const json::Value& messages, bool chatml, ToolMode tools) {
     std::string p;
     if (!chatml) {
         for (auto& m : messages.arr) {
@@ -2700,8 +2676,8 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
         std::string role = m.s("role");
         std::string content = m.s("content");
         if (role == "system") {
+            if (!has_system && tools != ToolMode::None) content += tool_prompt(tools);
             has_system = true;
-            if (with_tools) content += tool_prompt();
             p += "<|im_start|>system\n" + content + "<|im_end|>\n";
         } else if (role == "user") {
             // 让模型知道"今天"是哪天：新闻、版本、最近发生了什么都要用到。
@@ -2738,20 +2714,13 @@ std::string build_prompt(const json::Value& messages, bool chatml, bool with_too
             }
         }
     }
-    if (!has_system && with_tools) {
-        p = std::string("<|im_start|>system\n") + tool_prompt() + "<|im_end|>\n" + p;
+    if (!has_system && tools != ToolMode::None) {
+        p = std::string("<|im_start|>system\n") + tool_prompt(tools) + "<|im_end|>\n" + p;
     }
     p += "<|im_start|>assistant\n";
-    // 思考通道**永远打开**，不再取决于用户的开关。
-    //
-    // 之前的做法是"关掉思考"就塞一个空的 <think></think>，指望模型直接作答。
-    // 实测 LFM3-1.7B 根本不照办：它照样要想，只是把整段推理写进正文 ——
-    // 用户看到的就是几屏英文自言自语加最后一句答案，比开着思考还难读。
-    //
-    // 既然它无论如何都要想，那就让它在自己的通道里想：同样的 token 数、
-    // 同样的速度，但推理会被 </think> 收走，正文干净。界面上那个开关
-    // 改成"要不要把这段推理显示出来"，而不是"要不要想"。
-    if (g_think_style && !t_no_think) p += "<think>";
+    // Qwen3.5 的模板用闭合的空思考块进入直答模式。只省略开场标记，
+    // 模型仍可能自行写很长的推理。其他模型沿用各自原有的行为。
+    if (g_think_style) p += t_no_think ? g_direct_think_suffix : "<think>";
     return p;
 }
 
@@ -2827,7 +2796,7 @@ static PromptCache g_pcache;
 // 展开占位符 → 注入特征。返回 false 时 err 里是可以直接回给客户端的原因。
 //
 // force_raw：不加 chat 模板，直接续写。语音模型特别吃这一套 —— 见下面的判定。
-bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, bool with_tools,
+bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, ToolMode tools,
                   bool force_raw, std::vector<int32_t>* toks, MmCache* cache,
                   std::string* err, bool* transcribing = nullptr) {
     std::vector<MediaPart> media;
@@ -2898,7 +2867,7 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
         // 当成任务，回的是"我们需要执行 read_file……"然后一个工具都不调；
         // 关掉 RAG 同一句话 1.45 秒就正确调用。1.7B 这种规模一次只能抓住
         // 一个意图，而工具模式下"去读真实内容"本来就比"复述旧片段"更对。
-        if (request_is_local && g_kb_rag && media.empty() && !with_tools) {
+        if (request_is_local && g_kb_rag && media.empty() && tools == ToolMode::None) {
             std::string last_user;
             size_t last_idx = 0;
             bool has_last = false;
@@ -2931,7 +2900,7 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
                 }
             }
         }
-        prompt = build_prompt(flat, chatml, with_tools);
+        prompt = build_prompt(flat, chatml, tools);
     }
 
     // 拼出来的 prompt 长什么样，是这类"模型不听话"问题里唯一可靠的证据。
@@ -2939,7 +2908,7 @@ bool build_tokens(dubhe_engine* e, const json::Value& messages, bool chatml, boo
     if (const char* dump = std::getenv("DUBHE_DUMP_PROMPT")) {
         if (dump[0] != '0') {
             std::fprintf(stderr, "\n===== prompt (%zu 字节, chatml=%d tools=%d) =====\n%s\n=====\n",
-                         prompt.size(), (int)chatml, (int)with_tools, prompt.c_str());
+                         prompt.size(), (int)chatml, (int)tools, prompt.c_str());
         }
     }
 
@@ -3428,13 +3397,14 @@ bool load_language_model(const std::string& path, std::string* error) {
         if (!worker->start(error)) return false;
         g.worker = std::move(worker);
         g_think_style = 0;
+        g_direct_think_suffix = {};
         return true;
     }
     if (dubhe_load_model(g.engine, path.c_str()) != DUBHE_OK) {
         *error = dubhe_last_error();
         return false;
     }
-    refresh_model_markers(path);
+    refresh_model_markers(path, arch);
     return true;
 }
 
@@ -3462,6 +3432,7 @@ void publish_model_status() {
     if (!status.path.empty()) current_model_info(&status.info);
     status.caps = dubhe_mm_caps(g.engine);
     status.thinking = g_think_style != 0;
+    status.direct_answer = !g_direct_think_suffix.empty();
     status.parallel = g.worker ? 0 : std::min(g.parallel, (int)dubhe_batch_capacity(g.engine));
     std::lock_guard<std::mutex> lock(g.model_status_mu);
     g.model_status = std::move(status);
@@ -3509,7 +3480,7 @@ void run_cohort(const std::vector<InferenceJob*>& jobs, const ModelStatus& expec
         MmCache cache;
         std::string error;
         if (!build_tokens(g.engine, job->messages, expected.info.has_chat_template != 0,
-                          false, false, &job->tokens, &cache, &error)) continue;
+                          ToolMode::None, false, &job->tokens, &cache, &error)) continue;
         const int output = (int)job->request.n("max_tokens", 512);
         if (job->tokens.empty() || job->tokens.size() + (size_t)output > (size_t)(context - reserved))
             continue;
@@ -4225,6 +4196,7 @@ int main(int argc, char** argv) {
             details.set("gpu", json::Value::make_bool(info.is_gpu != 0));
             details.set("backend", json::Value::make_str(info.backend));
             details.set("think", json::Value::make_bool(model.thinking));
+            details.set("direct_answer", json::Value::make_bool(model.direct_answer));
             out.set("info", std::move(details));
         }
         conn.send(200, "application/json", json::dump(out));
@@ -5011,7 +4983,7 @@ int main(int argc, char** argv) {
         MmCache mc;
         std::vector<int32_t> toks;
         std::string berr;
-        if (!build_tokens(g.engine, one, mi.has_chat_template != 0, false, false,
+        if (!build_tokens(g.engine, one, mi.has_chat_template != 0, ToolMode::None, false,
                           &toks, &mc, &berr)) {
             c.send(500, "application/json", "{\"error\":" + json_escape("分词失败: " + berr) + "}");
             return;
@@ -5081,8 +5053,12 @@ int main(int argc, char** argv) {
             return;
         }
         const bool stream = body.flag("stream", false);
-        bool with_tools = body.s("tool_choice") != "none" &&
-            (body.get("tools") != nullptr || body.flag("dubhe_tools", false));
+        ToolMode tools = ToolMode::None;
+        if (body.s("tool_choice") != "none") {
+            if (body.get("tools") != nullptr || body.flag("dubhe_tools", false)) tools = ToolMode::All;
+            else if (body.flag("dubhe_search", false)) tools = ToolMode::Search;
+        }
+        const bool with_tools = tools != ToolMode::None;
         if (!is_local(req) && with_tools) {
             send_error(c, 403, "局域网共享只允许推理，工具请在运行 Dubhe 的设备上使用");
             return;
@@ -5168,13 +5144,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 跳过思考通道：翻译、改写、抽取这类"照着做就行"的任务用。
-        //
-        // 和 thinking=false 的区别：那个只是"想完了不给你看"，模型照样要想，
-        // 时间照样花；no_think 是连 `<think>` 都不替它开，让它直接出结果。
-        // 万一它还是自己写了 <think>，扫描器照样会把那段收进通道丢掉 ——
-        // 所以不会出现"推理漏进译文"。
-        t_no_think = body.get("no_think") && body.flag("no_think", false);
+        // 支持直答的模型把显式 thinking:false 当作快速模式。
+        // 单独提供 no_think 时，按该字段处理，例如翻译任务。
+        t_no_think = body.flag("no_think", !g_direct_think_suffix.empty() &&
+                               body.get("thinking") && !body.flag("thinking", false));
 
         // 提前失败的统一出口。
         //
@@ -5297,7 +5270,7 @@ int main(int argc, char** argv) {
         std::string berr;
         const bool force_raw = body.flag("dubhe_raw", false);
         bool transcribing = false;
-        if (!build_tokens(g.engine, grammar ? structured_messages : *msgs, chatml, with_tools,
+        if (!build_tokens(g.engine, grammar ? structured_messages : *msgs, chatml, tools,
                           force_raw, &toks, &mcache, &berr, &transcribing)) {
             fail(berr);
             return;
@@ -5394,16 +5367,12 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 大输入先报一声。
-        //
-        // 预填充是**一个字节都不吐**的一段：5 万 token 在 1.7B 上大约要一分钟，
-        // 这段时间界面上只有"生成中…"，用户以为卡死，去点停止、刷新。
-        // 这里先把 SSE 头和一个 note 发出去，界面就有话可说。
-        if (stream && n > 8000) {
+        // 让界面区分等待首字和已经开始生成。对于较慢的本地模型，几百个
+        // 输入 token 就足以造成可见的首字延迟。
+        if (stream && n >= 128) {
             c.begin_stream();   // 幂等：已经发过头就直接返回
             c.write_chunk("data: {\"dubhe\":{\"type\":\"note\",\"message\":" +
-                          json_escape("输入约 " + std::to_string(n) +
-                                      " tokens，正在做预填充，要等一会儿") +
+                          json_escape("正在读取约 " + std::to_string(n) + " 个输入 token…") +
                           "}}\n\n");
         }
 
@@ -5467,12 +5436,12 @@ int main(int argc, char** argv) {
                 fin.arr.push_back(note);
                 std::vector<int32_t> t3;
                 std::string e3;
-                if (!build_tokens(g.engine, fin, chatml, false, force_raw, &t3, &mcache, &e3) ||
+                if (!build_tokens(g.engine, fin, chatml, ToolMode::None, force_raw, &t3, &mcache, &e3) ||
                     t3.empty()) {
                     return false;
                 }
                 cur = std::move(t3);
-                with_tools = false;   // 下一轮不再找 tool_call，也不再抑制
+                tools = ToolMode::None;   // 下一轮只回答
                 pcid = g_pcache.current_id();
                 return true;
             };
@@ -5497,7 +5466,7 @@ int main(int argc, char** argv) {
                 ctx.gtoks.clear();
                 // 有工具说明时才做抑制判定 —— 否则根本没在找 tool_call，
                 // 直接往外吐就是最快的路。
-                ctx.no_suppress = !with_tools;
+                ctx.no_suppress = tools == ToolMode::None;
 
                 dubhe_stats s{};
                 const int generated = dubhe_generate(g.engine, cur.data(), (int32_t)cur.size(), &sp,
@@ -5529,7 +5498,7 @@ int main(int argc, char** argv) {
                 // 而工具轮恰恰是最需要复用的一轮（3600 token 的 prefill）。
                 if (!ctx.gtoks.empty()) g_pcache.extend(pcid, rtext, ctx.gtoks);
 
-                if (!with_tools) break;
+                if (tools == ToolMode::None) break;
 
                 std::string tname;
                 json::Value targs;
@@ -5551,6 +5520,12 @@ int main(int argc, char** argv) {
                             ? "（模型这一轮想调用工具，但调用格式不合法，没有产生可显示的回答。换个问法再试一次。）"
                             : vis);
                     }
+                    break;
+                }
+
+                if (tools == ToolMode::Search && tname != "web_search") {
+                    if (final_answer_round("本轮只允许联网搜索，请直接回答用户的问题。")) continue;
+                    emit_delta(&ctx, "（本轮只允许联网搜索，模型未能直接回答。）");
                     break;
                 }
 
@@ -5786,7 +5761,7 @@ int main(int argc, char** argv) {
                     }
                     msgs2.arr.back().set("content", json::Value::make_str(body));
                     t2.clear();
-                    if (!build_tokens(g.engine, msgs2, chatml, with_tools, force_raw, &t2, &mcache,
+                    if (!build_tokens(g.engine, msgs2, chatml, tools, force_raw, &t2, &mcache,
                                       &e2)) {
                         c.write_chunk("data: {\"dubhe\":{\"type\":\"error\",\"message\":" +
                                       json_escape(e2) + "}}\n\n");
@@ -5865,7 +5840,8 @@ int main(int argc, char** argv) {
         std::string tname;
         json::Value targs;
         size_t endpos = 0;
-        if (with_tools && extract_tool_call(acc, &tname, &targs, &endpos)) {
+        if (with_tools && extract_tool_call(acc, &tname, &targs, &endpos) &&
+            (tools != ToolMode::Search || tname == "web_search")) {
             msg.set("content", json::Value::make_str(""));
             json::Value calls = json::Value::make_arr();
             json::Value call = json::Value::make_obj();

@@ -1,6 +1,10 @@
 package dev.dubhe.mobile
 
 import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import androidx.activity.compose.BackHandler
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -24,6 +28,10 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -34,6 +42,8 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -51,6 +61,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -60,9 +71,16 @@ import androidx.compose.ui.unit.dp
 
 class MainActivity : ComponentActivity() {
     private val chat by viewModels<ChatViewModel>()
+    private var sharedInput by mutableStateOf<SharedInput?>(null)
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        sharedInput = readShare(intent)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (savedInstanceState == null) sharedInput = readShare(intent)
         enableEdgeToEdge()
         setContent {
             val openModel = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -82,8 +100,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkPalette else lightPalette) {
-                ChatScreen(
-                    chat,
+                DubheScreen(
+                    chat, sharedInput, onShareHandled = { sharedInput = null },
                     openModel = { select { openModel.launch(arrayOf("*/*")) } },
                     openProjector = { select { openProjector.launch(arrayOf("*/*")) } },
                     openAttachment = {
@@ -100,9 +118,29 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private data class SharedInput(val text: String? = null, val image: Uri? = null)
+
+private fun readShare(intent: Intent): SharedInput? {
+    if (intent.action == Intent.ACTION_PROCESS_TEXT) {
+        return intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()?.let { SharedInput(text = it) }
+    }
+    if (intent.action != Intent.ACTION_SEND) return null
+    if (intent.type?.startsWith("image/") == true) {
+        val uri = if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+        }
+        return uri?.takeIf { it.scheme == "content" }?.let { SharedInput(image = it) }
+    }
+    return intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.let { SharedInput(text = it) }
+}
+
 private val lightPalette = lightColorScheme(
     primary = Color(0xFF086353), onPrimary = Color.White,
     primaryContainer = Color(0xFFD0F0E5), onPrimaryContainer = Color(0xFF07372D),
+    secondaryContainer = Color(0xFFD6ECE4), onSecondaryContainer = Color(0xFF113B30),
     background = Color(0xFFF4F7F6), onBackground = Color(0xFF152822),
     surface = Color.White, onSurface = Color(0xFF152822),
     surfaceVariant = Color(0xFFE2EBE7), onSurfaceVariant = Color(0xFF465953),
@@ -111,135 +149,173 @@ private val lightPalette = lightColorScheme(
 private val darkPalette = darkColorScheme(
     primary = Color(0xFF92E0CD), onPrimary = Color(0xFF0C362C),
     primaryContainer = Color(0xFF1F4940), onPrimaryContainer = Color(0xFFE1FFF6),
+    secondaryContainer = Color(0xFF294B42), onSecondaryContainer = Color(0xFFD6EFE6),
     background = Color(0xFF0F1917), onBackground = Color(0xFFE1F0EB),
     surface = Color(0xFF172522), onSurface = Color(0xFFE1F0EB),
     surfaceVariant = Color(0xFF293B36), onSurfaceVariant = Color(0xFFC0D5CC),
 )
 
+private enum class Workspace(val label: String) {
+    Chat("对话"), Translate("翻译"), Models("模型"), Settings("设置"),
+}
+
 @Composable
-private fun ChatScreen(
+private fun DubheScreen(
     chat: ChatViewModel,
+    shared: SharedInput?,
+    onShareHandled: () -> Unit,
     openModel: () -> Unit,
     openProjector: () -> Unit,
     openAttachment: () -> Unit,
 ) {
     val state = chat.state
-    var input by rememberSaveable { mutableStateOf("") }
+    var workspace by rememberSaveable { mutableStateOf(Workspace.Chat) }
     var showUpdates by rememberSaveable { mutableStateOf(false) }
+    var showHistory by rememberSaveable { mutableStateOf(false) }
+    var input by rememberSaveable { mutableStateOf("") }
     val focus = LocalFocusManager.current
-    val canAsk = state.modelName != null && state.activity == Activity.Idle
-    val ask = {
-        if (canAsk && input.isNotBlank()) {
-            chat.ask(input)
-            input = ""
-            focus.clearFocus()
+    val keyboard = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    LaunchedEffect(shared, state.activity) {
+        if (shared == null) return@LaunchedEffect
+        workspace = Workspace.Translate
+        if (state.activity == Activity.Idle) {
+            shared.text?.let { chat.setTranslationSource(it, "来自其他应用") }
+            shared.image?.let { chat.importTranslation(it, image = true) }
+            onShareHandled()
         }
     }
-    Scaffold { insets ->
+    BackHandler(workspace != Workspace.Chat) { workspace = Workspace.Chat }
+
+    Scaffold(
+        bottomBar = {
+            if (!keyboard) NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+                Workspace.entries.forEachIndexed { index, item ->
+                    NavigationBarItem(
+                        selected = workspace == item,
+                        onClick = { focus.clearFocus(); workspace = item },
+                        icon = { WorkspaceIcon(index) },
+                        label = { Text(item.label) },
+                    )
+                }
+            }
+        },
+    ) { insets ->
         Box(
             Modifier.fillMaxSize().padding(insets).consumeWindowInsets(insets).imePadding(),
             contentAlignment = Alignment.TopCenter,
         ) {
-            Column(Modifier.widthIn(max = 760.dp).fillMaxSize().padding(horizontal = 16.dp)) {
-                ChatHeader(state, chat::newChat, openModel, openProjector, { showUpdates = true })
-                state.error?.let { ErrorBanner(it, chat::dismissError) }
-                if (state.activity == Activity.Loading && state.modelName != null) {
-                    LinearProgressIndicator(Modifier.fillMaxWidth())
-                }
-                if (state.turns.isEmpty()) {
-                    Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        EmptyConversation(state, openModel, chat::stop)
+            Column(Modifier.widthIn(max = 640.dp).fillMaxSize().padding(horizontal = 20.dp)) {
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (workspace == Workspace.Chat) {
+                        Image(
+                            painterResource(R.mipmap.ic_launcher), contentDescription = null,
+                            modifier = Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)),
+                        )
                     }
-                } else {
-                    ChatTranscript(state, Modifier.weight(1f).fillMaxWidth())
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            if (workspace == Workspace.Chat) "天枢" else workspace.label,
+                            style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold,
+                        )
+                        if (workspace == Workspace.Chat) state.modelName?.let { name ->
+                            Text(name, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                    if (workspace == Workspace.Chat) {
+                        TextButton(onClick = { showHistory = true }) { Text("历史") }
+                        TextButton(
+                            onClick = { chat.newChat(); input = "" }, enabled = state.activity == Activity.Idle,
+                        ) { Text("新对话") }
+                    }
                 }
-                if (state.modelName != null) {
-                    Composer(
-                        state, input, { input = it.take(12_000) }, canAsk, ask, chat::stop,
-                        openAttachment, chat::removeAttachment,
-                    )
+                state.error?.let { ErrorBanner(it, chat::dismissError) }
+                when (workspace) {
+                    Workspace.Chat -> {
+                        val canAsk = state.modelName != null && state.activity == Activity.Idle
+                        val ask = {
+                            if (canAsk && input.isNotBlank()) {
+                                chat.ask(input)
+                                input = ""
+                                focus.clearFocus()
+                            }
+                        }
+                        if (state.turns.isEmpty()) {
+                            EmptyConversation(
+                                state, Modifier.weight(1f).fillMaxWidth(),
+                                showModels = { workspace = Workspace.Models },
+                                showTranslation = { workspace = Workspace.Translate },
+                            )
+                        } else {
+                            ChatTranscript(state, Modifier.weight(1f).fillMaxWidth())
+                        }
+                        if (state.modelName != null) {
+                            Composer(
+                                state, input, { input = it.take(12_000) }, canAsk, ask, chat::stop,
+                                openAttachment, chat::removeAttachment,
+                            )
+                        }
+                    }
+                    Workspace.Translate -> TranslationScreen(chat, openModels = { workspace = Workspace.Models })
+                    Workspace.Models -> ModelsScreen(chat, openModel, openProjector) { workspace = Workspace.Translate }
+                    Workspace.Settings -> SettingsScreen(state, { showUpdates = true })
                 }
             }
         }
     }
     if (showUpdates) UpdateDialog { showUpdates = false }
+    if (showHistory) HistoryDialog(
+        chat, dismiss = { showHistory = false },
+        choose = { selected -> chat.selectConversation(selected); input = ""; showHistory = false },
+    )
 }
 
 @Composable
-private fun ChatHeader(
-    state: ChatState, newChat: () -> Unit, openModel: () -> Unit, openProjector: () -> Unit,
-    openUpdates: () -> Unit,
+private fun EmptyConversation(
+    state: ChatState,
+    modifier: Modifier,
+    showModels: () -> Unit,
+    showTranslation: () -> Unit,
 ) {
-    Row(
-        Modifier.fillMaxWidth().padding(vertical = 12.dp),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Image(
-            painterResource(R.mipmap.ic_launcher), contentDescription = null,
-            Modifier.size(39.dp).clip(RoundedCornerShape(11.dp)),
-        )
-        Column(Modifier.weight(1f)) {
-            Text("Dubhe", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            state.modelName?.let { name ->
-                Text(name, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-        }
-        if (state.modelName != null) {
-            TextButton(onClick = openModel, enabled = state.activity == Activity.Idle) { Text("换模型") }
-            TextButton(onClick = newChat, enabled = state.activity == Activity.Idle && state.turns.isNotEmpty()) {
-                Text("新对话")
-            }
-        }
-        TextButton(onClick = openUpdates) { Text("更新") }
-    }
-    state.modelDetail?.let { detail ->
-        Text(
-            detail, Modifier.padding(bottom = 6.dp), style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-    if (state.modelName != null) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = openProjector, enabled = state.activity == Activity.Idle) {
-                Text(if (state.projectorName == null) "导入多模态组件" else "更换组件")
-            }
-            state.projectorName?.let { name ->
-                Text(name, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-        }
-    }
-}
-
-@Composable
-private fun EmptyConversation(state: ChatState, openModel: () -> Unit, stop: () -> Unit) {
     Column(
-        Modifier.widthIn(max = 320.dp).fillMaxWidth().padding(8.dp),
-        verticalArrangement = Arrangement.spacedBy(13.dp),
-        horizontalAlignment = Alignment.Start,
+        modifier.verticalScroll(rememberScrollState()).padding(top = 24.dp, bottom = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(15.dp),
     ) {
         Text(
-            if (state.modelName == null) "在手机上运行模型" else "开始一段对话",
-            style = MaterialTheme.typography.headlineMedium,
-            fontWeight = FontWeight.SemiBold,
+            if (state.modelName == null) "在手机上离线使用" else "聊点什么？",
+            style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold,
         )
-        when (state.activity) {
-            Activity.Connecting -> Text("正在连接推理引擎。")
-            Activity.Importing -> if (state.modelName == null) {
-                Text(state.status.orEmpty())
-                val progress = state.progress
-                if (progress == null) LinearProgressIndicator(Modifier.fillMaxWidth())
-                else LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
-                TextButton(onClick = stop, enabled = !state.stopping) { Text("取消导入") }
+        if (state.modelName == null) {
+            Text(
+                "先下载或导入一个模型。下载完成后，聊天和翻译都可以在本机运行。",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(onClick = showModels) { Text("浏览模型") }
+        }
+        Surface(
+            onClick = showTranslation, shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surface,
+        ) {
+            Row(
+                Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                WorkspaceIcon(1)
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text("离线翻译", fontWeight = FontWeight.SemiBold)
+                    Text("文本、选中文字和截图", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Text("›", style = MaterialTheme.typography.titleLarge)
             }
-            Activity.Loading -> if (state.modelName == null) {
-                Text("正在加载模型…")
-                LinearProgressIndicator(Modifier.fillMaxWidth())
-            }
-            else -> if (state.modelName == null) {
-                Text("选一个本地 GGUF 文件，导入后即可离线聊天。")
-                Button(onClick = openModel, enabled = state.connected) { Text("选择 GGUF 文件") }
-            }
+        }
+        if (state.activity == Activity.Connecting || state.activity == Activity.Loading) {
+            Text(if (state.activity == Activity.Connecting) "正在连接推理引擎" else "正在加载模型",
+                color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+            LinearProgressIndicator(Modifier.fillMaxWidth())
         }
     }
 }

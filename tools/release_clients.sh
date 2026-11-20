@@ -40,14 +40,21 @@ awk -v header="## [$version]" '
 support="$HOME/Library/Application Support/Dubhe"
 export DUBHE_LLAMA_RUNTIME_DIR=${DUBHE_LLAMA_RUNTIME_DIR:-"$support/BuildRuntime/llama-macos-arm64"}
 signing=${DUBHE_ANDROID_SIGNING_DIR:-"$support/AndroidSigning"}
-export ANDROID_HOME=${ANDROID_HOME:-"$HOME/Library/Android/sdk"}
+local_android_sdk="$HOME/Library/Android/sdk"
+ndk_version=$(awk -F '"' '/^[[:space:]]*ndkVersion / { print $2; exit }' apps/android/app/build.gradle)
+export ANDROID_HOME=${ANDROID_HOME:-"$local_android_sdk"}
+if [[ ! -f "$ANDROID_HOME/ndk/$ndk_version/source.properties" &&
+      -f "$local_android_sdk/ndk/$ndk_version/source.properties" ]]; then
+  export ANDROID_HOME="$local_android_sdk"
+fi
 export JAVA_HOME=${JAVA_HOME:-"/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"}
 unset ANDROID_SDK_ROOT
 android_tools="$ANDROID_HOME/build-tools/36.0.0"
 android_certificate=a6f43cd30e0f4f9ee7fe981f315e54485bc4124cbc57fb249f66a3caa7b28bfb
 if [[ ! -x "$DUBHE_LLAMA_RUNTIME_DIR/llama-server" || ! -x "$android_tools/apksigner" ||
+      ! -f "$ANDROID_HOME/ndk/$ndk_version/source.properties" ||
       ! -f "$signing/android-release.p12" || ! -f "$signing/android-release.pass" ]]; then
-  echo "发布需要现有的 macOS 翻译运行时、Android SDK 36 和 Dubhe Android 发布签名。" >&2
+  echo "发布需要现有的 macOS 翻译运行时、Android SDK 36、NDK $ndk_version 和 Dubhe Android 发布签名。" >&2
   exit 2
 fi
 

@@ -9,7 +9,7 @@
 //   所以第一版外壳只解决**三件 Web 做不到的事**：
 //
 //     1. 双击就能开 —— 用户不需要先开终端敲 `dubhed -m ...`
-//     2. 进程生命周期 —— 关窗口就把引擎杀掉，不留孤儿进程占内存
+//     2. 进程生命周期 —— 退出应用时关闭引擎，不留孤儿进程占内存
 //     3. 端口不撞车 —— 7777 被占就往后找，而不是起来就报错
 //
 // 等 M5 真正做原生 UI 时，这一层换成 SwiftUI + XPC（ADR-0005），
@@ -225,8 +225,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var translationHotKeyHandler: EventHandlerRef?
     private var translationHotKeys: [EventHotKeyRef] = []
     private var unavailableTranslationHotKeys: [String] = []
+    private var translationStatusItem: NSStatusItem?
     private var capture: Process?
+    private let oneShotCapture = OneShotScreenCapture()
     private var recognizingScreenshot = false
+    private var pendingScreenshotText: String?
+    private var capturingScreenshot: Bool { capture != nil || oneShotCapture.isActive }
     private var overlay: NSPanel?
     private var overlayText: NSTextView?
     private var overlayTabs: NSSegmentedControl?
@@ -277,6 +281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         buildMenu()
         buildWindow()
         registerTranslationHotKeys()
+        buildTranslationStatusItem()
         // 由"打开 .gguf"触发启动时，第一个要加载的就是它，别再先用
         // 记住的那个起一遍再重启。
         if let u = pendingModelURL {
@@ -303,8 +308,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
-    // 关窗口 = 退出（这是一个单窗口工具，不是文档型 App）
-    func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+    // Hold the global shortcuts while the main window is closed.
+    func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { false }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if let window, !window.isVisible { showMainWindow() }
+        return true
+    }
+
+    @objc private func showMainWindow() {
+        guard let window else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     // ------------------------------------------------------------ 生成完成的通知
     //
@@ -388,6 +405,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         translationHotKeys.forEach { UnregisterEventHotKey($0) }
         if let translationHotKeyHandler { RemoveEventHandler(translationHotKeyHandler) }
         if capture?.isRunning == true { capture?.terminate() }
+        oneShotCapture.cancel()
         stopEngine()
     }
 
@@ -618,6 +636,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                           backing: .buffered, defer: false)
         window.title = "Dubhe"
         window.minSize = NSSize(width: 720, height: 520)
+        window.isReleasedWhenClosed = false
         window.delegate = self
         window.center()
         window.setFrameAutosaveName("DubheMainWindow")
@@ -653,6 +672,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         NSApp.activate(ignoringOtherApps: true)
 
         showSplash("正在启动本地引擎…")
+    }
+
+    private func buildTranslationStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button?.image = NSImage(systemSymbolName: "viewfinder", accessibilityDescription: "Dubhe 翻译")
+        item.button?.toolTip = "Dubhe 翻译"
+        let menu = NSMenu()
+        menu.addItem(withTitle: "截图翻译…　⌘⌥⇧T", action: #selector(captureAndOCR), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "翻译选中文字　⌃⇧T", action: #selector(translateSelection), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "翻译剪贴板图片", action: #selector(translateClipboardImage), keyEquivalent: "").target = self
+        if !unavailableTranslationHotKeys.isEmpty {
+            menu.addItem(withTitle: "快捷键被占用：\(unavailableTranslationHotKeys.joined(separator: "、"))",
+                         action: nil, keyEquivalent: "")
+        }
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "显示 Dubhe", action: #selector(showMainWindow), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "退出 Dubhe", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "").target = NSApp
+        item.menu = menu
+        translationStatusItem = item
     }
 
     private func registerTranslationHotKeys() {
@@ -956,7 +994,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                                        arguments: ["unavailable": unavailableTranslationHotKeys],
                                        in: nil, in: .page, completionHandler: nil)
         case "overlay":
-            if capture == nil, !recognizingScreenshot, let text = obj["text"] as? String {
+            if !capturingScreenshot, !recognizingScreenshot, let text = obj["text"] as? String {
                 showOverlay(text, title: (obj["title"] as? String) ?? "译文", source: obj["source"] as? String ?? "")
             }
         case "historyExport":
@@ -979,29 +1017,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // 框选后识别文字，交给页面翻译，结果再回到原生浮窗。
     @objc private func captureAndOCR() {
         dbg("screenshot translation requested")
-        withOCRLanguage { [weak self] language in self?.beginScreenshot(language: language) }
-    }
-
-    private func withOCRLanguage(_ action: @escaping (String) -> Void) {
-        guard uiLoaded else {
-            showOverlay("等本地引擎启动后再试。", title: "截图翻译")
-            return
-        }
-        webView.evaluateJavaScript("window.dubheOCRLanguage?.()") { value, _ in
-            action(value as? String ?? "auto")
-        }
-    }
-
-    private func beginScreenshot(language: String) {
-        guard capture == nil, !recognizingScreenshot else { return }
+        guard !capturingScreenshot, !recognizingScreenshot else { return }
+        overlay?.close()
         // 调试口：给一张现成的图，跳过交互选区直接识别。
         // 没有这个，验证 OCR 只能靠人手框选，没法自动化。
         if let fixed = ProcessInfo.processInfo.environment["DUBHE_OCR_FILE"], !fixed.isEmpty {
-            overlay?.close()
-            ocrFile(fixed, language: language)
+            ocrFile(fixed)
             return
         }
-        overlay?.close()
+        guard CGPreflightScreenCaptureAccess() else {
+            captureWithSystemPicker()
+            return
+        }
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("dubhe-ocr-\(UUID().uuidString).png")
         let p = Process()
@@ -1017,11 +1044,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 guard let self else { return }
                 self.capture = nil
                 if process.terminationStatus == 0, FileManager.default.fileExists(atPath: tmp.path) {
-                    self.ocrFile(tmp.path, language: language)
+                    self.ocrFile(tmp.path)
                 } else if !message.isEmpty || process.terminationStatus > 1 {
                     dbg("interactive screenshot failed (\(process.terminationStatus)): \(message)")
                     if !CGPreflightScreenCaptureAccess() {
-                        self.showScreenCapturePermission()
+                        self.captureWithSystemPicker()
                     } else {
                         self.showOverlay("系统未能生成这张截图，可以重新框选。", title: "截图失败")
                     }
@@ -1036,49 +1063,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
+    private func captureWithSystemPicker() {
+        dbg("using one-shot screen capture picker")
+        oneShotCapture.begin { [weak self] result in
+            guard let self, !self.shuttingDown else { return }
+            switch result {
+            case .success(let image):
+                if let image { self.recognizeScreenshot(image) }
+            case .failure(let error):
+                dbg("one-shot screen capture failed: \(error)")
+                self.showOverlay("系统截图未能完成。请重试，或按 ⌃⌘⇧4 框选到剪贴板后点击「翻译剪贴板图片」。",
+                                 title: "截图失败")
+            }
+        }
+    }
+
     @objc private func openScreenCaptureSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
             NSWorkspace.shared.open(url)
         }
     }
 
-    private func showScreenCapturePermission() {
-        let location = Bundle.main.bundleURL.path
-        showOverlay(
-            """
-            macOS 没有允许当前这份 Dubhe 截图。请在系统设置中选择下面这个应用，然后退出并重新打开。
-
-            \(location)
-
-            也可以按 ⌃⌘⇧4 用 macOS 框选并复制截图，再点「翻译剪贴板图片」。
-            """, title: "截图权限")
-    }
-
     @objc private func translateClipboardImage() {
-        withOCRLanguage { [weak self] language in
-            guard let self, self.capture == nil, !self.recognizingScreenshot else { return }
-            guard let image = NSImage(pasteboard: .general),
-                  let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-                self.showOverlay("剪贴板里没有图片。按 ⌃⌘⇧4 框选截图后再试。", title: "翻译剪贴板图片")
-                return
-            }
-            self.overlay?.close()
-            self.recognizeScreenshot(cg, language: language)
+        guard !capturingScreenshot, !recognizingScreenshot else { return }
+        guard let image = NSImage(pasteboard: .general),
+              let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            showOverlay("剪贴板里没有图片。按 ⌃⌘⇧4 框选截图后再试。", title: "翻译剪贴板图片")
+            return
         }
+        overlay?.close()
+        recognizeScreenshot(cg)
     }
 
-    private func ocrFile(_ path: String, language: String) {
+    private func ocrFile(_ path: String) {
         guard let img = NSImage(contentsOfFile: path),
               let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             showOverlay("无法读取刚截取的图片。", title: "截图失败")
             return
         }
-        recognizeScreenshot(cg, language: language)
+        recognizeScreenshot(cg)
     }
 
-    private func recognizeScreenshot(_ cg: CGImage, language: String) {
+    private func recognizeScreenshot(_ cg: CGImage) {
         recognizingScreenshot = true
         showOverlay("正在从截图中识别文字…", title: "识别中")
+        if uiLoaded {
+            webView.evaluateJavaScript("window.dubheOCRLanguage?.()") { [weak self] value, _ in
+                self?.performScreenshotOCR(cg, language: value as? String ?? "auto")
+            }
+        } else {
+            performScreenshotOCR(cg, language: "auto")
+        }
+    }
+
+    private func performScreenshotOCR(_ cg: CGImage, language: String) {
         DispatchQueue.global(qos: .userInitiated).async {
             let byLanguage = [
                 "zh": ["zh-Hans", "zh-Hant"], "en": ["en-US"], "ja": ["ja-JP"],
@@ -1114,7 +1152,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 DispatchQueue.main.async {
                     self.recognizingScreenshot = false
                     guard self.overlay?.title == "识别中" else { return }
-                    self.requestTranslation(text, callback: "dubheOcr")
+                    if (!self.uiLoaded || self.webView.isLoading), !text.isEmpty {
+                        self.pendingScreenshotText = text
+                        self.showOverlay("文字已识别，正在等待本地引擎启动。", title: "等待引擎", source: text)
+                    } else {
+                        self.requestTranslation(text, callback: "dubheOcr")
+                    }
                 }
             } catch {
                 dbg("ocr perform failed: \(error)")
@@ -1138,7 +1181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // AXIsProcessTrusted()，未授权就弹系统引导，别让用户以为程序坏了。
     @objc private func translateSelection() {
         dbg("selection translation requested")
-        guard capture == nil, !recognizingScreenshot else { return }
+        guard !capturingScreenshot, !recognizingScreenshot else { return }
         if NSApp.isActive {
             dbg("local translation shortcut")
             guard uiLoaded else {
@@ -1258,11 +1301,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             }
         }
         p.title = title
-        let screenPermission = title == "截图权限"
-        overlayTabs?.isHidden = screenPermission
-        overlayCopy?.isHidden = screenPermission
-        overlayScreenSettings?.isHidden = !screenPermission
-        overlayClipboard?.isHidden = !screenPermission
+        let screenshotFailed = title == "截图失败"
+        overlayTabs?.isHidden = screenshotFailed
+        overlayCopy?.isHidden = screenshotFailed
+        overlayScreenSettings?.isHidden = !screenshotFailed
+        overlayClipboard?.isHidden = !screenshotFailed
         overlayTranslating = title == "翻译中"
         overlayHasTranslation = title == "译文"
         if overlaySource != source { overlayTabs?.selectedSegment = 0 }
@@ -1291,6 +1334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         guard let closed = notification.object as? NSWindow else { return }
         if closed === window { overlay?.close() }
         guard closed === overlay else { return }
+        pendingScreenshotText = nil
         if overlayTranslating {
             webView.evaluateJavaScript("window.dubheCancelTranslation?.()") { _, _ in }
         }
@@ -1586,15 +1630,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }.resume()
     }
 
-    // 验收用：DUBHE_SHELL_AUTOCLOSE=3 表示界面加载完 3 秒后自己关窗口。
-    // 走的是真实路径（关窗口 → applicationShouldTerminateAfterLastWindowClosed
-    // → applicationWillTerminate → stopEngine），不是直接 exit()。
+    // 验收用：界面加载完后走与 ⌘Q 相同的应用退出路径。
     private func scheduleAutoCloseIfAsked() {
         let env = ProcessInfo.processInfo.environment
         if let s = env["DUBHE_SHELL_AUTOCLOSE"], let secs = Double(s), secs > 0 {
             dbg("autoclose in \(secs)s")
-            DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
-                self?.window.performClose(nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + secs) {
+                NSApp.terminate(nil)
             }
         }
         // 同理：DUBHE_SHELL_AUTORESTART=2 验证"重启引擎"这条路（⌘⇧R 同一条）。
@@ -1660,6 +1702,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         dbg("didFinish \(webView.url?.absoluteString ?? "?")")
         if let t = webView.title, !t.isEmpty { window.title = t }
         window.makeFirstResponder(webView)
+        if uiLoaded, let text = pendingScreenshotText {
+            pendingScreenshotText = nil
+            requestTranslation(text, callback: "dubheOcr")
+        }
         maybeSnapshot()
     }
 

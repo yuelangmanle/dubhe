@@ -1544,9 +1544,6 @@ bool q35_init(const Q35Spec& s, std::string* err) {
                      (int)(g_q35_px != nil));
     std::memset([g_q35_state contents], 0, [g_q35_state length]);
     std::memset([g_q35_conv contents], 0, [g_q35_conv length]);
-    std::memset([g_q35_kc contents], 0, [g_q35_kc length]);
-    std::memset([g_q35_vc contents], 0, [g_q35_vc length]);
-
     g_q35_ready = true;
     return true;
 }
@@ -2328,8 +2325,10 @@ void q35_reset() {
     if (!g_q35_ready) return;
     std::memset([g_q35_state contents], 0, [g_q35_state length]);
     std::memset([g_q35_conv contents], 0, [g_q35_conv length]);
-    std::memset([g_q35_kc contents], 0, [g_q35_kc length]);
-    std::memset([g_q35_vc contents], 0, [g_q35_vc length]);
+    // Prefill and decode overwrite K/V before attending to those positions.
+    // Restarting at position zero invalidates the old rows without touching
+    // the entire context buffer. DeltaNet and convolution retain state and
+    // therefore must still be cleared above.
 }
 
 }  // namespace metal

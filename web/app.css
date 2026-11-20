@@ -232,7 +232,6 @@ body::after {
   body::after { opacity: .035; }
 }
 
-#app { display: flex; height: 100%; position: relative; z-index: 0; }
 #app[hidden], .share-notice[hidden] { display: none; }
 .share-notice { max-width: 480px; margin: 10vh auto 0; padding: 30px; }
 .share-notice p { color: var(--text-2); }
@@ -337,6 +336,7 @@ body::after {
   height: 100%; height: 100dvh;
   display: grid;
   grid-template-columns: var(--nav-w) minmax(0, 1fr) var(--insp-w);
+  grid-template-rows: minmax(0, 1fr);
   gap: var(--gap);
   padding: var(--gap);
   padding-top: calc(var(--gap) + var(--safe-t));
@@ -1596,6 +1596,12 @@ textarea.field:focus, input.field:focus {
   :root { --nav-w: 212px; --insp-w: 288px; }
   .mp-name { max-width: 150px; }
 }
+/* 翻译区使用右栏的空间。用根视图状态同步两项样式，避免 WebKit
+ * 返回对话时只显示右栏、却仍保留翻译页的两列。 */
+.desk[data-view="translate"] #inspector { display: none; }
+@media (min-width: 1025px) {
+  .desk[data-view="translate"] { grid-template-columns: var(--nav-w) minmax(0, 1fr); }
+}
 @media (max-width: 1024px) {
   .desk { grid-template-columns: var(--nav-w) minmax(0, 1fr); }
   /* 右栏改成浮层：它信息密度高但可以随时关掉，占一列太浪费 */
@@ -2074,13 +2080,6 @@ body[data-glass="off"] .edge::before { display: none; }
 .delete-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .delete-confirm-actions [value="delete"] { color: var(--red); }
 .translation-glossary textarea { margin-top: 8px; }
-#app:not([hidden]):has(#views:not([hidden]) .translation-workspace) { display: grid; }
-.desk:has(#views:not([hidden]) .translation-workspace) #inspector { display: none; }
-@media (min-width: 861px) {
-  .desk:has(#views:not([hidden]) .translation-workspace) {
-    grid-template-columns: var(--nav-w) minmax(0, 1fr);
-  }
-}
 .translation-settings {
   display: grid;
   grid-template-columns: minmax(0, 2fr) repeat(2, minmax(0, 1fr));

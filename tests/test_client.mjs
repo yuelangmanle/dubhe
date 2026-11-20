@@ -229,6 +229,29 @@ try {
 
   await navigate(origin);
   await ready();
+  await cdp('Emulation.setDeviceMetricsOverride', { width: 1250, height: 786, deviceScaleFactor: 1, mobile: false });
+  await until(() => evaluate('innerWidth === 1250'), 'desktop viewport');
+  const desktopLayout = () => evaluate(`['#sidebar', 'main.chat', '#inspector'].map(selector => {
+    const { x, y, width, height } = document.querySelector(selector).getBoundingClientRect();
+    return { x, y, width, height };
+  })`);
+  const assertDesktopChat = async () => {
+    const [nav, chat, inspector] = await desktopLayout();
+    assert.equal(nav.width, 236, 'navigation uses the desktop grid width');
+    assert.equal(inspector.width, 316, 'inspector uses the desktop grid width');
+    assert.ok(nav.x < chat.x && chat.x < inspector.x, 'inspector stays to the right of chat');
+    assert.equal(inspector.y, chat.y, 'inspector stays in the chat row');
+    assert.equal(inspector.height, chat.height, 'the desktop panes have the same height');
+    assert.ok(chat.height > 750, 'chat fills the window');
+  };
+  await assertDesktopChat();
+  await openTranslation();
+  const [, translation, hiddenInspector] = await desktopLayout();
+  assert.ok(translation.width > 950, 'translation expands into the inspector column');
+  assert.equal(hiddenInspector.width, 0);
+  await click('#viewBack');
+  await assertDesktopChat();
+  await cdp('Emulation.clearDeviceMetricsOverride');
   await click('#newChat');
   await send('first chat');
   await until(() => holdChat, 'first chat streaming');
@@ -261,12 +284,14 @@ try {
   await until(() => requests.length === 3, 'queued chats sent');
   const second = requests[1];
   assert.deepEqual(second.messages.filter(m => m.role === 'user').map(m => m.content), ['second chat']);
-  assert.ok(second.messages.some(m => m.role === 'system' && m.content.includes('web_search')));
-  assert.equal(second.dubhe_tools, true);
+  assert.equal(second.dubhe_search, true);
+  assert.equal(second.dubhe_tools, false);
+  assert.ok(!second.messages.some(m => m.role === 'system' && m.content.includes('web_search')));
   assert.equal(second.thinking, true);
   assert.equal(second.workspace, '/a-project');
   assert.match(requests[2].messages.at(-1).content, /attachment contents/);
   assert.equal(requests[2].dubhe_tools, false);
+  assert.equal(requests[2].dubhe_search, false);
   assert.equal(await evaluate('document.querySelector("#input").value'), 'separate active draft', 'queued chat cleared a draft');
   assert.equal(await evaluate('document.querySelector("#convTitle").textContent'), '新对话', 'queued chat switched conversations');
   assert.equal(await evaluate('document.activeElement.id'), 'input', 'queued chat stole keyboard focus');
