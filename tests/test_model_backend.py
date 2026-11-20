@@ -20,6 +20,7 @@ FAKE_SERVER = """
     import json
     import os
     from pathlib import Path
+    import signal
     import time
 
     p = argparse.ArgumentParser()
@@ -31,6 +32,14 @@ FAKE_SERVER = """
     assert not os.environ.get("LLAMA_ARG_AGENT")
     key = Path(a.api_key_file).read_text().strip()
     assert key and not Path(a.api_key_file).stat().st_mode & 0o077
+    shutdown_log = os.environ.get("DUBHE_TEST_CHILD_SHUTDOWN")
+    if shutdown_log:
+        def stop(_signum, _frame):
+            with Path(shutdown_log).open("a") as log:
+                log.write("SIGTERM\\n")
+            time.sleep(0.15)
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, stop)
     Path(os.environ["DUBHE_TEST_CHILD_PID"]).write_text(str(os.getpid()))
     print("Test llama-server startup diagnostic", flush=True)
 

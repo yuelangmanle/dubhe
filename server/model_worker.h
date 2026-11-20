@@ -215,25 +215,29 @@ private:
     }
 
     void stop() {
+        if (pid_ > 0) {
+            // The Python worker terminates and reaps llama-server. Signalling both
+            // here would interrupt llama-server again while it is freeing Metal.
+            kill(pid_, SIGTERM);
+            const auto deadline = Time::now() + std::chrono::seconds(3);
+            int status = 0;
+            pid_t child;
+            do {
+                child = waitpid(pid_, &status, WNOHANG);
+                if (child > 0 || (child < 0 && errno != EINTR)) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            } while (Time::now() < deadline);
+            // Clean up any subprocess left by a worker that could not finish.
+            kill(-pid_, SIGKILL);
+            if (child <= 0) {
+                while (waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
+            }
+            pid_ = 0;
+        }
         if (input_ >= 0) close(input_);
         if (output_ >= 0) close(output_);
         input_ = output_ = -1;
         received_.clear();
-        if (pid_ <= 0) return;
-        kill(-pid_, SIGTERM);
-        const auto deadline = Time::now() + std::chrono::seconds(2);
-        int status = 0;
-        pid_t child = 0;
-        while (Time::now() < deadline) {
-            child = waitpid(pid_, &status, WNOHANG);
-            if (child != 0 && (child > 0 || errno != EINTR)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        if (child == 0) {
-            kill(-pid_, SIGKILL);
-            while (waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
-        }
-        pid_ = 0;
     }
 
     std::string script_, kind_, path_, projector_;

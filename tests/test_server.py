@@ -187,10 +187,24 @@ class ServiceTest(unittest.TestCase):
             fake = root / "llama-server"
             fake.write_text(f"#!{sys.executable}\n" + textwrap.dedent(FAKE_SERVER))
             fake.chmod(0o700)
+            wrapper = root / "worker-python"
+            wrapper.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+                import runpy, subprocess, sys, time
+                terminate = subprocess.Popen.terminate
+                def delayed_terminate(process):
+                    time.sleep(0.06)
+                    terminate(process)
+                subprocess.Popen.terminate = delayed_terminate
+                sys.argv = sys.argv[2:]
+                runpy.run_path(sys.argv[0], run_name="__main__")
+            """))
+            wrapper.chmod(0o700)
             child = root / "child.pid"
             started = root / "scan-started"
+            shutdown = root / "child-shutdown"
             env = dict(os.environ, DUBHE_LLAMA_SERVER=str(fake), DUBHE_TEST_CHILD_PID=str(child),
-                       DUBHE_TEST_SCAN_STARTED=str(started))
+                       DUBHE_TEST_SCAN_STARTED=str(started), DUBHE_TEST_CHILD_SHUTDOWN=str(shutdown),
+                       DUBHE_BACKEND_PYTHON=str(wrapper))
             models = root / "models"
             models.mkdir()
             weights = models / "Xiaomi-OCR-0.Q4_K_M.gguf"
@@ -244,6 +258,7 @@ class ServiceTest(unittest.TestCase):
                     time.sleep(0.025)
                 else:
                     self.fail("worker still alive after the scan client closed")
+                self.assertEqual(shutdown.read_text().splitlines(), ["SIGTERM"])
                 self.assertEqual(recognize("text")["text"], "Water level 10.2 m")
                 self.assertEqual(request(base, "/api/models/delete", {"path": str(projector)})[0], 200)
                 self.assertFalse(request(base, "/api/scan")[1]["installed"])
