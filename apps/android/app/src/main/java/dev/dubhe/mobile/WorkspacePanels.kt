@@ -1,7 +1,8 @@
 package dev.dubhe.mobile
 
-import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -9,31 +10,26 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Surface
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -41,138 +37,113 @@ import androidx.compose.ui.unit.dp
 import java.util.Locale
 
 @Composable
-internal fun WorkspaceIcon(index: Int) {
-    val color = MaterialTheme.colorScheme.onSurface
-    Canvas(Modifier.size(23.dp)) {
-        scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
-            val line = Stroke(width = 1.65f, cap = StrokeCap.Round)
-            when (index) {
-                0 -> {
-                    drawPath(Path().apply {
-                        moveTo(3f, 10f)
-                        quadraticTo(3f, 4f, 9f, 4f)
-                        lineTo(15f, 4f)
-                        quadraticTo(21f, 4f, 21f, 10f)
-                        lineTo(21f, 12f)
-                        quadraticTo(21f, 17.5f, 15f, 17.5f)
-                        lineTo(10f, 17.5f)
-                        lineTo(5f, 21f)
-                        lineTo(5f, 16f)
-                        quadraticTo(3f, 14f, 3f, 12f)
-                        close()
-                    }, color, style = line)
-                    for (x in listOf(8f, 12f, 16f)) drawCircle(color, 0.85f, Offset(x, 10.8f))
-                }
-                1 -> {
-                    drawCircle(color, radius = 8.5f, center = Offset(12f, 12f), style = line)
-                    drawOval(color, Offset(8.5f, 3.5f), Size(7f, 17f), style = line)
-                    drawLine(color, Offset(4f, 12f), Offset(20f, 12f), strokeWidth = 1.55f)
-                }
-                2 -> {
-                    drawPath(Path().apply {
-                        moveTo(12f, 2.8f)
-                        lineTo(20.8f, 7.8f)
-                        lineTo(20.8f, 16.5f)
-                        lineTo(12f, 21.3f)
-                        lineTo(3.2f, 16.5f)
-                        lineTo(3.2f, 7.8f)
-                        close()
-                        moveTo(3.2f, 7.8f)
-                        lineTo(12f, 12.8f)
-                        lineTo(20.8f, 7.8f)
-                        moveTo(12f, 12.8f)
-                        lineTo(12f, 21.3f)
-                    }, color, style = line)
-                }
-                else -> {
-                    for ((y, x) in listOf(6f to 8f, 12f to 15f, 18f to 11f)) {
-                        drawLine(color, Offset(3.5f, y), Offset(20.5f, y), strokeWidth = 1.6f, cap = StrokeCap.Round)
-                        drawRoundRect(color, Offset(x - 1.8f, y - 2.8f), Size(3.6f, 5.6f), CornerRadius(1.4f))
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
 internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importProjector: () -> Unit, openTranslation: () -> Unit) {
     val state = chat.state
     val idle = state.activity == Activity.Idle
     val links = LocalUriHandler.current
+    var selectedShop by rememberSaveable { mutableStateOf<Boolean?>(null) }
+    val shop = selectedShop ?: state.models.isEmpty()
     var deleting by remember { mutableStateOf<LocalModel?>(null) }
+
     Column(
-        Modifier.verticalScroll(rememberScrollState()).padding(bottom = 20.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        Modifier.verticalScroll(rememberScrollState()).padding(bottom = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(11.dp),
     ) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            SectionTitle("我的模型", Modifier.weight(1f))
-            OutlinedButton(importModel, enabled = idle) { Text("导入 GGUF") }
-        }
-        if (state.models.isEmpty()) {
-            Text("从商店下载，或导入已有的 GGUF 文件。", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        for (model in state.models) {
-            val translationModel = model.catalog?.translation == true
-            val active = state.activeModel?.file == model.file
-            ModelCard(
-                model.catalog?.name ?: model.name,
-                if (active) "正在使用" else if (translationModel) "专用翻译" else "本地 GGUF",
-            ) {
-                TextButton(
-                    onClick = { if (translationModel) openTranslation() else chat.selectModel(model) },
-                    enabled = !active && (translationModel || idle),
-                ) { Text(if (translationModel) "去翻译" else if (active) "已加载" else "加载") }
-                TextButton(onClick = { deleting = model }, enabled = idle) { Text("删除") }
-            }
-        }
-        if (state.activeModel != null) {
-            ModelCard("多模态组件", state.projectorName ?: "配合对话模型读取图片、视频或音频") {
-                TextButton(importProjector, enabled = idle) { Text(if (state.projectorName == null) "导入" else "更换") }
-            }
+        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+            SegmentedButton(
+                selected = !shop, onClick = { selectedShop = false },
+                shape = SegmentedButtonDefaults.itemShape(0, 2),
+            ) { Text("我的模型") }
+            SegmentedButton(
+                selected = shop, onClick = { selectedShop = true },
+                shape = SegmentedButtonDefaults.itemShape(1, 2),
+            ) { Text("模型商店") }
         }
         if (state.activity == Activity.Importing && state.downloading == null) {
-            ModelCard(state.status.orEmpty(), null) { TextButton(chat::stop, enabled = !state.stopping) { Text("取消") } }
+            ModelCard(state.status ?: "正在导入", null, Glyph.File) {
+                TextButton(chat::stop, enabled = !state.stopping) { Text("取消") }
+            }
             TransferProgress(state.progress)
         } else if (state.activity == Activity.Loading) {
             TransferProgress(null)
         }
-        HorizontalDivider(Modifier.padding(top = 6.dp))
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            SectionTitle("模型商店", Modifier.weight(1f))
-            TextButton(onClick = {
-                try {
-                    links.openUri("https://github.com/yuelangmanle/dubhe/blob/main/docs/model-downloads.md")
-                } catch (_: IllegalArgumentException) {
-                    chat.showError("无法打开模型下载来源。")
-                }
-            }) { Text("下载来源") }
-        }
-        for (item in mobileCatalog) {
-            val installed = state.models.any { it.catalog?.file == item.file }
-            val downloading = state.downloading == item.file
-            val size = if (item.bytes < 1_000_000_000) {
-                String.format(Locale.CHINA, "%.0f MB", item.bytes / 1_000_000.0)
-            } else {
-                String.format(Locale.CHINA, "%.2f GB", item.bytes / 1_000_000_000.0)
+
+        if (shop) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "下载后在本机使用", Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                TextButton(onClick = {
+                    try {
+                        links.openUri("https://github.com/yuelangmanle/dubhe/blob/main/docs/model-downloads.md")
+                    } catch (_: IllegalArgumentException) {
+                        chat.showError("无法打开模型下载来源。")
+                    }
+                }) { Text("下载来源") }
             }
-            ModelCard(item.name, item.description + " · " + size) {
-                when {
-                    installed -> Text("已下载", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                    downloading -> TextButton(chat::stop, enabled = !state.stopping) { Text("取消") }
-                    else -> TextButton({ chat.downloadModel(item) }, enabled = idle) {
-                        Text(if (item.file in state.partialDownloads) "继续下载" else "下载")
+            for (item in mobileCatalog) {
+                val installed = state.models.any { it.catalog?.file == item.file }
+                val downloading = state.downloading == item.file
+                val size = if (item.bytes < 1_000_000_000) {
+                    String.format(Locale.CHINA, "%.0f MB", item.bytes / 1_000_000.0)
+                } else {
+                    String.format(Locale.CHINA, "%.2f GB", item.bytes / 1_000_000_000.0)
+                }
+                ModelCard(item.name, item.description + " · " + size, if (item.translation) Glyph.Translate else Glyph.Model) {
+                    when {
+                        installed -> Text(
+                            "已下载", Modifier.padding(end = 7.dp),
+                            style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary,
+                        )
+                        downloading -> TextButton(chat::stop, enabled = !state.stopping) { Text("取消") }
+                        else -> TextButton({ chat.downloadModel(item) }, enabled = idle) {
+                            Text(if (item.file in state.partialDownloads) "继续下载" else "下载")
+                        }
                     }
                 }
+                if (downloading) {
+                    TransferProgress(state.progress)
+                    val progress = state.progress
+                    Text(
+                        if (state.stopping) "正在取消" else if (progress == 1f) "正在校验模型" else
+                            progress?.let { "已下载 " + (it * 100).toInt() + "%" } ?: "正在连接下载源",
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
             }
-            if (downloading) {
-                TransferProgress(state.progress)
-                val progress = state.progress
+        } else {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    if (state.stopping) "正在取消" else if (progress == 1f) "正在校验模型" else
-                        progress?.let { "已下载 " + (it * 100).toInt() + "%" } ?: "正在连接下载源",
-                    style = MaterialTheme.typography.labelMedium,
+                    "保存在此设备", Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                TextButton(importModel, enabled = idle) { Text("导入 GGUF") }
+            }
+            if (state.models.isEmpty()) {
+                ModelCard("还没有本地模型", "从模型商店下载，或导入已有的 GGUF 文件。", Glyph.Model) {
+                    TextButton({ selectedShop = true }) { Text("浏览商店") }
+                }
+            }
+            for (model in state.models) {
+                val translationModel = model.catalog?.translation == true
+                val active = state.activeModel?.file == model.file
+                ModelCard(
+                    model.catalog?.name ?: model.name,
+                    if (active) "正在使用" else if (translationModel) "专用翻译" else "本地 GGUF",
+                    if (translationModel) Glyph.Translate else Glyph.Model,
+                ) {
+                    TextButton(
+                        onClick = { if (translationModel) openTranslation() else chat.selectModel(model) },
+                        enabled = !active && (translationModel || idle),
+                    ) { Text(if (translationModel) "去翻译" else if (active) "已加载" else "加载") }
+                    TextButton(onClick = { deleting = model }, enabled = idle) { Text("删除") }
+                }
+            }
+            if (state.activeModel != null) {
+                ModelCard("多模态组件", state.projectorName ?: "为对话模型接入图片、视频或音频", Glyph.Attachment) {
+                    TextButton(importProjector, enabled = idle) { Text(if (state.projectorName == null) "导入" else "更换") }
+                }
             }
         }
     }
@@ -181,29 +152,32 @@ internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importPr
             onDismissRequest = { deleting = null },
             title = { Text("删除模型？") },
             text = { Text("将移除这台手机里的 " + (model.catalog?.name ?: model.name) + "。") },
-            confirmButton = {
-                Button({ chat.deleteModel(model); deleting = null }) { Text("删除") }
-            },
+            confirmButton = { Button({ chat.deleteModel(model); deleting = null }) { Text("删除") } },
             dismissButton = { TextButton({ deleting = null }) { Text("取消") } },
         )
     }
 }
 
 @Composable
-internal fun ModelCard(title: String, description: String?, actions: @Composable () -> Unit) {
-    Surface(shape = RoundedCornerShape(17.dp), color = MaterialTheme.colorScheme.surface) {
+internal fun ModelCard(title: String, description: String?, glyph: Glyph, actions: @Composable () -> Unit = {}) {
+    val colors = MaterialTheme.colorScheme
+    WorkspaceCard(Modifier.fillMaxWidth()) {
         Row(
-            Modifier.fillMaxWidth().padding(start = 15.dp, end = 9.dp, top = 10.dp, bottom = 10.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            Modifier.fillMaxWidth().padding(start = 12.dp, end = 5.dp, top = 10.dp, bottom = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            Box(
+                Modifier.size(34.dp).clip(MaterialTheme.shapes.small).background(colors.secondaryContainer),
+                contentAlignment = Alignment.Center,
+            ) { WorkspaceIcon(glyph, Modifier.size(19.dp), colors.onSecondaryContainer) }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(title, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 description?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant)
                 }
             }
-            actions()
+            Row(verticalAlignment = Alignment.CenterVertically) { actions() }
         }
     }
 }
@@ -220,18 +194,63 @@ internal fun SectionTitle(text: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-internal fun SettingsScreen(state: ChatState, checkUpdates: () -> Unit) {
+internal fun SettingsScreen(state: ChatState, checkUpdates: () -> Unit, showChangelog: () -> Unit) {
     Column(
         Modifier.verticalScroll(rememberScrollState()).padding(bottom = 20.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
+        verticalArrangement = Arrangement.spacedBy(13.dp),
     ) {
-        SectionTitle("版本")
-        ModelCard("Dubhe " + BuildConfig.VERSION_NAME, null) {
-            TextButton(checkUpdates) { Text("更新与日志") }
+        WorkspaceCard(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(14.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    DubheMark(38.dp)
+                    Column(Modifier.weight(1f)) {
+                        Text("天枢 Dubhe", style = MaterialTheme.typography.titleMedium)
+                        Text("版本 ${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
+                    TextButton(showChangelog) { Text("更新日志") }
+                    Button(checkUpdates) { Text("检查更新") }
+                }
+            }
         }
-        SectionTitle("运行状态")
-        ModelCard(state.modelName ?: "未加载对话模型", state.modelDetail) {}
+        SectionTitle("运行状态", Modifier.padding(start = 3.dp, top = 6.dp))
+        ModelCard(
+            state.modelName ?: "未加载对话模型",
+            state.modelDetail ?: if (state.connected) "本地引擎已连接" else "正在连接本地引擎",
+            Glyph.Model,
+        )
     }
+}
+
+@Composable
+internal fun ChatModelDialog(
+    models: List<LocalModel>, active: LocalModel?, enabled: Boolean,
+    dismiss: () -> Unit, choose: (LocalModel) -> Unit, manage: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = dismiss,
+        title = { Text("选择对话模型") },
+        text = {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 360.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (models.isEmpty()) Text("当前没有可加载的对话模型。")
+                for (model in models) {
+                    val selected = active?.file == model.file
+                    ModelCard(model.catalog?.name ?: model.name, if (selected) "本机运行" else null, Glyph.Model) {
+                        TextButton({ choose(model) }, enabled = enabled && !selected) {
+                            Text(if (selected) "已加载" else "加载")
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(manage) { Text("管理模型") } },
+        dismissButton = { TextButton(dismiss) { Text("关闭") } },
+    )
 }
 
 @Composable

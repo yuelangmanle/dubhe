@@ -2,7 +2,7 @@
     <string name="app_name">Dubhe</string>
     <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#087D6A</item>
-        <item name="android:windowBackground">#F4F7F6</item>
+        <item name="android:colorAccent">#344F41</item>
+        <item name="android:windowBackground">#F7F6F0</item>
     </style>
 </resources>

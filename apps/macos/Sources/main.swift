@@ -588,32 +588,110 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     @objc private func checkForUpdates() {
         guard !checkingForUpdate else { return }
         checkingForUpdate = true
+        showMainWindow()
         Task { @MainActor in
             defer { checkingForUpdate = false }
             let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
             let alert = NSAlert()
-            var showRelease = false
             do {
                 let release = try await ReleaseUpdates.latest()
-                if let version = try release.newerVersion(than: current) {
-                    alert.messageText = "Dubhe \(version) 可更新"
-                    alert.informativeText = "当前版本 \(current)。可在 GitHub 下载新版 macOS 安装包。"
-                    showRelease = true
-                } else {
+                guard let update = try release.update(than: current) else {
                     alert.messageText = "已是最新版本"
                     alert.informativeText = "当前版本 \(current)。"
+                    alert.addButton(withTitle: "关闭")
+                    _ = await alert.beginSheetModal(for: window)
+                    return
+                }
+
+                alert.messageText = "Dubhe \(update.version) 可更新"
+                alert.informativeText = "当前版本 \(current)。"
+                if let package = update.package {
+                    let size = ByteCountFormatter.string(fromByteCount: package.size, countStyle: .file)
+                    alert.informativeText += "安装包 \(size)。安装包打开后，退出 Dubhe，把新版拖到「应用程序」，再打开新版。"
+                    alert.addButton(withTitle: "下载并打开")
+                } else {
+                    alert.informativeText += "暂时无法在应用内下载这个版本的安装包。"
+                }
+                if !update.notes.isEmpty { alert.accessoryView = releaseNotesView(update.notes, height: 200) }
+                alert.addButton(withTitle: "打开 GitHub")
+                alert.addButton(withTitle: "关闭").keyEquivalent = "\u{1b}"
+                let choice = await alert.beginSheetModal(for: window)
+                if let package = update.package, choice == .alertFirstButtonReturn {
+                    await downloadUpdate(package, version: update.version, page: update.page)
+                } else if choice == (update.package == nil ? .alertFirstButtonReturn : .alertSecondButtonReturn) {
+                    NSWorkspace.shared.open(update.page)
                 }
             } catch {
-                alert.messageText = "未能完成更新检查"
-                alert.informativeText = error.localizedDescription
-                showRelease = true
-            }
-            if showRelease { alert.addButton(withTitle: "打开 GitHub") }
-            alert.addButton(withTitle: "关闭")
-            alert.beginSheetModal(for: window) { result in
-                if showRelease && result == .alertFirstButtonReturn { NSWorkspace.shared.open(ReleaseUpdates.page) }
+                await showUpdateProblem("未能完成更新检查", details: error.localizedDescription, page: ReleaseUpdates.page)
             }
         }
+    }
+
+    @MainActor
+    private func downloadUpdate(_ package: ReleaseUpdates.Package, version: String, page: URL) async {
+        let alert = NSAlert()
+        alert.messageText = "正在下载 Dubhe \(version)"
+        alert.addButton(withTitle: "取消").keyEquivalent = "\u{1b}"
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 40))
+        let progress = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 320, height: 16))
+        progress.isIndeterminate = false
+        progress.maxValue = Double(package.size)
+        let status = NSTextField(labelWithString: "正在连接 GitHub…")
+        status.frame = NSRect(x: 0, y: 23, width: 320, height: 17)
+        view.addSubview(progress)
+        view.addSubview(status)
+        alert.accessoryView = view
+        let download = Task {
+            try await package.download { event in
+                switch event {
+                case let .downloading(bytes):
+                    let percent = Int(Double(min(bytes, package.size)) / Double(package.size) * 100)
+                    progress.doubleValue = Double(bytes)
+                    status.stringValue = "已下载 \(percent)%"
+                case .verifying:
+                    status.stringValue = "正在校验安装包…"
+                    progress.isIndeterminate = true
+                    progress.startAnimation(nil)
+                }
+            }
+        }
+        alert.beginSheetModal(for: window) { response in
+            if response == .alertFirstButtonReturn { download.cancel() }
+        }
+
+        let result = await download.result
+        if window.attachedSheet === alert.window { window.endSheet(alert.window) }
+        switch result {
+        case let .success(file):
+            if download.isCancelled {
+                try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+                return
+            }
+            if !NSWorkspace.shared.open(file) {
+                let failure = NSAlert()
+                failure.messageText = "无法打开安装包"
+                failure.informativeText = "安装包已通过校验。请在 Finder 中打开它。"
+                failure.addButton(withTitle: "在 Finder 中显示")
+                failure.addButton(withTitle: "关闭")
+                if await failure.beginSheetModal(for: window) == .alertFirstButtonReturn {
+                    NSWorkspace.shared.activateFileViewerSelecting([file])
+                }
+            }
+        case let .failure(error):
+            if !download.isCancelled {
+                await showUpdateProblem("更新下载失败", details: error.localizedDescription, page: page)
+            }
+        }
+    }
+
+    @MainActor
+    private func showUpdateProblem(_ title: String, details: String, page: URL) async {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = details
+        alert.addButton(withTitle: "打开 GitHub")
+        alert.addButton(withTitle: "关闭")
+        if await alert.beginSheetModal(for: window) == .alertFirstButtonReturn { NSWorkspace.shared.open(page) }
     }
 
     @objc private func showChangelog() {
@@ -621,20 +699,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         alert.messageText = "更新日志"
         if let url = Bundle.main.url(forResource: "CHANGELOG", withExtension: "md"),
            let content = try? String(contentsOf: url, encoding: .utf8) {
-            let scroll = NSTextView.scrollableTextView()
-            scroll.frame = NSRect(x: 0, y: 0, width: 570, height: 365)
-            if let text = scroll.documentView as? NSTextView {
-                text.isEditable = false
-                text.font = .systemFont(ofSize: 13)
-                text.textContainerInset = NSSize(width: 8, height: 8)
-                text.string = content
-            }
-            alert.accessoryView = scroll
+            alert.accessoryView = releaseNotesView(content, height: 365)
         } else {
             alert.informativeText = "无法读取随应用提供的更新日志。"
         }
         alert.addButton(withTitle: "关闭")
         alert.beginSheetModal(for: window)
+    }
+
+    private func releaseNotesView(_ content: String, height: CGFloat) -> NSScrollView {
+        let scroll = NSTextView.scrollableTextView()
+        scroll.frame = NSRect(x: 0, y: 0, width: 570, height: height)
+        if let text = scroll.documentView as? NSTextView {
+            text.isEditable = false
+            text.font = .systemFont(ofSize: 13)
+            text.textContainerInset = NSSize(width: 8, height: 8)
+            text.string = content
+        }
+        return scroll
     }
 
     private func buildWindow() {

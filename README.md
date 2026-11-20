@@ -2,7 +2,7 @@
 
 Apple Silicon 和 Android 上的本地模型运行工具。原生引擎读取 GGUF，包含命令行、HTTP 服务和 macOS 客户端。
 
-当前版本 **0.32.1**。macOS 和 Android 均提供模型商店、对话历史、离线翻译和多模态输入。Mac 还可用 Xiaomi-OCR-0 在本机扫描图片和 PDF。两个客户端的安装包见 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。
+当前版本 **0.33.0**。macOS 和 Android 均提供模型商店、对话历史、离线翻译、多模态输入和应用内更新下载。Mac 还可用 Xiaomi-OCR-0 在本机扫描图片和 PDF。两个客户端的安装包见 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。
 
 已下载过的模型和配套组件可以从[模型下载来源](docs/model-downloads.md)找回。
 

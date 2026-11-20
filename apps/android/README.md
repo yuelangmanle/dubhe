@@ -2,7 +2,7 @@
 
 Dubhe 在 arm64 Android 12 及以上设备上读取本地 GGUF。应用使用 Kotlin 和 Compose，推理在独立的 `:engine` 进程中运行。
 
-可安装的 APK 在 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。打开「设置 → 更新与日志」可检查更新，或阅读本地更新日志。
+可安装的 APK 在 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。在「设置」点「检查更新」，可查看新版内容并下载 APK。应用校验安装包后交给 Android 确认安装，首次可能需要在系统设置中允许 Dubhe 安装应用。设置里的「更新日志」可离线打开。
 
 macOS 发布机从 `~/Library/Application Support/Dubhe/AndroidSigning` 读取 Android 发布密钥和密码。后续发布复用这套文件，发布脚本会核对 APK 的证书指纹。此前的调试 APK 使用不同证书。
 

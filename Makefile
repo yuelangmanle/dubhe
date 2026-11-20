@@ -247,6 +247,8 @@ ifeq ($(PLATFORM),Darwin)
 	"$(BUILD)/test_translation_pdf"
 	swiftc apps/macos/Sources/ScanPDF.swift apps/macos/Sources/ScanOCR.swift tests/test_scan_pdf.swift -o "$(BUILD)/test_scan_pdf" -framework PDFKit
 	"$(BUILD)/test_scan_pdf"
+	swiftc apps/macos/Sources/ReleaseUpdates.swift tests/test_release_updates.swift -o "$(BUILD)/test_release_updates"
+	"$(BUILD)/test_release_updates"
 endif
 
 # 一条命令自检（ADR-0007）：逐条运行并校验所用后端。
