@@ -228,15 +228,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var translationStatusItem: NSStatusItem?
     private var capture: Process?
     private let oneShotCapture = OneShotScreenCapture()
-    private var recognizingScreenshot = false
+    private var screenshotOCRRequest: UUID?
+    private var screenshotOCRTask: URLSessionDataTask?
+    private var screenshotRetryImage: CGImage?
+    private var recognizingScreenshot: Bool { screenshotOCRRequest != nil }
     private var pendingScreenshotText: String?
     private var capturingScreenshot: Bool { capture != nil || oneShotCapture.isActive }
+    private let scanPDFQueue = DispatchQueue(label: "com.dubhe.scan-pdf", qos: .userInitiated)
+    private var openingScanPDF = false
+    private var scanDocument: (requestId: String, pdf: ScanPDF)?
     private var overlay: NSPanel?
     private var overlayText: NSTextView?
     private var overlayTabs: NSSegmentedControl?
     private var overlayCopy: NSButton?
     private var overlayScreenSettings: NSButton?
     private var overlayClipboard: NSButton?
+    private var overlayVisionRetry: NSButton?
     private var overlaySource = ""
     private var overlayResult = ""
     private var overlayHasTranslation = false
@@ -406,6 +413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         if let translationHotKeyHandler { RemoveEventHandler(translationHotKeyHandler) }
         if capture?.isRunning == true { capture?.terminate() }
         oneShotCapture.cancel()
+        screenshotOCRTask?.cancel()
         stopEngine()
     }
 
@@ -1004,6 +1012,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             UserDefaults.standard.removeObject(forKey: Self.lastModelKey)
         case "translationDocument":
             handleTranslationDocument(obj)
+        case "scanOpenPDF":
+            if let id = obj["requestId"] as? String { openScanPDF(requestId: id) }
+        case "scanPDFPage":
+            if let id = obj["requestId"] as? String, let page = obj["page"] as? Int {
+                renderScanPDFPage(requestId: id, page: page)
+            }
+        case "scanClosePDF":
+            if let id = obj["requestId"] as? String, id == scanDocument?.requestId { scanDocument = nil }
+        case "scanSave":
+            handleScanSave(obj)
         default:
             break
         }
@@ -1104,19 +1122,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         recognizeScreenshot(cg)
     }
 
-    private func recognizeScreenshot(_ cg: CGImage) {
-        recognizingScreenshot = true
+    private func recognizeScreenshot(_ cg: CGImage, useVision: Bool = false) {
+        let request = UUID()
+        screenshotOCRRequest = request
+        screenshotRetryImage = nil
         showOverlay("正在从截图中识别文字…", title: "识别中")
-        if uiLoaded {
-            webView.evaluateJavaScript("window.dubheOCRLanguage?.()") { [weak self] value, _ in
-                self?.performScreenshotOCR(cg, language: value as? String ?? "auto")
+        if uiLoaded, !webView.isLoading {
+            webView.evaluateJavaScript("[window.dubheOCRProvider?.() ?? 'vision', window.dubheOCRLanguage?.() ?? 'auto']") {
+                [weak self] value, _ in
+                guard let self, self.screenshotOCRRequest == request else { return }
+                let settings = value as? [String] ?? []
+                if !useVision, settings.first == "xiaomi" {
+                    self.performXiaomiScreenshotOCR(cg, request: request)
+                } else {
+                    let language = settings.count == 2 ? settings[1] : "auto"
+                    self.performScreenshotOCR(cg, language: language, request: request)
+                }
             }
         } else {
-            performScreenshotOCR(cg, language: "auto")
+            performScreenshotOCR(cg, language: "auto", request: request)
         }
     }
 
-    private func performScreenshotOCR(_ cg: CGImage, language: String) {
+    private func performXiaomiScreenshotOCR(_ image: CGImage, request: UUID) {
+        showOverlay("正在用小米 OCR 识别截图。首次加载模型可能需要一会儿，关闭此窗口可取消。", title: "识别中")
+        let enginePort = port
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let prepared = Result { try ScanOCR.request(port: enginePort, image: image) }
+            DispatchQueue.main.async {
+                guard let self, self.screenshotOCRRequest == request else { return }
+                switch prepared {
+                case .success(let localRequest):
+                    let task = ScanOCR.session.dataTask(with: localRequest) { [weak self] data, response, error in
+                        let result = Result { try ScanOCR.recognizedText(data, response: response, error: error) }
+                        DispatchQueue.main.async {
+                            self?.completeScreenshotOCR(result, request: request, retryImage: image)
+                        }
+                    }
+                    self.screenshotOCRTask = task
+                    task.resume()
+                case .failure(let error):
+                    self.completeScreenshotOCR(.failure(error), request: request, retryImage: image)
+                }
+            }
+        }
+    }
+
+    @objc private func retryScreenshotWithVision() {
+        guard !recognizingScreenshot, let image = screenshotRetryImage else { return }
+        recognizeScreenshot(image, useVision: true)
+    }
+
+    private func performScreenshotOCR(_ cg: CGImage, language: String, request: UUID) {
         DispatchQueue.global(qos: .userInitiated).async {
             let byLanguage = [
                 "zh": ["zh-Hans", "zh-Hant"], "en": ["en-US"], "ja": ["ja-JP"],
@@ -1148,24 +1205,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     text = try recognize(.fast)
                     if text.isEmpty { throw error }
                 }
-                dbg("ocr recognized \(text.count) characters")
                 DispatchQueue.main.async {
-                    self.recognizingScreenshot = false
-                    guard self.overlay?.title == "识别中" else { return }
-                    if (!self.uiLoaded || self.webView.isLoading), !text.isEmpty {
-                        self.pendingScreenshotText = text
-                        self.showOverlay("文字已识别，正在等待本地引擎启动。", title: "等待引擎", source: text)
-                    } else {
-                        self.requestTranslation(text, callback: "dubheOcr")
-                    }
+                    self.completeScreenshotOCR(.success(text), request: request)
                 }
             } catch {
                 dbg("ocr perform failed: \(error)")
                 DispatchQueue.main.async {
-                    self.recognizingScreenshot = false
-                    guard self.overlay?.title == "识别中" else { return }
-                    self.showOverlay("文字识别失败，请重新截取清晰的文字区域。", title: "识别失败")
+                    self.completeScreenshotOCR(.failure(error), request: request)
                 }
+            }
+        }
+    }
+
+    private func completeScreenshotOCR(_ result: Result<String, Error>, request: UUID, retryImage: CGImage? = nil) {
+        guard screenshotOCRRequest == request else { return }
+        screenshotOCRRequest = nil
+        screenshotOCRTask = nil
+        guard overlay?.title == "识别中" else { return }
+        switch result {
+        case .success(let text):
+            dbg("ocr recognized \(text.count) characters")
+            if (!uiLoaded || webView.isLoading), !text.isEmpty {
+                pendingScreenshotText = text
+                showOverlay("文字已识别，正在等待本地引擎启动。", title: "等待引擎", source: text)
+            } else {
+                requestTranslation(text, callback: "dubheOcr")
+            }
+        case .failure(let error):
+            if let retryImage {
+                screenshotRetryImage = retryImage
+                showOverlay(error.localizedDescription, title: "小米识别失败")
+            } else {
+                showOverlay("文字识别失败，请重新截取清晰的文字区域。", title: "识别失败")
             }
         }
     }
@@ -1266,7 +1337,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             let copy = NSButton(title: "复制", target: self, action: #selector(copyOverlayText))
             let screenSettings = NSButton(title: "打开系统设置", target: self, action: #selector(openScreenCaptureSettings))
             let clipboard = NSButton(title: "翻译剪贴板图片", target: self, action: #selector(translateClipboardImage))
-            let controls = NSStackView(views: [tabs, copy, screenSettings, clipboard])
+            let visionRetry = NSButton(title: "用系统识别重试", target: self, action: #selector(retryScreenshotWithVision))
+            let controls = NSStackView(views: [tabs, copy, screenSettings, clipboard, visionRetry])
             controls.spacing = 8
             let content = NSView()
             for subview in [controls, scroll] as [NSView] {
@@ -1288,6 +1360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             overlayCopy = copy
             overlayScreenSettings = screenSettings
             overlayClipboard = clipboard
+            overlayVisionRetry = visionRetry
 
             // 浮窗跟着鼠标所在的屏幕，边缘留出关闭按钮。
             let frameSize = p.frame.size
@@ -1302,10 +1375,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         p.title = title
         let screenshotFailed = title == "截图失败"
-        overlayTabs?.isHidden = screenshotFailed
-        overlayCopy?.isHidden = screenshotFailed
+        let canRetryWithVision = title == "小米识别失败" && screenshotRetryImage != nil
+        overlayTabs?.isHidden = screenshotFailed || canRetryWithVision
+        overlayCopy?.isHidden = screenshotFailed || canRetryWithVision
         overlayScreenSettings?.isHidden = !screenshotFailed
         overlayClipboard?.isHidden = !screenshotFailed
+        overlayVisionRetry?.isHidden = !canRetryWithVision
         overlayTranslating = title == "翻译中"
         overlayHasTranslation = title == "译文"
         if overlaySource != source { overlayTabs?.selectedSegment = 0 }
@@ -1334,6 +1409,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         guard let closed = notification.object as? NSWindow else { return }
         if closed === window { overlay?.close() }
         guard closed === overlay else { return }
+        screenshotOCRRequest = nil
+        screenshotOCRTask?.cancel()
+        screenshotOCRTask = nil
+        screenshotRetryImage = nil
         pendingScreenshotText = nil
         if overlayTranslating {
             webView.evaluateJavaScript("window.dubheCancelTranslation?.()") { _, _ in }
@@ -1345,6 +1424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         overlayCopy = nil
         overlayScreenSettings = nil
         overlayClipboard = nil
+        overlayVisionRetry = nil
         overlaySource = ""
         overlayResult = ""
     }
@@ -1384,6 +1464,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
+    private func replyToScan(_ callback: String, _ result: [String: Any]) {
+        webView.callAsyncJavaScript("window[callback]?.(result)",
+                                   arguments: ["callback": callback, "result": result],
+                                   in: nil, in: .page, completionHandler: nil)
+    }
+
+    private func openScanPDF(requestId: String) {
+        guard !openingScanPDF, window.attachedSheet == nil else {
+            replyToScan("dubheScanPDFReady", ["requestId": requestId, "error": "请先关闭当前的文件选择窗口。"])
+            return
+        }
+        openingScanPDF = true
+        let picker = NSOpenPanel()
+        picker.allowedContentTypes = [.pdf]
+        picker.canChooseDirectories = false
+        picker.allowsMultipleSelection = false
+        picker.prompt = "打开 PDF"
+        picker.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            guard response == .OK, let url = picker.url else {
+                self.openingScanPDF = false
+                self.replyToScan("dubheScanPDFReady", ["requestId": requestId, "cancelled": true])
+                return
+            }
+            self.scanPDFQueue.async {
+                let opened = Result { try ScanPDF(url: url) }
+                DispatchQueue.main.async {
+                    self.openingScanPDF = false
+                    switch opened {
+                    case .success(let document):
+                        self.scanDocument = (requestId, document)
+                        self.replyToScan("dubheScanPDFReady", ["requestId": requestId, "name": url.lastPathComponent,
+                                                              "pageCount": document.pageCount])
+                    case .failure(let error):
+                        self.replyToScan("dubheScanPDFReady", ["requestId": requestId, "error": error.localizedDescription])
+                    }
+                }
+            }
+        }
+    }
+
+    private func renderScanPDFPage(requestId: String, page: Int) {
+        let reply: (String, String) -> Void = { [weak self] key, value in
+            self?.replyToScan("dubheScanPDFPage", ["requestId": requestId, "page": page, key: value])
+        }
+        guard let selected = scanDocument, selected.requestId == requestId else {
+            reply("error", "请重新打开要扫描的 PDF。")
+            return
+        }
+        scanPDFQueue.async {
+            let rendered = Result { try selected.pdf.pageDataURL(number: page) }
+            DispatchQueue.main.async {
+                guard self.scanDocument?.requestId == requestId else { return }
+                switch rendered {
+                case .success(let image): reply("image", image)
+                case .failure(let error): reply("error", error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func handleScanSave(_ message: [String: Any]) {
+        guard let id = message["requestId"] as? String else { return }
+        let reply: ([String: Any]) -> Void = { [weak self] result in
+            var values: [String: Any] = ["requestId": id, "saved": false]
+            values.merge(result) { _, result in result }
+            self?.replyToScan("dubheScanSaved", values)
+        }
+        guard let format = message["format"] as? String, ["md", "txt", "tex", "json"].contains(format),
+              let text = message["text"] as? String, !text.isEmpty, text.utf8.count <= 16 * 1024 * 1024 else {
+            reply(["error": "扫描结果为空、过大或导出格式无效。"])
+            return
+        }
+        guard window.attachedSheet == nil else {
+            reply(["error": "请先关闭当前的文件窗口，再导出扫描结果。"])
+            return
+        }
+        let name = (message["name"] as? String).map { URL(fileURLWithPath: $0).lastPathComponent }
+        saveDocument(Data(text.utf8), format: format, name: name ?? "扫描结果.\(format)", reply: reply)
+    }
+
     private func handleTranslationDocument(_ message: [String: Any]) {
         guard let id = message["id"] as? Int else { return }
         let reply: ([String: Any]) -> Void = { [weak self] result in
@@ -1402,7 +1563,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             }
             let name = (message["name"] as? String) ?? "译文." + format
             let save: (Data) -> Void = { [weak self] data in
-                self?.saveTranslation(data, format: format, name: name, reply: reply)
+                self?.saveDocument(data, format: format, name: name, reply: reply)
             }
             if format == "md" || format == "txt" {
                 save(Data(text.utf8))
@@ -1431,7 +1592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 reply(["error": "译文文件格式无效。"])
                 return
             }
-            saveTranslation(data, format: format, name: (message["name"] as? String) ?? "译文." + format, reply: reply)
+            saveDocument(data, format: format, name: (message["name"] as? String) ?? "译文." + format, reply: reply)
             return
         }
         let translations = message["translations"] as? [String]
@@ -1461,7 +1622,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
-    private func saveTranslation(_ data: Data, format: String, name: String, reply: @escaping ([String: Any]) -> Void) {
+    private func saveDocument(_ data: Data, format: String, name: String, reply: @escaping ([String: Any]) -> Void) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [UTType(filenameExtension: format, conformingTo: .data) ?? .data]
         panel.nameFieldStringValue = name
@@ -1471,7 +1632,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 try data.write(to: url, options: .atomic)
                 reply(["saved": true])
             } catch {
-                reply(["error": "保存译文失败：" + error.localizedDescription])
+                reply(["error": "无法保存文件。" + error.localizedDescription])
             }
         }
     }

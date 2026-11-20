@@ -26,6 +26,7 @@
 #include "storage.h"
 #include "store.h"
 #include "translation.h"
+#include "ocr.h"
 #include "model_worker.h"
 
 #include <ifaddrs.h>
@@ -3381,6 +3382,10 @@ bool request_allowed(const http::Request& req, http::Conn& conn, int port) {
 }
 
 bool load_language_model(const std::string& path, std::string* error) {
+    if (store::scan_file(path_base(path))) {
+        *error = "这是专用扫描模型，请到扫描页使用";
+        return false;
+    }
     g.worker.reset();
     const bool mlx = is_dir_p(path);
     const std::string arch = mlx ? "" : gguf_meta_string(path, "general.architecture");
@@ -3709,7 +3714,7 @@ void scan_models(const std::string& dir, std::vector<ModelEntry>* out, int depth
             // mmproj 是塔，不是模型。以前它会被当成可选模型列出来，点一下就
             // 拿视觉塔去当语言模型加载 —— 必然失败，但用户不知道为什么会失败。
             // 这里直接排除，改成挂到同目录的模型上（见 mmproj 字段）。
-            if (n.compare(0, 6, "mmproj") == 0) continue;
+            if (n.compare(0, 6, "mmproj") == 0 || store::scan_file(n)) continue;
             ModelEntry m;
             m.path = full;
             m.name = n.substr(0, n.size() - 5);
@@ -4020,6 +4025,10 @@ int main(int argc, char** argv) {
     // --mmproj 可以给多次：Omni 模型是视觉塔 + 语音塔两个独立文件。
     if (g.worker) mmprojs.clear();
     for (const auto& mp : mmprojs) {
+        if (store::scan_file(path_base(mp))) {
+            std::fprintf(stderr, "扫描视觉组件请在扫描页使用。\n");
+            continue;
+        }
         std::fprintf(stderr, "加载多模态塔 %s …\n", mp.c_str());
         auto t0 = std::chrono::steady_clock::now();
         if (dubhe_load_mmproj(g.engine, mp.c_str()) != DUBHE_OK) {
@@ -4232,6 +4241,24 @@ int main(int argc, char** argv) {
 
     store::Downloads downloads(g.model_dir, path_join(g.data_dir, "store.json"));
     translation::Service translator(g.model_dir, ModelWorker::script_for(g.web_root));
+    scan::Service scanner(g.model_dir, ModelWorker::script_for(g.web_root));
+    srv.get("/api/scan", [&scanner](const http::Request&, http::Conn& conn) {
+        conn.send(200, "application/json", json::dump(scanner.options()));
+    });
+    srv.post("/api/scan", [&scanner](const http::Request& req, http::Conn& conn) {
+        json::Value body;
+        if (!json::parse(req.body, &body) || body.type != json::Value::OBJ) {
+            send_error(conn, 400, "扫描请求格式无效");
+            return;
+        }
+        const auto result = scanner.recognize(body, [&conn] { return conn.peer_gone(); });
+        if (result.status == 499) return;
+        if (result.status != 200) { send_error(conn, result.status, result.text); return; }
+        auto out = json::Value::make_obj();
+        out.set("text", json::Value::make_str(result.text));
+        out.set("kind", json::Value::make_str(result.kind));
+        conn.send(200, "application/json", json::dump(out));
+    });
     srv.get("/api/translate", [&translator](const http::Request&, http::Conn& conn) {
         conn.send(200, "application/json", json::dump(translator.options()));
     });
@@ -4325,7 +4352,7 @@ int main(int argc, char** argv) {
         out.set("name", json::Value::make_str(name));
         conn.send(200, "application/json", json::dump(out));
     });
-    srv.post("/api/models/delete", [&translator](const http::Request& req, http::Conn& conn) {
+    srv.post("/api/models/delete", [&translator, &scanner](const http::Request& req, http::Conn& conn) {
         json::Value body;
         std::string path = req.param("path");
         if (path.empty() && json::parse(req.body, &body)) path = body.s("path");
@@ -4352,7 +4379,13 @@ int main(int argc, char** argv) {
         for (std::string tower; std::getline(towers, tower, ',');) in_use |= same_file(tower);
         if (in_use) { send_error(conn, 409, "这是当前模型的文件，请先卸载或切换模型"); return; }
         int result = 0;
-        if (!translator.remove_file(full, [&] { result = unlink(full.c_str()); })) {
+        auto remove = [&] { result = unlink(full.c_str()); };
+        if (store::scan_file(path_base(full))) {
+            if (!scanner.remove_file(full, remove)) {
+                send_error(conn, 409, "扫描正在使用此模型，请稍后再删除");
+                return;
+            }
+        } else if (!translator.remove_file(full, remove)) {
             send_error(conn, 409, "翻译正在使用此模型，请稍后再删除");
             return;
         }
@@ -4433,6 +4466,10 @@ int main(int argc, char** argv) {
             return;
         }
         const std::string full = path_abs(p);
+        if (store::scan_file(path_base(full))) {
+            send_error(c, 400, "这是专用扫描模型，请到扫描页使用");
+            return;
+        }
         if (store::translation_file(path_base(full))) {
             send_error(c, 400, "这是翻译模型，请到翻译页使用");
             return;
@@ -4502,7 +4539,8 @@ int main(int argc, char** argv) {
         if (want_mm.empty() && !g.worker) want_mm = find_sibling_mmproj(full);
         std::string mm_note;
         if (!want_mm.empty()) {
-            if (g.worker) mm_note = "此模型运行时当前支持文本";
+            if (store::scan_file(path_base(want_mm))) mm_note = "扫描视觉组件请在扫描页使用";
+            else if (g.worker) mm_note = "此模型运行时当前支持文本";
             else if (!is_file_p(want_mm) || !path_allowed(want_mm)) {
                 mm_note = "塔文件不存在或路径不允许: " + want_mm;
             } else if (dubhe_load_mmproj(g.engine, want_mm.c_str()) != DUBHE_OK) {

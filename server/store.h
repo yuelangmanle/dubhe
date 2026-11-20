@@ -33,6 +33,7 @@ struct Entry {
     const char* url;
     const char* sha256;
     const char* translation = nullptr;
+    bool scan = false;
 };
 
 // 文件固定到发布方的 Git revision。size 和 SHA-256 来自对应文件的 LFS 元数据。
@@ -72,11 +73,27 @@ inline constexpr Entry catalog[] = {
      "https://huggingface.co/IndexTeam/Index-Translate-2B-GGUF/resolve/"
      "3a0eca6ce931d88d00614d427ab3ed8ff0743902/Index-Translate-2B.Q4_K_M.gguf",
      "044b313d29342bd3b2c77cbb64023ca0d209bd9b3247763f9d162767ef2d746a", "index"},
+    {"xiaomi-ocr-0-q4", "Xiaomi-OCR-0 模型", "0.8B", "Q4_K_M", 529297664LL,
+     "Xiaomi-OCR-0.Q4_K_M.gguf",
+     "https://huggingface.co/prithivMLmods/Xiaomi-OCR-0-GGUF/resolve/"
+     "7bbfa072e0f3d70ac722e26fbccef5b9f64b7121/Xiaomi-OCR-0.Q4_K_M.gguf",
+     "1e497ff06b91a3d822c543066df3e9ef69c62c5423be09d739dfa1db55630d3a", nullptr, true},
+    {"xiaomi-ocr-0-vision", "Xiaomi-OCR-0 视觉组件", "", "BF16", 207346624LL,
+     "Xiaomi-OCR-0.mmproj-bf16.gguf",
+     "https://huggingface.co/prithivMLmods/Xiaomi-OCR-0-GGUF/resolve/"
+     "7bbfa072e0f3d70ac722e26fbccef5b9f64b7121/Xiaomi-OCR-0.mmproj-bf16.gguf",
+     "634d6bc95781ebf4a3f06570a59859fa5082d488db540fd474bc6b4061aec90e", nullptr, true},
 };
 
 inline const Entry* translation_file(std::string_view filename) {
     for (const auto& entry : catalog)
         if (entry.translation && filename == entry.file) return &entry;
+    return nullptr;
+}
+
+inline const Entry* scan_file(std::string_view filename) {
+    for (const auto& entry : catalog)
+        if (entry.scan && filename == entry.file) return &entry;
     return nullptr;
 }
 
@@ -153,7 +170,9 @@ public:
             item.set("params", json::Value::make_str(entry.params));
             item.set("quant", json::Value::make_str(entry.quant));
             item.set("translation", json::Value::make_bool(entry.translation != nullptr));
+            item.set("scan", json::Value::make_bool(entry.scan));
             item.set("note", json::Value::make_str(entry.translation ? "离线翻译 · 在翻译页使用" :
+                entry.scan ? "离线识别 · 在扫描页使用" :
                 entry.bytes > 16000000000LL ? "权重较大，请预留内存给上下文" : "安装前检查文件完整性"));
             item.set("bytes", json::Value::make_num((double)entry.bytes));
             item.set("total", json::Value::make_num((double)entry.bytes));

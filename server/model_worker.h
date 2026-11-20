@@ -22,9 +22,10 @@ extern char** environ;
 // HTTP to Dubhe clients. Model changes and cancellation explicitly reap the worker.
 class ModelWorker {
 public:
-    ModelWorker(std::string script, std::string kind, std::string path, int ctx, int threads)
+    ModelWorker(std::string script, std::string kind, std::string path, int ctx, int threads,
+                std::string projector = {})
         : script_(std::move(script)), kind_(std::move(kind)), path_(std::move(path)),
-          ctx_(ctx), threads_(threads) {}
+          projector_(std::move(projector)), ctx_(ctx), threads_(threads) {}
     ~ModelWorker() { stop(); }
 
     static std::string script_for(const std::string& web_root) {
@@ -102,6 +103,10 @@ public:
         if (!runtime.empty()) {
             args.push_back("--llama-server");
             args.push_back(std::move(runtime));
+        }
+        if (!projector_.empty()) {
+            args.push_back("--mmproj");
+            args.push_back(projector_);
         }
         std::vector<char*> argv;
         for (auto& arg : args) argv.push_back(arg.data());
@@ -231,7 +236,7 @@ private:
         pid_ = 0;
     }
 
-    std::string script_, kind_, path_;
+    std::string script_, kind_, path_, projector_;
     int ctx_, threads_;
     pid_t pid_ = 0;
     int input_ = -1, output_ = -1;

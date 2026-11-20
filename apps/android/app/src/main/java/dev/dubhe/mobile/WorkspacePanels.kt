@@ -34,6 +34,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -98,6 +99,7 @@ internal fun WorkspaceIcon(index: Int) {
 internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importProjector: () -> Unit, openTranslation: () -> Unit) {
     val state = chat.state
     val idle = state.activity == Activity.Idle
+    val links = LocalUriHandler.current
     var deleting by remember { mutableStateOf<LocalModel?>(null) }
     Column(
         Modifier.verticalScroll(rememberScrollState()).padding(bottom = 20.dp),
@@ -136,7 +138,16 @@ internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importPr
             TransferProgress(null)
         }
         HorizontalDivider(Modifier.padding(top = 6.dp))
-        SectionTitle("模型商店")
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            SectionTitle("模型商店", Modifier.weight(1f))
+            TextButton(onClick = {
+                try {
+                    links.openUri("https://github.com/yuelangmanle/dubhe/blob/main/docs/model-downloads.md")
+                } catch (_: IllegalArgumentException) {
+                    chat.showError("无法打开模型下载来源。")
+                }
+            }) { Text("下载来源") }
+        }
         for (item in mobileCatalog) {
             val installed = state.models.any { it.catalog?.file == item.file }
             val downloading = state.downloading == item.file

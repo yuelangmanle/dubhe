@@ -3,6 +3,7 @@
 
 import base64
 import concurrent.futures
+import http.client
 import json
 import os
 import socket
@@ -10,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -17,6 +19,8 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
+
+from test_model_backend import FAKE_SERVER
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +32,8 @@ AUDIO_WAV = os.getenv("DUBHE_TEST_AUDIO_WAV")
 AUDIO_TEXT = os.getenv("DUBHE_TEST_AUDIO_TEXT", "this is a local test")
 BATCH_MODEL = os.getenv("DUBHE_TEST_BATCH_MODEL")
 QWEN35_MODEL = os.getenv("DUBHE_TEST_QWEN35_MODEL")
+SCAN_IMAGE = ("data:image/png;base64,"
+              "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+l0V8AAAAASUVORK5CYII=")
 
 
 def request(base, path, body=None, *, timeout=20):
@@ -42,7 +48,7 @@ def request(base, path, body=None, *, timeout=20):
 
 
 @contextmanager
-def server(root, *args):
+def server(root, *args, env=None):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -52,7 +58,7 @@ def server(root, *args):
             [str(BINARY), "--port", str(port), "--web", str(ROOT / "web"),
              "--data-dir", str(root / "data"), "--model-dir", str(root / "models"),
              "--tmp-dir", str(root), "--no-shell", "--no-write", "--no-net", *args],
-            cwd=root, stdout=log, stderr=log,
+            cwd=root, stdout=log, stderr=log, env=env,
         )
         try:
             until = time.monotonic() + 20
@@ -140,6 +146,107 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(request(base, "/api/translate", job)[0], 404)
             self.assertEqual(request(base, "/api/translate", {**job, "model": "unknown"})[0], 400)
             self.assertEqual(request(base, "/api/translate", {**job, "target": "unknown"})[0], 400)
+
+    def test_scan_catalog_and_safe_input(self):
+        # A valid 1 x 1 PNG keeps the regression independent of image libraries.
+        models = {"xiaomi-ocr-0-q4": "Xiaomi-OCR-0.Q4_K_M.gguf",
+                  "xiaomi-ocr-0-vision": "Xiaomi-OCR-0.mmproj-bf16.gguf"}
+        with tempfile.TemporaryDirectory() as tmp, server(Path(tmp)) as base:
+            code, options = request(base, "/api/scan")
+            self.assertEqual(code, 200)
+            self.assertFalse(options["installed"])
+            self.assertEqual({entry["id"] for entry in options["files"]}, models.keys())
+            _, store = request(base, "/api/store")
+            self.assertEqual({entry["id"] for entry in store["items"] if entry.get("scan")}, models.keys())
+            job = {"mode": "text", "image": SCAN_IMAGE}
+            self.assertEqual(request(base, "/api/scan", job)[0], 404)
+            png = base64.b64decode(SCAN_IMAGE.split(",", 1)[1])
+            oversized = "data:image/png;base64," + base64.b64encode(
+                png[:16] + struct.pack(">I", 65536) + png[20:]).decode()
+            for invalid in ({"mode": "other"}, {"mode": "extract", "fields": [" "]},
+                            {"mode": "ask"}, {"image": "/etc/hosts"},
+                            {"image": "https://example.org/photo.png"},
+                            {"image": "data:image/png;base64,aGVsbG8="},
+                            {"image": SCAN_IMAGE[:-1] + "!"}, {"image": oversized}):
+                with self.subTest(invalid=invalid):
+                    self.assertEqual(request(base, "/api/scan", {**job, **invalid})[0], 400)
+            root = Path(tmp) / "models"
+            root.mkdir(exist_ok=True)
+            for filename in models.values():
+                model = root / filename
+                model.write_bytes(struct.pack("<4sIQQ", b"GGUF", 3, 0, 0))
+                code, result = request(base, "/api/load", {"path": str(model)})
+                self.assertEqual(code, 400)
+                self.assertIn("扫描", result["error"])
+            self.assertEqual(request(base, "/api/models")[1]["items"], [])
+
+    @unittest.skipUnless(sys.platform == "darwin", "OCR worker requires the macOS runtime")
+    def test_scan_worker_shapes_outputs_and_cancels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = root / "llama-server"
+            fake.write_text(f"#!{sys.executable}\n" + textwrap.dedent(FAKE_SERVER))
+            fake.chmod(0o700)
+            child = root / "child.pid"
+            started = root / "scan-started"
+            env = dict(os.environ, DUBHE_LLAMA_SERVER=str(fake), DUBHE_TEST_CHILD_PID=str(child),
+                       DUBHE_TEST_SCAN_STARTED=str(started))
+            models = root / "models"
+            models.mkdir()
+            weights = models / "Xiaomi-OCR-0.Q4_K_M.gguf"
+            projector = models / "Xiaomi-OCR-0.mmproj-bf16.gguf"
+            for path, size in ((weights, 529297664), (projector, 207346624)):
+                with path.open("wb") as file:
+                    file.write(struct.pack("<4sIQQ", b"GGUF", 3, 0, 0))
+                    file.truncate(size)
+
+            with server(root, env=env) as base:
+                options = request(base, "/api/scan")[1]
+                self.assertTrue(options["installed"] and options["runtime_available"])
+                def recognize(mode, **fields):
+                    code, result = request(base, "/api/scan", {"mode": mode, "image": SCAN_IMAGE, **fields})
+                    self.assertEqual(code, 200, result)
+                    return result
+
+                self.assertEqual(recognize("text"), {"kind": "text", "text": "Water level 10.2 m"})
+                self.assertEqual(recognize("formula"), {"kind": "latex", "text": "x^2+y^2"})
+                self.assertEqual(recognize("ask", question="What is the water level?")["kind"], "text")
+                data = recognize("extract", fields=["日期", "地点"])
+                self.assertEqual(data["kind"], "json")
+                self.assertEqual(json.loads(data["text"]), {"日期": "11/20", "地点": ""})
+                document = recognize("document")["text"]
+                self.assertTrue(document.startswith("# Report"))
+                self.assertTrue(document.rstrip().endswith("Notes"))
+                self.assertIn('<td colspan="2">Header</td>', document)
+                table = recognize("table")["text"]
+                self.assertIn('colspan="2" rowspan="2"', table)
+                self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", table)
+
+                host, port = base.removeprefix("http://").split(":")
+                session = http.client.HTTPConnection(host, int(port), timeout=5)
+                try:
+                    session.request("POST", "/api/scan", json.dumps({
+                        "mode": "ask", "image": SCAN_IMAGE, "question": "slow-test",
+                    }), {"Content-Type": "application/json"})
+                    deadline = time.monotonic() + 5
+                    while not started.exists() and time.monotonic() < deadline:
+                        time.sleep(0.025)
+                    self.assertTrue(started.exists(), "slow scan did not reach the worker")
+                    self.assertEqual(request(base, "/api/models/delete", {"path": str(projector)})[0], 409)
+                    pid = int(child.read_text())
+                finally:
+                    session.close()
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.025)
+                else:
+                    self.fail("worker still alive after the scan client closed")
+                self.assertEqual(recognize("text")["text"], "Water level 10.2 m")
+                self.assertEqual(request(base, "/api/models/delete", {"path": str(projector)})[0], 200)
+                self.assertFalse(request(base, "/api/scan")[1]["installed"])
 
     def test_remove_imported_model_only_removes_the_entry(self):
         with tempfile.TemporaryDirectory() as tmp:

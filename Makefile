@@ -245,6 +245,8 @@ integration-test: $(SRV)
 ifeq ($(PLATFORM),Darwin)
 	swiftc apps/macos/Sources/TranslationPDF.swift apps/macos/Sources/TranslationExport.swift tests/test_translation_pdf.swift -o "$(BUILD)/test_translation_pdf" -framework PDFKit -framework CoreText
 	"$(BUILD)/test_translation_pdf"
+	swiftc apps/macos/Sources/ScanPDF.swift apps/macos/Sources/ScanOCR.swift tests/test_scan_pdf.swift -o "$(BUILD)/test_scan_pdf" -framework PDFKit
+	"$(BUILD)/test_scan_pdf"
 endif
 
 # 一条命令自检（ADR-0007）：逐条运行并校验所用后端。

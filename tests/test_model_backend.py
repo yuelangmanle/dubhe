@@ -20,10 +20,12 @@ FAKE_SERVER = """
     import json
     import os
     from pathlib import Path
+    import time
 
     p = argparse.ArgumentParser()
     for arg in ("host", "port", "model", "alias", "api-key-file", "ctx-size", "threads", "parallel"):
         p.add_argument("--" + arg, required=True)
+    p.add_argument("--mmproj")
     a, _ = p.parse_known_args()
     assert a.host == "127.0.0.1" and a.parallel == "1"
     assert not os.environ.get("LLAMA_ARG_AGENT")
@@ -60,15 +62,49 @@ FAKE_SERVER = """
             assert self.path == "/v1/chat/completions"
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             assert body["stream"] is True and body["stream_options"]["include_usage"] is True
-            assert body["model"] == a.alias and body["seed"] == 42
-            assert body["messages"][-1]["content"] == "Hello"
-            assert body["max_tokens"] == 2 and body["temperature"] == 0 and body["top_k"] == 8
+            assert body["model"] == a.alias and body["temperature"] == 0
+            text, reason = "Hi", "length"
+            content = body["messages"][-1]["content"]
+            if a.mmproj:
+                assert Path(a.mmproj).name == "Xiaomi-OCR-0.mmproj-bf16.gguf"
+                assert a.ctx_size == "16384"
+                image, instruction = content
+                assert image["type"] == "image_url" and image["image_url"]["url"].startswith("data:image/png;base64,")
+                assert instruction["type"] == "text"
+                assert body["chat_template_kwargs"] == {"enable_thinking": False}
+                prompt = instruction["text"]
+                if "slow-test" in prompt:
+                    Path(os.environ["DUBHE_TEST_SCAN_STARTED"]).touch()
+                    time.sleep(30)
+                if "Markdown" in prompt:
+                    text = "<md>\\n# Report\\n\\n<fcel>Header<lcel><nl>\\n<fcel>01<fcel>02<nl>\\n\\nNotes\\n</md>"
+                elif "OTSL" in prompt:
+                    text = "<fcel><script>alert(1)</script><lcel><nl><ucel><xcel><nl>"
+                elif "LaTeX" in prompt:
+                    text = "x^2+y^2"
+                elif "JSON" in prompt:
+                    assert 'according to the following schema:' in prompt
+                    assert 'leave it as an empty string' in prompt
+                    fmt = body["response_format"]
+                    assert fmt["type"] == "json_schema"
+                    fields = fmt["json_schema"]["schema"]
+                    assert fields == {"type": "object", "additionalProperties": False,
+                        "required": ["日期", "地点"],
+                        "properties": {key: {"type": "string"} for key in ("日期", "地点")}}
+                    text = '{"日期":"11/20","地点":""}'
+                else:
+                    text = "Water level 10.2 m"
+                reason = "stop"
+            else:
+                assert body["seed"] == 42 and content == "Hello"
+                assert "response_format" not in body
+                assert body["max_tokens"] == 2 and body["top_k"] == 8
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
             for event in (
-                {"choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]},
-                {"choices": [{"delta": {}, "finish_reason": "length"}]},
+                {"choices": [{"delta": {"content": text}, "finish_reason": None}]},
+                {"choices": [{"delta": {}, "finish_reason": reason}]},
                 {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 2}},
             ):
                 self.wfile.write(("data: " + json.dumps(event) + "\\r\\n\\r\\n").encode())
@@ -97,6 +133,7 @@ class TestModelBackend(unittest.TestCase):
             request = {
                 "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
                 "max_tokens": 2, "temperature": 0, "top_p": 0.9, "top_k": 8, "seed": 42,
+                "ocr_fields": ["ignored for text"],
             }
             media = {"messages": [{"role": "user", "content": [{"type": "image_url"}]}]}
             proc = subprocess.run(

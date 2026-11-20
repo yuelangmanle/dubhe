@@ -12,6 +12,12 @@ const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const fixtures = new Map();
 const requests = [];
 const translations = [];
+const scans = [];
+const scanDownloads = [];
+const scanFiles = [
+  { id: 'xiaomi-ocr-0-q4', name: '小米 OCR', bytes: 529297664 },
+  { id: 'xiaomi-ocr-0-vision', name: '视觉组件', bytes: 207346624 },
+];
 const history = new Map();
 let holdChat;
 let holdSummary;
@@ -23,6 +29,8 @@ let historyImports = 0;
 let transferState = 'verifying';
 let shareOnly = false;
 let removedModel = '';
+let scanInstalled = false;
+let pauseAtScan = 0;
 const state = () => ({
   share_only: shareOnly,
   loaded: !!model, model, model_id: 'fixture', info: { params: 100, n_ctx: 4096, think: true },
@@ -82,6 +90,22 @@ const handler = async (req, res) => {
     if (data.text.includes('Drop marker')) return json({ text: '译文' });
     return json({ text: data.formatted ? data.text.replaceAll('Results', '结果').replace('Read', '阅读') : '译文' });
   }
+  if (path === '/api/scan') {
+    if (req.method === 'GET') return json({
+      runtime_available: true,
+      installed: scanInstalled,
+      files: scanFiles.map(file => ({ ...file, installed: scanInstalled })),
+    });
+    const job = await collect(req);
+    scans.push(job);
+    if (scans.length === pauseAtScan) return;
+    if (job.mode === 'extract') return json({ text: '{"题目":"年度报告","日期":null}', kind: 'json' });
+    if (job.mode === 'ask') return json({ text: '报告提到了流量。', kind: 'text' });
+    return json({
+      text: '# 年度报告\n\n<table><tr><td colspan="2"><img>流量</td></tr></table>\n\n模型输出。',
+      kind: 'markdown',
+    });
+  }
   if (path === '/api/load') {
     ({ path: model } = await collect(req));
     return json({ ok: true, model, ms: 1 });
@@ -97,7 +121,15 @@ const handler = async (req, res) => {
       installed: false, translation: true, note: '离线翻译', state: 'idle' },
     { id: 'index-translate-2b-q4', name: 'Index-Translate', params: '2B', quant: 'Q4', bytes: 1312164352,
       installed: true, translation: true, note: '离线翻译', state: 'done' },
+    ...scanFiles.map(file => ({ ...file, scan: true, installed: scanInstalled,
+      state: scanInstalled ? 'done' : scanDownloads.includes(file.id) ? 'running' : 'idle',
+      got: 0, total: file.bytes })),
   ] });
+  if (path === '/api/store/download') {
+    const { id } = await collect(req);
+    scanDownloads.push(id);
+    return json({ ok: true, state: 'running' });
+  }
   if (path === '/api/store/cancel') {
     transferState = 'cancelling';
     return json({ ok: true, state: transferState });
@@ -249,6 +281,12 @@ try {
   const [, translation, hiddenInspector] = await desktopLayout();
   assert.ok(translation.width > 950, 'translation expands into the inspector column');
   assert.equal(hiddenInspector.width, 0);
+  await click('#viewBack');
+  await assertDesktopChat();
+  await click('[data-view="scan"]');
+  const [, scanning, scanInspector] = await desktopLayout();
+  assert.ok(scanning.width > 950, 'scanner expands into the inspector column');
+  assert.equal(scanInspector.width, 0);
   await click('#viewBack');
   await assertDesktopChat();
   await cdp('Emulation.clearDeviceMetricsOverride');
@@ -551,6 +589,105 @@ try {
     row.textContent.includes('Index-Translate') && row.querySelector('button')?.textContent === '去翻译').querySelector('button').click()`);
   await until(() => evaluate('document.querySelector("#viewBody select")?.value === "index-translate-2b-q4"'), 'store opens installed translator');
   assert.equal(model, '');
+
+  await click('[data-view="scan"]');
+  await until(() => evaluate('!document.querySelector("#scanInstall").disabled'), 'scanner model catalog');
+  await click('#scanInstall');
+  await until(() => scanDownloads.length === 2, 'both scanner components requested');
+  assert.deepEqual(scanDownloads.sort(), scanFiles.map(file => file.id).sort());
+  scanInstalled = true;
+  await until(() => evaluate('document.querySelector(".scan-model-status").textContent.includes("已安装")'),
+    'scanner ready');
+  await evaluate(`(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 80;
+    canvas.height = 110;
+    window.makeScannerImage = () => canvas.toDataURL('image/jpeg');
+    window.scanNativeCalls = [];
+    window.webkit = { messageHandlers: { shell: { postMessage: message => {
+      window.scanNativeCalls.push(message);
+      if (message.type === 'scanOpenPDF') window.dubheScanPDFReady({
+        requestId: message.requestId, name: 'paper.pdf', pageCount: 4,
+      });
+      if (message.type === 'scanPDFPage') window.dubheScanPDFPage({
+        requestId: message.requestId, page: message.page, image: window.makeScannerImage(),
+      });
+      if (message.type === 'scanSave') window.dubheScanSaved({ requestId: message.requestId, saved: true });
+    } } } };
+  })()`);
+  await click('[data-view="translate"]');
+  await until(() => evaluate('!document.querySelector("#translationOCR").hidden'), 'screenshot OCR options');
+  await evaluate(`(() => {
+    const chooser = document.querySelector('#translationOCR');
+    chooser.value = 'xiaomi';
+    chooser.dispatchEvent(new Event('change'));
+  })()`);
+  assert.equal(await evaluate('window.dubheOCRProvider()'), 'xiaomi');
+  assert.equal(await evaluate('JSON.parse(localStorage.getItem("dubhe.translation.v1")).ocr'), 'xiaomi');
+  await click('[data-view="scan"]');
+  await evaluate(`(async () => {
+    const data = new DataTransfer();
+    const jpg = await fetch(window.makeScannerImage()).then(response => response.blob());
+    data.items.add(new File([jpg], 'report.jpg', { type: 'image/jpeg' }));
+    window.dispatchEvent(new DragEvent('drop', { dataTransfer: data, cancelable: true }));
+  })()`);
+  await until(() => evaluate('!document.querySelector("#scanRun").disabled'), 'image scanner ready');
+  await click('#scanRun');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent === "识别完成"'), 'image result');
+  assert.match(scans.at(-1).image, /^data:image\/jpeg;base64,/);
+  assert.equal(scans.at(-1).mode, 'document');
+  assert.equal(await evaluate('document.querySelector("#scanResult table td").colSpan'), 2);
+  assert.equal(await evaluate('!!document.querySelector("#scanResult img")'), false);
+  await click('#scanExport');
+  assert.equal(await evaluate('window.scanNativeCalls.at(-1).name'), 'report-扫描结果.md');
+  await click('#scanTranslate');
+  assert.match(await evaluate('document.querySelector("#viewBody textarea[aria-label=原文]").value'), /年度报告/);
+
+  await click('[data-view="scan"]');
+  await click('#scanOpenPDF');
+  await until(() => evaluate('document.querySelector("#scanPage").textContent.includes("1 / 4")'), 'PDF source');
+  await evaluate(`(() => {
+    document.querySelector('#scanFrom').value = '2';
+    document.querySelector('#scanTo').value = '3';
+    document.querySelector('#scanTo').dispatchEvent(new Event('input'));
+  })()`);
+  const beforePDF = scans.length;
+  pauseAtScan = beforePDF + 2;
+  await click('#scanRun');
+  await until(() => scans.length === pauseAtScan, 'second scan page is running');
+  await click('#scanStop');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent.includes("已保留 1 页")'),
+    'cancel keeps finished pages');
+  assert.equal(await evaluate('document.querySelector("#scanRun").textContent'), '继续识别');
+  await click('#scanRun');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent === "识别完成 · 2 页"'),
+    'resume skips finished page');
+  assert.equal(scans.length, beforePDF + 3);
+  assert.deepEqual(await evaluate('window.scanNativeCalls.filter(m => m.type === "scanPDFPage").map(m => m.page)'),
+    [1, 2, 3]);
+  await click('#scanPrevious');
+  await until(() => evaluate('document.querySelector("#scanResult").textContent.includes("年度报告")'),
+    'previous PDF result remains available');
+  await evaluate(`(() => {
+    const mode = document.querySelector('#scanMode');
+    mode.value = 'extract';
+    mode.dispatchEvent(new Event('change'));
+    const detail = document.querySelector('#scanDetail');
+    detail.value = '题目、日期';
+    detail.dispatchEvent(new Event('input'));
+    document.querySelector('#scanTo').value = '2';
+    document.querySelector('#scanTo').dispatchEvent(new Event('input'));
+  })()`);
+  await click('#scanRun');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent === "识别完成 · 1 页"'),
+    'field extraction for selected page');
+  assert.deepEqual(scans.at(-1).fields, ['题目', '日期']);
+  await click('#scanExport');
+  const scanExport = await evaluate('window.scanNativeCalls.at(-1)');
+  assert.equal(scanExport.format, 'json');
+  assert.deepEqual(JSON.parse(scanExport.text), [{ page: 2, fields: { 题目: '年度报告', 日期: null } }]);
+  await click('#scanClear');
+  assert.equal(await evaluate('window.scanNativeCalls.at(-1).type'), 'scanClosePDF');
 
   shareOnly = true;
   await navigate(otherOrigin + '/?share');

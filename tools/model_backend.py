@@ -20,7 +20,7 @@ import tempfile
 import time
 
 
-def chat_request(data):
+def chat_request(data, *, allow_image=False):
     if not isinstance(data, dict) or not isinstance(data.get("messages"), list) or not data["messages"]:
         raise ValueError("messages 必须是非空列表。")
     messages = []
@@ -28,13 +28,26 @@ def chat_request(data):
         if not isinstance(message, dict) or message.get("role") not in ("system", "user", "assistant"):
             raise ValueError("此后端仅支持文本对话。")
         content = message.get("content")
-        if isinstance(content, list) and all(
-            isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
-            for part in content
-        ):
-            content = "".join(part["text"] for part in content)
-        if not isinstance(content, str) or message.get("tool_calls"):
-            raise ValueError("此后端仅支持文本消息。")
+        if isinstance(content, list):
+            def is_text(part):
+                return (isinstance(part, dict) and part.get("type") == "text"
+                        and isinstance(part.get("text"), str))
+
+            if all(is_text(part) for part in content):
+                content = "".join(part["text"] for part in content)
+            elif allow_image and message["role"] == "user" and len(content) == 2:
+                image, text = content
+                url = image.get("image_url") if isinstance(image, dict) else None
+                url = url.get("url") if isinstance(url, dict) else None
+                if (not isinstance(url, str) or image.get("type") != "image_url" or not is_text(text)
+                        or not url.startswith(("data:image/png;base64,", "data:image/jpeg;base64,"))):
+                    raise ValueError("扫描只接受直接上传的一张 JPEG 或 PNG 图片。")
+                content = [{"type": "image_url", "image_url": {"url": url}},
+                           {"type": "text", "text": text["text"]}]
+            else:
+                raise ValueError("此后端仅支持文本消息。")
+        if not isinstance(content, (str, list)) or message.get("tool_calls"):
+            raise ValueError("消息格式不正确。")
         messages.append({"role": message["role"], "content": content})
 
     request = {"messages": messages}
@@ -52,6 +65,18 @@ def chat_request(data):
         request[name] = value
     if data.get("no_think") is True:
         request["chat_template_kwargs"] = {"enable_thinking": False}
+    if allow_image and "ocr_fields" in data:
+        fields = data["ocr_fields"]
+        if (not isinstance(fields, list) or not 1 <= len(fields) <= 20
+                or any(not isinstance(field, str) or not field.strip() or len(field.encode("utf-8")) > 96
+                       for field in fields) or len(set(fields)) != len(fields)):
+            raise ValueError("扫描字段列表格式不正确。")
+        request["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": "ocr_fields", "strict": True, "schema": {
+                "type": "object", "required": fields, "additionalProperties": False,
+                "properties": {field: {"type": "string"} for field in fields},
+            },
+        }}
     return request
 
 
@@ -160,7 +185,7 @@ def gguf_architecture(path):
 
 
 class LlamaModel:
-    def __init__(self, path, context, threads, llama_server=None):
+    def __init__(self, path, context, threads, llama_server=None, projector=None):
         if not path.is_file():
             raise ValueError("llama.cpp 模型需要本地 GGUF 文件。")
         executable = shutil.which(llama_server or os.environ.get("DUBHE_LLAMA_SERVER") or "llama-server")
@@ -179,11 +204,14 @@ class LlamaModel:
             key_file.write_text(self.key + "\n", encoding="ascii")
             # Use just the flags for this private worker and ignore inherited server options.
             env = {k: v for k, v in os.environ.items() if not k.startswith("LLAMA_")}
+            command = [str(Path(executable).resolve()), "--model", str(path), "--alias", self.alias,
+                       "--host", "127.0.0.1", "--port", str(self.port), "--api-key-file", str(key_file),
+                       "--ctx-size", str(context), "--threads", str(threads), "--parallel", "1",
+                       "--no-webui", "--no-context-shift", "--jinja"]
+            if projector:
+                command.extend(["--mmproj", str(projector), "--image-max-tokens", "7168", "--reasoning", "off"])
             self.process = subprocess.Popen(
-                [str(Path(executable).resolve()), "--model", str(path), "--alias", self.alias,
-                 "--host", "127.0.0.1", "--port", str(self.port), "--api-key-file", str(key_file),
-                 "--ctx-size", str(context), "--threads", str(threads), "--parallel", "1",
-                 "--no-webui", "--no-context-shift", "--jinja"],
+                command,
                 cwd=self.work.name, env=env, stdin=subprocess.DEVNULL, stdout=sys.stderr,
             )
             info = self.wait_until_ready()
@@ -284,6 +312,7 @@ def main():
     parser.add_argument("--ctx", type=int, required=True)
     parser.add_argument("--threads", type=int, required=True)
     parser.add_argument("--llama-server")
+    parser.add_argument("--mmproj", type=Path)
     args = parser.parse_args()
 
     # Library and subprocess diagnostics belong on stderr, including native stdout.
@@ -302,12 +331,15 @@ def main():
         if args.ctx <= 0 or args.threads <= 0:
             raise ValueError("上下文和线程数必须大于零。")
         path = args.model.resolve(strict=True)
+        projector = args.mmproj.resolve(strict=True) if args.mmproj else None
+        if projector and (args.backend != "llama" or not projector.is_file()):
+            raise ValueError("扫描需要本机 llama.cpp 及视觉组件文件。")
         model = MLXModel(path, args.ctx) if args.backend == "mlx" else LlamaModel(
-            path, args.ctx, args.threads, args.llama_server)
+            path, args.ctx, args.threads, args.llama_server, projector)
         emit({"ready": True, **model.info})
         for line in sys.stdin:
             try:
-                for event in model.generate(chat_request(json.loads(line))):
+                for event in model.generate(chat_request(json.loads(line), allow_image=projector is not None)):
                     emit(event)
             except BrokenPipeError:
                 return 0

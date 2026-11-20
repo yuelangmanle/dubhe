@@ -2,7 +2,9 @@
 
 Apple Silicon 和 Android 上的本地模型运行工具。原生引擎读取 GGUF，包含命令行、HTTP 服务和 macOS 客户端。
 
-当前版本 **0.31.0**。macOS 和 Android 均提供模型商店、对话历史、离线翻译和多模态输入。两个客户端的安装包见 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。
+当前版本 **0.32.0**。macOS 和 Android 均提供模型商店、对话历史、离线翻译和多模态输入。Mac 还可用 Xiaomi-OCR-0 在本机扫描图片和 PDF。两个客户端的安装包见 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。
+
+已下载过的模型和配套组件可以从[模型下载来源](docs/model-downloads.md)找回。
 
 ---
 
@@ -16,7 +18,7 @@ make integration-test      # HTTP 和真实浏览器回归
 make dmg                   # 本地签名的 macOS 安装包
 
 # 命令行对话
-./build/dubhe chat -m ~/.dubhe/models/qwen2.5-0.5b-instruct/qwen2.5-0.5b-instruct-q4_k_m.gguf
+./build/dubhe chat -m /path/to/model.gguf
 
 # 带 UI 的本地服务（浏览器打开 http://127.0.0.1:7777）
 ./build/dubhed -m <model.gguf>
