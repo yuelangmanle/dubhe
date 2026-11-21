@@ -17,7 +17,9 @@ const scanDownloads = [];
 const scanFiles = [
   { id: 'xiaomi-ocr-0-q4', name: '小米 OCR', bytes: 529297664 },
   { id: 'xiaomi-ocr-0-vision', name: '视觉组件', bytes: 207346624 },
+  { id: 'xiaomi-ocr-0-bf16', name: '小米 OCR BF16', bytes: 1516744960 },
 ];
+const scannerInstalled = file => scanInstalled && file.id !== 'xiaomi-ocr-0-bf16';
 const history = new Map();
 const tasks = new Map();
 let holdChat;
@@ -109,7 +111,7 @@ const handler = async (req, res) => {
     if (req.method === 'GET') return json({
       runtime_available: true,
       installed: scanInstalled,
-      files: scanFiles.map(file => ({ ...file, installed: scanInstalled })),
+      files: scanFiles.map(file => ({ ...file, installed: scannerInstalled(file) })),
     });
     const job = await collect(req);
     scans.push(job);
@@ -136,8 +138,8 @@ const handler = async (req, res) => {
       installed: false, translation: true, note: '离线翻译', state: 'idle' },
     { id: 'index-translate-2b-q4', name: 'Index-Translate', params: '2B', quant: 'Q4', bytes: 1312164352,
       installed: true, translation: true, note: '离线翻译', state: 'done' },
-    ...scanFiles.map(file => ({ ...file, scan: true, installed: scanInstalled,
-      state: scanInstalled ? 'done' : scanDownloads.includes(file.id) ? 'running' : 'idle',
+    ...scanFiles.map(file => ({ ...file, scan: true, installed: scannerInstalled(file),
+      state: scannerInstalled(file) ? 'done' : scanDownloads.includes(file.id) ? 'running' : 'idle',
       got: 0, total: file.bytes })),
   ] });
   if (path === '/api/store/download') {
@@ -609,10 +611,21 @@ try {
   await until(() => evaluate('!document.querySelector("#scanInstall").disabled'), 'scanner model catalog');
   await click('#scanInstall');
   await until(() => scanDownloads.length === 2, 'both scanner components requested');
-  assert.deepEqual(scanDownloads.sort(), scanFiles.map(file => file.id).sort());
+  assert.deepEqual(scanDownloads.sort(), ['xiaomi-ocr-0-q4', 'xiaomi-ocr-0-vision']);
   scanInstalled = true;
   await until(() => evaluate('document.querySelector(".scan-model-status").textContent.includes("已安装")'),
     'scanner ready');
+  const chooseVariant = value => evaluate(`(() => {
+    const variant = document.querySelector('#scanVariant');
+    variant.value = ${JSON.stringify(value)};
+    variant.dispatchEvent(new Event('change'));
+  })()`);
+  await chooseVariant('bf16');
+  await click('#scanInstall');
+  await until(() => scanDownloads.length === 3, 'high precision weight requested separately');
+  assert.equal(scanDownloads.at(-1), 'xiaomi-ocr-0-bf16');
+  await until(() => evaluate('!document.querySelector("#scanVariant").disabled'), 'install request registered');
+  await chooseVariant('q4');
   await evaluate(`(() => {
     const canvas = document.createElement('canvas');
     canvas.width = 80;
@@ -622,10 +635,13 @@ try {
     window.webkit = { messageHandlers: { shell: { postMessage: message => {
       window.scanNativeCalls.push(message);
       if (message.type === 'scanOpenPDF') window.dubheScanPDFReady({
-        requestId: message.requestId, name: 'paper.pdf', pageCount: 4,
+        requestId: message.requestId, name: 'paper.docx', pageCount: 4, identity: 'paper-identity',
       });
       if (message.type === 'scanPDFPage') window.dubheScanPDFPage({
-        requestId: message.requestId, page: message.page, image: window.makeScannerImage(),
+        requestId: message.requestId, page: message.page, image: window.makeScannerImage(), fine: message.fine,
+      });
+      if (message.type === 'scanFindRegions') window.dubheScanRegionsReady({
+        requestId: message.requestId, regions: [{ mode: 'table', x: .2, y: .3, width: .6, height: .5 }],
       });
       if (message.type === 'scanSave') window.dubheScanSaved({ requestId: message.requestId, saved: true });
     } } } };
@@ -653,6 +669,32 @@ try {
   assert.equal(scans.at(-1).mode, 'document');
   assert.equal(await evaluate('document.querySelector("#scanResult table td").colSpan'), 2);
   assert.equal(await evaluate('!!document.querySelector("#scanResult img")'), false);
+  await click('#scanEnlarge');
+  await cdp('Input.dispatchKeyEvent', {type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27});
+  await cdp('Input.dispatchKeyEvent', {type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27});
+  await until(() => evaluate('!document.querySelector(".scan-image-dialog[open]")'), 'close original preview');
+  assert.equal(await evaluate('document.querySelector("#views").hidden'), false);
+  assert.equal(await evaluate('document.querySelector("#scanResult")?.textContent.includes("年度报告")'), true);
+  await click('#scanRaw');
+  assert.equal(await evaluate('document.querySelector("#scanRaw").getAttribute("aria-pressed")'), 'true');
+  await click('#scanRaw');
+  await click('#scanReview');
+  await click('.scan-review-dialog button.vbtn.ghost');
+  await evaluate(`(() => {
+    const regions = document.querySelector('[aria-label="识别到的区域"]');
+    regions.value = '0';
+    regions.dispatchEvent(new Event('change'));
+  })()`);
+  assert.equal(await evaluate('document.querySelector("[aria-label=选区识别方式]").value'), 'table');
+  assert.equal(await evaluate('document.querySelector(".scan-region-box").hidden'), false);
+  await click('.scan-review-dialog header button');
+  await evaluate('document.querySelector("#scanLayout").value = "regions"');
+  await click('#scanRun');
+  await until(() => evaluate('document.querySelector(".scan-card h3").textContent && document.querySelector("#scanResult table") && document.querySelector("#scanStatus").textContent === "识别完成"'),
+    'document regions are reassembled');
+  assert.equal(scans.at(-1).mode, 'table');
+  assert.match(await evaluate('Array.from(document.querySelectorAll(".scan-source-name")).at(-1).textContent'), /分区识别/);
+  await evaluate('document.querySelector("#scanLayout").value = "page"');
   await click('#scanExport');
   assert.equal(await evaluate('window.scanNativeCalls.at(-1).name'), 'report-扫描结果.md');
   await click('#scanTranslate');
@@ -683,6 +725,17 @@ try {
   await click('#scanPrevious');
   await until(() => evaluate('document.querySelector("#scanResult").textContent.includes("年度报告")'),
     'previous PDF result remains available');
+  await click('#scanOpenPDF');
+  await until(() => evaluate('document.querySelector("#scanPage").textContent.includes("2 / 4")'),
+    'reopen original Word document without losing position');
+  assert.match(await evaluate('document.querySelector("#scanResult").textContent'), /年度报告/);
+  await evaluate('document.querySelector("#scanExportFormat").value = "paired"');
+  await click('#scanExport');
+  const pairedExport = await evaluate('window.scanNativeCalls.at(-1)');
+  assert.equal(pairedExport.format, 'pdf');
+  assert.deepEqual(pairedExport.pages, [2, 3]);
+  assert.match(pairedExport.notes[0], /年度报告/);
+  await evaluate('document.querySelector("#scanExportFormat").value = "auto"');
   await evaluate(`(() => {
     const mode = document.querySelector('#scanMode');
     mode.value = 'extract';
@@ -690,6 +743,10 @@ try {
     const detail = document.querySelector('#scanDetail');
     detail.value = '题目、日期';
     detail.dispatchEvent(new Event('input'));
+    document.querySelector('#scanLanguage').value = 'mixed';
+    document.querySelector('#scanQuality').value = 'fine';
+    document.querySelector('#scanRotation').value = '90';
+    document.querySelector('#scanLength').value = '4096';
     document.querySelector('#scanTo').value = '2';
     document.querySelector('#scanTo').dispatchEvent(new Event('input'));
   })()`);
@@ -697,6 +754,9 @@ try {
   await until(() => evaluate('document.querySelector("#scanStatus").textContent === "识别完成 · 1 页"'),
     'field extraction for selected page');
   assert.deepEqual(scans.at(-1).fields, ['题目', '日期']);
+  assert.equal(scans.at(-1).language, 'mixed');
+  assert.equal(scans.at(-1).max_tokens, 4096);
+  assert.equal(await evaluate('window.scanNativeCalls.filter(m => m.type === "scanPDFPage").at(-1).fine'), true);
   await click('#scanExport');
   const scanExport = await evaluate('window.scanNativeCalls.at(-1)');
   assert.equal(scanExport.format, 'json');
@@ -746,6 +806,7 @@ try {
   await click('[data-view="scan"]');
   await click('#scanOpenPDF');
   await until(() => evaluate('!document.querySelector("#scanRun").disabled'), 'twenty-page PDF is ready');
+  await evaluate('document.querySelector("#scanReadMode").value = "auto"');
   pauseAtScan = scans.length + 2;
   await click('#scanRun');
   await until(() => scans.length === pauseAtScan, 'second PDF page reached after first checkpoint');

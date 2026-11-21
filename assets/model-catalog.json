@@ -113,6 +113,18 @@
     "scan": true
   },
   {
+    "id": "xiaomi-ocr-0-bf16",
+    "name": "Xiaomi-OCR-0 高精度权重",
+    "params": "0.8B",
+    "quant": "BF16",
+    "bytes": 1516744960,
+    "file": "Xiaomi-OCR-0.BF16.gguf",
+    "repository": "prithivMLmods/Xiaomi-OCR-0-GGUF",
+    "revision": "7bbfa072e0f3d70ac722e26fbccef5b9f64b7121",
+    "sha256": "d796fa2cd211ba39a40f37691fc0046aa49f59c7968ec844eb9e81f2ae476a52",
+    "scan": true
+  },
+  {
     "id": "xiaomi-ocr-0-vision",
     "name": "Xiaomi-OCR-0 视觉组件",
     "params": "",

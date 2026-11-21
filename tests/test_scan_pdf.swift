@@ -31,6 +31,12 @@ enum ScanPDFTests {
         precondition(white.prefix(3).allSatisfy { $0 > 245 }, "the blank page background is white")
         let second = try decode(scan.pageDataURL(number: 2))
         precondition(second.width == 2400 && second.height == 1920, "the second page renders independently")
+        let fine = try decode(scan.pageDataURL(number: 1, fine: true))
+        precondition(fine.height == 3400, "high-detail mode renders the PDF at a larger size")
+        let exported = PDFDocument(data: try scan.originalPages([1]))!
+        precondition(exported.pageCount == 1 && exported.page(at: 0)?.rotation == 90)
+        precondition(exported.page(at: 0)?.bounds(for: .cropBox) == first.bounds(for: .cropBox),
+                     "export preserves the crop box")
         for number in [0, 3] {
             do {
                 _ = try scan.pageDataURL(number: number)

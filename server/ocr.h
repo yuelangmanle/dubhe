@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #include "model_worker.h"
 #include "store.h"
 
@@ -211,6 +213,10 @@ inline std::string document_tables(std::string_view document) {
 }
 
 class Service {
+    static constexpr auto q4_file = "Xiaomi-OCR-0.Q4_K_M.gguf";
+    static constexpr auto bf16_file = "Xiaomi-OCR-0.BF16.gguf";
+    static constexpr auto vision_file = "Xiaomi-OCR-0.mmproj-bf16.gguf";
+
 public:
     Service(std::string model_dir, std::string script)
         : model_dir_(std::move(model_dir)), script_(std::move(script)) {}
@@ -218,11 +224,14 @@ public:
     json::Value options() const {
         auto result = json::Value::make_obj();
         auto files = json::Value::make_arr();
-        bool complete = true;
+        bool vision_ready = false, q4_ready = false, bf16_ready = false;
         for (const auto& entry : store::catalog) {
             if (!entry.scan) continue;
             const bool present = installed(entry);
-            complete &= present;
+            const std::string_view filename = entry.file;
+            if (filename == vision_file) vision_ready = present;
+            if (filename == q4_file) q4_ready = present;
+            if (filename == bf16_file) bf16_ready = present;
             auto file = json::Value::make_obj();
             file.set("id", json::Value::make_str(entry.id));
             file.set("name", json::Value::make_str(entry.name));
@@ -232,7 +241,7 @@ public:
             files.arr.push_back(std::move(file));
         }
         result.set("runtime_available", json::Value::make_bool(!ModelWorker::llama_runtime(script_).empty()));
-        result.set("installed", json::Value::make_bool(complete));
+        result.set("installed", json::Value::make_bool(vision_ready && (q4_ready || bf16_ready)));
         result.set("files", std::move(files));
         return result;
     }
@@ -251,7 +260,8 @@ public:
         auto schema = json::Value::make_obj();
         if (mode == "document") {
             instruction = "Convert the main body of this page to Markdown. Use reading order, omit running headers and "
-                "footers, and represent formulas as LaTeX and tables as OTSL.";
+                "footers, and represent formulas as LaTeX and actual tables as OTSL. "
+                "Keep figure captions. Do not convert charts, plots or illustrations into tables or infer hidden values.";
             kind = "markdown";
             max_tokens = 6144;
         } else if (mode == "text") {
@@ -293,23 +303,50 @@ public:
             return {400, "请选择有效的扫描模式"};
         }
 
+        const auto language = body.s("language");
+        if (!language.empty() && language != "auto") {
+            static const std::pair<std::string_view, std::string_view> languages[] = {
+                {"zh", "Chinese"}, {"en", "English"}, {"mixed", "Chinese and English"},
+                {"ja", "Japanese"}, {"ko", "Korean"},
+            };
+            for (const auto& [code, name] : languages) {
+                if (language != code) continue;
+                instruction += "\nExpected source language: ";
+                instruction += name;
+                instruction += ". Preserve the original text and language. Do not translate.";
+                break;
+            }
+        }
+        if (const auto* limit = body.get("max_tokens")) {
+            if (limit->type != json::Value::NUM || limit->num < 512 || limit->num > 8192 ||
+                std::floor(limit->num) != limit->num)
+                return {400, "每页输出上限应为 512 到 8192 个 token"};
+            max_tokens = static_cast<int>(limit->num);
+        }
+
         const auto* image = body.get("image");
         if (!image || image->type != json::Value::STR || !valid_image(image->str))
             return {400, "扫描只接受 JPEG 或 PNG，最大 8 MiB、边长 4096 像素、总计 1200 万像素"};
 
-        const auto* model = store::scan_file("Xiaomi-OCR-0.Q4_K_M.gguf");
-        const auto* projector = store::scan_file("Xiaomi-OCR-0.mmproj-bf16.gguf");
+        const auto variant = body.s("variant");
+        if (!variant.empty() && variant != "q4" && variant != "bf16") return {400, "请选择有效的小米 OCR 版本"};
+        const auto* projector = store::scan_file(vision_file);
+        const auto* model = store::scan_file(variant == "bf16" ? bf16_file : q4_file);
         std::unique_lock lock(mu_, std::defer_lock);
         if (!lock.try_lock_for(std::chrono::milliseconds(200)))
             return {409, "正在扫描另一张图片，请等待完成或先停止"};
         if (client_left()) return {499, "扫描已停止"};
+        if (variant.empty() && !installed(*model)) model = store::scan_file(bf16_file);
         if (!installed(*model) || !installed(*projector))
             return {404, "请先下载小米 OCR 模型和视觉组件"};
         if (ModelWorker::llama_runtime(script_).empty())
             return {503, "找不到扫描运行时，请使用带 llama.cpp 的 Mac 安装包"};
 
-        if (!worker_) worker_ = std::make_unique<ModelWorker>(
-            script_, "llama", model_path(*model), 16384, 4, model_path(*projector));
+        if (!worker_ || worker_model_ != model) {
+            worker_.reset();
+            worker_ = std::make_unique<ModelWorker>(script_, "llama", model_path(*model), 16384, 4, model_path(*projector));
+            worker_model_ = model;
+        }
         std::string output, reason, error;
         dubhe_stats stats{};
         constexpr size_t max_output_bytes = 256 * 1024;
@@ -326,7 +363,7 @@ public:
             return {502, error.empty() ? "扫描运行失败" : std::move(error)};
         }
         if (reason == "length" || output.size() > max_output_bytes)
-            return {422, "结果达到长度上限，请缩小识别区域或使用单独的表格和公式模式"};
+            return {422, "结果达到长度上限。可提高输出上限、缩小识别区域，或使用单独的表格和公式模式"};
         auto decoded = trim(output);
         if (mode == "document" && decoded.starts_with("<md>") && decoded.ends_with("</md>"))
             decoded = trim(decoded.substr(4, decoded.size() - 9));
@@ -408,6 +445,7 @@ private:
     std::string model_dir_, script_;
     std::timed_mutex mu_;
     std::unique_ptr<ModelWorker> worker_;
+    const store::Entry* worker_model_ = nullptr;
 };
 
 }  // namespace scan

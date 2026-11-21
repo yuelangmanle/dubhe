@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -7,14 +8,76 @@ import UniformTypeIdentifiers
 /// Keep the document on disk and render one page at a time on the scanner queue.
 final class ScanPDF {
     private let document: PDFDocument
+    private let temporaryDirectory: URL?
+    let workingURL: URL
     let pageCount: Int
 
+    static func supports(_ url: URL) -> Bool {
+        ["pdf", "docx"].contains(url.pathExtension.lowercased())
+    }
+
     init(url: URL) throws {
+        if url.pathExtension.lowercased() == "docx" {
+            let converted = try Self.convertWord(url)
+            workingURL = converted.pdf
+            temporaryDirectory = converted.directory
+        } else {
+            workingURL = url
+            temporaryDirectory = nil
+        }
+        do {
+            document = try Self.open(workingURL)
+            pageCount = document.pageCount
+        } catch {
+            if let temporaryDirectory { try? FileManager.default.removeItem(at: temporaryDirectory) }
+            throw error
+        }
+    }
+
+    deinit {
+        if let temporaryDirectory { try? FileManager.default.removeItem(at: temporaryDirectory) }
+    }
+
+    private static func open(_ url: URL) throws -> PDFDocument {
         guard let document = PDFDocument(url: url) else { throw ScanError.invalidPDF }
         guard !document.isLocked else { throw ScanError.lockedPDF }
         guard document.pageCount > 0 else { throw ScanError.invalidPDF }
-        self.document = document
-        pageCount = document.pageCount
+        return document
+    }
+
+    private static func convertWord(_ url: URL) throws -> (pdf: URL, directory: URL) {
+        let manager = FileManager.default
+        let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "org.libreoffice.script")
+            ?? URL(fileURLWithPath: "/Applications/LibreOffice.app", isDirectory: true)
+        let binary = installed.appendingPathComponent("Contents/MacOS/soffice")
+        guard manager.isExecutableFile(atPath: binary.path) else { throw ScanError.wordRuntime }
+        let directory = manager.temporaryDirectory.appendingPathComponent("Dubhe-Scan-" + UUID().uuidString)
+        try manager.createDirectory(at: directory, withIntermediateDirectories: false,
+                                    attributes: [.posixPermissions: 0o700])
+        let pdf = directory.appendingPathComponent(url.deletingPathExtension().lastPathComponent + ".pdf")
+        do {
+            let process = Process()
+            process.executableURL = binary
+            let profile = directory.appendingPathComponent("profile", isDirectory: true)
+            process.arguments = ["-env:UserInstallation=" + profile.absoluteString, "--headless",
+                                 "--convert-to", "pdf:writer_pdf_Export", "--outdir", directory.path, url.path]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            let finished = DispatchSemaphore(value: 0)
+            process.terminationHandler = { _ in finished.signal() }
+            try process.run()
+            if finished.wait(timeout: .now() + 60) == .timedOut {
+                process.terminate()
+                throw ScanError.wordConversion
+            }
+            guard process.terminationStatus == 0, manager.fileExists(atPath: pdf.path) else {
+                throw ScanError.wordConversion
+            }
+            return (pdf, directory)
+        } catch {
+            try? manager.removeItem(at: directory)
+            throw error
+        }
     }
 
     func selectableText(number: Int) -> String {
@@ -23,7 +86,28 @@ final class ScanPDF {
         return text.utf8.count <= 256 * 1024 ? text : ""
     }
 
-    func pageDataURL(number: Int) throws -> String {
+    func originalPages(_ pages: [Int]) throws -> Data {
+        let selected = PDFDocument()
+        for number in pages {
+            guard (1...pageCount).contains(number),
+                  let page = document.page(at: number - 1)?.copy() as? PDFPage else {
+                throw ScanError.invalidPage(number)
+            }
+            selected.insert(page, at: selected.pageCount)
+        }
+        guard let data = selected.dataRepresentation(), selected.pageCount > 0 else { throw ScanError.invalidPDF }
+        return data
+    }
+
+    static func imagePDF(_ image: NSImage) throws -> Data {
+        let pdf = PDFDocument()
+        guard let page = PDFPage(image: image) else { throw ScanError.image }
+        pdf.insert(page, at: 0)
+        guard let data = pdf.dataRepresentation() else { throw ScanError.image }
+        return data
+    }
+
+    func pageDataURL(number: Int, fine: Bool = false) throws -> String {
         guard (1...pageCount).contains(number), let page = document.page(at: number - 1)?.pageRef else {
             throw ScanError.invalidPage(number)
         }
@@ -34,8 +118,9 @@ final class ScanPDF {
         guard crop.minX.isFinite, crop.minY.isFinite, crop.maxX.isFinite, crop.maxY.isFinite,
               width > 0, height > 0 else { throw ScanError.invalidPage(number) }
         let span = max(width, height)
-        let w = max(1, Int((width / span * ScanImage.maxSide).rounded()))
-        let h = max(1, Int((height / span * ScanImage.maxSide).rounded()))
+        let maxSide = fine ? 3400 : ScanImage.maxSide
+        let w = max(1, Int((width / span * maxSide).rounded()))
+        let h = max(1, Int((height / span * maxSide).rounded()))
         let scale = min(CGFloat(w) / width, CGFloat(h) / height)
         guard scale.isFinite else { throw ScanError.invalidPage(number) }
         let context = try ScanImage.whiteCanvas(width: w, height: h)
@@ -92,7 +177,7 @@ enum ScanImage {
 }
 
 private enum ScanError: LocalizedError {
-    case invalidPDF, lockedPDF, invalidPage(Int), image
+    case invalidPDF, lockedPDF, invalidPage(Int), image, wordRuntime, wordConversion
 
     var errorDescription: String? {
         switch self {
@@ -100,6 +185,8 @@ private enum ScanError: LocalizedError {
         case .lockedPDF: return "此 PDF 需要密码。请先解锁，再重新打开。"
         case .invalidPage(let number): return "无法读取 PDF 第 \(number) 页。"
         case .image: return "无法准备扫描图片。请重试，或缩小选取范围。"
+        case .wordRuntime: return "打开 Word 原版面需要 LibreOffice。也可在 Word 中另存为 PDF 后打开。"
+        case .wordConversion: return "无法生成 Word 页面。请检查文档是否可打开，或另存为 PDF 后重试。"
         }
     }
 }

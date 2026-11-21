@@ -194,6 +194,7 @@ class ServiceTest(unittest.TestCase):
     def test_scan_catalog_and_safe_input(self):
         # A valid 1 x 1 PNG keeps the regression independent of image libraries.
         models = {"xiaomi-ocr-0-q4": "Xiaomi-OCR-0.Q4_K_M.gguf",
+                  "xiaomi-ocr-0-bf16": "Xiaomi-OCR-0.BF16.gguf",
                   "xiaomi-ocr-0-vision": "Xiaomi-OCR-0.mmproj-bf16.gguf"}
         with tempfile.TemporaryDirectory() as tmp, server(Path(tmp)) as base:
             code, options = request(base, "/api/scan")
@@ -208,7 +209,7 @@ class ServiceTest(unittest.TestCase):
             oversized = "data:image/png;base64," + base64.b64encode(
                 png[:16] + struct.pack(">I", 65536) + png[20:]).decode()
             for invalid in ({"mode": "other"}, {"mode": "extract", "fields": [" "]},
-                            {"mode": "ask"}, {"image": "/etc/hosts"},
+                            {"mode": "ask"}, {"max_tokens": 8193}, {"max_tokens": 1024.5}, {"image": "/etc/hosts"},
                             {"image": "https://example.org/photo.png"},
                             {"image": "data:image/png;base64,aGVsbG8="},
                             {"image": SCAN_IMAGE[:-1] + "!"}, {"image": oversized}):
@@ -253,6 +254,7 @@ class ServiceTest(unittest.TestCase):
             models.mkdir()
             weights = models / "Xiaomi-OCR-0.Q4_K_M.gguf"
             projector = models / "Xiaomi-OCR-0.mmproj-bf16.gguf"
+            bf16 = models / "Xiaomi-OCR-0.BF16.gguf"
             for path, size in ((weights, 529297664), (projector, 207346624)):
                 with path.open("wb") as file:
                     file.write(struct.pack("<4sIQQ", b"GGUF", 3, 0, 0))
@@ -303,6 +305,16 @@ class ServiceTest(unittest.TestCase):
                 else:
                     self.fail("worker still alive after the scan client closed")
                 self.assertEqual(shutdown.read_text().splitlines(), ["SIGTERM"])
+                self.assertEqual(recognize("text")["text"], "Water level 10.2 m")
+                self.assertEqual(request(base, "/api/scan", {
+                    "mode": "text", "image": SCAN_IMAGE, "variant": "bf16",
+                })[0], 404)
+                with bf16.open("wb") as file:
+                    file.write(struct.pack("<4sIQQ", b"GGUF", 3, 0, 0))
+                    file.truncate(1516744960)
+                weights.unlink()
+                self.assertTrue(request(base, "/api/scan")[1]["installed"])
+                self.assertEqual(recognize("text", variant="bf16")["text"], "Water level 10.2 m")
                 self.assertEqual(recognize("text")["text"], "Water level 10.2 m")
                 self.assertEqual(request(base, "/api/models/delete", {"path": str(projector)})[0], 200)
                 self.assertFalse(request(base, "/api/scan")[1]["installed"])

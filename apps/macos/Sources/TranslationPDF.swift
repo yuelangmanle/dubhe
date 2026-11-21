@@ -15,19 +15,20 @@ enum TranslationPDF {
         return text
     }
 
-    static func rebuild(_ data: Data, translations: [String]) throws -> Data {
+    static func rebuild(_ data: Data, translations: [String], label: String = "译文") throws -> Data {
         let source = try open(data)
         guard translations.count == source.pageCount else { throw Failure.translationCount }
-        return try rebuild(source, pages: Array(1...source.pageCount), translations: translations)
+        return try rebuild(source, pages: Array(1...source.pageCount), translations: translations, label: label)
     }
 
-    static func rebuildSelectedPages(url: URL, pages: [Int], translations: [String]) throws -> Data {
+    static func rebuildSelectedPages(url: URL, pages: [Int], translations: [String],
+                                     label: String = "译文") throws -> Data {
         guard let source = PDFDocument(url: url), source.pageCount > 0 else { throw Failure.invalidPDF }
         guard !source.isLocked else { throw Failure.locked }
-        return try rebuild(source, pages: pages, translations: translations)
+        return try rebuild(source, pages: pages, translations: translations, label: label)
     }
 
-    private static func rebuild(_ source: PDFDocument, pages: [Int], translations: [String]) throws -> Data {
+    private static func rebuild(_ source: PDFDocument, pages: [Int], translations: [String], label: String) throws -> Data {
         guard !pages.isEmpty, pages.count == translations.count else { throw Failure.translationCount }
         let buffer = NSMutableData()
         guard let consumer = CGDataConsumer(data: buffer as CFMutableData),
@@ -38,7 +39,7 @@ enum TranslationPDF {
             guard (1...source.pageCount).contains(number), let page = source.page(at: number - 1) else {
                 throw Failure.invalidPage(number)
             }
-            try addPage(page, number: number, translation: translation, to: context)
+            try addPage(page, number: number, translation: translation, label: label, to: context)
         }
         // Closing the context writes the PDF trailer before the buffer is copied.
         context.closePDF()
@@ -53,7 +54,8 @@ enum TranslationPDF {
         return pdf
     }
 
-    private static func addPage(_ page: PDFPage, number: Int, translation: String, to context: CGContext) throws {
+    private static func addPage(_ page: PDFPage, number: Int, translation: String, label: String,
+                                to context: CGContext) throws {
         let crop = page.bounds(for: .cropBox)
         let rotated = page.rotation % 180 != 0
         guard let pageRef = page.pageRef else { throw Failure.invalidPage(number) }
@@ -94,10 +96,10 @@ enum TranslationPDF {
             if content.length == 0 { break }
 
             let left = (isContinuation ? 0 : width) + margin
-            let label = isContinuation ? "第 \(number) 页译文（续）" : "译文"
+            let heading = isContinuation ? "第 \(number) 页\(label)（续）" : label
             context.textMatrix = .identity
             context.textPosition = CGPoint(x: left, y: pageHeight - margin - 13)
-            CTLineDraw(CTLineCreateWithAttributedString(styled(label, size: 13)), context)
+            CTLineDraw(CTLineCreateWithAttributedString(styled(heading, size: 13)), context)
             let textBounds = CGRect(x: left, y: margin,
                                     width: min(pageWidth - left - margin, 560),
                                     height: pageHeight - 2 * margin - 28)

@@ -39,6 +39,11 @@
      "https://huggingface.co/prithivMLmods/Xiaomi-OCR-0-GGUF/resolve/"
      "7bbfa072e0f3d70ac722e26fbccef5b9f64b7121/Xiaomi-OCR-0.Q4_K_M.gguf",
      "1e497ff06b91a3d822c543066df3e9ef69c62c5423be09d739dfa1db55630d3a", nullptr, true, false},
+    {"xiaomi-ocr-0-bf16", "Xiaomi-OCR-0 高精度权重", "0.8B", "BF16", 1516744960LL,
+     "Xiaomi-OCR-0.BF16.gguf",
+     "https://huggingface.co/prithivMLmods/Xiaomi-OCR-0-GGUF/resolve/"
+     "7bbfa072e0f3d70ac722e26fbccef5b9f64b7121/Xiaomi-OCR-0.BF16.gguf",
+     "d796fa2cd211ba39a40f37691fc0046aa49f59c7968ec844eb9e81f2ae476a52", nullptr, true, false},
     {"xiaomi-ocr-0-vision", "Xiaomi-OCR-0 视觉组件", "", "BF16", 207346624LL,
      "Xiaomi-OCR-0.mmproj-bf16.gguf",
      "https://huggingface.co/prithivMLmods/Xiaomi-OCR-0-GGUF/resolve/"
