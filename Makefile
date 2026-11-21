@@ -238,6 +238,7 @@ test: $(BUILD)/test_quant $(BUILD)/test_abi $(BUILD)/test_store
 	"$(BUILD)/test_store"
 
 integration-test: $(SRV)
+	python3 tools/gen_model_catalog.py --check
 	python3 tests/test_server.py "$(SRV)"
 	python3 tests/test_model_backend.py
 	python3 tests/test_translation_docx.py

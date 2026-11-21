@@ -4,6 +4,7 @@ import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
+import android.text.format.Formatter
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -21,11 +23,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -45,14 +49,20 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
 @Composable
-internal fun TranslationScreen(chat: ChatViewModel, openModels: () -> Unit) {
+internal fun TranslationScreen(chat: ChatViewModel, openModels: () -> Unit, openTasks: () -> Unit) {
     val state = chat.state
     val translation = chat.translation
     val active = state.activity == Activity.Translating
     val idle = state.activity == Activity.Idle
-    val dedicated = state.models.any { it.catalog?.translation == true }
-    val canTranslate = state.modelName != null || dedicated
+    val dedicated = state.models.firstOrNull { it.catalog?.translation == true }
+    val canTranslate = state.modelName != null || dedicated != null
+    val task = chat.translationTask?.takeUnless { it.finished }
+    val selectedTaskModel = task?.let { current ->
+        if (current.dedicated) state.models.firstOrNull { it.translationKey == current.modelKey }
+        else state.activeModel?.takeIf { it.translationKey == current.modelKey }
+    }
     val context = LocalContext.current
+    var showGlossary by rememberSaveable { mutableStateOf(false) }
     var exportName by rememberSaveable { mutableStateOf<String?>(null) }
     var exportText by rememberSaveable { mutableStateOf("") }
     val export = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { response ->
@@ -94,6 +104,14 @@ internal fun TranslationScreen(chat: ChatViewModel, openModels: () -> Unit) {
                 context.getSystemService(ClipboardManager::class.java)
                     ?.setPrimaryClip(ClipData.newPlainText("译文", translation.result))
             },
+            share = {
+                launchPicker {
+                    context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, translation.result)
+                    }, "分享译文"))
+                }
+            },
             save = { format ->
                 launchPicker {
                     exportName = format.name
@@ -107,56 +125,128 @@ internal fun TranslationScreen(chat: ChatViewModel, openModels: () -> Unit) {
             },
         )
     }
-    BoxWithConstraints(Modifier.fillMaxWidth()) {
+    BoxWithConstraints(Modifier.fillMaxSize()) {
         val twoPanels = maxWidth >= 620.dp
-        Column(
-            Modifier.verticalScroll(rememberScrollState()).padding(bottom = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             WorkspaceCard(Modifier.fillMaxWidth()) {
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 3.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    LanguagePicker(translation.from, true, !active, Modifier.weight(1f)) { language ->
-                        chat.updateTranslation { it.copy(from = language, result = "") }
+                Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(openTasks) { Text("最近任务") }
+                        TextButton({ showGlossary = true }, enabled = idle) { Text("常用术语") }
+                        Spacer(Modifier.weight(1f))
+                        TextButton(chat::newTranslation, enabled = idle) { Text("新翻译") }
                     }
-                    IconAction(Glyph.Swap, "交换语言", !active && translation.from != Language.Auto) {
-                        chat.updateTranslation {
-                            it.copy(from = it.to, to = it.from, source = it.result.ifBlank { it.source }, result = "")
+                    if (task != null && selectedTaskModel == null && !active) {
+                        Text("继续翻译需要原来的模型 ${task.modelName}。", Modifier.padding(horizontal = 8.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                        Row {
+                            TextButton(openModels) { Text("管理模型") }
+                            TextButton(chat::changeTranslationModel, enabled = idle) { Text("换模型重新翻译") }
+                        }
+                    } else if (canTranslate || active) {
+                        TranslationControls(
+                            state.modelName, dedicated?.name, translation.preferDedicated, active,
+                            canRun = idle && translation.source.isNotBlank(), stopping = state.stopping,
+                            action = when {
+                                task != null -> "继续翻译"
+                                chat.translationTask?.finished == true -> "重新翻译"
+                                else -> "翻译"
+                            },
+                            lockedModel = task?.modelName,
+                            choose = { dedicatedModel -> chat.updateTranslation { it.copy(preferDedicated = dedicatedModel) } },
+                            run = chat::translate, stop = chat::stop,
+                        )
+                    } else {
+                        val recommended = mobileCatalog.firstOrNull { it.translation }
+                        if (recommended != null) {
+                            val size = Formatter.formatShortFileSize(context, recommended.bytes)
+                            Text(
+                                "${recommended.name} · $size", Modifier.padding(horizontal = 8.dp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall,
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                TextButton({ chat.downloadModel(recommended) }, enabled = idle) {
+                                    Text(if (recommended.file in state.partialDownloads) "继续下载" else "下载翻译模型")
+                                }
+                                TextButton(openModels) { Text("选用对话模型") }
+                                if (state.downloading == recommended.file) {
+                                    TextButton(chat::stop, enabled = !state.stopping) { Text("暂停") }
+                                }
+                            }
+                        } else {
+                            TextButton(openModels) { Text("选择翻译模型") }
                         }
                     }
-                    LanguagePicker(translation.to, false, !active, Modifier.weight(1f)) { language ->
-                        chat.updateTranslation { it.copy(to = language, result = "") }
+                    if (active || state.activity == Activity.Importing) {
+                        TransferProgress(state.progress)
+                        state.status?.let { Text(it, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(5.dp)) }
+                    } else if (task != null && task.completed > 0) {
+                        Text("已保存 ${task.completed} / ${task.total} 段", Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelMedium)
                     }
                 }
             }
-            if (twoPanels) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    source(Modifier.weight(1f), 3)
-                    output(Modifier.weight(1f), 184.dp)
+            Column(
+                Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(bottom = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                WorkspaceCard(Modifier.fillMaxWidth()) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        LanguagePicker(translation.from, true, !active, Modifier.weight(1f)) { language ->
+                            chat.updateTranslation { it.copy(from = language, result = "") }
+                        }
+                        IconAction(Glyph.Swap, "交换语言", !active && translation.from != Language.Auto) {
+                            chat.updateTranslation {
+                                it.copy(from = it.to, to = it.from, source = it.result.ifBlank { it.source }, result = "")
+                            }
+                        }
+                        LanguagePicker(translation.to, false, !active, Modifier.weight(1f)) { language ->
+                            chat.updateTranslation { it.copy(to = language, result = "") }
+                        }
+                    }
                 }
-            } else {
-                source(Modifier.fillMaxWidth(), 5)
-            }
-            if (canTranslate) {
-                TranslationControls(
-                    state.modelName, dedicated, translation.preferDedicated, active,
-                    canRun = idle && translation.source.isNotBlank(), stopping = state.stopping,
-                    choose = { dedicatedModel -> chat.updateTranslation { it.copy(preferDedicated = dedicatedModel) } },
-                    run = chat::translate, stop = chat::stop,
-                )
-            } else {
-                ModelCard("选择翻译模型", "下载混元翻译，或加载一个对话模型。", Glyph.Model) {
-                    TextButton(openModels) { Text("选模型") }
+                if (twoPanels) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        source(Modifier.weight(1f), 3)
+                        output(Modifier.weight(1f), 184.dp)
+                    }
+                } else {
+                    source(Modifier.fillMaxWidth(), 5)
+                    output(Modifier.fillMaxWidth(), 128.dp)
                 }
             }
-            if (active || state.activity == Activity.Importing && state.downloading == null) {
-                TransferProgress(state.progress)
-                state.status?.let { Text(it, style = MaterialTheme.typography.labelMedium) }
-            }
-            if (!twoPanels) output(Modifier.fillMaxWidth(), 128.dp)
         }
+    }
+    if (showGlossary) {
+        var terms by rememberSaveable { mutableStateOf(translation.glossary) }
+        var error by rememberSaveable { mutableStateOf<String?>(null) }
+        AlertDialog(
+            onDismissRequest = { showGlossary = false },
+            title = { Text("常用术语") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("每行填一个「原文 = 译法」。保存后可用于新的翻译。")
+                    OutlinedTextField(
+                        terms, { terms = it.take(1200); error = null }, Modifier.fillMaxWidth(),
+                        minLines = 4, maxLines = 8, label = { Text("术语表") },
+                        placeholder = { Text("reservoir = 水库") },
+                        isError = error != null,
+                        supportingText = error?.let { message -> { Text(message) } },
+                    )
+                    if (task != null) Text("修改会为这份原文开始一条新任务。原任务仍可从「最近任务」续做。")
+                }
+            },
+            confirmButton = {
+                Button({
+                    error = chat.saveTranslationGlossary(terms)
+                    if (error == null) showGlossary = false
+                }) { Text("保存") }
+            },
+            dismissButton = { TextButton({ showGlossary = false }) { Text("取消") } },
+        )
     }
 }
 
@@ -211,7 +301,8 @@ private fun TranslationSource(
 
 @Composable
 private fun TranslationResult(
-    result: String, active: Boolean, modifier: Modifier, minHeight: Dp, copy: () -> Unit, save: (TranslationFormat) -> Unit,
+    result: String, active: Boolean, modifier: Modifier, minHeight: Dp,
+    copy: () -> Unit, share: () -> Unit, save: (TranslationFormat) -> Unit,
 ) {
     var exportMenu by remember { mutableStateOf(false) }
     val canUse = result.isNotBlank()
@@ -221,6 +312,7 @@ private fun TranslationResult(
                 SectionTitle("译文", Modifier.weight(1f))
                 if (canUse) {
                     IconAction(Glyph.Copy, "复制译文", onClick = copy)
+                    TextButton(share, enabled = !active) { Text("分享") }
                     Box {
                         IconAction(Glyph.Download, "导出译文", enabled = !active) { exportMenu = true }
                         DropdownMenu(exportMenu, { exportMenu = false }) {
@@ -250,12 +342,14 @@ private fun TranslationResult(
 
 @Composable
 private fun TranslationControls(
-    modelName: String?, dedicated: Boolean, preferDedicated: Boolean, active: Boolean,
-    canRun: Boolean, stopping: Boolean, choose: (Boolean) -> Unit, run: () -> Unit, stop: () -> Unit,
+    modelName: String?, dedicatedName: String?, preferDedicated: Boolean, active: Boolean,
+    canRun: Boolean, stopping: Boolean, action: String, lockedModel: String?,
+    choose: (Boolean) -> Unit, run: () -> Unit, stop: () -> Unit,
 ) {
     var modelMenu by remember { mutableStateOf(false) }
-    val selected = if (dedicated && (preferDedicated || modelName == null)) "混元翻译 Hy-MT2" else modelName.orEmpty()
-    val canSwitch = dedicated && modelName != null
+    val selected = lockedModel ?: if (preferDedicated) (dedicatedName ?: modelName).orEmpty()
+        else (modelName ?: dedicatedName).orEmpty()
+    val canSwitch = lockedModel == null && dedicatedName != null && modelName != null
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.weight(1f)) {
             if (canSwitch) {
@@ -264,7 +358,7 @@ private fun TranslationControls(
                     WorkspaceIcon(Glyph.Chevron, Modifier.size(16.dp))
                 }
                 DropdownMenu(modelMenu, { modelMenu = false }) {
-                    DropdownMenuItem(text = { Text("混元翻译 Hy-MT2") }, onClick = {
+                    DropdownMenuItem(text = { Text(dedicatedName.orEmpty()) }, onClick = {
                         choose(true)
                         modelMenu = false
                     })
@@ -282,7 +376,7 @@ private fun TranslationControls(
         }
         Spacer(Modifier.width(8.dp))
         if (active) Button(stop, enabled = !stopping) { Text("停止翻译") }
-        else Button(run, enabled = canRun) { Text("翻译") }
+        else Button(run, enabled = canRun) { Text(action) }
     }
 }
 

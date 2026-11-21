@@ -15,6 +15,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.UUID
 import java.util.zip.ZipInputStream
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -71,6 +72,64 @@ class WorkspaceSmokeTest {
         assertEquals(state, ConversationStore(context).read())
         ConversationStore(context).write(Conversations(first.id, listOf(first)))
         assertEquals(listOf(first), ConversationStore(context).read().items)
+    }
+
+    @Test
+    fun restoresTranslationAtNextUnfinishedBlock() {
+        val store = TranslationTaskStore(context)
+        val input = TranslationState(
+            source = normalizeTranslationSource("Reservoir level.\r\n\r\nMonitor the gate."),
+            from = Language.English, to = Language.Chinese, glossary = "Reservoir = 水库",
+        )
+        val task = TranslationTask(UUID.randomUUID().toString(), input, "approved-model.gguf", "专用翻译", true, total = 2)
+        store.write(task.checkpoint(0, "水库水位。", translated = true, finished = false)
+            .checkpoint(1, "\n\n", translated = false, finished = false))
+
+        val reopened = TranslationTaskStore(context)
+        val pending = reopened.list().single()
+        assertEquals(task.id, pending.id)
+        assertEquals("approved-model.gguf", pending.modelKey)
+        assertEquals("水库水位。\n\n", pending.input.result)
+        assertEquals(1, pending.completed)
+        assertEquals(listOf("Monitor the gate."), translationBlocks(pending.input.source).drop(pending.nextBlock))
+        assertEquals(input.glossary, pending.input.glossary)
+
+        reopened.write(pending.checkpoint(2, "监控闸门。", translated = true, finished = true))
+        val finished = TranslationTaskStore(context).read(task.id)
+        assertTrue(finished?.finished == true)
+        assertEquals("水库水位。\n\n监控闸门。", finished?.input?.result)
+        reopened.remove(task.id)
+        assertTrue(TranslationTaskStore(context).list().isEmpty())
+    }
+
+    @Test
+    fun keepsLastScanAndAppliesOnlyRelevantGlossaryTerms() {
+        TranslationTaskStore(context).writeScan("闸门水位")
+        assertEquals("闸门水位", TranslationTaskStore(context).readScan())
+        val glossary = readTranslationGlossary("reservoir = 水库\nspillway = 泄洪道")
+        val prompt = translationPrompt("Reservoir level", Language.English, Language.Chinese, true, glossary)
+        assertTrue(prompt.contains("reservoir = 水库"))
+        assertFalse(prompt.contains("泄洪道"))
+        assertTrue(runCatching { readTranslationGlossary("无分隔符") }.isFailure)
+        assertTrue(runCatching { readTranslationGlossary("Gate = 闸门\ngate = 门") }.isFailure)
+    }
+
+    @Test
+    fun reportsAndClearsOnlyCatalogPartials() = runBlocking {
+        val catalogItem = mobileCatalog.first()
+        val models = File(folder, "models").apply { mkdir() }
+        val partial = File(models, "${catalogItem.file}.part").apply { writeText("GGUF-") }
+        val installed = File(models, "existing.gguf").apply { writeText("GGUF") }
+        val unrelated = File(models, "user-file.part").apply { writeText("keep") }
+        val store = ModelStore(context)
+        assertTrue(store.remember(LocalModel(installed, "本地模型")))
+        assertEquals(5L, store.storage().incomplete)
+        assertEquals(4L, store.storage().installed)
+        store.clearPartialDownloads()
+        assertFalse(partial.exists())
+        assertTrue(installed.exists())
+        assertTrue(unrelated.exists())
+        assertEquals(0L, store.storage().incomplete)
     }
 
     @Test

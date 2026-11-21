@@ -1,0 +1,127 @@
+[
+  {
+    "id": "qwen35-9b-q4",
+    "name": "Qwen3.5-9B Instruct",
+    "params": "9B",
+    "quant": "Q4_K_M",
+    "bytes": 5680522464,
+    "file": "Qwen3.5-9B-Q4_K_M.gguf",
+    "repository": "unsloth/Qwen3.5-9B-GGUF",
+    "revision": "3885219b6810b007914f3a7950a8d1b469d598a5",
+    "sha256": "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8"
+  },
+  {
+    "id": "qwen35-4b-q4",
+    "name": "Qwen3.5-4B Instruct",
+    "params": "4B",
+    "quant": "Q4_K_M",
+    "bytes": 2740937888,
+    "file": "Qwen3.5-4B-Q4_K_M.gguf",
+    "repository": "unsloth/Qwen3.5-4B-GGUF",
+    "revision": "e87f176479d0855a907a41277aca2f8ee7a09523",
+    "sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+    "android": {
+      "order": 4,
+      "name": "Qwen3.5 4B",
+      "description": "通用对话 · 建议内存充足的手机"
+    }
+  },
+  {
+    "id": "lfm25-26b-q4",
+    "name": "LFM2.5-2.6B",
+    "params": "2.6B",
+    "quant": "Q4_K_M",
+    "bytes": 1674455040,
+    "file": "LFM2.5-2.6B-Q4_K_M.gguf",
+    "repository": "LiquidAI/LFM2.5-2.6B-GGUF",
+    "revision": "e7caca5d835a3901a8e0d63e94009429bafafdfc",
+    "sha256": "02a8b7e17487d326e46d68ce0ba24211e1b80a14c4cd0597fa73c1cd697f52ed",
+    "android": {
+      "order": 3,
+      "name": "LFM2.5 2.6B",
+      "description": "对话模型 · 需要更多内存"
+    }
+  },
+  {
+    "id": "lfm25-12b-q4",
+    "name": "LFM2.5-1.2B Instruct",
+    "params": "1.2B",
+    "quant": "Q4_K_M",
+    "bytes": 730895168,
+    "file": "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
+    "repository": "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+    "revision": "8ed288026e23958ad9dfa92d53ed773a8eee7125",
+    "sha256": "b1b3de114215d9507409a662a501a631095a479a419584e8a2ded6304b19b4f5",
+    "android": {
+      "order": 1,
+      "name": "LFM2.5 1.2B",
+      "description": "轻量对话 · 适合先试用"
+    },
+    "recommended": true
+  },
+  {
+    "id": "qwen38-27b-q4",
+    "name": "Qwen3.8-27B",
+    "params": "27B",
+    "quant": "UD-Q4_K_M",
+    "bytes": 16564259744,
+    "file": "Qwen3.8-27B-UD-Q4_K_M.gguf",
+    "repository": "unsloth/Qwen3.8-27B-GGUF",
+    "revision": "4af51b3542f775b0a8e4b310bfb3f17e01c306c9",
+    "sha256": "1bce504dfecd84153666928a41d8a66706f0158d3a317bc5196b72819d7dc529"
+  },
+  {
+    "id": "hy-mt2-18b-q4",
+    "name": "Hy-MT2 1.8B · 混元翻译",
+    "params": "1.8B",
+    "quant": "Q4_K_M",
+    "bytes": 1133080448,
+    "file": "Hy-MT2-1.8B-Q4_K_M.gguf",
+    "repository": "tencent/Hy-MT2-1.8B-GGUF",
+    "revision": "a0c709d9fac510f2c807aa3af52872340dc37a4a",
+    "sha256": "dc5f44fcf1fa496ee7ad725982c0c8c553a4de00259b53af84c4b89fb0c06699",
+    "translation": "hy",
+    "android": {
+      "order": 2,
+      "name": "混元翻译 Hy-MT2 1.8B",
+      "description": "专用离线翻译 · 可独立使用"
+    },
+    "recommended": true
+  },
+  {
+    "id": "index-translate-2b-q4",
+    "name": "Index-Translate 2B · B 站翻译",
+    "params": "2B",
+    "quant": "Q4_K_M",
+    "bytes": 1312164352,
+    "file": "Index-Translate-2B.Q4_K_M.gguf",
+    "repository": "IndexTeam/Index-Translate-2B-GGUF",
+    "revision": "3a0eca6ce931d88d00614d427ab3ed8ff0743902",
+    "sha256": "044b313d29342bd3b2c77cbb64023ca0d209bd9b3247763f9d162767ef2d746a",
+    "translation": "index"
+  },
+  {
+    "id": "xiaomi-ocr-0-q4",
+    "name": "Xiaomi-OCR-0 模型",
+    "params": "0.8B",
+    "quant": "Q4_K_M",
+    "bytes": 529297664,
+    "file": "Xiaomi-OCR-0.Q4_K_M.gguf",
+    "repository": "prithivMLmods/Xiaomi-OCR-0-GGUF",
+    "revision": "7bbfa072e0f3d70ac722e26fbccef5b9f64b7121",
+    "sha256": "1e497ff06b91a3d822c543066df3e9ef69c62c5423be09d739dfa1db55630d3a",
+    "scan": true
+  },
+  {
+    "id": "xiaomi-ocr-0-vision",
+    "name": "Xiaomi-OCR-0 视觉组件",
+    "params": "",
+    "quant": "BF16",
+    "bytes": 207346624,
+    "file": "Xiaomi-OCR-0.mmproj-bf16.gguf",
+    "repository": "prithivMLmods/Xiaomi-OCR-0-GGUF",
+    "revision": "7bbfa072e0f3d70ac722e26fbccef5b9f64b7121",
+    "sha256": "634d6bc95781ebf4a3f06570a59859fa5082d488db540fd474bc6b4061aec90e",
+    "scan": true
+  }
+]

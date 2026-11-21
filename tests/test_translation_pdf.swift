@@ -62,6 +62,15 @@ enum TestTranslationPDF {
         require(isRed(pixelOnPage(smallPage, at: CGPoint(x: 28, y: 88))), "small source is drawn at its original size")
 
         let scan = samplePDF(text: nil)
+        let scanURL = FileManager.default.temporaryDirectory.appendingPathComponent("Dubhe-\(UUID()).pdf")
+        try scan.write(to: scanURL)
+        defer { try? FileManager.default.removeItem(at: scanURL) }
+        let pairedScan = PDFDocument(data: try TranslationPDF.rebuildSelectedPages(
+            url: scanURL, pages: [1], translations: [translated]))!
+        require(pairedScan.pageCount == 1, "only requested pages are exported")
+        let pairedPage = pairedScan.page(at: 0)!
+        require(isRed(pixelOnPage(pairedPage, at: CGPoint(x: 28, y: 28))), "scan graphics remain on the left")
+        require(pairedPage.string?.contains(translated) == true, "the scan translation is searchable")
         expectError("文字") { _ = try TranslationPDF.paragraphs(scan) }
         expectError("PDF") { _ = try TranslationPDF.paragraphs(Data()) }
         expectError("页数") { _ = try TranslationPDF.rebuild(original, translations: [translated]) }

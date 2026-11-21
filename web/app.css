@@ -2354,3 +2354,105 @@ body[data-glass="off"] .edge::before { display: none; }
 }
 .tbar { display: flex; align-items: center; gap: 10px; margin: 12px 0; flex-wrap: wrap; }
 .tbar .vmeta { margin: 0; }
+
+.advanced-nav > summary {
+  padding: 8px 12px;
+  color: var(--muted, var(--text));
+  cursor: pointer;
+  font-size: 13px;
+}
+.advanced-nav > .nav-item {
+  width: 100%;
+}
+.task-section-title {
+  margin: 0 0 10px;
+}
+.task-row .vname {
+  overflow-wrap: anywhere;
+}
+.task-save-status {
+  margin-inline-start: auto;
+}
+.translation-bilingual {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.store-space {
+  margin-inline-start: auto;
+}
+.scan-card .scan-tools {
+  flex-wrap: wrap;
+}
+.scan-review-dialog {
+  width: min(1080px, 94vw);
+  max-height: 88vh;
+  overflow: auto;
+  border: 1px solid var(--edge, #cbd5cc);
+  border-radius: 18px;
+  padding: 16px;
+  background: var(--panel-solid, var(--bg));
+  color: var(--text);
+}
+.scan-review-dialog::backdrop {
+  background: rgba(26, 41, 35, .37);
+}
+.scan-review-columns {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+}
+.scan-review-columns h4 {
+  margin: 0 0 8px;
+}
+.scan-review-original, .scan-review-editor {
+  min-width: 0;
+  border: 1px solid var(--edge, #cbd5cc);
+  border-radius: 12px;
+  padding: 12px;
+}
+.scan-region-frame {
+  position: relative;
+  max-height: 60vh;
+  overflow: hidden;
+  line-height: 0;
+  touch-action: none;
+  cursor: crosshair;
+}
+.scan-region-frame img {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  width: auto;
+  height: auto;
+}
+.scan-region-frame:has(img) {
+  display: inline-block;
+}
+.scan-region-box {
+  position: absolute;
+  z-index: 1;
+  border: 2px solid #337657;
+  background: rgba(80, 160, 115, .20);
+  pointer-events: none;
+}
+.scan-review-editor textarea {
+  display: block;
+  width: 100%;
+  min-height: 48vh;
+  margin-block: 0 8px;
+  resize: vertical;
+}
+.scan-region-result {
+  width: 100%;
+  min-height: 60px;
+  margin-top: 8px;
+}
+@media (max-width: 720px) {
+  .scan-review-columns { grid-template-columns: minmax(0, 1fr); }
+  .scan-review-editor textarea { min-height: 32vh; }
+  .task-save-status { margin-inline-start: 0; }
+}

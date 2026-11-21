@@ -24,6 +24,7 @@
 #include "json_grammar.h"
 #include "calc.h"
 #include "storage.h"
+#include "tasks.h"
 #include "store.h"
 #include "translation.h"
 #include "ocr.h"
@@ -2318,6 +2319,8 @@ void refresh_model_markers(const std::string& model_path, std::string_view arch)
             } else if (tpl.find("<think></think>") != std::string::npos) {
                 g_direct_think_suffix = "<think></think>";
             }
+        } else if (arch == "lfm3" && tpl.find("<think></think>") != std::string::npos) {
+            g_direct_think_suffix = "<think></think>";
         }
     }
     // <function=name> 是 LFM3 系 render_tool_calls 的写法，和 JSON 完全不同
@@ -2719,7 +2722,7 @@ std::string build_prompt(const json::Value& messages, bool chatml, ToolMode tool
         p = std::string("<|im_start|>system\n") + tool_prompt(tools) + "<|im_end|>\n" + p;
     }
     p += "<|im_start|>assistant\n";
-    // Qwen3.5 的模板用闭合的空思考块进入直答模式。只省略开场标记，
+    // 支持直答的模板用闭合的空思考块。只省略开场标记，
     // 模型仍可能自行写很长的推理。其他模型沿用各自原有的行为。
     if (g_think_style) p += t_no_think ? g_direct_think_suffix : "<think>";
     return p;
@@ -4239,6 +4242,33 @@ int main(int argc, char** argv) {
         }
     });
 
+    const storage::Tasks tasks(g.data_dir);
+    srv.get("/api/tasks", [&tasks](const http::Request& req, http::Conn& conn) {
+        const auto id = req.param("id");
+        json::Value task;
+        const auto status = id.empty() ? tasks.list(&task) : tasks.read(id, &task);
+        if (status == storage::Tasks::INVALID) { send_error(conn, 400, "任务编号无效"); return; }
+        if (status == storage::Tasks::MISSING) { send_error(conn, 404, "这个任务已删除或不存在"); return; }
+        if (status != storage::Tasks::OK) { send_error(conn, 500, "无法读取已保存的任务"); return; }
+        auto result = json::Value::make_obj();
+        result.set(id.empty() ? "tasks" : "task", std::move(task));
+        conn.send(200, "application/json", json::dump(result));
+    });
+    srv.post("/api/tasks", [&tasks](const http::Request& req, http::Conn& conn) {
+        if (req.body.size() > storage::Tasks::max_payload_bytes + 4096) {
+            send_error(conn, 413, "任务结果太大，请导出后分段处理");
+            return;
+        }
+        json::Value change;
+        if (!json::parse(req.body, &change)) { send_error(conn, 400, "任务数据格式无效"); return; }
+        switch (tasks.apply(change)) {
+            case storage::Tasks::OK: conn.send(200, "application/json", R"({"ok":true})"); break;
+            case storage::Tasks::INVALID: send_error(conn, 400, "任务数据格式无效"); break;
+            case storage::Tasks::TOO_LARGE: send_error(conn, 413, "任务结果太大，请导出后分段处理"); break;
+            default: send_error(conn, 507, "无法保存任务，请检查剩余空间和文件权限"); break;
+        }
+    });
+
     store::Downloads downloads(g.model_dir, path_join(g.data_dir, "store.json"));
     translation::Service translator(g.model_dir, ModelWorker::script_for(g.web_root));
     scan::Service scanner(g.model_dir, ModelWorker::script_for(g.web_root));
@@ -4297,6 +4327,13 @@ int main(int argc, char** argv) {
         out.set("ok", json::Value::make_bool(true));
         out.set("state", json::Value::make_str(downloads.cancel(id)));
         conn.send(200, "application/json", json::dump(out));
+    });
+    srv.post("/api/store/clear-partial", [&downloads](const http::Request& req, http::Conn& conn) {
+        json::Value body;
+        if (!json::parse(req.body, &body)) { send_error(conn, 400, "模型下载数据格式无效"); return; }
+        const auto result = downloads.clear_partial(body.s("id"));
+        if (!result.error.empty()) { send_error(conn, result.status, result.error); return; }
+        conn.send(200, "application/json", R"({"ok":true})");
     });
     srv.get("/api/store/mirror", [&downloads](const http::Request&, http::Conn& conn) {
         json::Value out = json::Value::make_obj();

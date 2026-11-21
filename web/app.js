@@ -2951,6 +2951,7 @@
     models: { title: '模型', render: () => viewModels() },
     translate: { title: '翻译', render: () => viewTranslate() },
     scan: { title: '扫描', render: () => viewScan() },
+    tasks: { title: '任务与存储', render: () => viewTasks() },
     tools: { title: '工具', render: () => viewTools() },
     agent: { title: 'Agent', render: () => viewAgent() },
     files: { title: '文件', render: () => viewFiles(state.fsPath) },
@@ -3030,8 +3031,12 @@
     setViewHead(v.title, '', []);
     // 地址栏带上是哪个视图：刷新不丢位置，也能直接分享 /#kb
     try { history.replaceState(null, '', '#' + name); } catch (e) {}
-    document.querySelectorAll('.nav-item[data-view]').forEach((x) =>
-      x.classList.toggle('on', x.dataset.view === name));
+    document.querySelectorAll('.nav-item[data-view]').forEach((x) => {
+      const selected = x.dataset.view === name;
+      x.classList.toggle('on', selected);
+      const advanced = selected && x.closest('.advanced-nav');
+      if (advanced) advanced.open = true;
+    });
     v.render();
   }
 
@@ -3042,6 +3047,124 @@
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
     document.querySelectorAll('.nav-item[data-view]').forEach((x) =>
       x.classList.toggle('on', x.dataset.view === 'chat'));
+  }
+
+  async function saveLocalTask(kind, id, title, payload, status) {
+    if (!isLocalPage || state.server?.share_only) return;
+    try {
+      await vpost('/api/tasks', { upsert: { kind, id, title: title.slice(0, 100), payload } });
+      status.textContent = '已保存在本机';
+    } catch (e) {
+      status.textContent = '任务未保存 · ' + e.message;
+    }
+  }
+
+  async function fingerprintFile(file) {
+    const hash = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+    return Array.from(new Uint8Array(hash), value => value.toString(16).padStart(2, '0')).join('');
+  }
+
+  async function viewTasks() {
+    const body = $('#viewBody');
+    const section = el('section', 'vsec');
+    const storage = el('section', 'vsec');
+    const list = el('div', 'vcard');
+    section.append(el('h3', 'task-section-title', '最近任务'), list);
+    body.replaceChildren(section, storage);
+    setViewHead('任务与存储', '', [
+      { label: '新建扫描', on: () => openView('scan') },
+      { label: '新建翻译', on: () => openView('translate') },
+    ]);
+    const visible = () => state.view === 'tasks' && section.isConnected;
+    list.appendChild(vEmpty('正在读取本机任务'));
+    try {
+      const data = await vapi('/api/tasks');
+      if (!visible()) return;
+      const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+      list.replaceChildren();
+      if (!tasks.length) list.appendChild(vEmpty('还没有任务', '开始扫描或翻译后，结果会在这里保存。'));
+      for (const task of tasks) {
+        const row = el('div', 'vrow task-row');
+        const main = el('div', 'vmain');
+        const kind = task.kind === 'scan' ? '扫描' : '翻译';
+        main.append(el('div', 'vname', task.title), el('div', 'vmeta',
+          kind + ' · ' + fmtAgo(task.updated / 1000) + ' · ' + fmtBytes(task.bytes)));
+        const resume = el('button', 'vbtn', '打开');
+        resume.setAttribute('aria-label', '打开任务 ' + task.title);
+        resume.onclick = async () => {
+          resume.disabled = true;
+          try {
+            const { task: entry } = await vapi('/api/tasks?id=' + encodeURIComponent(task.id));
+            if (!visible()) return;
+            openView(task.kind === 'scan' ? 'scan' : 'translate');
+            const pane = task.kind === 'scan' ? scanPane : translationPane;
+            pane.restoreTask(entry);
+          } catch (e) {
+            main.appendChild(el('div', 'vnote bad', '打不开任务 · ' + e.message));
+          } finally {
+            resume.disabled = false;
+          }
+        };
+        const remove = el('button', 'vbtn ghost', '移除');
+        remove.setAttribute('aria-label', '移除任务 ' + task.title);
+        remove.onclick = async () => {
+          if (scanPane?.usesTask(task.id) || translationPane?.usesTask(task.id)) {
+            main.appendChild(el('div', 'vnote', '请先在任务页面停止并清空当前任务。'));
+            return;
+          }
+          if (!confirm('移除这个任务及其进度？原文件会保留。')) return;
+          remove.disabled = true;
+          try {
+            await vpost('/api/tasks', { delete: task.id });
+            if (visible()) viewTasks();
+          } catch (e) {
+            main.appendChild(el('div', 'vnote bad', '移除失败 · ' + e.message));
+            remove.disabled = false;
+          }
+        };
+        row.append(main, resume, remove);
+        list.appendChild(row);
+      }
+    } catch (e) {
+      if (visible()) list.replaceChildren(vEmpty('读不到本机任务', e.message));
+    }
+    try {
+      const data = await vapi('/api/store');
+      if (!visible() || !data.storage) return;
+      const usage = data.storage;
+      const card = el('div', 'vcard');
+      const usageRow = el('div', 'vrow');
+      const main = el('div', 'vmain');
+      main.append(el('div', 'vname', '模型目录'),
+        el('div', 'vmeta', '剩余 ' + fmtBytes(usage.free_bytes) + ' · 已下载 ' +
+          fmtBytes(usage.installed_bytes) + ' · 未完成 ' + fmtBytes(usage.partial_bytes)));
+      const models = el('button', 'vbtn', '管理模型');
+      models.onclick = () => openView('models');
+      usageRow.append(main, models);
+      card.appendChild(usageRow);
+      for (const item of (data.items || []).filter(item => item.can_clear_partial)) {
+        const row = el('div', 'vrow task-row');
+        const label = el('div', 'vmain');
+        label.append(el('div', 'vname', item.name), el('div', 'vmeta', '未完成的下载'));
+        const clear = el('button', 'vbtn ghost', '清理');
+        clear.onclick = async () => {
+          if (!confirm('清理 ' + item.name + ' 的未完成下载？')) return;
+          clear.disabled = true;
+          try {
+            await vpost('/api/store/clear-partial', { id: item.id });
+            if (visible()) viewTasks();
+          } catch (e) {
+            label.appendChild(el('div', 'vnote bad', e.message));
+            clear.disabled = false;
+          }
+        };
+        row.append(label, clear);
+        card.appendChild(row);
+      }
+      storage.replaceChildren(el('h3', 'task-section-title', '设备存储'), card);
+    } catch (e) {
+      if (visible()) storage.replaceChildren(vEmpty('读不到存储信息', e.message));
+    }
   }
 
   function vEmpty(title, desc) {
@@ -3151,6 +3274,10 @@
     view.active = new Set(d.items.filter(activeTransfer).map((m) => m.id));
 
     const heading = el('div', 'vtitle store-heading', '模型商店');
+    if (d.storage) {
+      const space = el('span', 'vmeta store-space', '可用 ' + fmtBytes(d.storage.free_bytes));
+      heading.appendChild(space);
+    }
     const sources = el('a', 'vbtn ghost', '下载来源');
     sources.href = 'https://github.com/yuelangmanle/dubhe/blob/main/docs/model-downloads.md';
     sources.target = '_blank';
@@ -3182,9 +3309,13 @@
       const main = el('div', 'vmain');
       const nm = el('div', 'vname', m.name);
       nm.appendChild(el('span', 'vtag', m.params + ' · ' + m.quant));
+      if (m.recommended) nm.appendChild(el('span', 'vtag on', '适合先试'));
       if (m.installed) nm.appendChild(el('span', 'vtag on', '已下载'));
       main.appendChild(nm);
       main.appendChild(el('div', 'vmeta', m.note + ' · ' + fmtBytes(m.installed ? m.got || m.bytes : m.bytes)));
+      if (!m.installed && d.storage?.free_bytes < Math.max(0, m.bytes - (m.got || 0))) {
+        main.appendChild(el('div', 'vnote', '可用空间不足'));
+      }
       row.appendChild(main);
 
       if (m.installed) {
@@ -3358,6 +3489,7 @@
     }
     if (request !== modelsRequest || !local.isConnected || state.view !== 'models') return;
     const actions = [{ label: '刷新', icon: 'restart', on: () => viewModels() }];
+    actions.push({ label: '任务与存储', on: () => openView('tasks') });
     if (d.current) actions.push({
       label: '卸载当前模型',
       on: async () => {
@@ -3682,7 +3814,7 @@
     return { parts, total: parts.filter(p => p.translate).length, next: 0, finished: 0, result: '' };
   }
 
-  async function translateDocument(draft, prefs, signal, progress, render) {
+  async function translateDocument(draft, prefs, signal, progress, render, checkpoint) {
     const glossary = translationGlossary(prefs.glossary);
     const request = async (text, formatted) => {
       const data = await vpost('/api/translate', {
@@ -3694,11 +3826,12 @@
       }
       return data.text.trim();
     };
-    for (; draft.next < draft.parts.length; draft.next++) {
+    while (draft.next < draft.parts.length) {
       signal.throwIfAborted();
       const p = draft.parts[draft.next];
       if (!p.translate) {
         draft.result += p.value;
+        draft.next++;
         continue;
       }
       const part = (draft.finished + 1) + ' / ' + draft.total + ' 段';
@@ -3725,7 +3858,9 @@
       }
       draft.result += piece;
       draft.finished++;
+      draft.next++;
       render(draft.result);
+      if (checkpoint) await checkpoint();
     }
     render(draft.result);
   }
@@ -3768,6 +3903,7 @@
 
   function viewTranslate() {
     setViewHead('翻译', '', [
+      { label: '最近任务', on: () => openView('tasks') },
       { label: '模型商店', on: () => openView('models') },
     ]);
     translationPane ??= createTranslationPane();
@@ -3798,6 +3934,7 @@
     let modelError = '';
     let job = null;
     let work = null;
+    let taskId = null;
 
     const card = el('div', 'vcard');
 
@@ -3858,11 +3995,86 @@
       setTranslationPrefs({ glossary: glossary.value });
       updateControls();
     };
-    terms.appendChild(glossary);
+    const presetKey = 'dubhe.glossary-presets.v1';
+    let presets = [];
+    try {
+      const saved = JSON.parse(readPreference(presetKey));
+      if (Array.isArray(saved)) presets = saved;
+    } catch (e) {}
+    const presetTools = el('div', 'tbar glossary-presets');
+    const presetName = el('input', 'vsel');
+    presetName.placeholder = '术语表名称';
+    presetName.maxLength = 40;
+    presetName.setAttribute('aria-label', '术语表名称');
+    const presetSelect = el('select', 'vsel');
+    presetSelect.setAttribute('aria-label', '已保存的术语表');
+    const savePreset = el('button', 'vbtn', '保存术语表');
+    const loadPreset = el('button', 'vbtn', '使用');
+    const removePreset = el('button', 'vbtn ghost', '删除');
+    const presetStatus = el('span', 'vmeta');
+    presetStatus.setAttribute('role', 'status');
+    function showPresets(current = '') {
+      const empty = el('option', '', '选择术语表');
+      empty.value = '';
+      empty.disabled = true;
+      presetSelect.replaceChildren(empty, ...presets.map(({name}) => {
+        const option = el('option', '', name);
+        option.value = name;
+        return option;
+      }));
+      presetSelect.value = presets.some(item => item.name === current) ? current : '';
+      loadPreset.disabled = removePreset.disabled = Boolean(job || !presetSelect.value);
+    }
+    presetSelect.onchange = () => { loadPreset.disabled = removePreset.disabled = !presetSelect.value; };
+    savePreset.onclick = () => {
+      const name = presetName.value.trim();
+      if (!name || !glossary.value.trim()) {
+        presetStatus.textContent = '先填写术语表和名称。';
+        return;
+      }
+      if (glossary.value.length > 40_000) {
+        presetStatus.textContent = '术语表过长，请先精简。';
+        return;
+      }
+      const index = presets.findIndex(item => item.name === name);
+      if (index < 0 && presets.length >= 30) {
+        presetStatus.textContent = '术语表已达 30 份，可先删除一份。';
+        return;
+      }
+      if (index >= 0 && !confirm('更新已有的术语表「' + name + '」？')) return;
+      if (index < 0) presets.push({ name, text: glossary.value });
+      else presets[index].text = glossary.value;
+      writePreference(presetKey, JSON.stringify(presets));
+      showPresets(name);
+      presetStatus.textContent = '已保存术语表';
+    };
+    loadPreset.onclick = () => {
+      const selected = presets.find(item => item.name === presetSelect.value);
+      if (!selected) return;
+      glossary.value = selected.text;
+      glossary.oninput();
+      presetName.value = selected.name;
+      presetStatus.textContent = '已使用「' + selected.name + '」';
+    };
+    removePreset.onclick = () => {
+      const name = presetSelect.value;
+      if (!name || !confirm('删除术语表「' + name + '」？')) return;
+      presets = presets.filter(item => item.name !== name);
+      writePreference(presetKey, JSON.stringify(presets));
+      showPresets();
+      presetStatus.textContent = '已删除术语表';
+    };
+    presetTools.append(presetName, savePreset, presetSelect, loadPreset, removePreset, presetStatus);
+    showPresets();
+    terms.append(glossary, presetTools);
 
     const bar = el('div', 'tbar');
     const fileBtn = el('button', 'vbtn', '读文件');
-    const clearFile = el('button', 'vbtn ghost', '移除文件');
+    const clearFile = el('button', 'vbtn ghost', '清空工作区');
+    clearFile.id = 'translationClear';
+    const sample = el('button', 'vbtn ghost', '试用示例');
+    const relink = el('button', 'vbtn ghost', '重新选择原文件');
+    let relinking = false;
     clearFile.hidden = true;
     let sourceFile = null;
     let fileName = '';
@@ -3875,11 +4087,13 @@
     inputFile.accept = '.txt,.md,.markdown,.csv,.log';
     if (window.webkit?.messageHandlers?.shell) inputFile.accept += ',.docx,.pdf';
     inputFile.style.display = 'none';
-    fileBtn.onclick = () => inputFile.click();
     clearFile.onclick = () => {
       sourceFile = exportedParts = null;
+      includeSource.checked = false;
       fileName = '';
       work = null;
+      taskId = null;
+      savedStatus.textContent = '';
       ta.value = '';
       setOutput('');
       copyBtn.disabled = true;
@@ -3887,7 +4101,15 @@
       prog.textContent = '';
       updateControls();
     };
+    relink.onclick = () => { relinking = true; inputFile.click(); };
+    sample.onclick = () => {
+      acceptScan('Our field survey began after the rain. We measured the river level at three locations.', '英文试用示例');
+      prog.textContent = '已填入示例，选择目标语言后即可翻译。';
+    };
+    fileBtn.onclick = () => { relinking = false; inputFile.click(); };
     inputFile.onchange = async () => {
+      const restoreOriginal = relinking;
+      relinking = false;
       const file = inputFile.files?.[0];
       inputFile.value = '';
       if (!file || readingFile || job) return;
@@ -3900,17 +4122,31 @@
         let content;
         if (format) {
           if (file.size > 16 * 1024 * 1024) throw new Error('PDF 或 Word 文件请控制在 16 MB 内。');
+          const digest = await fingerprintFile(file);
+          if (restoreOriginal) {
+            if (format !== sourceFile?.format || digest !== sourceFile.digest) {
+              throw new Error('选择的文件和此任务的原件不同。');
+            }
+            sourceFile.document = await documentBase64(file);
+            prog.textContent = '原文件已恢复，可按原格式导出。';
+            return;
+          }
           const data = await documentBase64(file);
           const { paragraphs } = await nativeDocumentRequest({ format, document: data });
           if (!Array.isArray(paragraphs) || !paragraphs.some(p => p.trim())) {
-            throw new Error('读不到文件中的文本。扫描页可以先用截图取词。');
+            throw new Error('原文件中没有可直接读取的文字，请在「扫描」中识别后再送来翻译。');
           }
-          next = { format, document: data, paragraphs };
+          next = { format, document: data, paragraphs, digest };
           content = paragraphs.join('\n\n');
         } else {
+          if (restoreOriginal) throw new Error('请选择此任务原来的 PDF 或 Word 文件。');
+          if (file.size > 8 * 1024 * 1024) throw new Error('文本文件请控制在 8 MB 内。');
           content = await file.text();
         }
         sourceFile = next;
+        includeSource.checked = false;
+        taskId = null;
+        savedStatus.textContent = '';
         fileName = file.name;
         const extension = fileName.split('.').at(-1).toLowerCase();
         const defaultFormat = extension === 'markdown' ? 'md' : extension;
@@ -3933,7 +4169,7 @@
     };
     bar.appendChild(fileBtn);
     bar.appendChild(inputFile);
-    bar.appendChild(clearFile);
+    bar.append(clearFile, relink, sample);
 
     const ocrSelect = el('select', 'vsel');
     ocrSelect.id = 'translationOCR';
@@ -4000,6 +4236,12 @@
     const prog = el('span', 'vmeta', '');
     prog.setAttribute('role', 'status');
     bar.appendChild(prog);
+    const savedStatus = el('span', 'vmeta task-save-status', '');
+    savedStatus.setAttribute('role', 'status');
+    bar.appendChild(savedStatus);
+    const downloadModel = el('button', 'vbtn', '下载翻译模型');
+    downloadModel.onclick = () => openView('models');
+    bar.appendChild(downloadModel);
     const stop = el('button', 'vbtn', '停止翻译');
     stop.hidden = true;
     stop.onclick = () => job?.abort();
@@ -4035,7 +4277,11 @@
       exportFormat.appendChild(option);
     }
     const saveDocument = el('button', 'vbtn', '导出');
-    exportGroup.append(exportFormat, saveDocument);
+    const includeSource = el('input');
+    includeSource.type = 'checkbox';
+    const bilingual = el('label', 'translation-bilingual');
+    bilingual.append(includeSource, document.createTextNode('附原文'));
+    exportGroup.append(bilingual, exportFormat, saveDocument);
     resultActions.appendChild(exportGroup);
     outCard.appendChild(resultActions);
     workspace.appendChild(outCard);
@@ -4053,7 +4299,25 @@
     saveDocument.onclick = async () => {
       const format = exportFormat.value;
       const name = (fileName ? fileName.replace(/\.[^.]+$/, '') + '-译文' : '译文') + '.' + format;
-      const text = outBox.textContent;
+      let text = outBox.textContent;
+      let blocks;
+      if (includeSource.checked) {
+        const originals = sourceFile?.paragraphs ?? [ta.value];
+        const results = exportedParts ?? [text];
+        const sections = originals.map((original, index) => {
+          const page = sourceFile?.pages?.[index];
+          const heading = page ? '第 ' + page + ' 页' : originals.length > 1 ? '第 ' + (index + 1) + ' 节' : '';
+          return { heading, original, translation: results[index] || '' };
+        });
+        text = sections.map(({ heading, original, translation }) =>
+          (heading ? '## ' + heading + '\n\n' : '') + '原文\n\n' + original +
+          '\n\n译文\n\n' + translation).join('\n\n');
+        blocks = sections.flatMap(({ heading, original, translation }) => [
+          ...(heading ? [{kind: 'h2', text: heading}] : []),
+          {kind: 'h3', text: '原文'}, {kind: 'p', text: original},
+          {kind: 'h3', text: '译文'}, {kind: 'p', text: translation},
+        ]);
+      }
       const previous = prog.textContent;
       exporting = true;
       updateControls();
@@ -4071,7 +4335,12 @@
         }
         prog.textContent = '正在导出…';
         let result;
-        if (format === sourceFile?.format && exportedParts) {
+        if (includeSource.checked && format === 'pdf' && sourceFile?.origin?.bookmark && exportedParts) {
+          result = await nativeDocumentRequest({ action: 'scanBilingual', name,
+            bookmark: sourceFile.origin.bookmark, identity: sourceFile.origin.identity,
+            pages: sourceFile.pages, translations: exportedParts });
+        } else if (!includeSource.checked && format === sourceFile?.format && exportedParts) {
+          if (!sourceFile.document) throw new Error('请选择原文件以保留其版式，或勾选「附原文」导出双语文本。');
           const { document: translated } = await nativeDocumentRequest({
             format, document: sourceFile.document, translations: exportedParts,
           });
@@ -4080,7 +4349,7 @@
         } else {
           const formatted = format === 'pdf' || format === 'docx';
           result = await nativeDocumentRequest({
-            action: 'export', format, name, text, ...(formatted ? { blocks: translationBlocks(preview) } : {}),
+            action: 'export', format, name, text, ...(formatted ? { blocks: blocks ?? translationBlocks(preview) } : {}),
           });
         }
         prog.textContent = result.saved ? '已保存译文文件' : previous;
@@ -4095,7 +4364,7 @@
     const settings = () => ({
       model: selM.value, source: selS.value, target: selL.value, glossary: glossary.value,
     });
-    const canResume = () => work && (work.translated.length || work.segment?.finished) &&
+    const canResume = () => work && !work.complete && (work.translated.length || work.segment?.finished) &&
       work.file === sourceFile && work.text === ta.value &&
       Object.entries(settings()).every(([key, value]) => value === work.prefs[key]);
 
@@ -4107,8 +4376,14 @@
       go.disabled = Boolean(job || readingFile || exporting || !installed || !catalog?.runtime_available);
       go.textContent = !job && canResume() ? '继续翻译' : '翻译';
       stop.hidden = !job;
+      downloadModel.hidden = !catalog || Boolean(installed);
+      clearFile.hidden = !fileName && !work && !ta.value;
+      relink.hidden = !sourceFile || !['pdf', 'docx'].includes(sourceFile.format) || Boolean(sourceFile.document);
+      relink.disabled = sample.disabled = Boolean(job || readingFile || exporting);
       selM.disabled = Boolean(job || !catalog);
       selS.disabled = selL.disabled = glossary.disabled = Boolean(job);
+      presetName.disabled = presetSelect.disabled = savePreset.disabled = Boolean(job);
+      loadPreset.disabled = removePreset.disabled = Boolean(job || !presetSelect.value);
       fileBtn.disabled = clearFile.disabled = Boolean(job || readingFile || exporting);
       ta.readOnly = Boolean(job || sourceFile || readingFile);
       const native = Boolean(window.webkit?.messageHandlers?.shell);
@@ -4151,12 +4426,69 @@
       updateControls();
     };
 
+    async function checkpoint() {
+      if (!work || !taskId) return;
+      const { file, prefs, translated, segment, complete } = work;
+      const source = file ? {
+        format: file.format, paragraphs: file.paragraphs,
+        digest: file.digest || '', pages: file.pages || null, origin: file.origin || null,
+      } : null;
+      await saveLocalTask('translation', taskId, fileName || '文本翻译', {
+        fileName, source, text: file ? '' : work.text, prefs, translated, complete: !!complete,
+        bilingual: includeSource.checked,
+        segment: segment ? { next: segment.next, finished: segment.finished, result: segment.result } : null,
+      }, savedStatus);
+    }
+
+    function paragraphSource(paragraph, pdf) {
+      return pdf ? paragraph.split(/\r?\n[ \t]*\r?\n/)
+        .map(block => block.replace(/[ \t]*\r?\n[ \t]*/g, ' ')).join('\n\n') : paragraph;
+    }
+
+    function restoreTask(task) {
+      if (job || readingFile || exporting) {
+        prog.textContent = '请先完成或停止当前操作。';
+        return;
+      }
+      const data = task?.payload;
+      if (!data || !data.prefs || !Array.isArray(data.translated)) {
+        prog.textContent = '找不到这个翻译任务的记录。';
+        return;
+      }
+      taskId = task.id;
+      fileName = data.fileName || '';
+      sourceFile = data.source;
+      ta.value = sourceFile?.paragraphs.join('\n\n') ?? data.text;
+      const restored = data.segment ? prepareTranslation(paragraphSource(
+        (sourceFile?.paragraphs ?? [ta.value])[data.translated.length] ?? '',
+        sourceFile?.format === 'pdf',
+      )) : null;
+      if (restored) Object.assign(restored, data.segment);
+      work = { text: ta.value, file: sourceFile, prefs: data.prefs, translated: data.translated,
+        complete: data.complete, segment: restored };
+      setTranslationPrefs(data.prefs);
+      selM.value = data.prefs.model;
+      selS.value = data.prefs.source;
+      selL.value = data.prefs.target;
+      glossary.value = data.prefs.glossary;
+      includeSource.checked = data.bilingual || false;
+      exportedParts = work.complete ? data.translated : null;
+      const partial = [...data.translated, ...(restored?.result ? [restored.result] : [])].join('\n\n');
+      setOutput(partial, work.complete);
+      copyBtn.disabled = !partial;
+      savedStatus.textContent = '已从本机恢复';
+      prog.textContent = work.complete ? '已恢复完成的译文'
+        : partial ? '已恢复已完成的译文，可继续翻译。' : '已恢复待翻译的原文。';
+      updateControls();
+    }
+
     go.onclick = async () => {
       const text = ta.value;
       if (!text.trim()) { prog.textContent = '先输入要翻译的文字。'; return; }
       const resume = canResume();
       if (!resume) {
-        work = { text, file: sourceFile, prefs: settings(), translated: [], segment: null };
+        work = { text, file: sourceFile, prefs: settings(), translated: [], segment: null, complete: false };
+        taskId = crypto.randomUUID();
         setOutput('');
       }
       job = new AbortController();
@@ -4166,6 +4498,7 @@
       exportedParts = null;
       prog.textContent = resume ? '正在继续翻译…' : '准备翻译…';
       try {
+        await checkpoint();
         const { translated, prefs } = work;
         const paragraphs = sourceFile?.paragraphs ?? [text];
         const pdf = sourceFile?.format === 'pdf';
@@ -4174,19 +4507,19 @@
         let segmentCount = 0;
         for (let i = translated.length; i < paragraphs.length; i++) {
           const paragraph = paragraphs[i];
-          const source = pdf
-            ? paragraph.split(/\r?\n[ \t]*\r?\n/).map(block => block.replace(/[ \t]*\r?\n[ \t]*/g, ' ')).join('\n\n')
-            : paragraph;
-          const position = sourceFile ? (i + 1) + ' / ' + paragraphs.length + ' ' + unit : '';
+          const source = paragraphSource(paragraph, pdf);
+          const position = sourceFile?.pages?.[i] ? '原第 ' + sourceFile.pages[i] + ' 页'
+            : sourceFile ? (i + 1) + ' / ' + paragraphs.length + ' ' + unit : '';
           const prefix = i ? complete + '\n\n' : '';
           const segment = work.segment ??= prepareTranslation(source);
           await translateDocument(segment, prefs, signal,
             status => { prog.textContent = position || status; },
-            partial => { setOutput(prefix + partial); });
+            partial => { setOutput(prefix + partial); }, checkpoint);
           translated.push(segment.result);
           complete = prefix + segment.result;
           segmentCount = segment.total;
           work.segment = null;
+          await checkpoint();
         }
         if (sourceFile) {
           exportedParts = translated;
@@ -4195,7 +4528,8 @@
           prog.textContent = segmentCount ? '完成 · ' + segmentCount + ' 段' : '已原样保留代码';
         }
         setOutput(complete, true);
-        work = null;
+        work.complete = true;
+        await checkpoint();
       } catch (e) {
         const partial = outBox.textContent ? '（已保留完成的译文）' : '';
         prog.textContent = signal.aborted ? '已停止' + partial : '翻译失败' + partial + ' · ' + e.message;
@@ -4208,12 +4542,17 @@
     };
     setOutput('');
     updateControls();
-    function acceptScan(text, name) {
+    function acceptScan(text, name, pages, origin) {
       if (job || readingFile || exporting) {
         prog.textContent = '请等当前操作完成后再送入扫描结果。';
         return;
       }
-      sourceFile = exportedParts = work = null;
+      exportedParts = work = null;
+      sourceFile = pages ? { format: 'scan', paragraphs: pages.map(item => item[1].text),
+        pages: pages.map(item => item[0]), origin } : null;
+      taskId = null;
+      includeSource.checked = Boolean(pages);
+      savedStatus.textContent = '';
       fileName = name;
       ta.value = text;
       clearFile.hidden = false;
@@ -4223,7 +4562,7 @@
       updateControls();
       ta.focus();
     }
-    return { body, refreshModels, acceptScan };
+    return { body, refreshModels, acceptScan, restoreTask, usesTask: id => id === taskId && !!job };
   }
 
   // ---------------------------------------------------------------- 扫描
@@ -4239,7 +4578,8 @@
   let scanPane;
 
   function viewScan() {
-    setViewHead('扫描', '', [{ label: '模型商店', on: () => openView('models') }]);
+    setViewHead('扫描', '', [{ label: '最近任务', on: () => openView('tasks') },
+      { label: '模型商店', on: () => openView('models') }]);
     scanPane ??= createScanPane();
     $('#viewBody').appendChild(scanPane.body);
     scanPane.refreshModels();
@@ -4317,7 +4657,9 @@
     let catalog, catalogError = '', modelError = '', modelBusy = false;
     let refreshCounter = 0, poll, files = [];
     let source, page = 1, raster, lastPdfImage, drawnPage = 0, loadingImage;
-    let pendingPDF, pendingSave, work, job;
+    let lastPdfText = '';
+    let pendingPDF, pendingSave, work, job, taskId, pdfOpened, pendingBatch, batch;
+    let relinkingPDF = false, relinkingImage = false;
     const pendingPages = new Map();
 
     const modelBar = el('div', 'scan-model vcard');
@@ -4342,8 +4684,12 @@
     const sourceTools = el('div', 'scan-tools');
     const openImage = button('OpenImage', '打开图片');
     const openPDF = button('OpenPDF', '打开 PDF');
+    const batchOpen = button('BatchOpen', '批量 PDF');
+    batchOpen.setAttribute('aria-label', '批量扫描 PDF');
     const clear = button('Clear', '移除原件', 'ghost');
-    sourceTools.append(openImage, openPDF, clear);
+    const sample = button('Sample', '试用示例', 'ghost');
+    const relink = button('Relink', '重新选择原件');
+    sourceTools.append(openImage, openPDF, batchOpen, sample, relink, clear);
     sourceHead.append(sourceTitle, sourceTools);
     const upload = el('input');
     upload.id = 'scanImage';
@@ -4377,6 +4723,12 @@
       mode.appendChild(option);
     }
     modeLine.append(el('span', '', '识别方式'), mode);
+    const nativeText = el('input');
+    nativeText.type = 'checkbox';
+    nativeText.checked = true;
+    const nativeTextLabel = el('label', 'translation-bilingual');
+    nativeTextLabel.append(nativeText, document.createTextNode('优先读取 PDF 文字'));
+    nativeText.onchange = () => update();
     const range = el('div', 'scan-range');
     function pageBound(title, id) {
       const label = el('label', 'scan-control');
@@ -4403,8 +4755,10 @@
     const actionRow = el('div', 'scan-action-row');
     const run = button('Run', '开始识别', 'pri');
     const stop = button('Stop', '停止识别');
-    actionRow.append(run, stop, status);
-    options.append(optionRow, modeTip, detail, actionRow);
+    const savedStatus = el('span', 'vmeta task-save-status');
+    savedStatus.setAttribute('role', 'status');
+    actionRow.append(run, stop, status, savedStatus);
+    options.append(optionRow, nativeTextLabel, modeTip, detail, actionRow);
     inputCard.appendChild(options);
 
     const resultHead = el('header', 'scan-card-head');
@@ -4419,19 +4773,23 @@
     const copy = button('Copy', '复制');
     const exportResult = button('Export', '导出');
     const translate = button('Translate', '送去翻译');
-    resultTools.append(copy, exportResult, translate);
+    const review = button('Review', '校对本页');
+    const question = button('AskDocument', '问这份文档');
+    resultTools.append(review, copy, exportResult, translate, question);
     resultCard.append(resultHead, output, resultTools);
     workspace.append(inputCard, resultCard);
     body.append(modelBar, workspace);
 
     const isPDF = () => source?.kind === 'pdf';
+    const originalReady = () => Boolean(source?.image || source?.requestId);
     const selection = () => ({
       mode: mode.value, first: isPDF() ? from.valueAsNumber : 1, last: isPDF() ? to.valueAsNumber : 1,
+      preferText: isPDF() && mode.value === 'document' && nativeText.checked,
       detail: /^(extract|ask)$/.test(mode.value) ? detailValue.value.trim() : '',
     });
     const validRange = value => Number.isInteger(value.first) && Number.isInteger(value.last) &&
       value.first >= 1 && value.first <= value.last && value.last <= (source?.pageCount ?? 1);
-    const canContinue = value => work && work.source === source && work.results.size &&
+    const canContinue = value => work && work.source === source &&
       work.results.size < value.last - value.first + 1 &&
       Object.keys(value).every(key => value[key] === work[key]);
     const result = () => work?.results.get(page);
@@ -4458,21 +4816,24 @@
       install.hidden = installed || !catalog?.runtime_available;
       install.textContent = activeFiles.length ? '取消下载'
         : files.some(file => file.state === 'error' || file.state === 'cancelled') ? '继续下载' : '下载扫描模型';
-      install.disabled = modelBusy || Boolean(job) || !files.length ||
+      install.disabled = modelBusy || Boolean(job || batch) || !files.length ||
         activeFiles.length > 0 && activeFiles.every(file => file.state === 'cancelling');
       remove.hidden = !files.some(file => file.installed && file.path) || activeFiles.length > 0;
-      remove.disabled = modelBusy || Boolean(job);
-      openPDF.hidden = !native();
+      remove.disabled = modelBusy || Boolean(job || batch);
+      openPDF.hidden = batchOpen.hidden = !native();
       clear.hidden = !source;
-      const busy = Boolean(job || pendingPDF || loadingImage || pendingSave);
-      openImage.disabled = openPDF.disabled = clear.disabled = busy;
+      const busy = Boolean(job || pendingPDF || loadingImage || pendingSave || pendingBatch || batch);
+      openImage.disabled = openPDF.disabled = batchOpen.disabled = clear.disabled = sample.disabled = relink.disabled = busy;
+      batchOpen.textContent = batch ? '批量 ' + batch.current + ' / ' + batch.total : '批量 PDF';
+      relink.hidden = !source || originalReady() || isPDF() && !native();
       pagination.hidden = range.hidden = !isPDF();
-      mode.disabled = from.disabled = to.disabled = detailValue.disabled = Boolean(job);
+      mode.disabled = from.disabled = to.disabled = detailValue.disabled = nativeText.disabled = Boolean(job || batch);
+      nativeTextLabel.hidden = !isPDF() || mode.value !== 'document';
       sourceName.textContent = source?.name || '';
       sourceName.title = source?.name || '';
       position.textContent = isPDF() ? '第 ' + page + ' / ' + source.pageCount + ' 页' : '';
-      prev.disabled = Boolean(job) || page <= 1;
-      next.disabled = Boolean(job) || page >= (source?.pageCount ?? 1);
+      prev.disabled = Boolean(job || batch) || page <= 1;
+      next.disabled = Boolean(job || batch) || page >= (source?.pageCount ?? 1);
       blank.hidden = Boolean(source || loadingImage || pendingPDF);
       image.hidden = enlarge.hidden = !raster;
       opening.hidden = !blank.hidden || Boolean(raster) || drawnPage === page;
@@ -4482,17 +4843,20 @@
       detail.hidden = s.mode !== 'extract' && s.mode !== 'ask';
       detailTitle.textContent = s.mode === 'extract' ? '字段名称' : '问题';
       detailValue.placeholder = s.mode === 'extract' ? '例如：题目、作者、日期' : '例如：图中的纵轴表示什么？';
-      stop.hidden = !job;
-      stop.disabled = !!job?.signal.aborted;
-      run.disabled = busy || modelBusy || !source || !ready || !validRange(s) || (!detail.hidden && !s.detail);
+      stop.hidden = !job && !batch;
+      stop.disabled = !!job?.signal.aborted || !!batch?.stopped;
+      run.disabled = busy || modelBusy || !originalReady() || (!ready && !s.preferText) || !validRange(s) || (!detail.hidden && !s.detail);
       run.textContent = canContinue(s) ? '继续识别' : '开始识别';
       const item = result();
       showRaw.hidden = item?.kind !== 'markdown';
       showRaw.textContent = raw ? '查看预览' : '查看原文';
+      review.disabled = !item || busy;
       const hasResults = Boolean(work?.results.size);
-      copy.disabled = exportResult.disabled = !hasResults || Boolean(pendingSave);
+      copy.disabled = exportResult.disabled = !hasResults || Boolean(pendingSave || batch);
       translate.hidden = !hasResults || !['document', 'text'].includes(work.mode);
-      translate.disabled = Boolean(job);
+      translate.disabled = Boolean(job || batch);
+      question.hidden = translate.hidden;
+      question.disabled = Boolean(job || batch);
       exportResult.textContent = isPDF() && hasResults ? '导出已识别页' : '导出';
     }
 
@@ -4515,13 +4879,16 @@
     }
 
     function replaceSource(nextSource) {
-      if (isPDF()) shellPost({ type: 'scanClosePDF', requestId: source.requestId });
+      if (source?.requestId) shellPost({ type: 'scanClosePDF', requestId: source.requestId });
       source = nextSource;
       page = 1;
       drawnPage = 0;
       raster = null;
       lastPdfImage = null;
+      lastPdfText = '';
       work = null;
+      taskId = null;
+      savedStatus.textContent = '';
       raw = false;
       image.removeAttribute('src');
       from.max = to.max = String(source?.pageCount ?? 1);
@@ -4541,12 +4908,15 @@
       if (existing) return existing.promise;
       let finish;
       const promise = new Promise((resolve, reject) => {
-        finish = (data, error) => {
+        finish = (data, error, text) => {
           pendingPages.delete(key);
           clearTimeout(timeout);
           if (error) reject(error);
           else {
-            if (file === source) lastPdfImage = { file, page: index, image: data };
+            if (file === source) {
+              lastPdfImage = { file, page: index, image: data };
+              lastPdfText = text || '';
+            }
             resolve(data);
           }
         };
@@ -4572,6 +4942,12 @@
       image.removeAttribute('src');
       renderResult();
       if (!source) return;
+      if (!originalReady()) {
+        drawnPage = page;
+        setStatus('已保留结果。重新选择原件后，可继续识别或框选重扫。');
+        update();
+        return;
+      }
       const file = source;
       try {
         showRaster(file, index, await pageImage(file, index));
@@ -4595,18 +4971,27 @@
     window.dubheScanPDFReady = (message) => {
       if (message.requestId !== pendingPDF) return;
       pendingPDF = null;
+      const reconnect = relinkingPDF;
+      relinkingPDF = false;
+      let opened = false;
       if (!message.cancelled && !message.error && Number.isInteger(message.pageCount) && message.pageCount > 0) {
-        replaceSource({ kind: 'pdf', requestId: message.requestId, name: message.name, pageCount: message.pageCount });
+        const file = { kind: 'pdf', requestId: message.requestId, name: message.name, pageCount: message.pageCount,
+          bookmark: message.bookmark || '', identity: message.identity || '' };
+        if (reconnect) opened = reattach(file);
+        else { replaceSource(file); opened = true; }
       } else if (!message.cancelled) {
         setStatus(message.error || 'PDF 没有可识别页面。', true);
       }
+      pdfOpened?.(opened);
+      pdfOpened = null;
       update();
     };
     window.dubheScanPDFPage = (message) => {
       const pending = pendingPages.get(message.requestId + ':' + message.page);
       if (!pending) return;
       const valid = typeof message.image === 'string' && /^data:image\/(?:jpeg|png);base64,/.test(message.image);
-      pending.finish(message.image, valid && !message.error ? null : new Error(message.error || '读取 PDF 页失败。'));
+      pending.finish(message.image, valid && !message.error ? null : new Error(message.error || '读取 PDF 页失败。'),
+        typeof message.selectableText === 'string' ? message.selectableText : '');
     };
     window.dubheScanSaved = (message) => {
       if (message.requestId !== pendingSave) return;
@@ -4616,13 +5001,16 @@
       update();
     };
 
-    async function importImage(file) {
-      if (!file || job || pendingPDF || loadingImage || pendingSave) return;
+    async function importImage(file, reconnect = false) {
+      if (!file || job || batch || pendingBatch || pendingPDF || loadingImage || pendingSave) return;
       loadingImage = true;
       setStatus('');
       update();
       try {
-        replaceSource({ kind: 'image', name: file.name, image: await scanImageData(file) });
+        const image = await scanImageData(file);
+        const nextSource = { kind: 'image', name: file.name, image, identity: await fingerprintFile(file) };
+        if (reconnect) reattach(nextSource);
+        else replaceSource(nextSource);
       } catch (e) {
         setStatus(e.message, true);
       } finally {
@@ -4631,17 +5019,99 @@
       }
     }
 
-    openImage.onclick = () => upload.click();
+    openImage.onclick = () => { relinkingImage = false; upload.click(); };
     upload.onchange = () => {
       const file = upload.files?.[0];
       upload.value = '';
-      importImage(file);
+      importImage(file, relinkingImage);
+      relinkingImage = false;
     };
-    openPDF.onclick = () => {
+    function openPDFPicker(reconnect = false, bookmark = '') {
       pendingPDF = crypto.randomUUID();
+      relinkingPDF = reconnect;
       update();
-      shellPost({ type: 'scanOpenPDF', requestId: pendingPDF });
+      return new Promise(resolve => {
+        pdfOpened = resolve;
+        shellPost({ type: bookmark ? 'scanRestorePDF' : 'scanOpenPDF', requestId: pendingPDF, bookmark });
+      });
+    }
+    openPDF.onclick = () => openPDFPicker();
+    batchOpen.onclick = () => {
+      pendingBatch = crypto.randomUUID();
+      update();
+      shellPost({ type: 'scanBatchOpen', requestId: pendingBatch });
     };
+    window.dubheScanBatchReady = async message => {
+      if (message.requestId !== pendingBatch) return;
+      pendingBatch = null;
+      const files = Array.isArray(message.files) ? message.files : [];
+      if (message.cancelled || !files.length) {
+        if (!message.cancelled) setStatus(message.error || '没有可打开的 PDF。', true);
+        update();
+        return;
+      }
+      batch = { current: 0, total: files.length, stopped: false };
+      update();
+      const tasks = files.map(file => ({ id: crypto.randomUUID(), kind: 'scan',
+        title: file.name.slice(0, 100), payload: { source: file, mode: 'document',
+          first: 1, last: file.pageCount, detail: '', results: [], page: 1, preferText: true } }));
+      batch.ids = new Set(tasks.map(task => task.id));
+      let done = 0;
+      try {
+        for (const task of tasks) await vpost('/api/tasks', { upsert: task });
+        for (const task of tasks) {
+          if (batch.stopped) break;
+          batch.current++;
+          update();
+          const opened = await restoreTask(task, true);
+          if (batch.stopped) break;
+          if (!opened) continue;
+          await run.onclick();
+          if (work?.results.size === task.payload.last) done++;
+        }
+        const unavailable = Array.isArray(message.unavailable) ? message.unavailable.length : 0;
+        setStatus('批量已完成 ' + done + ' / ' + tasks.length + ' 份' +
+          (unavailable ? ' · ' + unavailable + ' 份无法打开' : '') +
+          (done < tasks.length ? ' · 可在「最近任务」继续' : ' · 结果已存入「最近任务」'));
+      } catch (error) {
+        setStatus('批量中断 · ' + error.message + ' · 已写入的任务在「最近任务」', true);
+      } finally {
+        batch = null;
+        update();
+      }
+    };
+    relink.onclick = () => {
+      if (isPDF()) openPDFPicker(true);
+      else { relinkingImage = true; upload.click(); }
+    };
+    function examplePage() {
+      const canvas = el('canvas');
+      canvas.width = 1100;
+      canvas.height = 740;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#f9f6ed';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#253b30';
+      ctx.font = 'bold 48px sans-serif';
+      ctx.fillText('Field notebook  ·  河流观测记录', 80, 130);
+      ctx.font = '34px sans-serif';
+      ['Station A / 07:30', 'Water level: 2.48 m', 'Water temperature: 19.6 °C',
+        'A second reading was taken after the rain.'].forEach((line, index) => {
+        ctx.fillText(line, 84, 236 + index * 86);
+      });
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#92a099';
+      for (let i = 0; i < 4; i++) {
+        ctx.beginPath();
+        ctx.moveTo(80, 262 + i * 86);
+        ctx.lineTo(1020, 262 + i * 86);
+        ctx.stroke();
+      }
+      return canvas.toDataURL('image/jpeg', 0.93);
+    }
+    sample.onclick = () => replaceSource({
+      kind: 'image', name: '试用示例 · 河流观测记录', example: true, image: examplePage(),
+    });
     clear.onclick = () => replaceSource(null);
     enlarge.onclick = () => {
       const dialog = el('dialog', 'scan-image-dialog');
@@ -4664,6 +5134,165 @@
     from.oninput = to.oninput = detailValue.oninput = update;
     mode.onchange = () => { detailValue.value = ''; update(); };
     showRaw.onclick = () => { raw = !raw; renderResult(); };
+
+    review.onclick = () => {
+      const item = result();
+      if (!item || job) return;
+      const reviewedPage = page;
+      const dialog = el('dialog', 'scan-review-dialog');
+      const header = el('header', 'scan-card-head');
+      const title = el('h3', '', isPDF() ? '校对第 ' + page + ' 页' : '校对识别结果');
+      const close = el('button', 'vbtn', '关闭');
+      close.onclick = () => dialog.close();
+      header.append(title, close);
+      const columns = el('div', 'scan-review-columns');
+      const original = el('div', 'scan-review-original');
+      const editor = el('div', 'scan-review-editor');
+      const draft = el('textarea', 'field');
+      draft.setAttribute('aria-label', '本页校对稿');
+      draft.value = item.text;
+      const actions = el('div', 'scan-tools');
+      const save = el('button', 'vbtn pri', '保存本页');
+      const status = el('p', 'vmeta');
+      status.setAttribute('role', 'status');
+      actions.append(save);
+      editor.append(el('h4', '', '校对稿'), draft, actions, status);
+      const controller = new AbortController();
+      dialog.addEventListener('close', () => {
+        controller.abort();
+        dialog.remove();
+        // Keep the keyboard user's place when editing finishes.
+        review.focus();
+      }, { once: true });
+
+      if (raster) {
+        const frame = el('div', 'scan-region-frame');
+        const preview = el('img');
+        preview.src = raster;
+        preview.alt = '当前页原件。可拖动选择需要重扫的区域。';
+        preview.draggable = false;
+        const box = el('span', 'scan-region-box');
+        box.hidden = true;
+        const reScan = el('button', 'vbtn', '识别选区');
+        reScan.disabled = true;
+        let anchor, selection, activePointer;
+        function point(event) {
+          const bounds = preview.getBoundingClientRect();
+          return {
+            x: Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width)),
+            y: Math.min(1, Math.max(0, (event.clientY - bounds.top) / bounds.height)),
+          };
+        }
+        function updateBox(point) {
+          const x = Math.min(anchor.x, point.x);
+          const y = Math.min(anchor.y, point.y);
+          const width = Math.abs(anchor.x - point.x);
+          const height = Math.abs(anchor.y - point.y);
+          selection = { x, y, width, height };
+          Object.assign(box.style, { left: x * 100 + '%', top: y * 100 + '%',
+            width: width * 100 + '%', height: height * 100 + '%' });
+          box.hidden = false;
+          reScan.disabled = !catalog?.installed || !catalog.runtime_available ||
+            width * preview.naturalWidth < 12 || height * preview.naturalHeight < 12;
+        }
+        frame.onpointerdown = event => {
+          if (event.button !== 0 || !preview.naturalWidth || activePointer !== undefined) return;
+          activePointer = event.pointerId;
+          frame.setPointerCapture(activePointer);
+          anchor = point(event);
+          updateBox(anchor);
+        };
+        frame.onpointermove = event => { if (event.pointerId === activePointer) updateBox(point(event)); };
+        frame.onpointerup = event => {
+          if (event.pointerId !== activePointer) return;
+          updateBox(point(event));
+          activePointer = undefined;
+        };
+        frame.onpointercancel = () => {
+          activePointer = selection = undefined;
+          box.hidden = true;
+          reScan.disabled = true;
+        };
+        frame.append(preview, box);
+        const regionResult = el('textarea', 'field scan-region-result');
+        regionResult.placeholder = '所选区域的结果会显示在这里';
+        regionResult.setAttribute('aria-label', '选区识别结果');
+        const insert = el('button', 'vbtn ghost', '插入校对稿');
+        insert.disabled = true;
+        insert.onclick = () => {
+          draft.setRangeText(regionResult.value, draft.selectionStart, draft.selectionEnd, 'end');
+          draft.focus();
+        };
+        const regionMode = el('select', 'vsel');
+        regionMode.setAttribute('aria-label', '选区识别方式');
+        for (const [value, label] of [['text', '文字'], ['table', '表格'], ['formula', '公式']]) {
+          const option = el('option', '', label);
+          option.value = value;
+          regionMode.appendChild(option);
+        }
+        if (['formula', 'table'].includes(work.mode)) regionMode.value = work.mode;
+        reScan.onclick = async () => {
+          if (!selection || reScan.disabled) return;
+          const canvas = el('canvas');
+          const { x, y, width, height } = selection;
+          const sw = width * preview.naturalWidth;
+          const sh = height * preview.naturalHeight;
+          canvas.width = Math.max(1, Math.round(sw));
+          canvas.height = Math.max(1, Math.round(sh));
+          canvas.getContext('2d', { alpha: false }).drawImage(preview, x * preview.naturalWidth,
+            y * preview.naturalHeight, sw, sh, 0, 0, canvas.width, canvas.height);
+          reScan.disabled = true;
+          frame.style.pointerEvents = 'none';
+          insert.disabled = true;
+          status.textContent = '正在识别所选区域…';
+          try {
+            const image = canvas.toDataURL('image/jpeg', 0.94);
+            const reply = await vpost('/api/scan', { image, mode: regionMode.value }, controller.signal);
+            if (!reply.text?.trim()) throw new Error('没有识别到文字。');
+            regionResult.value = reply.text;
+            insert.disabled = false;
+            status.textContent = '选区已识别。核对后可插入或手动修改校对稿。';
+          } catch (e) {
+            if (!controller.signal.aborted) status.textContent = '选区识别失败 · ' + e.message;
+          } finally {
+            frame.style.pointerEvents = '';
+            reScan.disabled = false;
+          }
+        };
+        const regionActions = el('div', 'scan-tools');
+        regionActions.append(regionMode, reScan, insert);
+        original.append(el('h4', '', '原页'), frame, el('p', 'vmeta', '从原页拖出一个矩形，可识别这块区域。'),
+          regionActions, regionResult);
+      } else {
+        original.append(vEmpty('原件尚未打开', '关闭校对后，重新选择原件可以对照原页。'));
+      }
+      save.onclick = async () => {
+        const text = draft.value.trim();
+        if (!text) { status.textContent = '校对稿不能留空。'; return; }
+        if (item.kind === 'json') {
+          try {
+            const value = JSON.parse(text);
+            if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error();
+          } catch (e) {
+            status.textContent = '请保留 JSON 对象格式。';
+            return;
+          }
+        }
+        save.disabled = true;
+        close.disabled = true;
+        work.results.set(reviewedPage, { ...item, text });
+        await checkpoint();
+        renderResult();
+        dialog.close();
+        setStatus('已更新本页校对稿。');
+      };
+      dialog.addEventListener('cancel', event => { if (save.disabled) event.preventDefault(); });
+      columns.append(original, editor);
+      dialog.append(header, columns);
+      dialog.setAttribute('aria-label', title.textContent);
+      document.body.appendChild(dialog);
+      dialog.showModal();
+    };
 
     async function refreshModels() {
       clearTimeout(poll);
@@ -4720,13 +5349,67 @@
     };
     recheck.onclick = () => { modelError = ''; refreshModels(); };
 
+    async function checkpoint() {
+      if (!work || !taskId || !source) return;
+      const { kind, name, pageCount, bookmark, identity, example } = source;
+      await saveLocalTask('scan', taskId, name, {
+        source: { kind, name, pageCount: pageCount ?? 1, bookmark: bookmark || '',
+          identity: identity || '', example: !!example },
+        mode: work.mode, first: work.first, last: work.last, detail: work.detail, preferText: work.preferText,
+        results: [...work.results.entries()], page,
+      }, savedStatus);
+    }
+
+    function reattach(file) {
+      if (!source || file.kind !== source.kind ||
+          file.identity !== source.identity || (file.pageCount ?? 1) !== (source.pageCount ?? 1)) {
+        if (file.requestId) shellPost({ type: 'scanClosePDF', requestId: file.requestId });
+        setStatus('这份原件与已保存的任务不同。请重新选择。', true);
+        return false;
+      }
+      source = file;
+      if (work) work.source = file;
+      lastPdfImage = null;
+      setStatus('已重新打开原件');
+      showPage(page);
+      return true;
+    }
+
+    function restoreTask(task, fromBatch = false) {
+      if (job || pendingPDF || pendingSave || loadingImage || ((batch || pendingBatch) && !fromBatch)) {
+        setStatus('请先完成或停止当前操作。');
+        return;
+      }
+      const data = task?.payload;
+      if (!data?.source || !Array.isArray(data.results)) {
+        setStatus('找不到这个扫描任务的记录。', true);
+        return;
+      }
+      const file = { ...data.source };
+      if (file.example) file.image = examplePage();
+      replaceSource(file);
+      mode.value = data.mode;
+      nativeText.checked = data.preferText ?? true;
+      detailValue.value = data.detail;
+      from.value = data.first;
+      to.value = data.last;
+      taskId = task.id;
+      work = { source: file, mode: data.mode, first: data.first, last: data.last,
+        detail: data.detail, preferText: data.preferText ?? false, results: new Map(data.results) };
+      savedStatus.textContent = '已从本机恢复';
+      showPage(Math.min(file.pageCount, Math.max(1, data.page || 1)));
+      if (isPDF() && native() && file.bookmark) return openPDFPicker(true, file.bookmark);
+      return originalReady();
+    }
+
     stop.onclick = () => {
+      if (batch) batch.stopped = true;
       job?.abort();
       update();
     };
     run.onclick = async () => {
       const s = selection();
-      if (!validRange(s) || !source || !catalog?.installed) return;
+      if (!validRange(s) || !originalReady() || (!s.preferText && !catalog?.installed)) return;
       const fields = s.mode === 'extract'
         ? [...new Set(s.detail.split(/[,，、\n]/).map(field => field.trim()).filter(Boolean))] : [];
       const bytes = value => new TextEncoder().encode(value).length;
@@ -4738,11 +5421,15 @@
         setStatus('问题过长，请缩短后重试。', true);
         return;
       }
-      if (!canContinue(s)) work = { ...s, source, results: new Map() };
+      if (!canContinue(s)) {
+        work = { ...s, source, results: new Map() };
+        taskId = crypto.randomUUID();
+      }
       job = new AbortController();
       const signal = job.signal;
       let current = s.first;
       try {
+        await checkpoint();
         for (; current <= s.last; current++) {
           if (work.results.has(current)) continue;
           page = current;
@@ -4758,13 +5445,21 @@
           const payload = { mode: s.mode, image: data };
           if (s.mode === 'extract') payload.fields = fields;
           if (s.mode === 'ask') payload.question = s.detail;
-          const item = await vpost('/api/scan', payload, signal);
+          // Ordinary text PDFs need no OCR inference. Keep scanned pages and PDFs with only
+          // a few selectable marks on the image recognition path.
+          const selectable = s.preferText && lastPdfImage?.page === current && lastPdfText;
+          const hasText = selectable && (selectable.match(/[\p{L}\p{N}]/gu)?.length ?? 0) >= 20;
+          if (!hasText && (!catalog?.installed || !catalog.runtime_available)) {
+            throw new Error('本页是扫描图片。下载扫描模型后可从此页继续。');
+          }
+          const item = hasText ? { kind: 'markdown', text: selectable } : await vpost('/api/scan', payload, signal);
           signal.throwIfAborted();
           if (typeof item.text !== 'string' || !item.text.trim() || !Object.hasOwn(SCAN_FORMATS, item.kind)) {
             throw new Error('没有取得有效的识别结果。');
           }
           work.results.set(current, item);
           renderResult();
+          await checkpoint();
         }
         setStatus(isPDF() ? '识别完成 · ' + work.results.size + ' 页' : '识别完成');
       } catch (e) {
@@ -4778,7 +5473,7 @@
     };
 
     function allResults() {
-      const results = [...work.results.entries()];
+      const results = [...work.results.entries()].sort((a, b) => a[0] - b[0]);
       const firstKind = results[0][1].kind;
       const format = SCAN_FORMATS[firstKind];
       let text = results[0][1].text;
@@ -4791,7 +5486,7 @@
         ).join('\n\n');
       }
       const name = source.name.replace(/\.[^.]+$/, '') + '-扫描结果';
-      return { format, name, text };
+      return { format, name, text, results };
     }
 
     copy.onclick = async () => {
@@ -4824,13 +5519,43 @@
       }
     };
     translate.onclick = () => {
-      const { name, text } = allResults();
+      const { name, text, results } = allResults();
       openView('translate');
-      translationPane.acceptScan(text, name);
+      const origin = isPDF() && source.bookmark ? { bookmark: source.bookmark, identity: source.identity } : null;
+      translationPane.acceptScan(text, name, results, origin);
+    };
+
+    question.onclick = async () => {
+      if (!state.server?.loaded) {
+        setStatus('请先在模型页加载对话模型。');
+        return;
+      }
+      const { name, results } = allResults();
+      const context = state.server?.info?.n_ctx || 4096;
+      const budget = Math.max(800, Math.min(12_000, Math.floor(context / 2)));
+      const limit = Math.max(120, Math.floor(budget / results.length) - 48);
+      let excerpt = '';
+      let included = 0;
+      for (const [number, item] of results) {
+        const section = '[第 ' + number + ' 页]\n' + item.text.slice(0, limit)
+          + (item.text.length > limit ? '\n（本页节选）' : '') + '\n\n';
+        if (excerpt.length + section.length > budget) break;
+        excerpt += section;
+        included++;
+      }
+      closeView();
+      newConv();
+      const input = $('#input');
+      input.value = '请只根据附件回答。能找到依据时标明原页码，找不到时说明附件未提供。\n我的问题：';
+      input.dispatchEvent(new Event('input'));
+      input.focus();
+      if (included < results.length) excerpt += '（附件只包括前 ' + included + ' 个已识别页。）';
+      await attachFile(new File([excerpt], name + '-页码摘录.txt', { type: 'text/plain' }), draftFor());
     };
 
     renderResult();
-    return { body, refreshModels, importImage };
+    return { body, refreshModels, importImage, restoreTask,
+      usesTask: id => id === taskId && !!job || Boolean(batch?.ids?.has(id)) };
   }
 
   // ---------------------------------------------------------------- 工具
@@ -5439,9 +6164,15 @@
       else takeFile(file);
     });
 
-    document.querySelectorAll('.chip').forEach((c) => {
-      c.onclick = () => send(c.dataset.p);
-    });
+    $('#tryChat').onclick = () => {
+      if (!state.server?.loaded) { openView('models'); return; }
+      const input = $('#input');
+      input.value = '用两句话介绍一个适合初学者的观测或读书方法。';
+      input.dispatchEvent(new Event('input'));
+      input.focus();
+    };
+    $('#tryTranslation').onclick = () => openView('translate');
+    $('#tryScan').onclick = () => openView('scan');
 
     // 左栏导航：功能视图盖在对话区上，切回来时
     // 滚动位置和草稿都还在。

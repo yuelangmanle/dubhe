@@ -62,9 +62,16 @@ mac_name="Dubhe-$version-macOS-arm64.dmg"
 android_name="Dubhe-$version-Android-arm64.apk"
 mac="$output/$mac_name"
 android="$output/$android_name"
-make -j 4 BUILD=build/verify-release dmg
+if [[ -n "${DUBHE_NOTARY_PROFILE:-}" ]]; then
+  make -j 4 BUILD=build/verify-release MACOS_APP_ARGS=--notarize dmg
+else
+  make -j 4 BUILD=build/verify-release dmg
+fi
 hdiutil verify -quiet build/verify-release/Dubhe.dmg
 /usr/bin/codesign --verify --deep --strict build/verify-release/Dubhe.app
+if [[ -n "${DUBHE_NOTARY_PROFILE:-}" ]]; then
+  xcrun stapler validate build/verify-release/Dubhe.dmg
+fi
 cp build/verify-release/Dubhe.dmg "$mac"
 ./apps/android/gradlew -p apps/android :app:assembleRelease
 "$android_tools/apksigner" sign --ks "$signing/android-release.p12" --ks-key-alias dubhe-release \
@@ -84,25 +91,45 @@ cmp CHANGELOG.md build/verify-release/Dubhe.app/Contents/Resources/CHANGELOG.md
 printf '%s\n' "$mac" "$android"
 
 if [[ "$mode" == publish ]]; then
+  retry() {
+    local attempt
+    for attempt in 1 2 3; do
+      if "$@"; then return 0; fi
+      if [[ "$attempt" != 3 ]]; then sleep "$attempt"; fi
+    done
+    return 1
+  }
+
+  draft() {
+    if ! gh release view "$tag" --repo "$repo" --json isDraft --jq .isDraft; then
+      gh release create "$tag" --repo "$repo" --verify-tag --draft --title "Dubhe $version" --notes-file "$notes" >&2 || return 1
+      gh release view "$tag" --repo "$repo" --json isDraft --jq .isDraft
+    fi
+  }
+
+  upload_verified() {
+    local file=$1 name=${1##*/} remote expected
+    expected="sha256:$(shasum -a 256 "$file" | awk '{print $1}')"
+    remote=$(gh release view "$tag" --repo "$repo" --json assets \
+      --jq ".assets[] | select(.name == \"$name\" and .state == \"uploaded\") | .digest") || return 1
+    if [[ "$remote" == "$expected" ]]; then return 0; fi
+    gh release upload "$tag" --repo "$repo" --clobber "$file" || return 1
+    remote=$(gh release view "$tag" --repo "$repo" --json assets \
+      --jq ".assets[] | select(.name == \"$name\" and .state == \"uploaded\") | .digest") || return 1
+    [[ "$remote" == "$expected" ]]
+  }
+
   if git show-ref --verify --quiet "refs/tags/$tag"; then
     [[ "$(git rev-parse "$tag^{commit}")" == "$(git rev-parse HEAD)" ]]
   else
     git tag -a "$tag" -m "Dubhe $version"
   fi
-  git push --atomic origin HEAD:refs/heads/main "refs/tags/$tag"
-  if draft=$(gh release view "$tag" --repo "$repo" --json isDraft --jq .isDraft 2>/dev/null); then
-    if [[ "$draft" != true ]]; then
-      echo "$tag 已发布，请提升版本号后再发布。" >&2
-      exit 2
-    fi
-  else
-    gh release create "$tag" --repo "$repo" --verify-tag --draft --title "Dubhe $version" --notes-file "$notes"
+  retry git push --atomic origin HEAD:refs/heads/main "refs/tags/$tag"
+  if [[ "$(retry draft)" != true ]]; then
+    echo "无法打开 $tag 发布草稿。已发布的版本请提升版本号后再发布。" >&2
+    exit 2
   fi
-  gh release upload "$tag" --repo "$repo" --clobber "$mac" "$android"
-  assets=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name')
-  if [[ "$assets" != *"$mac_name"* || "$assets" != *"$android_name"* ]]; then
-    echo "GitHub 草稿中缺少安装包，请重试。" >&2
-    exit 1
-  fi
-  gh release edit "$tag" --repo "$repo" --draft=false --latest
+  retry upload_verified "$mac"
+  retry upload_verified "$android"
+  retry gh release edit "$tag" --repo "$repo" --draft=false --latest
 fi

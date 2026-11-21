@@ -8,6 +8,9 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/wait.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -34,55 +37,12 @@ struct Entry {
     const char* sha256;
     const char* translation = nullptr;
     bool scan = false;
+    bool recommended = false;
 };
 
 // 文件固定到发布方的 Git revision。size 和 SHA-256 来自对应文件的 LFS 元数据。
 inline constexpr Entry catalog[] = {
-    {"qwen35-9b-q4", "Qwen3.5-9B Instruct", "9B", "Q4_K_M", 5680522464LL,
-     "Qwen3.5-9B-Q4_K_M.gguf",
-     "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/"
-     "3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-Q4_K_M.gguf",
-     "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8"},
-    {"qwen35-4b-q4", "Qwen3.5-4B Instruct", "4B", "Q4_K_M", 2740937888LL,
-     "Qwen3.5-4B-Q4_K_M.gguf",
-     "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/"
-     "e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
-     "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"},
-    {"lfm25-26b-q4", "LFM2.5-2.6B", "2.6B", "Q4_K_M", 1674455040LL,
-     "LFM2.5-2.6B-Q4_K_M.gguf",
-     "https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF/resolve/"
-     "e7caca5d835a3901a8e0d63e94009429bafafdfc/LFM2.5-2.6B-Q4_K_M.gguf",
-     "02a8b7e17487d326e46d68ce0ba24211e1b80a14c4cd0597fa73c1cd697f52ed"},
-    {"lfm25-12b-q4", "LFM2.5-1.2B Instruct", "1.2B", "Q4_K_M", 730895168LL,
-     "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
-     "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/"
-     "8ed288026e23958ad9dfa92d53ed773a8eee7125/LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
-     "b1b3de114215d9507409a662a501a631095a479a419584e8a2ded6304b19b4f5"},
-    {"qwen38-27b-q4", "Qwen3.8-27B", "27B", "UD-Q4_K_M", 16564259744LL,
-     "Qwen3.8-27B-UD-Q4_K_M.gguf",
-     "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/"
-     "4af51b3542f775b0a8e4b310bfb3f17e01c306c9/Qwen3.8-27B-UD-Q4_K_M.gguf",
-     "1bce504dfecd84153666928a41d8a66706f0158d3a317bc5196b72819d7dc529"},
-    {"hy-mt2-18b-q4", "Hy-MT2 1.8B · 混元翻译", "1.8B", "Q4_K_M", 1133080448LL,
-     "Hy-MT2-1.8B-Q4_K_M.gguf",
-     "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/"
-     "a0c709d9fac510f2c807aa3af52872340dc37a4a/Hy-MT2-1.8B-Q4_K_M.gguf",
-     "dc5f44fcf1fa496ee7ad725982c0c8c553a4de00259b53af84c4b89fb0c06699", "hy"},
-    {"index-translate-2b-q4", "Index-Translate 2B · B 站翻译", "2B", "Q4_K_M", 1312164352LL,
-     "Index-Translate-2B.Q4_K_M.gguf",
-     "https://huggingface.co/IndexTeam/Index-Translate-2B-GGUF/resolve/"
-     "3a0eca6ce931d88d00614d427ab3ed8ff0743902/Index-Translate-2B.Q4_K_M.gguf",
-     "044b313d29342bd3b2c77cbb64023ca0d209bd9b3247763f9d162767ef2d746a", "index"},
-    {"xiaomi-ocr-0-q4", "Xiaomi-OCR-0 模型", "0.8B", "Q4_K_M", 529297664LL,
-     "Xiaomi-OCR-0.Q4_K_M.gguf",
-     "https://huggingface.co/prithivMLmods/Xiaomi-OCR-0-GGUF/resolve/"
-     "7bbfa072e0f3d70ac722e26fbccef5b9f64b7121/Xiaomi-OCR-0.Q4_K_M.gguf",
-     "1e497ff06b91a3d822c543066df3e9ef69c62c5423be09d739dfa1db55630d3a", nullptr, true},
-    {"xiaomi-ocr-0-vision", "Xiaomi-OCR-0 视觉组件", "", "BF16", 207346624LL,
-     "Xiaomi-OCR-0.mmproj-bf16.gguf",
-     "https://huggingface.co/prithivMLmods/Xiaomi-OCR-0-GGUF/resolve/"
-     "7bbfa072e0f3d70ac722e26fbccef5b9f64b7121/Xiaomi-OCR-0.mmproj-bf16.gguf",
-     "634d6bc95781ebf4a3f06570a59859fa5082d488db540fd474bc6b4061aec90e", nullptr, true},
+#include "model_catalog.inc"
 };
 
 inline const Entry* translation_file(std::string_view filename) {
@@ -119,6 +79,17 @@ inline bool normalize_mirror(std::string* mirror) {
            mirror->find_first_of("/\\?#@ \r\n\t", prefix) == std::string::npos;
 }
 
+inline double physical_memory_bytes() {
+#if defined(__APPLE__)
+    uint64_t memory = 0;
+    size_t bytes = sizeof(memory);
+    return sysctlbyname("hw.memsize", &memory, &bytes, nullptr, 0) == 0 ? static_cast<double>(memory) : 0;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page_size > 0 ? static_cast<double>(pages) * page_size : 0;
+#endif
+}
+
 class Downloads {
 public:
     Downloads(std::string models, std::string config, std::span<const Entry> entries = catalog)
@@ -150,6 +121,7 @@ public:
         root.set("dir", json::Value::make_str(models_));
         root.set("mirror", json::Value::make_str(mirror()));
         json::Value items = json::Value::make_arr();
+        double partial_bytes = 0;
         std::lock_guard<std::mutex> lock(mu_);
         for (const auto& entry : entries_) {
             const std::string path = models_ + "/" + entry.file;
@@ -171,6 +143,8 @@ public:
             item.set("quant", json::Value::make_str(entry.quant));
             item.set("translation", json::Value::make_bool(entry.translation != nullptr));
             item.set("scan", json::Value::make_bool(entry.scan));
+            item.set("recommended", json::Value::make_bool(entry.recommended));
+            item.set("url", json::Value::make_str(entry.url));
             item.set("note", json::Value::make_str(entry.translation ? "离线翻译 · 在翻译页使用" :
                 entry.scan ? "离线识别 · 在扫描页使用" :
                 entry.bytes > 16000000000LL ? "权重较大，请预留内存给上下文" : "安装前检查文件完整性"));
@@ -179,9 +153,12 @@ public:
             item.set("got", json::Value::make_num((double)(installed ? entry.bytes : partial)));
             item.set("installed", json::Value::make_bool(installed));
             item.set("state", json::Value::make_str(state));
+            item.set("can_clear_partial", json::Value::make_bool(partial > 0 && !active(state)));
+            partial_bytes += static_cast<double>(partial);
             items.arr.push_back(std::move(item));
         }
         root.set("items", std::move(items));
+        root.set("storage", storage_status(partial_bytes));
         return root;
     }
 
@@ -248,7 +225,64 @@ public:
         return found == jobs_.end() ? "idle" : cancel_job(*found->second);
     }
 
+    Reply clear_partial(const std::string& id) {
+        const auto entry = std::find_if(entries_.begin(), entries_.end(),
+            [&](const Entry& candidate) { return id == candidate.id; });
+        if (entry == entries_.end()) return {400, "", "没有这个模型"};
+        std::lock_guard<std::mutex> lock(mu_);
+        auto job = jobs_.find(id);
+        if (job != jobs_.end()) {
+            {
+                std::lock_guard<std::mutex> job_lock(job->second->mu);
+                if (active(job->second->state)) return {409, job->second->state, "请先停止下载"};
+            }
+            if (job->second->worker.joinable()) job->second->worker.join();
+        }
+        const std::string part = models_ + "/" + entry->file + ".part";
+        if (file_size(part) >= 0) {
+            storage::FileLock file_lock(part + ".lock", LOCK_EX | LOCK_NB);
+            if (!file_lock) return {409, "", "另一 Dubhe 进程可能正在下载此模型"};
+            if (unlink(part.c_str()) != 0 && errno != ENOENT) return {507, "", "无法删除未完成的下载"};
+        }
+        if (job != jobs_.end()) jobs_.erase(job);
+        return {200, "idle", ""};
+    }
+
 private:
+    static bool active(std::string_view state) {
+        return state == "running" || state == "verifying" || state == "cancelling";
+    }
+
+    json::Value storage_status(double partial_bytes) const {
+        double installed_bytes = 0;
+        std::error_code ec;
+        const std::filesystem::recursive_directory_iterator end;
+        for (std::filesystem::recursive_directory_iterator pos(
+                models_, std::filesystem::directory_options::skip_permission_denied, ec);
+             !ec && pos != end; pos.increment(ec)) {
+            const auto& entry = *pos;
+            const auto extension = entry.path().extension().string();
+            if (extension != ".gguf" && extension != ".safetensors" && extension != ".npz" && extension != ".bin")
+                continue;
+            const auto bytes = file_size(entry.path().string());
+            if (bytes > 0) installed_bytes += static_cast<double>(bytes);
+        }
+        double free_bytes = 0;
+        for (auto dir = std::filesystem::path(models_); !dir.empty();) {
+            const auto space = std::filesystem::space(dir, ec);
+            if (!ec) { free_bytes = static_cast<double>(space.available); break; }
+            const auto parent = dir.parent_path();
+            if (parent == dir) break;
+            dir = parent;
+        }
+        auto info = json::Value::make_obj();
+        info.set("free_bytes", json::Value::make_num(free_bytes));
+        info.set("installed_bytes", json::Value::make_num(installed_bytes));
+        info.set("partial_bytes", json::Value::make_num(partial_bytes));
+        info.set("memory_bytes", json::Value::make_num(physical_memory_bytes()));
+        return info;
+    }
+
     struct Job {
         std::mutex mu;
         std::string state = "running";

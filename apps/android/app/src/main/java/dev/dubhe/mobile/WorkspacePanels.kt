@@ -30,10 +30,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import android.text.format.Formatter
 import java.util.Locale
 
 @Composable
@@ -41,6 +43,8 @@ internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importPr
     val state = chat.state
     val idle = state.activity == Activity.Idle
     val links = LocalUriHandler.current
+    val context = LocalContext.current
+    val freeMemory = availableMemory()
     var selectedShop by rememberSaveable { mutableStateOf<Boolean?>(null) }
     val shop = selectedShop ?: state.models.isEmpty()
     var deleting by remember { mutableStateOf<LocalModel?>(null) }
@@ -90,7 +94,8 @@ internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importPr
                 } else {
                     String.format(Locale.CHINA, "%.2f GB", item.bytes / 1_000_000_000.0)
                 }
-                ModelCard(item.name, item.description + " · " + size, if (item.translation) Glyph.Translate else Glyph.Model) {
+                val fit = if (freeMemory > 0 && item.bytes >= freeMemory) " · 当前内存较紧" else ""
+                ModelCard(item.name, item.description + " · " + size + fit, if (item.translation) Glyph.Translate else Glyph.Model) {
                     when {
                         installed -> Text(
                             "已下载", Modifier.padding(end = 7.dp),
@@ -112,6 +117,10 @@ internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importPr
                     )
                 }
             }
+            if (freeMemory > 0) Text(
+                "此刻可用内存 ${Formatter.formatShortFileSize(context, freeMemory)}。运行模型还需要额外内存。",
+                color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall,
+            )
         } else {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -128,9 +137,10 @@ internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importPr
             for (model in state.models) {
                 val translationModel = model.catalog?.translation == true
                 val active = state.activeModel?.file == model.file
+                val size = Formatter.formatShortFileSize(context, model.file.length())
                 ModelCard(
                     model.catalog?.name ?: model.name,
-                    if (active) "正在使用" else if (translationModel) "专用翻译" else "本地 GGUF",
+                    (if (active) "正在使用" else if (translationModel) "专用翻译" else "本地 GGUF") + " · " + size,
                     if (translationModel) Glyph.Translate else Glyph.Model,
                 ) {
                     TextButton(
@@ -194,7 +204,7 @@ internal fun SectionTitle(text: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-internal fun SettingsScreen(state: ChatState, checkUpdates: () -> Unit, showChangelog: () -> Unit) {
+internal fun SettingsScreen(state: ChatState, checkUpdates: () -> Unit, showChangelog: () -> Unit, openTasks: () -> Unit) {
     Column(
         Modifier.verticalScroll(rememberScrollState()).padding(bottom = 20.dp),
         verticalArrangement = Arrangement.spacedBy(13.dp),
@@ -214,6 +224,9 @@ internal fun SettingsScreen(state: ChatState, checkUpdates: () -> Unit, showChan
                     Button(checkUpdates) { Text("检查更新") }
                 }
             }
+        }
+        ModelCard("任务与存储", "最近翻译、扫描结果和模型占用", Glyph.History) {
+            TextButton(openTasks) { Text("打开") }
         }
         SectionTitle("运行状态", Modifier.padding(start = 3.dp, top = 6.dp))
         ModelCard(

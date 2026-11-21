@@ -48,6 +48,7 @@ internal data class ChatState(
     val models: List<LocalModel> = emptyList(),
     val partialDownloads: Set<String> = emptySet(),
     val downloading: String? = null,
+    val modelStorage: ModelStorage? = null,
 )
 
 internal class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -57,9 +58,19 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         private set
     var conversations by mutableStateOf(Conversations())
         private set
+    var translationTasks by mutableStateOf(emptyList<TranslationTask>())
+        private set
+    var translationTask by mutableStateOf<TranslationTask?>(null)
+        private set
+    var scanText by mutableStateOf("")
+        private set
+    var hasSavedScan by mutableStateOf(false)
+        private set
 
     private val store = ModelStore(application)
     private val historyStore = ConversationStore(application)
+    private val translationStore = TranslationTaskStore(application)
+    private val translationPrefs = application.getSharedPreferences("dubhe-translation", Context.MODE_PRIVATE)
     private val historyIO = Dispatchers.IO.limitedParallelism(1)
     private val responses = Messenger(Handler(Looper.getMainLooper(), ::receive))
     private var engine: Messenger? = null
@@ -111,6 +122,11 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             } catch (_: Exception) {
                 showError("无法读取本地对话历史。")
             }
+            withContext(Dispatchers.IO) { translationStore.list() }.let { translationTasks = it }
+            scanText = withContext(Dispatchers.IO) { translationStore.readScan() }
+            hasSavedScan = scanText.isNotEmpty()
+            val terms = withContext(Dispatchers.IO) { translationPrefs.getString("glossary", "").orEmpty() }
+            translation = translation.copy(glossary = terms)
             bind()
         }
     }
@@ -132,13 +148,22 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
-    fun downloadModel(item: CatalogModel) {
+    fun downloadModel(item: CatalogModel, loadAfter: Boolean = false) {
         if (!state.connected || state.activity != Activity.Idle) return
         state = state.copy(downloading = item.file)
         importFile("正在下载 ${item.name}") { update ->
-            store.download(item) { update(it) }
-            state = state.copy(activity = Activity.Idle, progress = null, status = "模型已下载")
+            val model = store.download(item) { update(it) }
+            if (loadAfter && !item.translation) load(ModelRequest(ModelSlot.Language, model, saveSelection = true))
+            else state = state.copy(activity = Activity.Idle, progress = null, status = "模型已下载")
         }
+    }
+
+    fun prepareLightChat() {
+        if (state.activity != Activity.Idle) return
+        val installed = state.models.filter { it.catalog?.translation != true }.minByOrNull { it.file.length() }
+        val suggested = recommendedChatModel()
+        if (installed != null) selectModel(installed)
+        else if (suggested != null) downloadModel(suggested, loadAfter = true)
     }
 
     fun selectModel(model: LocalModel) {
@@ -172,7 +197,15 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     private fun refreshLibrary() {
-        state = state.copy(models = store.library(), partialDownloads = store.partials())
+        state = state.copy(models = store.library(), partialDownloads = store.partials(), modelStorage = store.storage())
+    }
+
+    fun clearPartialDownloads() {
+        importFile("正在清理未完成的下载") {
+            store.clearPartialDownloads()
+            refreshLibrary()
+            state = state.copy(activity = Activity.Idle, status = "已清理未完成的下载")
+        }
     }
 
     fun importAttachment(uri: Uri) {
@@ -311,7 +344,11 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun updateTranslation(update: (TranslationState) -> TranslationState) {
         if (state.activity == Activity.Translating) return
-        translation = update(translation)
+        val next = update(translation)
+        if (next.copy(result = "") != translation.copy(result = "")) {
+            translationTask = null
+            translation = next.copy(result = "")
+        }
     }
 
     fun setTranslationSource(text: String, label: String? = null) {
@@ -330,11 +367,104 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
+    fun scanImage(uri: Uri) {
+        importFile("正在本机识别图片") {
+            val text = readTranslationInput(getApplication(), uri, image = true)
+            withContext(Dispatchers.IO) { translationStore.writeScan(text) }
+            scanText = text
+            hasSavedScan = true
+            state = state.copy(activity = Activity.Idle, status = null)
+        }
+    }
+
+    fun editScanText(text: String) {
+        if (state.activity == Activity.Idle) scanText = text.take(translationLimit)
+    }
+
+    fun saveScan() {
+        if (state.activity != Activity.Idle) return
+        val text = scanText
+        importFile("正在保存识别结果") {
+            withContext(Dispatchers.IO) { translationStore.writeScan(text) }
+            hasSavedScan = text.isNotEmpty()
+            state = state.copy(activity = Activity.Idle, status = "识别结果已保存")
+        }
+    }
+
+    fun clearScan() {
+        importFile("正在清除扫描结果") {
+            withContext(Dispatchers.IO) { translationStore.writeScan("") }
+            scanText = ""
+            hasSavedScan = false
+            state = state.copy(activity = Activity.Idle, status = null)
+        }
+    }
+
+    fun selectTranslationTask(task: TranslationTask) {
+        if (state.activity != Activity.Idle) return
+        translationTask = task
+        translation = task.input
+        state = state.copy(error = null, status = null)
+    }
+
+    fun newTranslation() {
+        if (state.activity != Activity.Idle) return
+        translationTask = null
+        translation = translation.copy(
+            source = "", result = "", inputLabel = null,
+            glossary = translationPrefs.getString("glossary", "").orEmpty(),
+        )
+        state = state.copy(error = null, status = null)
+    }
+
+    fun changeTranslationModel() {
+        if (state.activity != Activity.Idle) return
+        translationTask = null
+        translation = translation.copy(result = "")
+        state = state.copy(error = null, status = null)
+    }
+
+    fun saveTranslationGlossary(value: String): String? {
+        if (state.activity != Activity.Idle) return "请等当前任务结束后再修改术语。"
+        val normalized = value.trim()
+        return try {
+            readTranslationGlossary(normalized)
+            translationPrefs.edit().putString("glossary", normalized).apply()
+            updateTranslation { it.copy(glossary = normalized) }
+            null
+        } catch (error: IllegalArgumentException) {
+            error.message
+        }
+    }
+
+    fun deleteTranslationTask(task: TranslationTask) {
+        importFile("正在删除任务") {
+            withContext(Dispatchers.IO) { translationStore.remove(task.id) }
+            translationTasks = translationTasks.filterNot { it.id == task.id }
+            if (translationTask?.id == task.id) translationTask = null
+            state = state.copy(activity = Activity.Idle, status = null)
+        }
+    }
+
+    private fun rememberTranslationTask(task: TranslationTask) {
+        translationTask = task
+        translationTasks = listOf(task) + translationTasks.filterNot { it.id == task.id }
+        translation = task.input
+    }
+
     fun translate() {
         val input = translation
         if (state.activity != Activity.Idle || input.source.isBlank()) return
-        val dedicated = state.models.firstOrNull { it.catalog?.translation == true }
-            .takeIf { input.preferDedicated || state.activeModel == null }
+        val resumed = translationTask?.takeUnless { it.finished }
+        val dedicated = if (resumed != null) {
+            state.models.firstOrNull { resumed.dedicated && it.translationKey == resumed.modelKey }
+        } else {
+            state.models.firstOrNull { it.catalog?.translation == true }.takeIf { input.preferDedicated || state.activeModel == null }
+        }
+        if (resumed != null && (if (resumed.dedicated) dedicated == null else state.activeModel?.translationKey != resumed.modelKey)) {
+            showError("继续需要原来的模型 ${resumed.modelName}。请到模型页下载或加载它。")
+            return
+        }
         if (dedicated == null && state.activeModel == null) {
             showError("请先在模型页下载混元翻译，或加载一个对话模型。")
             return
@@ -343,14 +473,36 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             showError("请选择不同的原文和目标语言。")
             return
         }
-        translation = input.copy(result = "")
+        val model = dedicated ?: requireNotNull(state.activeModel)
+        val source = normalizeTranslationSource(input.source)
+        val task = resumed ?: TranslationTask(
+            UUID.randomUUID().toString(), input.copy(source = source, result = ""),
+            model.translationKey, model.name, dedicated != null,
+            total = translationBlocks(source).count { it.isNotBlank() },
+        )
         state = state.copy(activity = Activity.Translating, status = "正在准备翻译", progress = null, error = null, stopping = false)
-        send(EngineProtocol.Translate, Bundle().apply {
-            putString("source", input.source.trim().replace("\r\n", "\n").replace('\r', '\n'))
-            putString("from", input.from.name)
-            putString("to", input.to.name)
-            dedicated?.let { putString("modelPath", it.file.absolutePath) }
-        })
+        val endpoint = engine
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { if (resumed == null) translationStore.write(task) }
+                rememberTranslationTask(task)
+                if (engine !== endpoint || state.activity != Activity.Translating) return@launch
+                if (state.stopping) {
+                    state = state.copy(activity = Activity.Idle, stopping = false, status = "已暂停翻译")
+                    return@launch
+                }
+                send(EngineProtocol.Translate, Bundle().apply {
+                    putString("taskId", task.id)
+                    dedicated?.let { putString("modelPath", it.file.absolutePath) }
+                })
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                if (state.activity == Activity.Translating) state = state.copy(
+                    activity = Activity.Idle, stopping = false, status = null, error = "无法保存翻译任务。",
+                )
+            }
+        }
     }
 
     fun exportTranslation(uri: Uri, format: TranslationFormat, result: String) {
@@ -438,11 +590,15 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             EngineProtocol.Text -> {
                 val text = data.getString("text").orEmpty()
                 if (state.activity == Activity.Translating) {
-                    translation = translation.copy(result = translation.result + text)
-                    val total = data.getInt("total")
-                    if (!state.stopping && total > 0) {
-                        val completed = data.getInt("completed")
-                        state = state.copy(status = "已翻译 $completed / $total 段", progress = completed.toFloat() / total)
+                    val task = translationTask ?: return true
+                    val completed = data.getInt("completed")
+                    rememberTranslationTask(task.copy(
+                        input = translation.copy(result = translation.result + text),
+                        completed = completed, nextBlock = data.getInt("nextBlock"),
+                        finished = data.getBoolean("finished"), updatedAt = data.getLong("updatedAt"),
+                    ))
+                    if (!state.stopping) {
+                        state = state.copy(status = "已翻译 $completed / ${task.total} 段", progress = completed.toFloat() / task.total)
                     }
                 } else {
                     val latest = state.turns.lastOrNull() ?: return true

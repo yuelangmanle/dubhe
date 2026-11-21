@@ -147,6 +147,50 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(request(base, "/api/translate", {**job, "model": "unknown"})[0], 400)
             self.assertEqual(request(base, "/api/translate", {**job, "target": "unknown"})[0], 400)
 
+    def test_document_task_checkpoints_survive_new_engine_port(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = {"id": "paper-1", "kind": "scan", "title": "20 页论文", "payload": {"pages": {"1": "正文"}}}
+            with server(root) as base:
+                self.assertEqual(request(base, "/api/tasks"), (200, {"tasks": []}))
+                self.assertEqual(request(base, "/api/tasks", {"upsert": task})[0], 200)
+                self.assertEqual(request(base, "/api/tasks", {"upsert": {**task, "id": "../data"}})[0], 400)
+                self.assertEqual(request(base, "/api/tasks", {"upsert": task, "delete": task["id"]})[0], 400)
+            with server(root) as base:
+                status, summary = request(base, "/api/tasks")
+                self.assertEqual(status, 200)
+                self.assertEqual([item["id"] for item in summary["tasks"]], [task["id"]])
+                self.assertNotIn("payload", summary["tasks"][0])
+                status, result = request(base, "/api/tasks?id=paper-1")
+                self.assertEqual(status, 200)
+                self.assertEqual(result["task"]["payload"], task["payload"])
+                task["payload"]["pages"]["2"] = "补完第 2 页"
+                self.assertEqual(request(base, "/api/tasks", {"upsert": task})[0], 200)
+                self.assertEqual(request(base, "/api/tasks?id=paper-1")[1]["task"]["payload"], task["payload"])
+                self.assertEqual(request(base, "/api/tasks", {"delete": "paper-1"})[0], 200)
+                self.assertEqual(request(base, "/api/tasks?id=paper-1")[0], 404)
+
+    def test_storage_reports_and_clears_only_known_partial_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            folder = root / "models"
+            folder.mkdir()
+            weight = folder / "my-model.gguf"
+            part = folder / "LFM2.5-1.2B-Instruct-Q4_K_M.gguf.part"
+            weight.write_bytes(b"GGUF" + b"\0" * 20)
+            part.write_bytes(b"GGUF")
+            with server(root) as base:
+                status, catalog = request(base, "/api/store")
+                self.assertEqual(status, 200)
+                self.assertEqual(catalog["storage"]["installed_bytes"], 24)
+                self.assertEqual(catalog["storage"]["partial_bytes"], 4)
+                row = next(item for item in catalog["items"] if item["id"] == "lfm25-12b-q4")
+                self.assertTrue(row["recommended"] and row["can_clear_partial"])
+                self.assertEqual(request(base, "/api/store/clear-partial", {"id": "../my-model.gguf"})[0], 400)
+                self.assertEqual(request(base, "/api/store/clear-partial", {"id": row["id"]})[0], 200)
+                self.assertFalse(part.exists())
+                self.assertTrue(weight.is_file())
+
     def test_scan_catalog_and_safe_input(self):
         # A valid 1 x 1 PNG keeps the regression independent of image libraries.
         models = {"xiaomi-ocr-0-q4": "Xiaomi-OCR-0.Q4_K_M.gguf",

@@ -29,6 +29,8 @@ jobs:
           install-dependencies: true
       - name: Build and run native tests
         run: make -j 2 all test TEST_ALLOW_NO_METAL=1
+      - name: Validate synthetic quality cases
+        run: python3 -m unittest discover -s tests -p 'test_quality_*.py'
       - name: Run service and browser tests
         timeout-minutes: 5
         env:
@@ -66,5 +68,5 @@ jobs:
           done
       - name: Build the Android app and Kotlin SDK
         run: |
-          ./apps/android/gradlew -p apps/android --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest :dubhekit:assembleRelease
+          ./apps/android/gradlew -p apps/android --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest :app:lintRelease :dubhekit:assembleRelease
           ./apps/android/gradlew -p apps/android --no-daemon -PdubheVulkan=true :app:assembleDebug

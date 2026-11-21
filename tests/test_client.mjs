@@ -19,6 +19,7 @@ const scanFiles = [
   { id: 'xiaomi-ocr-0-vision', name: '视觉组件', bytes: 207346624 },
 ];
 const history = new Map();
+const tasks = new Map();
 let holdChat;
 let holdSummary;
 let holdTranslation;
@@ -54,6 +55,20 @@ const handler = async (req, res) => {
     if (data.import) historyImports++;
     for (const c of (data.import || [])) if (!history.has(c.id)) history.set(c.id, c);
     for (const c of (data.upsert || [])) history.set(c.id, c);
+    return json({ ok: true });
+  }
+  if (path === '/api/tasks') {
+    if (req.method === 'GET') {
+      const id = new URL(req.url, 'http://127.0.0.1').searchParams.get('id');
+      if (id) return tasks.has(id) ? json({ task: tasks.get(id) }) : json({ error: '记录已移除' }, 404);
+      return json({ tasks: [...tasks.values()].reverse().map(({ payload, ...summary }) => summary) });
+    }
+    const data = await collect(req);
+    if (data.upsert) {
+      const task = data.upsert;
+      tasks.set(task.id, { ...task, updated: Date.now(), bytes: JSON.stringify(task.payload).length });
+    }
+    if (data.delete) tasks.delete(data.delete);
     return json({ ok: true });
   }
   if (path === '/api/state') return json(state());
@@ -256,7 +271,7 @@ try {
     document.querySelector('#viewBody textarea').value = ${JSON.stringify(text)};
     document.querySelector('#viewBody .tbar .pri').click();
   })()`);
-  const translateStatus = () => evaluate('document.querySelector("#viewBody .tbar .pri").parentElement.querySelector(".vmeta").textContent');
+  const translateStatus = () => evaluate('document.querySelector("#viewBody .tbar .pri")?.parentElement.querySelector(".vmeta")?.textContent || ""');
   const translationDone = (status) => until(async () => (await translateStatus()).includes(status), status);
 
   await navigate(origin);
@@ -479,7 +494,7 @@ try {
   await translationDone('已保存译文文件');
   assert.deepEqual(await evaluate('window.documentCalls[1].translations'), ['译文', '译文']);
   assert.equal(await evaluate('window.documentCalls[2].name'), 'research-译文.docx');
-  await evaluate('[...document.querySelectorAll("#viewBody button")].find(b => b.textContent === "移除文件").click()');
+  await click('#translationClear');
   const report = '# Results\n\nThe river rose.\n\n- Retain this item.\n\n| Results | Flow |\n| --- | --- |\n| A | 6 |';
   await translate(report);
   await translationDone('完成');
@@ -688,6 +703,127 @@ try {
   assert.deepEqual(JSON.parse(scanExport.text), [{ page: 2, fields: { 题目: '年度报告', 日期: null } }]);
   await click('#scanClear');
   assert.equal(await evaluate('window.scanNativeCalls.at(-1).type'), 'scanClosePDF');
+
+  // Restart both workspaces with only the locally saved checkpoint available.
+  model = '/models/a.gguf';
+  await navigate(origin + '/?restore=translation#tasks');
+  await ready();
+  await until(() => evaluate('[...document.querySelectorAll(".task-row .vname")].some(x => x.textContent === "research.docx")'),
+    'completed translation in recent tasks after restart');
+  await click('button[aria-label="打开任务 research.docx"]');
+  await translationDone('已恢复完成的译文');
+  assert.equal(await evaluate('document.querySelector("#viewBody pre").textContent'), '译文\n\n译文');
+  assert.equal(await evaluate('[...document.querySelectorAll("#viewBody button")].find(b => b.textContent === "重新选择原文件")?.hidden'), false);
+  await evaluate(`(() => {
+    const glossary = document.querySelector('.translation-glossary textarea');
+    glossary.value = 'Runoff = 径流';
+    document.querySelector('input[aria-label="术语表名称"]').value = '水文研究';
+    [...document.querySelectorAll('.glossary-presets button')].find(b => b.textContent === '保存术语表').click();
+    glossary.value = '';
+    [...document.querySelectorAll('.glossary-presets button')].find(b => b.textContent === '使用').click();
+  })()`);
+  assert.equal(await evaluate('document.querySelector(".translation-glossary textarea").value'), 'Runoff = 径流');
+
+  const bridgeForLargePDF = () => evaluate(`(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 120;
+    canvas.height = 150;
+    const image = canvas.toDataURL('image/jpeg');
+    window.scanNativeCalls = [];
+    window.webkit = { messageHandlers: { shell: { postMessage: message => {
+      window.scanNativeCalls.push(message);
+      if (['scanOpenPDF', 'scanRestorePDF'].includes(message.type)) window.dubheScanPDFReady({
+        requestId: message.requestId, name: 'twenty-pages.pdf', pageCount: 20,
+        bookmark: 'test-bookmark', identity: 'test-identity',
+      });
+      if (message.type === 'scanPDFPage') window.dubheScanPDFPage({
+        requestId: message.requestId, page: message.page, image,
+        selectableText: message.page === 20 ? 'This last page has selectable text and uses no OCR inference.' : '',
+      });
+    } } } };
+  })()`);
+  await bridgeForLargePDF();
+  await click('[data-view="scan"]');
+  await click('#scanOpenPDF');
+  await until(() => evaluate('!document.querySelector("#scanRun").disabled'), 'twenty-page PDF is ready');
+  pauseAtScan = scans.length + 2;
+  await click('#scanRun');
+  await until(() => scans.length === pauseAtScan, 'second PDF page reached after first checkpoint');
+  await click('#scanStop');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent.includes("已保留 1 页")'),
+    'partial PDF checkpoint is safe');
+  await navigate(origin + '/?restore=scan#tasks');
+  await ready();
+  await bridgeForLargePDF();
+  await until(() => evaluate('!!document.querySelector(\'button[aria-label="打开任务 twenty-pages.pdf"]\')'),
+    'recent task is present after reloading the workspace');
+  await click('button[aria-label="打开任务 twenty-pages.pdf"]');
+  await until(() => evaluate('document.querySelector("#scanRun")?.disabled === false && document.querySelector("#scanRun").textContent === "继续识别"'),
+    'partial PDF opens via bookmark');
+  assert.equal(await evaluate('window.scanNativeCalls.find(m => m.type === "scanRestorePDF").bookmark'), 'test-bookmark');
+  const resumeCount = scans.length;
+  await click('#scanRun');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent === "识别完成 · 20 页"'),
+    '20-page PDF completes from saved progress');
+  assert.equal(scans.length - resumeCount, 18, 'already saved page and selectable text page are not sent to OCR');
+  assert.match(await evaluate('document.querySelector("#scanResult").textContent'), /selectable text/);
+  await click('#scanReview');
+  await until(() => evaluate('document.querySelector("dialog[open] .scan-region-frame img")?.naturalWidth > 0'),
+    'review shows original PDF page');
+  const bounds = await evaluate(`(() => {
+    const r = document.querySelector('dialog[open] .scan-region-frame img').getBoundingClientRect();
+    return [r.left + r.width * 0.2, r.top + r.height * 0.2, r.left + r.width * 0.65, r.top + r.height * 0.65];
+  })()`);
+  const [x1, y1, x2, y2] = bounds;
+  await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: x1, y: y1, button: 'left', buttons: 1, clickCount: 1 });
+  await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x2, y: y2, button: 'left', buttons: 1 });
+  await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x2, y: y2, button: 'left', buttons: 0, clickCount: 1 });
+  await evaluate('[...document.querySelectorAll("dialog[open] button")].find(b => b.textContent === "识别选区").click()');
+  await until(() => evaluate('document.querySelector("dialog[open] .scan-region-result")?.value.length > 0'),
+    'cropped area gets a separate result');
+  assert.equal(scans.at(-1).mode, 'text');
+  await evaluate(`(() => {
+    document.querySelector('textarea[aria-label="本页校对稿"]').value = 'Manual correction, page 20.';
+    [...document.querySelectorAll('dialog[open] button')].find(b => b.textContent === '保存本页').click();
+  })()`);
+  await until(() => evaluate('document.querySelector("#scanResult").textContent.includes("Manual correction")'),
+    'the correction appears in the results');
+  const saved = [...tasks.values()].find(task => task.title === 'twenty-pages.pdf');
+  assert.equal(saved.payload.results.length, 20);
+  assert.match(saved.payload.results.find(([page]) => page === 1)[1].text, /年度报告/);
+  assert.equal(saved.payload.results.find(([page]) => page === 20)[1].text, 'Manual correction, page 20.');
+  assert.equal(JSON.stringify(saved.payload).includes('data:image'), false, 'journal stores result text and a file reference only');
+
+  await evaluate(`(() => {
+    const shell = window.webkit.messageHandlers.shell;
+    const original = shell.postMessage;
+    const opened = new Map();
+    const image = document.createElement('canvas').toDataURL('image/jpeg');
+    shell.postMessage = message => {
+      if (message.type === 'scanBatchOpen') {
+        window.dubheScanBatchReady({ requestId: message.requestId,
+          files: ['one', 'two'].map(name => ({kind: 'pdf', name: name + '.pdf', pageCount: 1,
+            bookmark: 'batch-' + name, identity: name})), unavailable: [] });
+      } else if (message.type === 'scanRestorePDF' && message.bookmark.startsWith('batch-')) {
+        const name = message.bookmark.slice(6);
+        opened.set(message.requestId, name);
+        window.dubheScanPDFReady({requestId: message.requestId, name: name + '.pdf', pageCount: 1,
+          bookmark: message.bookmark, identity: name});
+      } else if (message.type === 'scanPDFPage' && opened.has(message.requestId)) {
+        window.dubheScanPDFPage({requestId: message.requestId, page: message.page, image,
+          selectableText: 'Selectable PDF text for ' + opened.get(message.requestId)});
+      } else original(message);
+    };
+  })()`);
+  const batchBefore = scans.length;
+  await click('#scanBatchOpen');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent.includes("批量已完成 2 / 2")'),
+    'two PDFs complete as separate saved tasks');
+  for (const name of ['one', 'two']) {
+    const task = [...tasks.values()].find(item => item.title === name + '.pdf');
+    assert.equal(task.payload.results[0][1].text, 'Selectable PDF text for ' + name);
+  }
+  assert.equal(scans.length, batchBefore);
 
   shareOnly = true;
   await navigate(otherOrigin + '/?share');

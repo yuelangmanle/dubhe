@@ -17,6 +17,12 @@ final class ScanPDF {
         pageCount = document.pageCount
     }
 
+    func selectableText(number: Int) -> String {
+        guard (1...pageCount).contains(number) else { return "" }
+        let text = document.page(at: number - 1)?.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return text.utf8.count <= 256 * 1024 ? text : ""
+    }
+
     func pageDataURL(number: Int) throws -> String {
         guard (1...pageCount).contains(number), let page = document.page(at: number - 1)?.pageRef else {
             throw ScanError.invalidPage(number)

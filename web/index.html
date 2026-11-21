@@ -935,6 +935,12 @@
         <span class="ni"><svg class="i" viewBox="0 0 24 24"><use href="#i-scan"/></svg></span>
         <span>扫描</span>
       </button>
+      <button class="nav-item" data-view="tasks">
+        <span class="ni"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-folder"/></svg></span>
+        <span>任务与存储</span>
+      </button>
+      <details class="advanced-nav">
+        <summary>进阶工具</summary>
       <button class="nav-item" data-view="tools">
         <span class="ni"><svg class="i" viewBox="0 0 24 24"><use href="#i-nodes"/></svg></span>
         <span>工具</span>
@@ -959,6 +965,7 @@
         <span class="ni"><svg class="i" viewBox="0 0 24 24"><use href="#i-think"/></svg></span>
         <span>记忆</span>
       </button>
+      </details>
     </nav>
 
     <div class="nav-sep"></div>
@@ -1039,9 +1046,9 @@
         <h1>天枢 Dubhe</h1>
         <p>本地推理，数据不出设备</p>
         <div class="chips">
-          <button class="chip" data-p="用三句话解释什么是本地大模型推理引擎">解释本地推理</button>
-          <button class="chip" data-p="帮我写一个 Python 快速排序，并解释时间复杂度">写段代码</button>
-          <button class="chip" data-p="把这句话翻译成英文：这个模型完全运行在我的笔记本上">翻译一句</button>
+          <button class="chip" id="tryChat">试一次对话</button>
+          <button class="chip" id="tryTranslation">翻译文字</button>
+          <button class="chip" id="tryScan">扫描文档</button>
         </div>
       </div>
     </div>

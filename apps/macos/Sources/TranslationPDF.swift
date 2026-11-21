@@ -18,14 +18,27 @@ enum TranslationPDF {
     static func rebuild(_ data: Data, translations: [String]) throws -> Data {
         let source = try open(data)
         guard translations.count == source.pageCount else { throw Failure.translationCount }
+        return try rebuild(source, pages: Array(1...source.pageCount), translations: translations)
+    }
+
+    static func rebuildSelectedPages(url: URL, pages: [Int], translations: [String]) throws -> Data {
+        guard let source = PDFDocument(url: url), source.pageCount > 0 else { throw Failure.invalidPDF }
+        guard !source.isLocked else { throw Failure.locked }
+        return try rebuild(source, pages: pages, translations: translations)
+    }
+
+    private static func rebuild(_ source: PDFDocument, pages: [Int], translations: [String]) throws -> Data {
+        guard !pages.isEmpty, pages.count == translations.count else { throw Failure.translationCount }
         let buffer = NSMutableData()
         guard let consumer = CGDataConsumer(data: buffer as CFMutableData),
               let context = CGContext(consumer: consumer, mediaBox: nil, nil) else {
             throw Failure.output
         }
-        for (index, translation) in translations.enumerated() {
-            guard let page = source.page(at: index) else { throw Failure.invalidPage(index + 1) }
-            try addPage(page, number: index + 1, translation: translation, to: context)
+        for (number, translation) in zip(pages, translations) {
+            guard (1...source.pageCount).contains(number), let page = source.page(at: number - 1) else {
+                throw Failure.invalidPage(number)
+            }
+            try addPage(page, number: number, translation: translation, to: context)
         }
         // Closing the context writes the PDF trailer before the buffer is copied.
         context.closePDF()

@@ -23,6 +23,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** The non-exported service owns the model in the :engine process. */
 class EngineService : Service() {
@@ -41,6 +42,7 @@ class EngineService : Service() {
     private var chatResident = false
     private var projector: ProjectorCapabilities? = null
     private var projectorFile: File? = null
+    private val translations by lazy { TranslationTaskStore(this) }
     private val power by lazy { requireNotNull(getSystemService(PowerManager::class.java)) }
     private val thermalListener = PowerManager.OnThermalStatusChangedListener { status ->
         overheated = status >= PowerManager.THERMAL_STATUS_SEVERE
@@ -253,43 +255,50 @@ class EngineService : Service() {
     }
 
     private suspend fun translate(data: Bundle, id: Int, reply: Messenger) {
-        val source = requireNotNull(data.getString("source"))
-        val from = Language.valueOf(requireNotNull(data.getString("from")))
-        val to = Language.valueOf(requireNotNull(data.getString("to")))
+        val taskId = requireNotNull(data.getString("taskId"))
+        var task = withContext(Dispatchers.IO) { translations.read(taskId) }
+            ?: error("找不到这条翻译任务。")
+        require(!task.finished) { "这条翻译任务已完成。" }
+        val from = task.input.from
+        val to = task.input.to
+        val glossary = readTranslationGlossary(task.input.glossary)
         val dedicated = data.getString("modelPath")?.let(::File)
-        require(source.isNotBlank() && source.length <= translationLimit)
+        require((dedicated != null) == task.dedicated)
         if (dedicated != null) {
             engine.unloadModel()
             chatResident = false
         }
         try {
             val info = if (dedicated == null) ensureChatModel() else engine.loadModel(dedicated)
-            val blocks = translationBlocks(source)
-            val total = blocks.count { it.isNotBlank() }
-            var completed = 0
-            for (block in blocks) {
+            val blocks = translationBlocks(task.input.source)
+            for (index in task.nextBlock until blocks.size) {
                 if (stopRequested) break
-                if (block.isBlank()) {
-                    reply.post(EngineProtocol.Text, id, Bundle().apply { putString("text", block) })
-                    continue
+                val block = blocks[index]
+                val translated = if (block.isBlank()) block else {
+                    val instruction = translationPrompt(block, from, to, dedicated != null, glossary)
+                    val prompt = if (dedicated != null) instruction else renderPrompt(info, listOf(instruction), null)
+                        .let { if (info.architecture == "qwen35") "$it<think>\n\n</think>\n\n" else it }
+                    val tokens = engine.tokenize(prompt, addSpecial = dedicated == null)
+                    if (stopRequested) break
+                    val budget = minOf(1024, info.contextSize - tokens.size)
+                    check(budget >= 32) { "这段原文超出了模型可处理的长度。" }
+                    val result = engine.generate(tokens, Sampling(maxTokens = budget, temperature = 0f, repeatPenalty = 1f))
+                    if (result.cancelled || stopRequested) break
+                    check(result.stats.generatedTokens < budget) { "译文达到长度上限，请缩短这段原文后重试。" }
+                    result.text.replace(Regex("<think>[\\s\\S]*?</think>"), "").trim().also {
+                        check(it.isNotEmpty()) { "模型没有输出译文。" }
+                    }
                 }
-                val instruction = translationPrompt(block, from, to, dedicated != null)
-                val prompt = if (dedicated != null) instruction else renderPrompt(info, listOf(instruction), null)
-                    .let { if (info.architecture == "qwen35") "$it<think>\n\n</think>\n\n" else it }
-                val tokens = engine.tokenize(prompt, addSpecial = dedicated == null)
-                if (stopRequested) break
-                val budget = minOf(1024, info.contextSize - tokens.size)
-                check(budget >= 32) { "这段原文超出了模型可处理的长度。" }
-                val result = engine.generate(tokens, Sampling(maxTokens = budget, temperature = 0f, repeatPenalty = 1f))
-                if (result.cancelled || stopRequested) break
-                check(result.stats.generatedTokens < budget) { "译文达到长度上限，请缩短这段原文后重试。" }
-                val translated = result.text.replace(Regex("<think>[\\s\\S]*?</think>"), "").trim()
-                check(translated.isNotEmpty()) { "模型没有输出译文。" }
-                reply.post(EngineProtocol.Text, id, Bundle().apply {
+                task = task.checkpoint(index, translated, block.isNotBlank(), index == blocks.lastIndex)
+                val checkpoint = task
+                withContext(Dispatchers.IO) { translations.write(checkpoint) }
+                if (!reply.post(EngineProtocol.Text, id, Bundle().apply {
                     putString("text", translated)
-                    putInt("completed", ++completed)
-                    putInt("total", total)
-                })
+                    putInt("nextBlock", checkpoint.nextBlock)
+                    putInt("completed", checkpoint.completed)
+                    putBoolean("finished", checkpoint.finished)
+                    putLong("updatedAt", checkpoint.updatedAt)
+                })) break
             }
         } finally {
             if (dedicated != null) engine.unloadModel()

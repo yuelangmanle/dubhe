@@ -1096,6 +1096,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             handleTranslationDocument(obj)
         case "scanOpenPDF":
             if let id = obj["requestId"] as? String { openScanPDF(requestId: id) }
+        case "scanBatchOpen":
+            if let id = obj["requestId"] as? String { openScanBatch(requestId: id) }
+        case "scanRestorePDF":
+            if let id = obj["requestId"] as? String, let bookmark = obj["bookmark"] as? String {
+                restoreScanPDF(requestId: id, bookmark: bookmark)
+            }
         case "scanPDFPage":
             if let id = obj["requestId"] as? String, let page = obj["page"] as? Int {
                 renderScanPDFPage(requestId: id, page: page)
@@ -1570,18 +1576,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 self.replyToScan("dubheScanPDFReady", ["requestId": requestId, "cancelled": true])
                 return
             }
+            self.loadScanPDF(requestId: requestId, url: url)
+        }
+    }
+
+    private func restoreScanPDF(requestId: String, bookmark: String) {
+        var stale = false
+        guard !openingScanPDF, bookmark.utf8.count <= 16_384,
+              let data = Data(base64Encoded: bookmark),
+              let url = try? URL(resolvingBookmarkData: data, options: [.withoutUI, .withoutMounting],
+                                 relativeTo: nil, bookmarkDataIsStale: &stale),
+              url.isFileURL, url.pathExtension.lowercased() == "pdf" else {
+            replyToScan("dubheScanPDFReady", ["requestId": requestId, "error": "找不到原 PDF，请重新选择。"])
+            return
+        }
+        openingScanPDF = true
+        loadScanPDF(requestId: requestId, url: url)
+    }
+
+    private func openScanBatch(requestId: String) {
+        let reply: ([String: Any]) -> Void = { [weak self] content in
+            var result = content
+            result["requestId"] = requestId
+            self?.replyToScan("dubheScanBatchReady", result)
+        }
+        guard !openingScanPDF, window.attachedSheet == nil else {
+            reply(["error": "请先关闭当前的文件选择窗口。"])
+            return
+        }
+        openingScanPDF = true
+        let picker = NSOpenPanel()
+        picker.allowedContentTypes = [.pdf]
+        picker.canChooseDirectories = false
+        picker.allowsMultipleSelection = true
+        picker.prompt = "添加 PDF"
+        picker.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            guard response == .OK else {
+                self.openingScanPDF = false
+                reply(["cancelled": true])
+                return
+            }
+            let urls = picker.urls
             self.scanPDFQueue.async {
-                let opened = Result { try ScanPDF(url: url) }
+                var files: [[String: Any]] = []
+                var errors: [String] = []
+                for url in urls {
+                    do {
+                        let document = try ScanPDF(url: url)
+                        let metadata = try Self.scanPDFReference(url: url)
+                        guard !metadata.bookmark.isEmpty else { throw CocoaError(.fileReadNoPermission) }
+                        files.append(["kind": "pdf", "name": url.lastPathComponent,
+                                      "pageCount": document.pageCount, "bookmark": metadata.bookmark,
+                                      "identity": metadata.identity])
+                    } catch {
+                        errors.append(url.lastPathComponent)
+                    }
+                }
+                let result: [String: Any] = ["files": files, "unavailable": errors]
                 DispatchQueue.main.async {
                     self.openingScanPDF = false
-                    switch opened {
-                    case .success(let document):
-                        self.scanDocument = (requestId, document)
-                        self.replyToScan("dubheScanPDFReady", ["requestId": requestId, "name": url.lastPathComponent,
-                                                              "pageCount": document.pageCount])
-                    case .failure(let error):
-                        self.replyToScan("dubheScanPDFReady", ["requestId": requestId, "error": error.localizedDescription])
-                    }
+                    reply(result)
+                }
+            }
+        }
+    }
+
+    private static func scanPDFReference(url: URL) throws -> (bookmark: String, identity: String) {
+        let bookmark = try? url.bookmarkData(options: [.minimalBookmark])
+        let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let identity = "\(values.fileSize ?? -1):\(values.contentModificationDate?.timeIntervalSince1970 ?? -1)"
+        return (bookmark?.base64EncodedString() ?? "", identity)
+    }
+
+    private func loadScanPDF(requestId: String, url: URL) {
+        scanPDFQueue.async {
+            let opened = Result {
+                let document = try ScanPDF(url: url)
+                let metadata = try Self.scanPDFReference(url: url)
+                return (document, metadata.bookmark, metadata.identity)
+            }
+            DispatchQueue.main.async {
+                self.openingScanPDF = false
+                switch opened {
+                case .success(let (document, bookmark, identity)):
+                    self.scanDocument = (requestId, document)
+                    self.replyToScan("dubheScanPDFReady", ["requestId": requestId, "name": url.lastPathComponent,
+                                                          "pageCount": document.pageCount, "bookmark": bookmark,
+                                                          "identity": identity])
+                case .failure(let error):
+                    self.replyToScan("dubheScanPDFReady", ["requestId": requestId, "error": error.localizedDescription])
                 }
             }
         }
@@ -1597,10 +1681,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         scanPDFQueue.async {
             let rendered = Result { try selected.pdf.pageDataURL(number: page) }
+            let selectableText = selected.pdf.selectableText(number: page)
             DispatchQueue.main.async {
                 guard self.scanDocument?.requestId == requestId else { return }
                 switch rendered {
-                case .success(let image): reply("image", image)
+                case .success(let image):
+                    self.replyToScan("dubheScanPDFPage", ["requestId": requestId, "page": page,
+                                                          "image": image, "selectableText": selectableText])
                 case .failure(let error): reply("error", error.localizedDescription)
                 }
             }
@@ -1637,6 +1724,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             )
         }
         let action = message["action"] as? String
+        if action == "scanBilingual" {
+            guard let encoded = message["bookmark"] as? String, encoded.utf8.count <= 16_384,
+                  let bookmark = Data(base64Encoded: encoded), let identity = message["identity"] as? String,
+                  let pages = message["pages"] as? [Int], let translations = message["translations"] as? [String],
+                  pages.count == translations.count, !pages.isEmpty else {
+                reply(["error": "找不到原 PDF 或完整的逐页译文。"])
+                return
+            }
+            let name = (message["name"] as? String) ?? "双语扫描.pdf"
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    var stale = false
+                    let url = try URL(resolvingBookmarkData: bookmark, options: [.withoutUI, .withoutMounting],
+                                      relativeTo: nil, bookmarkDataIsStale: &stale)
+                    guard url.isFileURL, url.pathExtension.lowercased() == "pdf" else {
+                        DispatchQueue.main.async { reply(["error": "找不到原 PDF。可导出双语文本。"] ) }
+                        return
+                    }
+                    let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+                    let actual = "\(values.fileSize ?? -1):\(values.contentModificationDate?.timeIntervalSince1970 ?? -1)"
+                    guard actual == identity else {
+                        DispatchQueue.main.async { reply(["error": "原 PDF 已改变。可导出双语文本。"] ) }
+                        return
+                    }
+                    let data = try TranslationPDF.rebuildSelectedPages(url: url, pages: pages, translations: translations)
+                    DispatchQueue.main.async { self.saveDocument(data, format: "pdf", name: name, reply: reply) }
+                } catch {
+                    DispatchQueue.main.async { reply(["error": error.localizedDescription]) }
+                }
+            }
+            return
+        }
         if action == "export" {
             guard let format = message["format"] as? String, ["md", "txt", "pdf", "docx"].contains(format),
                   let text = message["text"] as? String, !text.isEmpty, text.utf8.count <= 24 * 1024 * 1024 else {
