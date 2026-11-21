@@ -2,13 +2,13 @@
 
 Apple Silicon 和 Android 上的本地模型运行工具。原生引擎读取 GGUF，包含命令行、HTTP 服务和 macOS 客户端。
 
-当前版本 **0.35.1**。macOS 和 Android 均提供本机对话、离线翻译、扫描、任务恢复和应用内更新。Mac 支持图片、多页 PDF 与 Word，Android 支持照片和截图转文字。两个客户端的安装包见 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。
+当前版本 **0.35.2**。macOS 和 Android 均提供本机对话、离线翻译、扫描、任务恢复和应用内更新。Mac 支持图片、多页 PDF 与 Word，Android 支持照片和截图转文字。两个客户端的安装包见 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。
 
 已下载过的模型和配套组件可以从[模型下载来源](docs/model-downloads.md)找回。
 
 第一次使用可以从「对话」「翻译」或「扫描」开始。做过的扫描和翻译可以从「最近任务」打开，也可在「任务与存储」查看模型和未完成下载。开发与发布可参考[质量验收说明](tools/quality.md)。
 
-Mac 扫描页的「打开 PDF / Word」支持 DOCX，通过本机 LibreOffice 保留原页图表和分页。macOS 26 及以上可在「识别设置」中用分区识别处理印刷段落和表格，也可从「校对本页」重扫选区。「原件 + 识别文字 PDF」会保留每页原件并在旁边放可复制的文字。导出原件 PDF 可沿用原页尺寸。
+Mac 扫描页的「打开 PDF / Word」支持 DOCX，通过本机 LibreOffice 保留原页图表和分页。macOS 26 及以上可在「识别设置」中用分区识别处理印刷段落和表格，也可从「校对本页」重扫选区。「原件 + 识别文字 PDF」会保留每页原件并在旁边放可复制的文字。也可只导出原版面 PDF，完整保留原件的页面和图表。
 
 ---
 

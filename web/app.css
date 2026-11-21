@@ -2270,6 +2270,11 @@ body[data-glass="off"] .edge::before { display: none; }
   color: var(--text); padding: 14px; font-size: 14px; line-height: 1.65; overflow-wrap: anywhere;
 }
 .scan-result-empty { margin: 0; color: var(--secondary); }
+.scan-layout-page {
+  display: block; width: 100%; padding: 0; border: 0; border-radius: 7px;
+  background: var(--fill); overflow: hidden; cursor: zoom-in;
+}
+.scan-layout-page img { display: block; width: 100%; height: auto; }
 .scan-result-raw { margin: 0; white-space: pre-wrap; font: inherit; }
 .scan-table-scroll { overflow-x: auto; margin: 10px 0; }
 .scan-output .translation-preview .scan-table-scroll table { width: max-content; min-width: 100%; margin: 0; }

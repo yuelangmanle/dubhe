@@ -4981,10 +4981,14 @@
 
     const resultHead = el('header', 'scan-card-head');
     const resultTitle = el('div', 'scan-title');
+    const resultHeading = el('h3', '', '识别结果');
     const resultPage = el('p', 'scan-source-name');
-    resultTitle.append(el('h3', '', '识别结果'), resultPage);
+    resultTitle.append(resultHeading, resultPage);
     const showRaw = button('Raw', '识别文本', 'ghost');
-    resultHead.append(resultTitle, showRaw);
+    const showOriginal = button('OriginalLayout', '原版面', 'ghost');
+    const resultViews = el('div', 'scan-tools');
+    resultViews.append(showOriginal, showRaw);
+    resultHead.append(resultTitle, resultViews);
     const output = el('div', 'scan-output');
     output.id = 'scanResult';
     const resultTools = el('div', 'scan-tools scan-result-tools');
@@ -4993,8 +4997,8 @@
     const exportFormat = el('select', 'vsel');
     exportFormat.id = 'scanExportFormat';
     exportFormat.setAttribute('aria-label', '导出格式');
-    for (const [value, label] of [['auto', '识别结果'], ['paired', '原件 + 识别文字 PDF'], ['original', '原件 PDF'],
-      ['docx', '可编辑文字 Word'], ['md', 'Markdown'], ['txt', '纯文本'], ['csv', '本页表格 CSV']]) {
+    for (const [value, label] of [['auto', '识别文字'], ['paired', '原版面 + 识别文字（PDF）'], ['original', '原版面（PDF）'],
+      ['docx', '可编辑文字（.docx）'], ['md', 'Markdown（.md）'], ['txt', '纯文本（.txt）'], ['csv', '本页表格（.csv）']]) {
       const option = el('option', '', label);
       option.value = value;
       exportFormat.appendChild(option);
@@ -5036,8 +5040,10 @@
     const removable = () => variantFiles().filter(file => file.installed && file.path &&
       (file.id !== 'xiaomi-ocr-0-vision' || !files.some(other =>
         other.installed && other.id !== file.id && other.id !== 'xiaomi-ocr-0-' + variant.value)));
-    let raw = false;
-    let resultScroll = [0, 0];
+    const textFormats = { md: 'Markdown', txt: '纯文本', tex: 'LaTeX', json: 'JSON' };
+    let exportChoice, raw = false, originalLayout = false;
+    let resultScroll = [0, 0, 0];
+    const resultView = () => originalLayout ? 2 : Number(raw);
 
     function update() {
       const activeFiles = active();
@@ -5102,35 +5108,69 @@
         !validRange(s) || (!detail.hidden && !s.detail);
       run.textContent = canContinue(s) ? '继续识别' : canRescan(s) ? '重扫本页' : '开始识别';
       const item = result();
-      showRaw.hidden = !['markdown', 'latex'].includes(item?.kind);
+      showRaw.hidden = originalLayout || !['markdown', 'latex'].includes(item?.kind);
       showRaw.textContent = raw ? '预览' : item?.kind === 'latex' ? 'LaTeX 源码' : '识别文本';
       showRaw.setAttribute('aria-pressed', String(raw));
+      showOriginal.hidden = !source;
+      showOriginal.disabled = !raster && !originalLayout;
+      showOriginal.textContent = originalLayout ? '返回识别结果' : '原版面';
+      showOriginal.setAttribute('aria-pressed', String(originalLayout));
       review.disabled = (!item && (!raster || !ready)) || busy;
       review.textContent = item ? '校对本页' : '框选识别';
       const hasResults = Boolean(work?.results.size);
-      copy.disabled = exportFormat.disabled = exportResult.disabled = !hasResults || Boolean(pendingSave || batch || job);
+      copy.disabled = !hasResults || Boolean(pendingSave || batch || job);
       translate.hidden = !hasResults || !['document', 'text'].includes(work.mode);
       translate.disabled = Boolean(job || batch);
       question.hidden = translate.hidden;
       question.disabled = Boolean(job || batch);
+      const canExportOriginal = Boolean(native() && originalReady());
+      const autoFormat = hasResults ? resultFormat(work.results.values()) : null;
+      exportFormat.options[0].textContent = autoFormat
+        ? textFormats[autoFormat] + '（.' + autoFormat + '）' : '识别文字';
       for (const option of exportFormat.options) {
-        option.hidden = ['paired', 'original'].includes(option.value) ? !native() || !originalReady()
+        option.hidden = option.value === 'original' ? !canExportOriginal
+          : option.value === 'paired' ? !canExportOriginal || !hasResults
+          : !hasResults ? true
           : option.value === 'csv' ? item?.kind !== 'markdown' ||
             !/<table\b|^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*\|[ \t]*:?-{3,}/im.test(item.text)
-          : option.value === 'docx' && !native();
+          : option.value === autoFormat || option.value === 'docx' && !native();
       }
-      if (exportFormat.selectedOptions[0]?.hidden) exportFormat.value = 'auto';
-      exportResult.textContent = isPDF() ? (exportFormat.value === 'csv' ? '导出本页' : '导出已识别页') : '导出';
+      const preferred = exportChoice ?? (canExportOriginal && (!hasResults || originalLayout)
+        ? 'original' : canExportOriginal && work?.mode === 'document' ? 'paired' : 'auto');
+      exportFormat.value = Array.from(exportFormat.options).some(option => option.value === preferred && !option.hidden)
+        ? preferred : hasResults ? 'auto' : canExportOriginal ? 'original' : 'auto';
+      exportFormat.disabled = exportResult.disabled = (!hasResults && !canExportOriginal) || Boolean(pendingSave || batch || job);
+      const extension = ['paired', 'original'].includes(exportFormat.value) ? 'pdf'
+        : exportFormat.value === 'auto' ? autoFormat : exportFormat.value;
+      exportResult.textContent = extension ? '导出 ' + extension.toUpperCase() : '导出';
+      exportResult.title = exportFormat.value === 'original' ? '导出原件全部页面'
+        : exportFormat.value === 'csv' ? '导出本页表格' : isPDF() ? '导出已识别的页面' : '';
     }
-    exportFormat.onchange = update;
+    exportFormat.onchange = () => { exportChoice = exportFormat.value; update(); };
 
     function renderResult({ keepScroll = false } = {}) {
       const item = result();
       const method = { embedded: '原文件文字', regions: '分区识别', page: '整页识别',
         text: '文字识别', region: '框选识别', chart: '图表读数 · 需对照原图' }[item?.method];
-      resultPage.textContent = [isPDF() ? '第 ' + page + ' 页' : '', method].filter(Boolean).join(' · ');
+      resultHeading.textContent = originalLayout ? '原版面' : '识别结果';
+      resultPage.textContent = [isPDF() ? '第 ' + page + ' 页' : '', originalLayout ? '' : method].filter(Boolean).join(' · ');
       output.replaceChildren();
-      if (!item) {
+      if (originalLayout) {
+        if (raster) {
+          const original = el('button', 'scan-layout-page');
+          original.setAttribute('aria-label', '放大原版面');
+          original.onclick = () => enlarge.click();
+          const pageImage = el('img');
+          pageImage.src = raster;
+          pageImage.alt = isPDF() ? '原版面 · 第 ' + page + ' 页' : '原版面';
+          original.appendChild(pageImage);
+          output.appendChild(original);
+        } else {
+          output.appendChild(el('p', 'scan-result-empty', !originalReady()
+            ? '请重新选择原件以查看原版面。'
+            : drawnPage === page ? '本页原版面无法显示。' : '正在准备本页原版面…'));
+        }
+      } else if (!item) {
         output.appendChild(el('p', 'scan-result-empty', work?.results.size
           ? '这一页还没有识别结果。' : '识别结果会显示在这里。'));
       } else if (item.kind === 'markdown' && !raw) {
@@ -5145,8 +5185,8 @@
       } else {
         output.appendChild(el('pre', 'scan-result-raw', item.text));
       }
-      if (!keepScroll) resultScroll = [0, 0];
-      output.scrollTop = resultScroll[Number(raw)];
+      if (!keepScroll) resultScroll = [0, 0, 0];
+      output.scrollTop = resultScroll[resultView()];
       update();
     }
 
@@ -5161,7 +5201,8 @@
       taskId = null;
       savedStatus.textContent = '';
       raw = false;
-      exportFormat.value = 'auto';
+      originalLayout = false;
+      exportChoice = undefined;
       image.removeAttribute('src');
       from.max = to.max = String(source?.pageCount ?? 1);
       from.value = '1';
@@ -5203,7 +5244,8 @@
       raster = data;
       image.src = raster;
       drawnPage = index;
-      update();
+      if (originalLayout) renderResult({ keepScroll: true });
+      else update();
     }
 
     async function showPage(index) {
@@ -5227,7 +5269,8 @@
         if (file !== source || index !== page) return;
         drawnPage = index;
         setStatus('预览失败 · ' + e.message, true);
-        update();
+        if (originalLayout) renderResult({ keepScroll: true });
+        else update();
       }
     }
 
@@ -5541,8 +5584,13 @@
     language.onchange = quality.onchange = rotation.onchange = length.onchange = enhance.onchange = update;
     mode.onchange = () => { detailValue.value = ''; update(); };
     showRaw.onclick = () => {
-      resultScroll[Number(raw)] = output.scrollTop;
+      resultScroll[resultView()] = output.scrollTop;
       raw = !raw;
+      renderResult({ keepScroll: true });
+    };
+    showOriginal.onclick = () => {
+      resultScroll[resultView()] = output.scrollTop;
+      originalLayout = !originalLayout;
       renderResult({ keepScroll: true });
     };
 
@@ -6020,20 +6068,30 @@
       }
     };
 
+    function resultFormat(items) {
+      let format;
+      for (const item of items) {
+        if (item.kind === 'markdown') return 'md';
+        format ??= SCAN_FORMATS[item.kind];
+      }
+      return format;
+    }
+
+    const scanName = () => source.name.replace(/\.[^.]+$/, '');
+
     function allResults() {
       const results = [...work.results.entries()].sort((a, b) => a[0] - b[0]);
-      const firstKind = results.some(([, item]) => item.kind === 'markdown') ? 'markdown' : results[0][1].kind;
-      const format = SCAN_FORMATS[firstKind];
+      const format = resultFormat(results.map(([, item]) => item));
       let text = results[0][1].text;
-      if (isPDF() && firstKind === 'json') {
+      if (isPDF() && format === 'json') {
         text = JSON.stringify(results.map(([page, item]) => ({ page, fields: JSON.parse(item.text) })), null, 2);
       } else if (isPDF() && results.length > 1) {
         text = results.map(([page, item]) =>
-          (firstKind === 'markdown' ? '## ' : firstKind === 'latex' ? '% ' : '') +
+          (format === 'md' ? '## ' : format === 'tex' ? '% ' : '') +
           '第 ' + page + ' 页\n\n' + item.text
         ).join('\n\n');
       }
-      const name = source.name.replace(/\.[^.]+$/, '') + '-扫描结果';
+      const name = scanName() + '-扫描结果';
       return { format, name, text, results };
     }
 
@@ -6047,8 +6105,10 @@
     };
     exportResult.onclick = () => {
       try {
-      const { format, name, text, results } = allResults();
         const requested = exportFormat.value;
+        const original = requested === 'original';
+        const { format, name, text, results } = original
+          ? { format: 'pdf', name: scanName(), text: '', results: [] } : allResults();
         const pdf = requested === 'original' || requested === 'paired';
         const extension = pdf ? 'pdf' : requested === 'auto' ? format : requested;
         let suffix = requested === 'original' ? '-原件' : '';
@@ -6064,7 +6124,8 @@
           const request = { type: 'scanSave', requestId: pendingSave, format: extension, name: filename, text: exportText };
           if (pdf) {
             request.sourceId = source.requestId || '';
-            request.pages = results.map(([number]) => number);
+            request.original = original;
+            if (!original) request.pages = results.map(([number]) => number);
             if (!isPDF()) request.image = source.image;
             if (requested === 'paired') request.notes = results.map(([, item]) => scanReadingText(item));
           } else if (requested === 'docx' || requested === 'txt') {

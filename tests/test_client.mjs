@@ -665,6 +665,17 @@ try {
     window.dispatchEvent(new DragEvent('drop', { dataTransfer: data, cancelable: true }));
   })()`);
   await until(() => evaluate('!document.querySelector("#scanRun").disabled'), 'image scanner ready');
+  const chooseExport = value => evaluate(`(() => {
+    const format = document.querySelector('#scanExportFormat');
+    format.value = ${JSON.stringify(value)};
+    format.dispatchEvent(new Event('change'));
+  })()`);
+  assert.equal(await evaluate('document.querySelector("#scanExportFormat").value'), 'original');
+  await click('#scanExport');
+  const originalImage = await evaluate('window.scanNativeCalls.at(-1)');
+  assert.equal(originalImage.format, 'pdf');
+  assert.equal(originalImage.original, true);
+  assert.match(originalImage.image, /^data:image\/jpeg;base64,/);
   await click('#scanReview');
   await click('.scan-review-dialog button.vbtn.ghost');
   await evaluate(`(() => {
@@ -678,19 +689,26 @@ try {
   await evaluate('[...document.querySelectorAll("dialog button")].find(b => b.textContent === "用作本页结果").click()');
   await click('.scan-review-dialog .pri');
   await until(() => evaluate('document.querySelector("#scanResult table")?.textContent.includes("Lake A")'), 'save a selection before whole-page OCR');
-  await evaluate('document.querySelector("#scanExportFormat").value = "csv"');
+  await chooseExport('csv');
   await click('#scanExport');
   const csv = await evaluate('window.scanNativeCalls.at(-1)');
   assert.equal(csv.format, 'csv');
   assert.match(csv.name, /图表估读\.csv$/);
   assert.ok(csv.text.includes('"Lake A","~10.2"'));
-  await evaluate('document.querySelector("#scanExportFormat").value = "auto"');
+  await chooseExport('auto');
   await click('#scanRun');
   await until(() => evaluate('document.querySelector("#scanStatus").textContent === "识别完成"'), 'image result');
   assert.match(scans.at(-1).image, /^data:image\/jpeg;base64,/);
   assert.equal(scans.at(-1).mode, 'document');
   assert.equal(await evaluate('document.querySelector("#scanResult table td").colSpan'), 2);
   assert.equal(await evaluate('!!document.querySelector("#scanResult img")'), false);
+  assert.equal(await evaluate('document.querySelector("#scanExportFormat").selectedOptions[0].textContent'), 'Markdown（.md）');
+  assert.equal(await evaluate('document.querySelector("#scanExport").textContent'), '导出 MD');
+  await click('#scanOriginalLayout');
+  assert.equal(await evaluate('document.querySelector("#scanResult img").src === document.querySelector(".scan-image-frame img").src'), true);
+  assert.equal(await evaluate('!!document.querySelector("#scanResult table")'), false);
+  await click('#scanOriginalLayout');
+  assert.equal(await evaluate('!!document.querySelector("#scanResult table")'), true);
   await until(() => evaluate('!!document.querySelector("#scanResult math msub")'), 'inline LaTeX produces MathML subscripts');
   assert.equal(await evaluate('document.querySelector("#scanResult math mo").textContent'), '∈');
   await click('#scanEnlarge');
@@ -773,13 +791,21 @@ try {
   await until(() => evaluate('document.querySelector("#scanPage").textContent.includes("2 / 4")'),
     'reopen original Word document without losing position');
   assert.match(await evaluate('document.querySelector("#scanResult").textContent'), /年度报告/);
-  await evaluate('document.querySelector("#scanExportFormat").value = "paired"');
+  assert.equal(await evaluate('document.querySelector("#scanExportFormat").value'), 'paired');
   await click('#scanExport');
   const pairedExport = await evaluate('window.scanNativeCalls.at(-1)');
   assert.equal(pairedExport.format, 'pdf');
   assert.deepEqual(pairedExport.pages, [2, 3]);
   assert.match(pairedExport.notes[0], /年度报告/);
-  await evaluate('document.querySelector("#scanExportFormat").value = "auto"');
+  await click('#scanOriginalLayout');
+  assert.equal(await evaluate('document.querySelector("#scanExportFormat").value'), 'original');
+  await click('#scanExport');
+  const originalPDF = await evaluate('window.scanNativeCalls.at(-1)');
+  assert.equal(originalPDF.original, true);
+  assert.equal(originalPDF.name, 'paper-原件.pdf');
+  assert.equal(originalPDF.pages, undefined);
+  await click('#scanOriginalLayout');
+  await chooseExport('auto');
   await evaluate(`(() => {
     const mode = document.querySelector('#scanMode');
     mode.value = 'extract';
@@ -804,6 +830,7 @@ try {
   await click('#scanExport');
   const scanExport = await evaluate('window.scanNativeCalls.at(-1)');
   assert.equal(scanExport.format, 'json');
+  assert.equal(await evaluate('document.querySelector("#scanExport").textContent'), '导出 JSON');
   assert.deepEqual(JSON.parse(scanExport.text), [{ page: 2, fields: { 题目: '年度报告', 日期: null } }]);
   await click('#scanClear');
   assert.equal(await evaluate('window.scanNativeCalls.at(-1).type'), 'scanClosePDF');

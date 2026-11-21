@@ -19,6 +19,9 @@ enum ScanPDFTests {
 
         let scan = try ScanPDF(url: url)
         precondition(scan.pageCount == 2, "PDF pages use the original order")
+        let original = try scan.originalPages()
+        let input = try Data(contentsOf: url)
+        precondition(original == input, "whole-original PDF export preserves the original bytes")
         let rotated = try decode(scan.pageDataURL(number: 1))
         precondition(rotated.width == 1680 && rotated.height == 2400, "rotation determines page dimensions")
         let red = pixel(rotated, x: 250, y: 290)

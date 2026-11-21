@@ -1723,8 +1723,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             values.merge(result) { _, result in result }
             self?.replyToScan("dubheScanSaved", values)
         }
+        let original = message["original"] as? Bool == true
+        let text = message["text"] as? String ?? ""
         guard let format = message["format"] as? String, ["md", "txt", "tex", "json", "csv", "docx", "pdf"].contains(format),
-              let text = message["text"] as? String, !text.isEmpty, text.utf8.count <= 16 * 1024 * 1024 else {
+              (!text.isEmpty || format == "pdf" && original), text.utf8.count <= 16 * 1024 * 1024 else {
             reply(["error": "扫描结果为空、过大或导出格式无效。"])
             return
         }
@@ -1749,6 +1751,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     return try TranslationExport.render(format: "docx", blocks: blocks)
                 }
                 if let selected {
+                    if original { return try selected.originalPages() }
                     if let notes {
                         return try TranslationPDF.rebuildSelectedPages(url: selected.workingURL, pages: pages,
                                                                        translations: notes, label: "识别文字")

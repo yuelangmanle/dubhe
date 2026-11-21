@@ -102,7 +102,8 @@ final class ScanPDF {
         return text.utf8.count <= 256 * 1024 ? text : ""
     }
 
-    func originalPages(_ pages: [Int]) throws -> Data {
+    func originalPages(_ pages: [Int]? = nil) throws -> Data {
+        guard let pages else { return try Data(contentsOf: workingURL, options: .mappedIfSafe) }
         let selected = PDFDocument()
         for number in pages {
             guard (1...pageCount).contains(number),
