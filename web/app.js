@@ -3050,12 +3050,14 @@
   }
 
   async function saveLocalTask(kind, id, title, payload, status) {
-    if (!isLocalPage || state.server?.share_only) return;
+    if (!isLocalPage || state.server?.share_only) return false;
     try {
       await vpost('/api/tasks', { upsert: { kind, id, title: title.slice(0, 100), payload } });
       status.textContent = '已保存在本机';
+      return true;
     } catch (e) {
       status.textContent = '任务未保存 · ' + e.message;
+      return false;
     }
   }
 
@@ -3072,8 +3074,8 @@
     section.append(el('h3', 'task-section-title', '最近任务'), list);
     body.replaceChildren(section, storage);
     setViewHead('任务与存储', '', [
-      { label: '新建扫描', on: () => openView('scan') },
-      { label: '新建翻译', on: () => openView('translate') },
+      { label: '新建扫描', on: () => { openView('scan'); scanPane.startNew(); } },
+      { label: '新建翻译', on: () => { openView('translate'); translationPane.startNew(); } },
     ]);
     const visible = () => state.view === 'tasks' && section.isConnected;
     list.appendChild(vEmpty('正在读取本机任务'));
@@ -4089,20 +4091,7 @@
     inputFile.accept = '.txt,.md,.markdown,.csv,.log';
     if (window.webkit?.messageHandlers?.shell) inputFile.accept += ',.docx,.pdf';
     inputFile.style.display = 'none';
-    clearFile.onclick = () => {
-      sourceFile = exportedParts = null;
-      includeSource.checked = false;
-      fileName = '';
-      work = null;
-      taskId = null;
-      savedStatus.textContent = '';
-      ta.value = '';
-      setOutput('');
-      copyBtn.disabled = true;
-      clearFile.hidden = true;
-      prog.textContent = '';
-      updateControls();
-    };
+    clearFile.onclick = startNew;
     relink.onclick = () => { relinking = true; inputFile.click(); };
     sample.onclick = () => {
       acceptScan('Our field survey began after the rain. We measured the river level at three locations.', '英文试用示例');
@@ -4544,27 +4533,40 @@
     };
     setOutput('');
     updateControls();
-    function acceptScan(text, name, pages, origin) {
+    function startNew() {
       if (job || readingFile || exporting) {
-        prog.textContent = '请等当前操作完成后再送入扫描结果。';
-        return;
+        prog.textContent = '请先完成或停止当前操作。';
+        return false;
       }
       exportedParts = work = null;
+      sourceFile = null;
+      taskId = null;
+      includeSource.checked = false;
+      savedStatus.textContent = '';
+      fileName = '';
+      ta.value = '';
+      clearFile.hidden = true;
+      setOutput('');
+      copyBtn.disabled = true;
+      prog.textContent = '';
+      updateControls();
+      ta.focus();
+      return true;
+    }
+
+    function acceptScan(text, name, pages, origin) {
+      if (!startNew()) return;
       sourceFile = pages ? { format: 'scan', paragraphs: pages.map(item => item[1].text),
         pages: pages.map(item => item[0]), origin } : null;
-      taskId = null;
       includeSource.checked = Boolean(pages);
-      savedStatus.textContent = '';
       fileName = name;
       ta.value = text;
       clearFile.hidden = false;
-      setOutput('');
-      copyBtn.disabled = true;
       prog.textContent = '已载入扫描结果';
       updateControls();
       ta.focus();
     }
-    return { body, refreshModels, acceptScan, restoreTask, usesTask: id => id === taskId && !!job };
+    return { body, refreshModels, acceptScan, startNew, restoreTask, usesTask: id => id === taskId && !!job };
   }
 
   // ---------------------------------------------------------------- 扫描
@@ -4972,10 +4974,12 @@
     detail.append(detailTitle, detailValue, presets);
     const actionRow = el('div', 'scan-action-row');
     const run = button('Run', '开始识别', 'pri');
+    const runPage = button('RunPage', '识别本页');
     const stop = button('Stop', '停止识别');
     const savedStatus = el('span', 'vmeta task-save-status');
     savedStatus.setAttribute('role', 'status');
-    actionRow.append(run, stop, status, savedStatus);
+    const retrySave = button('RetrySave', '重试保存', 'ghost');
+    actionRow.append(run, runPage, stop, status, savedStatus, retrySave);
     options.append(modeLine, modeTip, detail, actionRow, advanced);
     inputCard.appendChild(options);
 
@@ -4992,7 +4996,7 @@
     const output = el('div', 'scan-output');
     output.id = 'scanResult';
     const resultTools = el('div', 'scan-tools scan-result-tools');
-    const copy = button('Copy', '复制');
+    const copy = button('Copy', '复制已识别页');
     const exportResult = button('Export', '导出');
     const exportFormat = el('select', 'vsel');
     exportFormat.id = 'scanExportFormat';
@@ -5007,7 +5011,8 @@
     const review = button('Review', '校对本页');
     const question = button('AskDocument', '问这份文档');
     const exportTools = el('div', 'scan-tools scan-export-tools');
-    exportTools.append(exportFormat, exportResult);
+    const exportScope = el('span', 'vmeta');
+    exportTools.append(exportScope, exportFormat, exportResult);
     resultTools.append(review, copy, translate, question, exportTools);
     resultCard.append(resultHead, output, resultTools);
     workspace.append(inputCard, resultCard);
@@ -5025,10 +5030,16 @@
     });
     const validRange = value => Number.isInteger(value.first) && Number.isInteger(value.last) &&
       value.first >= 1 && value.first <= value.last && value.last <= (source?.pageCount ?? 1);
-    const sameWork = value => work?.source === source && work &&
-      Object.keys(value).every(key => value[key] === work[key]);
-    const canContinue = value => sameWork(value) && work.results.size < value.last - value.first + 1;
-    const canRescan = value => sameWork(value) && work.results.has(page) && !canContinue(value);
+    const sameTask = value => work && work.source === source && work.mode === value.mode && work.detail === value.detail;
+    const sameSettings = value => sameTask(value) &&
+      Object.keys(value).every(key => key === 'first' || key === 'last' || value[key] === work[key]);
+    const resultInRange = value => sameSettings(value)
+      ? [...work.results.keys()].filter(index => index >= value.first && index <= value.last && !work.pending.has(index)).length
+      : 0;
+    let savingTask = false, saveFailed = false;
+    const scanBusy = () => Boolean(job || pendingPDF || loadingImage || pendingSave || pendingBatch || batch || savingTask);
+    const canLeave = () => !saveFailed || !work?.results.size ||
+      confirm('当前结果尚未保存到最近任务。仍要离开这份结果吗？');
     const result = () => work?.results.get(page);
     const variantFiles = (value = variant.value, available = files) =>
       available.filter(file => file.id === 'xiaomi-ocr-0-' + value || file.id === 'xiaomi-ocr-0-vision');
@@ -5076,7 +5087,7 @@
       remove.disabled = modelBusy || Boolean(job || batch);
       openPDF.hidden = batchOpen.hidden = !native();
       clear.hidden = !source;
-      const busy = Boolean(job || pendingPDF || loadingImage || pendingSave || pendingBatch || batch);
+      const busy = scanBusy();
       openImage.disabled = openPDF.disabled = batchOpen.disabled = clear.disabled = sample.disabled = relink.disabled = busy;
       batchOpen.textContent = batch ? '批量 ' + batch.current + ' / ' + batch.total : '批量文档';
       relink.hidden = !source || originalReady() || isPDF() && !native();
@@ -5104,10 +5115,19 @@
       detailValue.placeholder = s.mode === 'extract' ? '例如：题目、作者、日期' : '例如：图中的纵轴表示什么？';
       stop.hidden = !job && !batch;
       stop.disabled = !!job?.signal.aborted || !!batch?.stopped;
-      run.disabled = busy || modelBusy || !originalReady() || (!ready && s.readMode === 'ocr') ||
-        !validRange(s) || (!detail.hidden && !s.detail);
-      run.textContent = canContinue(s) ? '继续识别' : canRescan(s) ? '重扫本页' : '开始识别';
+      retrySave.hidden = !saveFailed || !work?.results.size;
+      retrySave.disabled = busy;
       const item = result();
+      const readyToScan = !busy && !modelBusy && originalReady() && (ready || s.readMode !== 'ocr') &&
+        (detail.hidden || s.detail);
+      run.disabled = !readyToScan || !validRange(s);
+      const complete = resultInRange(s);
+      run.textContent = !complete ? '开始识别' : complete < s.last - s.first + 1 ? '继续识别'
+        : s.first === s.last ? '重扫所选页' : '重扫所选页面';
+      runPage.hidden = !isPDF() || s.first === page && s.last === page;
+      runPage.disabled = !readyToScan;
+      runPage.textContent = item ? '重扫本页' : '仅识别本页';
+      copy.textContent = isPDF() ? '复制已识别页' : '复制';
       showRaw.hidden = originalLayout || !['markdown', 'latex'].includes(item?.kind);
       showRaw.textContent = raw ? '预览' : item?.kind === 'latex' ? 'LaTeX 源码' : '识别文本';
       showRaw.setAttribute('aria-pressed', String(raw));
@@ -5135,10 +5155,13 @@
             !/<table\b|^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*\|[ \t]*:?-{3,}/im.test(item.text)
           : option.value === autoFormat || option.value === 'docx' && !native();
       }
-      const preferred = exportChoice ?? (canExportOriginal && (!hasResults || originalLayout)
-        ? 'original' : canExportOriginal && work?.mode === 'document' ? 'paired' : 'auto');
-      exportFormat.value = Array.from(exportFormat.options).some(option => option.value === preferred && !option.hidden)
-        ? preferred : hasResults ? 'auto' : canExportOriginal ? 'original' : 'auto';
+      const defaultExport = canExportOriginal && (!hasResults || originalLayout)
+        ? 'original' : canExportOriginal && work?.mode === 'document' ? 'paired' : 'auto';
+      exportFormat.value = Array.from(exportFormat.options).some(option => option.value === exportChoice && !option.hidden)
+        ? exportChoice : defaultExport;
+      exportScope.hidden = !isPDF() || !hasResults && !canExportOriginal;
+      exportScope.textContent = exportFormat.value === 'original' ? '全部 ' + (source?.pageCount ?? 1) + ' 页'
+        : exportFormat.value === 'csv' ? '第 ' + page + ' 页' : '已识别 ' + (work?.results.size ?? 0) + ' 页';
       exportFormat.disabled = exportResult.disabled = (!hasResults && !canExportOriginal) || Boolean(pendingSave || batch || job);
       const extension = ['paired', 'original'].includes(exportFormat.value) ? 'pdf'
         : exportFormat.value === 'auto' ? autoFormat : exportFormat.value;
@@ -5199,6 +5222,7 @@
       lastPdfPage = null;
       work = null;
       taskId = null;
+      saveFailed = false;
       savedStatus.textContent = '';
       raw = false;
       originalLayout = false;
@@ -5210,6 +5234,14 @@
       if (nextSource?.kind === 'pdf') readMode.value = readPreference || (variantInstalled() ? 'ocr' : 'auto');
       setStatus('');
       showPage(1);
+    }
+
+    function startNew() {
+      if (scanBusy()) { setStatus('请先完成或停止当前操作。'); return; }
+      if (!canLeave()) return;
+      mode.value = 'document';
+      detailValue.value = '';
+      replaceSource(null);
     }
 
     function preparedPage(file, index, quality = 'standard', textSource = 'ocr') {
@@ -5342,7 +5374,11 @@
     };
 
     async function importImage(file, reconnect = false) {
-      if (!file || job || batch || pendingBatch || pendingPDF || loadingImage || pendingSave) return;
+      if (!file || scanBusy()) return;
+      if (/\.(pdf|docx)$/i.test(file.name)) {
+        setStatus(native() ? '请用「打开 PDF / Word」导入文档。此处支持拖入图片。' : '请在 Mac 客户端打开 PDF 或 Word。', true);
+        return;
+      }
       loadingImage = true;
       setStatus('');
       update();
@@ -5350,7 +5386,7 @@
         const image = await scanImageData(file);
         const nextSource = { kind: 'image', name: file.name, image, identity: await fingerprintFile(file) };
         if (reconnect || sameOriginal(nextSource)) reattach(nextSource);
-        else replaceSource(nextSource);
+        else if (canLeave()) replaceSource(nextSource);
       } catch (e) {
         setStatus(e.message, true);
       } finally {
@@ -5375,8 +5411,11 @@
         shellPost({ type: bookmark ? 'scanRestorePDF' : 'scanOpenPDF', requestId: pendingPDF, bookmark });
       });
     }
-    openPDF.onclick = () => openPDFPicker();
+    openPDF.onclick = () => { if (canLeave()) openPDFPicker(); };
     batchOpen.onclick = () => {
+      const { error } = scanInputs(selection());
+      if (error) { setStatus(error, true); return; }
+      if (!canLeave()) return;
       pendingBatch = crypto.randomUUID();
       update();
       shellPost({ type: 'scanBatchOpen', requestId: pendingBatch });
@@ -5393,13 +5432,12 @@
       batch = { current: 0, total: files.length, stopped: false };
       update();
       const settings = {
-        readMode: readMode.value, language: language.value, quality: quality.value,
-        rotation: Number(rotation.value), enhance: enhance.checked, maxTokens: Number(length.value),
-        variant: variant.value, layout: layout.value,
+        ...selection(),
+        readMode: mode.value === 'document' ? readMode.value : 'ocr',
       };
       const tasks = files.map(file => ({ id: crypto.randomUUID(), kind: 'scan',
-        title: file.name.slice(0, 100), payload: { ...settings, source: file, mode: 'document',
-          first: 1, last: file.pageCount, detail: '', results: [], page: 1 } }));
+        title: file.name.slice(0, 100), payload: { ...settings, source: file,
+          first: 1, last: file.pageCount, results: [], page: 1 } }));
       batch.ids = new Set(tasks.map(task => task.id));
       let done = 0;
       try {
@@ -5411,14 +5449,15 @@
           const opened = await restoreTask(task, true);
           if (batch.stopped) break;
           if (!opened) continue;
-          await run.onclick();
-          if (work?.results.size === task.payload.last) done++;
+          if (await runScan({ fromBatch: true }) && !saveFailed) done++;
+          if (saveFailed) break;
         }
         const unavailable = Array.isArray(message.unavailable) ? message.unavailable.length : 0;
         if (isPDF() && originalReady() && !raster) await showPage(page);
         setStatus('批量已完成 ' + done + ' / ' + tasks.length + ' 份' +
           (unavailable ? ' · ' + unavailable + ' 份无法打开' : '') +
-          (done < tasks.length ? ' · 可在「最近任务」继续' : ' · 结果已存入「最近任务」'));
+          (saveFailed ? ' · 请重试保存当前文档' : done < tasks.length
+            ? ' · 可在「最近任务」继续' : ' · 结果已存入「最近任务」'));
       } catch (error) {
         setStatus('批量中断 · ' + error.message + ' · 已写入的任务在「最近任务」', true);
       } finally {
@@ -5455,10 +5494,12 @@
       }
       return canvas.toDataURL('image/jpeg', 0.93);
     }
-    sample.onclick = () => replaceSource({
-      kind: 'image', name: '试用示例 · 河流观测记录', example: true, image: examplePage(),
-    });
-    clear.onclick = () => replaceSource(null);
+    sample.onclick = () => {
+      if (canLeave()) replaceSource({
+        kind: 'image', name: '试用示例 · 河流观测记录', example: true, image: examplePage(),
+      });
+    };
+    clear.onclick = () => { if (canLeave()) replaceSource(null); };
     enlarge.onclick = () => {
       if (!raster) return;
       const dialog = el('dialog', 'scan-image-dialog');
@@ -5795,17 +5836,19 @@
         }
         saving = save.disabled = true;
         close.disabled = true;
-        if (!work || reviewedPage < work.first || reviewedPage > work.last) {
-          work = { ...settings, source, mode: draftMode, first: reviewedPage, last: reviewedPage, results: new Map() };
+        if (!work || !item && work.mode !== 'document' && draftMode !== work.mode) {
+          work = { ...settings, source, mode: draftMode, first: reviewedPage, last: reviewedPage,
+            results: new Map(), pending: new Set() };
           taskId = crypto.randomUUID();
         }
         work.results.set(reviewedPage, {
           ...item, text, kind: draftKind, method: item?.method ?? (draftMode === 'chart' ? 'chart' : 'region'),
         });
-        await checkpoint();
+        work.pending.delete(reviewedPage);
+        const saved = await checkpoint();
         renderResult();
         dialog.close();
-        setStatus(item ? '已更新本页校对稿。' : '已保存本页选区结果。');
+        setStatus(saved ? '本页已保存。' : '本页已更新，尚未写入最近任务。请重试保存。', !saved);
       };
       dialog.addEventListener('cancel', event => { if (saving) event.preventDefault(); });
       columns.append(original, editor);
@@ -5872,17 +5915,29 @@
     recheck.onclick = () => { modelError = ''; refreshModels(); };
 
     async function checkpoint() {
-      if (!work || !taskId || !source) return;
+      if (!work || !taskId || !source || savingTask) return false;
       const { kind, name, pageCount, bookmark, identity, example } = source;
-      await saveLocalTask('scan', taskId, name, {
-        source: { kind, name, pageCount: pageCount ?? 1, bookmark: bookmark || '',
-          identity: identity || '', example: !!example },
-        mode: work.mode, first: work.first, last: work.last, detail: work.detail, readMode: work.readMode,
-        language: work.language, quality: work.quality, rotation: work.rotation, enhance: work.enhance,
-        maxTokens: work.maxTokens, variant: work.variant, layout: work.layout,
-        results: [...work.results.entries()], page,
-      }, savedStatus);
+      savingTask = true;
+      update();
+      try {
+        const saved = await saveLocalTask('scan', taskId, name, {
+          source: { kind, name, pageCount: pageCount ?? 1, bookmark: bookmark || '',
+            identity: identity || '', example: !!example },
+          mode: work.mode, first: work.first, last: work.last, detail: work.detail, readMode: work.readMode,
+          language: work.language, quality: work.quality, rotation: work.rotation, enhance: work.enhance,
+          maxTokens: work.maxTokens, variant: work.variant, layout: work.layout,
+          results: [...work.results.entries()], pending: [...work.pending], page,
+        }, savedStatus);
+        saveFailed = !saved;
+        return saved;
+      } finally {
+        savingTask = false;
+        update();
+      }
     }
+    retrySave.onclick = async () => {
+      if (!scanBusy() && await checkpoint()) setStatus('已保存到最近任务。');
+    };
 
     function sameOriginal(file) {
       return source && file.identity && file.kind === source.kind && file.identity === source.identity &&
@@ -5905,7 +5960,7 @@
     }
 
     function restoreTask(task, fromBatch = false) {
-      if (job || pendingPDF || pendingSave || loadingImage || ((batch || pendingBatch) && !fromBatch)) {
+      if (job || pendingPDF || pendingSave || loadingImage || savingTask || ((batch || pendingBatch) && !fromBatch)) {
         setStatus('请先完成或停止当前操作。');
         return;
       }
@@ -5914,9 +5969,11 @@
         setStatus('找不到这个扫描任务的记录。', true);
         return;
       }
-      const file = { ...data.source };
+      if (task.id === taskId && originalReady()) return true;
+      if (!fromBatch && !canLeave()) return;
+      const file = originalReady() && sameOriginal(data.source) ? source : { ...data.source };
       if (file.example) file.image = examplePage();
-      replaceSource(file);
+      if (file !== source) replaceSource(file);
       mode.value = data.mode;
       variant.value = data.variant === 'bf16' ? 'bf16' : 'q4';
       layout.value = data.layout === 'regions' ? 'regions' : 'page';
@@ -5932,10 +5989,13 @@
       from.value = data.first;
       to.value = data.last;
       taskId = task.id;
-      work = { ...selection(), source: file, results: new Map(data.results) };
+      const pending = Array.isArray(data.pending)
+        ? data.pending.filter(number => Number.isInteger(number) && number >= 1 && number <= file.pageCount) : [];
+      work = { ...selection(), source: file, results: new Map(data.results), pending: new Set(pending) };
+      saveFailed = false;
       savedStatus.textContent = '已从本机恢复';
-      showPage(Math.min(file.pageCount, Math.max(1, data.page || 1)));
-      if (isPDF() && native() && file.bookmark) return openPDFPicker(true, file.bookmark);
+      showPage(Math.min(file.pageCount ?? 1, Math.max(1, data.page || 1)));
+      if (!originalReady() && isPDF() && native() && file.bookmark) return openPDFPicker(true, file.bookmark);
       return originalReady();
     }
 
@@ -5984,44 +6044,70 @@
       return { ...reply, method: payload.mode === 'chart' ? 'chart' : 'page' };
     }
 
-    run.onclick = async () => {
-      const s = selection();
-      if (!validRange(s) || !originalReady() || (s.readMode === 'ocr' && !variantInstalled(s.variant))) return;
+    run.onclick = () => runScan();
+    runPage.onclick = () => runScan({ single: true });
+
+    function scanInputs(s) {
       const fields = s.mode === 'extract'
         ? [...new Set(s.detail.split(/[,，、\n]/).map(field => field.trim()).filter(Boolean))] : [];
       const bytes = value => new TextEncoder().encode(value).length;
-      if (s.mode === 'extract' && (!fields.length || fields.length > 20 || fields.some(field => bytes(field) > 96))) {
-        setStatus('请输入 1–20 个较短的字段名称，用逗号或换行分隔。', true);
-        return;
+      let error = '';
+      if (s.mode === 'extract' && (!fields.length || fields.length > 20 ||
+          fields.some(field => bytes(field) > 96 || /[\r\t]/.test(field)))) {
+        error = '请输入 1–20 个较短的字段名称，用逗号或换行分隔。';
+      } else if (s.mode === 'ask' && (!s.detail || bytes(s.detail) > 2048)) {
+        error = s.detail ? '问题过长，请缩短后重试。' : '请输入要向图片或文档提出的问题。';
       }
-      if (s.mode === 'ask' && bytes(s.detail) > 2048) {
-        setStatus('问题过长，请缩短后重试。', true);
-        return;
+      return { fields, error };
+    }
+
+    async function runScan({ single = false, fromBatch = false } = {}) {
+      if (job || modelBusy || pendingPDF || loadingImage || pendingSave || pendingBatch || savingTask ||
+          batch && !fromBatch) return false;
+      const settings = selection();
+      const s = single && !validRange(settings) ? { ...settings, first: page, last: page } : settings;
+      if (!validRange(s) || !originalReady()) return false;
+      if (s.readMode === 'ocr' && (!variantInstalled(s.variant) || !catalog?.runtime_available)) {
+        setStatus('请选择已安装的 OCR 模型，或改为读取文档文字。', true);
+        return false;
       }
-      const rescan = canRescan(s);
+      const { fields, error } = scanInputs(s);
+      if (error) { setStatus(error, true); return false; }
       const previousWork = work;
       const previousPage = page;
-      const pendingWork = canContinue(s) || rescan ? work : { ...s, source, results: new Map() };
-      const pendingId = pendingWork === work ? taskId : crypto.randomUUID();
-      if (!work?.results.size) {
+      const reuse = sameTask(s);
+      const updatingPage = reuse && work.results.has(page);
+      if (!reuse && !fromBatch && !canLeave()) return false;
+      const scope = Array.from({ length: s.last - s.first + 1 }, (_, index) => s.first + index);
+      const matching = sameSettings(s);
+      const incomplete = matching
+        ? scope.filter(number => !work.results.has(number) || work.pending.has(number)) : scope;
+      const targets = single ? [page] : incomplete.length ? incomplete : scope;
+      const pendingWork = reuse && single ? work : {
+        ...s, source, results: reuse ? work.results : new Map(),
+        pending: new Set(matching ? [...work.pending, ...targets] : targets),
+      };
+      const pendingId = reuse ? taskId : crypto.randomUUID();
+      if (reuse || !work?.results.size) {
         work = pendingWork;
         taskId = pendingId;
       }
       job = new AbortController();
       const signal = job.signal;
-      let current = rescan ? page : s.first;
-      const finalPage = rescan ? page : s.last;
+      setStatus('正在准备识别…');
+      update();
+      let current = targets[0];
       try {
-        if (work === pendingWork && !rescan) await checkpoint();
-        for (; current <= finalPage; current++) {
-          if (!rescan && pendingWork.results.has(current)) continue;
+        if (work === pendingWork && !single) await checkpoint();
+        for (const [index, number] of targets.entries()) {
+          signal.throwIfAborted();
+          current = number;
           page = current;
           raster = null;
           drawnPage = 0;
           image.removeAttribute('src');
           renderResult();
-          setStatus(isPDF() ? '正在识别第 ' + current + ' 页 · ' +
-            pendingWork.results.size + ' / ' + (s.last - s.first + 1) + ' 页完成' : '正在识别…');
+          setStatus(isPDF() ? '正在识别第 ' + current + ' 页 · ' + (index + 1) + ' / ' + targets.length : '正在识别…');
           const { image: data, text: selectable = '' } = await scanPageForJob(source, current, signal, s);
           signal.throwIfAborted();
           if (data) showRaster(source, current, data);
@@ -6052,21 +6138,26 @@
           work = pendingWork;
           taskId = pendingId;
           work.results.set(current, item);
+          if (!single || sameSettings(s)) work.pending.delete(current);
           renderResult();
           await checkpoint();
         }
         if (isPDF() && !raster && !batch) await showPage(page);
-        setStatus(isPDF() ? '识别完成 · ' + work.results.size + ' 页' : '识别完成');
+        const pageStatus = (updatingPage ? '已更新第 ' : '已识别第 ') + current + ' 页';
+        setStatus(isPDF() ? (single ? pageStatus : '识别完成 · ' + scope.length + ' 页') : '识别完成');
+        return true;
       } catch (e) {
         const kept = work.results.size ? ' · 已保留 ' + work.results.size + ' 页结果' : '';
         if (work === previousWork && work !== pendingWork && page !== previousPage) await showPage(previousPage);
+        else if (!raster && !batch && isPDF()) await showPage(page);
         if (signal.aborted) setStatus('已停止识别' + kept);
         else setStatus((isPDF() ? '第 ' + current + ' 页识别失败' : '识别失败') + ' · ' + e.message + kept, true);
+        return false;
       } finally {
         job = null;
         update();
       }
-    };
+    }
 
     function resultFormat(items) {
       let format;
@@ -6187,7 +6278,7 @@
     };
 
     renderResult();
-    return { body, refreshModels, importImage, restoreTask,
+    return { body, refreshModels, importImage, startNew, restoreTask,
       usesTask: id => id === taskId && !!job || Boolean(batch?.ids?.has(id)) };
   }
 

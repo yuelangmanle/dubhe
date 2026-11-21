@@ -22,6 +22,9 @@ const scanFiles = [
 const scannerInstalled = file => scanInstalled && file.id !== 'xiaomi-ocr-0-bf16';
 const history = new Map();
 const tasks = new Map();
+let holdNextScanSave = false;
+let releaseScanSave;
+let failNextScanSave = false;
 let holdChat;
 let holdSummary;
 let holdTranslation;
@@ -68,7 +71,16 @@ const handler = async (req, res) => {
     const data = await collect(req);
     if (data.upsert) {
       const task = data.upsert;
+      if (task.kind === 'scan' && failNextScanSave) {
+        failNextScanSave = false;
+        return json({ error: '模拟本机写入失败' }, 507);
+      }
       tasks.set(task.id, { ...task, updated: Date.now(), bytes: JSON.stringify(task.payload).length });
+      if (task.kind === 'scan' && holdNextScanSave) {
+        holdNextScanSave = false;
+        releaseScanSave = () => json({ ok: true });
+        return;
+      }
     }
     if (data.delete) tasks.delete(data.delete);
     return json({ ok: true });
@@ -772,7 +784,13 @@ try {
   })()`);
   const beforePDF = scans.length;
   pauseAtScan = beforePDF + 2;
+  holdNextScanSave = true;
   await click('#scanRun');
+  await until(() => releaseScanSave, 'first scan task save is in flight');
+  assert.equal(await evaluate('document.querySelector("#scanRun").disabled && document.querySelector("#scanClear").disabled'), true);
+  await click('#scanRun');
+  assert.equal(scans.length, beforePDF);
+  releaseScanSave();
   await until(() => scans.length === pauseAtScan, 'second scan page is running');
   await click('#scanStop');
   await until(() => evaluate('document.querySelector("#scanStatus").textContent.includes("已保留 1 页")'),
@@ -805,6 +823,36 @@ try {
   assert.equal(originalPDF.name, 'paper-原件.pdf');
   assert.equal(originalPDF.pages, undefined);
   await click('#scanOriginalLayout');
+  const originalTask = [...tasks.values()].find(task => task.title === 'paper.docx' && task.payload.mode === 'document');
+  await evaluate(`(() => {
+    const from = document.querySelector('#scanFrom');
+    from.value = '1';
+    from.dispatchEvent(new Event('input'));
+  })()`);
+  const beforeExpand = scans.length;
+  await click('#scanRun');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent === "识别完成 · 3 页"'),
+    'expanding a range keeps the finished pages');
+  assert.equal(scans.length, beforeExpand + 1);
+  assert.deepEqual(tasks.get(originalTask.id).payload.results.map(([page]) => page).sort(), [1, 2, 3]);
+  const beforeRescan = scans.length;
+  await click('#scanRunPage');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent === "已更新第 1 页"'),
+    'current page rescan leaves the selected range and other pages intact');
+  assert.equal(scans.length, beforeRescan + 1);
+  assert.equal(tasks.get(originalTask.id).payload.results.length, 3);
+  pauseAtScan = scans.length + 2;
+  await click('#scanRun');
+  await until(() => scans.length === pauseAtScan, 'the second page is being reprocessed');
+  await click('#scanStop');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent.includes("已保留 3 页")'),
+    'stopping a repeated scan keeps the older text');
+  assert.deepEqual(tasks.get(originalTask.id).payload.pending, [2, 3]);
+  const beforeRetry = scans.length;
+  await click('#scanRun');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent === "识别完成 · 3 页"'),
+    'repeating a scan resumes at its unfinished pages');
+  assert.equal(scans.length, beforeRetry + 2);
   await chooseExport('auto');
   await evaluate(`(() => {
     const mode = document.querySelector('#scanMode');
@@ -817,6 +865,7 @@ try {
     document.querySelector('#scanQuality').value = 'fine';
     document.querySelector('#scanRotation').value = '90';
     document.querySelector('#scanLength').value = '4096';
+    document.querySelector('#scanFrom').value = '2';
     document.querySelector('#scanTo').value = '2';
     document.querySelector('#scanTo').dispatchEvent(new Event('input'));
   })()`);
@@ -832,8 +881,11 @@ try {
   assert.equal(scanExport.format, 'json');
   assert.equal(await evaluate('document.querySelector("#scanExport").textContent'), '导出 JSON');
   assert.deepEqual(JSON.parse(scanExport.text), [{ page: 2, fields: { 题目: '年度报告', 日期: null } }]);
-  await click('#scanClear');
+  await click('[data-view="tasks"]');
+  await evaluate('[...document.querySelectorAll("#viewActions button")].find(b => b.textContent === "新建扫描").click()');
   assert.equal(await evaluate('window.scanNativeCalls.at(-1).type'), 'scanClosePDF');
+  assert.equal(await evaluate('document.querySelector(".scan-source-name").textContent'), '');
+  assert.ok(tasks.has(originalTask.id));
 
   // Restart both workspaces with only the locally saved checkpoint available.
   model = '/models/a.gguf';
@@ -915,12 +967,17 @@ try {
   await until(() => evaluate('document.querySelector("dialog[open] .scan-region-result")?.value.length > 0'),
     'cropped area gets a separate result');
   assert.equal(scans.at(-1).mode, 'text');
+  failNextScanSave = true;
   await evaluate(`(() => {
     document.querySelector('textarea[aria-label="本页校对稿"]').value = 'Manual correction, page 20.';
     [...document.querySelectorAll('dialog[open] button')].find(b => b.textContent === '保存本页').click();
   })()`);
   await until(() => evaluate('document.querySelector("#scanResult").textContent.includes("Manual correction")'),
     'the correction appears in the results');
+  await until(() => evaluate('!document.querySelector("#scanRetrySave").hidden'), 'failed save keeps the correction and offers retry');
+  assert.match(await evaluate('document.querySelector("#scanStatus").textContent'), /尚未写入/);
+  await click('#scanRetrySave');
+  await until(() => evaluate('document.querySelector("#scanStatus").textContent === "已保存到最近任务。"'), 'retry saves the correction');
   const saved = [...tasks.values()].find(task => task.title === 'twenty-pages.pdf');
   assert.equal(saved.payload.results.length, 20);
   assert.match(saved.payload.results.find(([page]) => page === 1)[1].text, /年度报告/);
