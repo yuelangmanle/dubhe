@@ -85,7 +85,9 @@ FAKE_SERVER = """
                 if "slow-test" in prompt:
                     Path(os.environ["DUBHE_TEST_SCAN_STARTED"]).touch()
                     time.sleep(30)
-                if "Markdown" in prompt:
+                if "data in this chart" in prompt:
+                    text = "| Station | Level |\\n| --- | --- |\\n| Lake A | ~10.2 |"
+                elif "Markdown" in prompt:
                     text = "<md>\\n# Report\\n\\n<fcel>Header<lcel><nl>\\n<fcel>01<fcel>02<nl>\\n\\nNotes\\n</md>"
                 elif "OTSL" in prompt:
                     text = "<fcel><script>alert(1)</script><lcel><nl><ucel><xcel><nl>"

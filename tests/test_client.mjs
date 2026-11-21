@@ -118,8 +118,10 @@ const handler = async (req, res) => {
     if (scans.length === pauseAtScan) return;
     if (job.mode === 'extract') return json({ text: '{"题目":"年度报告","日期":null}', kind: 'json' });
     if (job.mode === 'ask') return json({ text: '报告提到了流量。', kind: 'text' });
+    if (job.mode === 'chart') return json({ text: 'Station | Level\n--- | ---\nLake A | ~10.2', kind: 'markdown' });
+
     return json({
-      text: '# 年度报告\n\n<table><tr><td colspan="2"><img>流量</td></tr></table>\n\n模型输出。',
+      text: '# 年度报告\n\n<table><tr><td colspan="2"><img>流量</td></tr></table>\n\n模型输出 \\(p_0 \\in [0.08, 0.20]\\)。',
       kind: 'markdown',
     });
   }
@@ -169,7 +171,7 @@ const handler = async (req, res) => {
     return;
   }
   const name = path === '/' ? 'index.html' : path.slice(1);
-  if (!/^[\w.-]+$/.test(name)) { res.writeHead(404).end(); return; }
+  if (!/^(?:vendor\/)?[\w.-]+$/.test(name)) { res.writeHead(404).end(); return; }
   const contentType = { html: 'text/html', js: 'text/javascript', css: 'text/css' };
   try {
     if (!fixtures.has(name)) fixtures.set(name, await readFile(join(web, name)));
@@ -638,7 +640,7 @@ try {
         requestId: message.requestId, name: 'paper.docx', pageCount: 4, identity: 'paper-identity',
       });
       if (message.type === 'scanPDFPage') window.dubheScanPDFPage({
-        requestId: message.requestId, page: message.page, image: window.makeScannerImage(), fine: message.fine,
+        ...message, image: window.makeScannerImage(),
       });
       if (message.type === 'scanFindRegions') window.dubheScanRegionsReady({
         requestId: message.requestId, regions: [{ mode: 'table', x: .2, y: .3, width: .6, height: .5 }],
@@ -663,13 +665,55 @@ try {
     window.dispatchEvent(new DragEvent('drop', { dataTransfer: data, cancelable: true }));
   })()`);
   await until(() => evaluate('!document.querySelector("#scanRun").disabled'), 'image scanner ready');
+  await click('#scanReview');
+  await click('.scan-review-dialog button.vbtn.ghost');
+  await evaluate(`(() => {
+    const regions = document.querySelector('[aria-label="识别到的区域"]');
+    regions.value = '0';
+    regions.dispatchEvent(new Event('change'));
+    document.querySelector('[aria-label="选区识别方式"]').value = 'chart';
+    [...document.querySelectorAll('dialog button')].find(b => b.textContent === '识别选区').click();
+  })()`);
+  await until(() => evaluate('document.querySelector(".scan-region-result").value.includes("~10.2")'), 'chart crop produces rows');
+  await evaluate('[...document.querySelectorAll("dialog button")].find(b => b.textContent === "用作本页结果").click()');
+  await click('.scan-review-dialog .pri');
+  await until(() => evaluate('document.querySelector("#scanResult table")?.textContent.includes("Lake A")'), 'save a selection before whole-page OCR');
+  await evaluate('document.querySelector("#scanExportFormat").value = "csv"');
+  await click('#scanExport');
+  const csv = await evaluate('window.scanNativeCalls.at(-1)');
+  assert.equal(csv.format, 'csv');
+  assert.match(csv.name, /图表估读\.csv$/);
+  assert.ok(csv.text.includes('"Lake A","~10.2"'));
+  await evaluate('document.querySelector("#scanExportFormat").value = "auto"');
   await click('#scanRun');
   await until(() => evaluate('document.querySelector("#scanStatus").textContent === "识别完成"'), 'image result');
   assert.match(scans.at(-1).image, /^data:image\/jpeg;base64,/);
   assert.equal(scans.at(-1).mode, 'document');
   assert.equal(await evaluate('document.querySelector("#scanResult table td").colSpan'), 2);
   assert.equal(await evaluate('!!document.querySelector("#scanResult img")'), false);
+  await until(() => evaluate('!!document.querySelector("#scanResult math msub")'), 'inline LaTeX produces MathML subscripts');
+  assert.equal(await evaluate('document.querySelector("#scanResult math mo").textContent'), '∈');
   await click('#scanEnlarge');
+  await until(() => evaluate('document.querySelector(".scan-image-dialog img").style.width !== ""'), 'preview image sized');
+  const fitWidth = await evaluate('document.querySelector(".scan-image-dialog img").getBoundingClientRect().width');
+  await evaluate(`(() => {
+    const zoom = document.querySelector('[aria-label="原件缩放"]');
+    zoom.value = '173';
+    zoom.dispatchEvent(new Event('input'));
+  })()`);
+  assert.equal(await evaluate('document.querySelector(".scan-zoom-percent").textContent'), '173%');
+  assert.ok(Math.abs(await evaluate('document.querySelector(".scan-image-dialog img").getBoundingClientRect().width') / fitWidth - 1.73) < .04);
+  await evaluate(`(() => {
+    const viewport = document.querySelector('.scan-image-viewport');
+    const bounds = viewport.getBoundingClientRect();
+    viewport.dispatchEvent(new WheelEvent('wheel', {
+      ctrlKey: true, deltaY: -120, clientX: bounds.x + bounds.width / 2, clientY: bounds.y + bounds.height / 2,
+      cancelable: true,
+    }));
+  })()`);
+  assert.ok(await evaluate('document.querySelector(\'[aria-label="原件缩放"]\').valueAsNumber > 173'));
+  await evaluate('[...document.querySelectorAll(".scan-image-dialog button")].find(b => b.textContent === "适合窗口").click()');
+  assert.equal(await evaluate('document.querySelector(".scan-zoom-percent").textContent'), '100%');
   await cdp('Input.dispatchKeyEvent', {type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27});
   await cdp('Input.dispatchKeyEvent', {type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27});
   await until(() => evaluate('!document.querySelector(".scan-image-dialog[open]")'), 'close original preview');
@@ -756,7 +800,7 @@ try {
   assert.deepEqual(scans.at(-1).fields, ['题目', '日期']);
   assert.equal(scans.at(-1).language, 'mixed');
   assert.equal(scans.at(-1).max_tokens, 4096);
-  assert.equal(await evaluate('window.scanNativeCalls.filter(m => m.type === "scanPDFPage").at(-1).fine'), true);
+  assert.equal(await evaluate('window.scanNativeCalls.filter(m => m.type === "scanPDFPage").at(-1).quality'), 'fine');
   await click('#scanExport');
   const scanExport = await evaluate('window.scanNativeCalls.at(-1)');
   assert.equal(scanExport.format, 'json');
@@ -797,7 +841,8 @@ try {
         bookmark: 'test-bookmark', identity: 'test-identity',
       });
       if (message.type === 'scanPDFPage') window.dubheScanPDFPage({
-        requestId: message.requestId, page: message.page, image,
+        ...message, image: message.page === 20 && message.textSource === 'auto' ? '' : image,
+        textOnly: message.page === 20 && message.textSource === 'auto',
         selectableText: message.page === 20 ? 'This last page has selectable text and uses no OCR inference.' : '',
       });
     } } } };
@@ -866,12 +911,15 @@ try {
           files: ['one', 'two'].map(name => ({kind: 'pdf', name: name + '.pdf', pageCount: 1,
             bookmark: 'batch-' + name, identity: name})), unavailable: [] });
       } else if (message.type === 'scanRestorePDF' && message.bookmark.startsWith('batch-')) {
+        window.scanNativeCalls.push(message);
         const name = message.bookmark.slice(6);
         opened.set(message.requestId, name);
         window.dubheScanPDFReady({requestId: message.requestId, name: name + '.pdf', pageCount: 1,
           bookmark: message.bookmark, identity: name});
       } else if (message.type === 'scanPDFPage' && opened.has(message.requestId)) {
-        window.dubheScanPDFPage({requestId: message.requestId, page: message.page, image,
+        window.scanNativeCalls.push(message);
+        window.dubheScanPDFPage({...message, image: message.textSource === 'auto' ? '' : image,
+          textOnly: message.textSource === 'auto',
           selectableText: 'Selectable PDF text for ' + opened.get(message.requestId)});
       } else original(message);
     };
@@ -885,6 +933,8 @@ try {
     assert.equal(task.payload.results[0][1].text, 'Selectable PDF text for ' + name);
   }
   assert.equal(scans.length, batchBefore);
+  assert.deepEqual(await evaluate('window.scanNativeCalls.filter(m => m.type === "scanRestorePDF" && m.bookmark.startsWith("batch-")).map(restore => window.scanNativeCalls.filter(m => m.type === "scanPDFPage" && m.requestId === restore.requestId).map(m => m.textSource))'),
+    [['auto'], ['auto', 'ocr']], 'text-only batch renders just the final preview');
 
   shareOnly = true;
   await navigate(otherOrigin + '/?share');

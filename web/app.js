@@ -4571,7 +4571,8 @@
   const SCAN_MODES = [
     ['document', '论文与文档', '按阅读顺序识别正文、标题、表格和公式。'],
     ['text', '文字与手写', '提取选中图片或页面上的文字，适合手写报告。'],
-    ['table', '表格', '识别表格行列与合并单元格。'],
+    ['table', '图片中的表格', '按行列读取表格，支持合并单元格。'],
+    ['chart', '统计图转表格', '从柱状图或折线图提取可辨认的数据，近似值需要对照原图。'],
     ['formula', '公式', '将图片中的公式转成 LaTeX。'],
     ['extract', '提取字段', '按指定的字段提取信息，输出 JSON。'],
     ['ask', '图片问答', '根据当前图片或选中页面回答问题。'],
@@ -4615,10 +4616,15 @@
     }
   }
 
-  async function prepareScanRaster(data, settings) {
+  async function decodeScanImage(data) {
     const source = el('img');
     source.src = data;
     await source.decode();
+    return source;
+  }
+
+  async function prepareScanRaster(data, settings) {
+    const source = await decodeScanImage(data);
     const limit = SCAN_DETAILS[settings.quality];
     const scale = Math.min(1, limit / Math.max(source.naturalWidth, source.naturalHeight));
     if (scale === 1 && !settings.enhance && !settings.rotation) return data;
@@ -4643,7 +4649,69 @@
     return canvas.toDataURL('image/jpeg', 0.88);
   }
 
-  function appendScanMarkdown(host, text) {
+  let scanMathLoading;
+  function scanFormula(latex, display, fallback) {
+    const node = el('span', display ? 'scan-formula display' : 'scan-formula', fallback);
+    if (latex.length > 4096) return node;
+    const render = () => {
+      try {
+        window.katex.render(latex, node, { displayMode: display, output: 'mathml', trust: false,
+          strict: 'ignore', maxExpand: 250, maxSize: 15 });
+      } catch {
+        node.textContent = fallback;
+      }
+    };
+    if (window.katex) render();
+    else {
+      scanMathLoading ??= new Promise((resolve, reject) => {
+        const script = el('script');
+        script.src = '/vendor/katex-0.19.1.min.js';
+        script.onload = resolve;
+        script.onerror = reject;
+        document.head.appendChild(script);
+      });
+      scanMathLoading.then(render, () => {});
+    }
+    return node;
+  }
+
+  function scanMathTokens(text) {
+    const expressions = [];
+    const prefix = 'DUBHEMATH' + crypto.randomUUID().replaceAll('-', '') + 'X';
+    const source = text.replace(/\\\[([\s\S]+?)\\\]|\\\(([^\r\n]+?)\\\)|\$\$([\s\S]+?)\$\$|(?<!\\|\$)\$([^\s$\r\n](?:[^$\r\n]*?[^\s$\r\n])?)\$(?!\d|\$)/g,
+      (raw, bracket, bracketInline, dollars, dollar) => {
+        const latex = bracket ?? bracketInline ?? dollars ?? dollar;
+        if (dollar && /^\d+(?:[.,]\d+)*$/.test(dollar)) return raw;
+        const index = expressions.push({ latex, raw, display: bracket !== undefined || dollars !== undefined }) - 1;
+        return prefix + index + 'Z';
+      });
+    return { source, expressions, prefix };
+  }
+
+  function insertScanMath(host, { expressions, prefix }) {
+    if (!expressions.length) return;
+    const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) {
+      if (walker.currentNode.data.includes(prefix)) nodes.push(walker.currentNode);
+    }
+    const pattern = new RegExp(prefix + '(\\d+)Z', 'g');
+    for (const node of nodes) {
+      const parts = [];
+      let offset = 0;
+      for (const match of node.data.matchAll(pattern)) {
+        parts.push(node.data.slice(offset, match.index));
+        const { latex, raw, display } = expressions[Number(match[1])];
+        parts.push(node.parentElement.closest('pre,code') ? raw : scanFormula(latex, display, raw));
+        offset = match.index + match[0].length;
+      }
+      node.replaceWith(...parts, node.data.slice(offset));
+    }
+  }
+
+  function appendScanMarkdown(host, text, typeset = false) {
+    const math = typeset ? scanMathTokens(text) : null;
+    if (math) text = math.source;
     const appendMarkdown = value => {
       const part = el('div');
       const cleaned = value.replace(/^\s*\|[ \t]*<COLSPAN=\d+>[ \t]*(.+?)[ \t]*\|[ \t]*$/gim, '$1')
@@ -4672,6 +4740,7 @@
       offset = match.index + match[0].length;
     }
     appendMarkdown(text.slice(offset));
+    if (math) insertScanMath(host, math);
     for (const table of host.querySelectorAll('table')) {
       const scroll = el('div', 'scan-table-scroll');
       scroll.tabIndex = 0;
@@ -4682,10 +4751,7 @@
     }
   }
 
-  async function cropScanRaster(data, region) {
-    const source = el('img');
-    source.src = data;
-    await source.decode();
+  function cropScanRaster(source, region) {
     const width = region.width * source.naturalWidth;
     const height = region.height * source.naturalHeight;
     const canvas = el('canvas');
@@ -4708,6 +4774,34 @@
     return scanExportBlocks(item).map(block => block.text).join('\n\n');
   }
 
+  function scanTableCSV(item) {
+    const preview = el('div');
+    appendScanMarkdown(preview, item.text);
+    const quote = value => {
+      const normalized = /^[\t\r\n=+@-]/.test(value) && !/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(value)
+        ? "'" + value : value;
+      return '"' + normalized.replaceAll('"', '""') + '"';
+    };
+    const tables = Array.from(preview.querySelectorAll('table'), table => {
+      const rows = Array.from(table.rows, () => []);
+      for (const [y, row] of Array.from(table.rows).entries()) {
+        let x = 0;
+        for (const cell of row.cells) {
+          while (rows[y][x] !== undefined) x++;
+          for (let dy = 0; dy < cell.rowSpan && y + dy < rows.length; dy++) {
+            for (let dx = 0; dx < cell.colSpan; dx++) rows[y + dy][x + dx] = '';
+          }
+          rows[y][x] = cell.textContent.trim();
+          x += cell.colSpan;
+        }
+      }
+      const width = rows.reduce((max, row) => Math.max(max, row.length), 0);
+      return rows.map(row => Array.from({ length: width }, (_, i) => quote(row[i] ?? '')).join(',')).join('\r\n');
+    });
+    if (!tables.length) throw new Error('本页没有可导出的表格。可先用表格模式识别图片或选区。');
+    return '\uFEFF' + tables.join('\r\n\r\n');
+  }
+
   function createScanPane() {
     const body = el('div', 'scan-pane');
     const native = () => window.webkit?.messageHandlers?.shell;
@@ -4726,8 +4820,7 @@
 
     let catalog, catalogError = '', modelError = '', modelBusy = false;
     let refreshCounter = 0, poll, files = [];
-    let source, page = 1, raster, lastPdfImage, drawnPage = 0, loadingImage;
-    let lastPdfText = '';
+    let source, page = 1, raster, lastPdfPage, drawnPage = 0, loadingImage;
     let pendingPDF, pendingSave, work, job, taskId, pdfOpened, pendingBatch, batch;
     let relinkingPDF = false, relinkingImage = false;
     const pendingPages = new Map();
@@ -4883,7 +4976,7 @@
     const savedStatus = el('span', 'vmeta task-save-status');
     savedStatus.setAttribute('role', 'status');
     actionRow.append(run, stop, status, savedStatus);
-    options.append(modeLine, modeTip, detail, advanced, actionRow);
+    options.append(modeLine, modeTip, detail, actionRow, advanced);
     inputCard.appendChild(options);
 
     const resultHead = el('header', 'scan-card-head');
@@ -4901,7 +4994,7 @@
     exportFormat.id = 'scanExportFormat';
     exportFormat.setAttribute('aria-label', '导出格式');
     for (const [value, label] of [['auto', '识别结果'], ['paired', '原件 + 识别文字 PDF'], ['original', '原件 PDF'],
-      ['docx', '可编辑文字 Word'], ['md', 'Markdown'], ['txt', '纯文本']]) {
+      ['docx', '可编辑文字 Word'], ['md', 'Markdown'], ['txt', '纯文本'], ['csv', '本页表格 CSV']]) {
       const option = el('option', '', label);
       option.value = value;
       exportFormat.appendChild(option);
@@ -5009,27 +5102,32 @@
         !validRange(s) || (!detail.hidden && !s.detail);
       run.textContent = canContinue(s) ? '继续识别' : canRescan(s) ? '重扫本页' : '开始识别';
       const item = result();
-      showRaw.hidden = item?.kind !== 'markdown';
-      showRaw.textContent = raw ? '整理后的结果' : '识别文本';
+      showRaw.hidden = !['markdown', 'latex'].includes(item?.kind);
+      showRaw.textContent = raw ? '预览' : item?.kind === 'latex' ? 'LaTeX 源码' : '识别文本';
       showRaw.setAttribute('aria-pressed', String(raw));
-      review.disabled = !item || busy;
+      review.disabled = (!item && (!raster || !ready)) || busy;
+      review.textContent = item ? '校对本页' : '框选识别';
       const hasResults = Boolean(work?.results.size);
       copy.disabled = exportFormat.disabled = exportResult.disabled = !hasResults || Boolean(pendingSave || batch || job);
       translate.hidden = !hasResults || !['document', 'text'].includes(work.mode);
       translate.disabled = Boolean(job || batch);
       question.hidden = translate.hidden;
       question.disabled = Boolean(job || batch);
-      exportResult.textContent = isPDF() ? '导出已识别页' : '导出';
       for (const option of exportFormat.options) {
         option.hidden = ['paired', 'original'].includes(option.value) ? !native() || !originalReady()
+          : option.value === 'csv' ? item?.kind !== 'markdown' ||
+            !/<table\b|^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*\|[ \t]*:?-{3,}/im.test(item.text)
           : option.value === 'docx' && !native();
       }
       if (exportFormat.selectedOptions[0]?.hidden) exportFormat.value = 'auto';
+      exportResult.textContent = isPDF() ? (exportFormat.value === 'csv' ? '导出本页' : '导出已识别页') : '导出';
     }
+    exportFormat.onchange = update;
 
     function renderResult({ keepScroll = false } = {}) {
       const item = result();
-      const method = { embedded: '原文件文字', regions: '分区识别', page: '整页识别', text: '文字识别' }[item?.method];
+      const method = { embedded: '原文件文字', regions: '分区识别', page: '整页识别',
+        text: '文字识别', region: '框选识别', chart: '图表读数 · 需对照原图' }[item?.method];
       resultPage.textContent = [isPDF() ? '第 ' + page + ' 页' : '', method].filter(Boolean).join(' · ');
       output.replaceChildren();
       if (!item) {
@@ -5037,8 +5135,13 @@
           ? '这一页还没有识别结果。' : '识别结果会显示在这里。'));
       } else if (item.kind === 'markdown' && !raw) {
         const preview = el('div', 'translation-preview');
-        appendScanMarkdown(preview, item.text);
+        appendScanMarkdown(preview, item.text, true);
         output.appendChild(preview);
+      } else if (item.kind === 'latex' && !raw) {
+        const math = scanMathTokens(item.text.trim());
+        const latex = math.expressions.length === 1 && math.source === math.prefix + '0Z'
+          ? math.expressions[0].latex : item.text.trim();
+        output.appendChild(scanFormula(latex, true, item.text));
       } else {
         output.appendChild(el('pre', 'scan-result-raw', item.text));
       }
@@ -5053,8 +5156,7 @@
       page = 1;
       drawnPage = 0;
       raster = null;
-      lastPdfImage = null;
-      lastPdfText = '';
+      lastPdfPage = null;
       work = null;
       taskId = null;
       savedStatus.textContent = '';
@@ -5069,32 +5171,30 @@
       showPage(1);
     }
 
-    function pageImage(file, index, fine = false) {
-      if (file.kind === 'image') return Promise.resolve(file.image);
-      if (lastPdfImage?.file === file && lastPdfImage.page === index && lastPdfImage.fine === fine) {
-        return Promise.resolve(lastPdfImage.image);
+    function preparedPage(file, index, quality = 'standard', textSource = 'ocr') {
+      if (file.kind === 'image') return Promise.resolve({ image: file.image });
+      if (lastPdfPage?.file === file && lastPdfPage.page === index && lastPdfPage.quality === quality &&
+          (lastPdfPage.textSource === textSource || (textSource === 'ocr' && lastPdfPage.result.image))) {
+        return Promise.resolve(lastPdfPage.result);
       }
-      const key = file.requestId + ':' + index + ':' + fine;
+      const key = [file.requestId, index, quality, textSource].join(':');
       const existing = pendingPages.get(key);
       if (existing) return existing.promise;
       let finish;
       const promise = new Promise((resolve, reject) => {
-        finish = (data, error, text) => {
+        finish = (result, error) => {
           pendingPages.delete(key);
           clearTimeout(timeout);
           if (error) reject(error);
           else {
-            if (file === source) {
-              lastPdfImage = { file, page: index, image: data, fine };
-              lastPdfText = text || '';
-            }
-            resolve(data);
+            if (file === source) lastPdfPage = { file, page: index, result, quality, textSource };
+            resolve(result);
           }
         };
       });
       const timeout = setTimeout(() => finish(null, new Error('读取文档页超时。')), 30000);
       pendingPages.set(key, { promise, finish });
-      shellPost({ type: 'scanPDFPage', requestId: file.requestId, page: index, fine });
+      shellPost({ type: 'scanPDFPage', requestId: file.requestId, page: index, quality, textSource });
       return promise;
     }
 
@@ -5121,7 +5221,8 @@
       }
       const file = source;
       try {
-        showRaster(file, index, await pageImage(file, index));
+        const { image } = await preparedPage(file, index);
+        showRaster(file, index, image);
       } catch (e) {
         if (file !== source || index !== page) return;
         drawnPage = index;
@@ -5130,12 +5231,13 @@
       }
     }
 
-    function scanPageForJob(file, index, signal, fine) {
+    function scanPageForJob(file, index, signal, settings) {
       return new Promise((resolve, reject) => {
         const abort = () => reject(signal.reason);
         if (signal.aborted) { abort(); return; }
         signal.addEventListener('abort', abort, { once: true });
-        pageImage(file, index, fine).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+        preparedPage(file, index, settings.quality, settings.readMode).then(resolve, reject)
+          .finally(() => signal.removeEventListener('abort', abort));
       });
     }
 
@@ -5158,11 +5260,13 @@
       update();
     };
     window.dubheScanPDFPage = (message) => {
-      const pending = pendingPages.get(message.requestId + ':' + message.page + ':' + Boolean(message.fine));
+      const pending = pendingPages.get([message.requestId, message.page, message.quality, message.textSource].join(':'));
       if (!pending) return;
-      const valid = typeof message.image === 'string' && /^data:image\/(?:jpeg|png);base64,/.test(message.image);
-      pending.finish(message.image, valid && !message.error ? null : new Error(message.error || '读取文档页失败。'),
-        typeof message.selectableText === 'string' ? message.selectableText : '');
+      const image = typeof message.image === 'string' && /^data:image\/(?:jpeg|png);base64,/.test(message.image)
+        ? message.image : '';
+      const text = typeof message.selectableText === 'string' ? message.selectableText : '';
+      pending.finish({ image, text }, (image || message.textOnly) && !message.error
+        ? null : new Error(message.error || '读取文档页失败。'));
     };
     window.dubheScanRegionsReady = message => {
       pendingRegions.get(message.requestId)?.(message.error ? new Error(message.error) : null, message.regions);
@@ -5268,6 +5372,7 @@
           if (work?.results.size === task.payload.last) done++;
         }
         const unavailable = Array.isArray(message.unavailable) ? message.unavailable.length : 0;
+        if (isPDF() && originalReady() && !raster) await showPage(page);
         setStatus('批量已完成 ' + done + ' / ' + tasks.length + ' 份' +
           (unavailable ? ' · ' + unavailable + ' 份无法打开' : '') +
           (done < tasks.length ? ' · 可在「最近任务」继续' : ' · 结果已存入「最近任务」'));
@@ -5312,39 +5417,116 @@
     });
     clear.onclick = () => replaceSource(null);
     enlarge.onclick = () => {
+      if (!raster) return;
       const dialog = el('dialog', 'scan-image-dialog');
       const head = el('div', 'scan-card-head');
-      const title = el('h3', '', source.name);
+      const title = el('h3', '', source.name + (isPDF() ? ' · 第 ' + page + ' 页' : ''));
+      const controls = el('div', 'scan-tools scan-zoom-tools');
       const close = el('button', 'vbtn', '关闭');
       close.onclick = () => dialog.close();
-      const tools = el('div', 'scan-tools');
-      const zoom = el('select', 'vsel');
+      const zoomOut = el('button', 'vbtn ghost', '−');
+      zoomOut.setAttribute('aria-label', '缩小');
+      const zoomIn = el('button', 'vbtn ghost', '+');
+      zoomIn.setAttribute('aria-label', '放大');
+      const fit = el('button', 'vbtn ghost', '适合窗口');
+      const zoom = el('input');
+      zoom.type = 'range';
+      zoom.min = '25';
+      zoom.max = '400';
+      zoom.step = '1';
+      zoom.value = '100';
       zoom.setAttribute('aria-label', '原件缩放');
-      for (const [value, title] of [['fit', '适合窗口'], ['1', '100%'], ['1.5', '150%'], ['2', '200%']]) {
-        const option = el('option', '', title);
-        option.value = value;
-        zoom.appendChild(option);
-      }
-      tools.append(zoom, close);
-      head.append(title, tools);
+      const percent = el('output', 'scan-zoom-percent', '100%');
+      controls.append(zoomOut, zoom, zoomIn, percent, fit, close);
+      head.append(title, controls);
+      const viewport = el('div', 'scan-image-viewport');
+      viewport.tabIndex = 0;
+      viewport.setAttribute('aria-label', '原件预览 · 捏合或按住 Command 滚动缩放 · 可拖动查看');
+      const surface = el('div', 'scan-image-surface');
       const full = el('img');
       full.src = raster;
       full.alt = isPDF() ? '原件第 ' + page + ' 页' : '原件预览';
-      const viewport = el('div', 'scan-image-viewport');
-      viewport.appendChild(full);
-      zoom.onchange = () => {
-        full.style.width = zoom.value === 'fit' ? '' : Math.round(full.naturalWidth * Number(zoom.value)) + 'px';
-        viewport.classList.toggle('zoomed', zoom.value !== 'fit');
-        viewport.scrollTo(0, 0);
-      };
+      full.draggable = false;
+      surface.appendChild(full);
+      viewport.appendChild(surface);
       dialog.append(head, viewport);
+
+      let scale = 1, gestureScale, drag;
+      const setScale = (value, x, y) => {
+        if (!full.naturalWidth) return;
+        const frame = viewport.getBoundingClientRect();
+        x ??= frame.left + viewport.clientWidth / 2;
+        y ??= frame.top + viewport.clientHeight / 2;
+        const old = full.getBoundingClientRect();
+        const fractionX = old.width ? (x - old.left) / old.width : 0.5;
+        const fractionY = old.height ? (y - old.top) / old.height : 0.5;
+        scale = Math.min(4, Math.max(0.25, value));
+        zoom.value = String(Math.round(scale * 100));
+        percent.textContent = zoom.value + '%';
+        zoomOut.disabled = scale <= 0.25;
+        zoomIn.disabled = scale >= 4;
+        const width = viewport.clientWidth - 20;
+        const height = viewport.clientHeight - 20;
+        const aspect = full.naturalWidth / full.naturalHeight;
+        const baseWidth = Math.min(width, height * aspect);
+        full.style.width = baseWidth * scale + 'px';
+        full.style.height = baseWidth * scale / aspect + 'px';
+        viewport.classList.toggle('pannable', scale > 1);
+        const next = full.getBoundingClientRect();
+        viewport.scrollLeft += next.left + fractionX * next.width - x;
+        viewport.scrollTop += next.top + fractionY * next.height - y;
+      };
+      zoom.oninput = () => setScale(zoom.valueAsNumber / 100);
+      zoomOut.onclick = () => setScale(scale / 1.2);
+      zoomIn.onclick = () => setScale(scale * 1.2);
+      fit.onclick = () => setScale(1);
+      viewport.addEventListener('wheel', event => {
+        if (!event.ctrlKey && !event.metaKey) return;
+        event.preventDefault();
+        const delta = event.deltaY * (event.deltaMode ? 16 : 1);
+        setScale(scale * Math.exp(-delta * 0.006), event.clientX, event.clientY);
+      }, { passive: false });
+      viewport.addEventListener('gesturestart', event => { event.preventDefault(); gestureScale = scale; });
+      viewport.addEventListener('gesturechange', event => {
+        if (!gestureScale) return;
+        event.preventDefault();
+        setScale(gestureScale * event.scale, event.clientX, event.clientY);
+      });
+      viewport.addEventListener('gestureend', () => { gestureScale = undefined; });
+      viewport.onpointerdown = event => {
+        if (event.button !== 0 || event.target !== full || scale <= 1) return;
+        viewport.setPointerCapture(event.pointerId);
+        drag = { id: event.pointerId, x: event.clientX, y: event.clientY,
+          left: viewport.scrollLeft, top: viewport.scrollTop };
+        viewport.classList.add('dragging');
+        event.preventDefault();
+      };
+      viewport.onpointermove = event => {
+        if (drag?.id !== event.pointerId) return;
+        viewport.scrollLeft = drag.left + drag.x - event.clientX;
+        viewport.scrollTop = drag.top + drag.y - event.clientY;
+      };
+      viewport.onlostpointercapture = () => { drag = null; viewport.classList.remove('dragging'); };
+      dialog.onkeydown = event => {
+        if (event.target === zoom) return;
+        if (event.key === '+' || event.key === '=') zoomIn.click();
+        else if (event.key === '-') zoomOut.click();
+        else if (event.key === '0') fit.click();
+        else return;
+        event.preventDefault();
+      };
+      const resize = new ResizeObserver(() => setScale(scale));
       dialog.setAttribute('aria-label', '原件预览');
       dialog.addEventListener('close', () => {
+        resize.disconnect();
         dialog.remove();
         enlarge.focus({ preventScroll: true });
       }, { once: true });
       document.body.appendChild(dialog);
       dialog.showModal();
+      resize.observe(viewport);
+      full.onload = () => setScale(scale);
+      setScale(1);
     };
     prev.onclick = () => showPage(page - 1);
     next.onclick = () => showPage(page + 1);
@@ -5366,11 +5548,13 @@
 
     review.onclick = () => {
       const item = result();
-      if (!item || job) return;
+      if ((!item && !raster) || job) return;
       const reviewedPage = page;
+      const settings = selection();
+      let draftKind = item?.kind ?? 'text', draftMode = settings.mode, saving = false;
       const dialog = el('dialog', 'scan-review-dialog');
       const header = el('header', 'scan-card-head');
-      const title = el('h3', '', isPDF() ? '校对第 ' + page + ' 页' : '校对识别结果');
+      const title = el('h3', '', item ? (isPDF() ? '校对第 ' + page + ' 页' : '校对识别结果') : '框选识别');
       const close = el('button', 'vbtn', '关闭');
       close.onclick = () => dialog.close();
       header.append(title, close);
@@ -5379,7 +5563,8 @@
       const editor = el('div', 'scan-review-editor');
       const draft = el('textarea', 'field');
       draft.setAttribute('aria-label', '本页校对稿');
-      draft.value = item.text;
+      draft.value = item?.text ?? '';
+      draft.placeholder = '识别选区后，可把结果放到这里编辑和保存';
       const actions = el('div', 'scan-tools');
       const save = el('button', 'vbtn pri', '保存本页');
       const status = el('p', 'vmeta');
@@ -5446,33 +5631,49 @@
         const regionResult = el('textarea', 'field scan-region-result');
         regionResult.placeholder = '所选区域的结果会显示在这里';
         regionResult.setAttribute('aria-label', '选区识别结果');
-        const insert = el('button', 'vbtn ghost', '插入校对稿');
+        let recognized;
+        const insert = el('button', 'vbtn ghost', item ? '插入校对稿' : '用作本页结果');
         insert.disabled = true;
         insert.onclick = () => {
-          draft.setRangeText(regionResult.value, draft.selectionStart, draft.selectionEnd, 'end');
+          let value = regionResult.value;
+          if (!item) {
+            draftKind = recognized.kind;
+            draftMode = recognized.mode;
+            draft.value = value;
+          } else {
+            if (draftKind === 'markdown' && recognized.kind === 'latex' && !/^(\\[([]|\$|\\begin)/.test(value.trim())) {
+              value = '\\(' + value.trim() + '\\)';
+            }
+            if (draftKind === 'markdown' && recognized.kind === 'markdown') value = '\n\n' + value + '\n\n';
+            draft.setRangeText(value, draft.selectionStart, draft.selectionEnd, 'end');
+          }
           draft.focus();
         };
         const regionMode = el('select', 'vsel');
         regionMode.setAttribute('aria-label', '选区识别方式');
-        for (const [value, label] of [['text', '文字'], ['table', '表格'], ['formula', '公式'], ['document', '文档版面']]) {
+        for (const [value, label] of [['text', '文字'], ['table', '表格'], ['chart', '统计图转表格'],
+          ['formula', '公式'], ['document', '文档版面']]) {
           const option = el('option', '', label);
           option.value = value;
           regionMode.appendChild(option);
         }
-        if (['formula', 'table'].includes(work.mode)) regionMode.value = work.mode;
+        const activeMode = item ? work.mode : settings.mode;
+        if (['formula', 'table', 'chart'].includes(activeMode)) regionMode.value = activeMode;
         reScan.onclick = async () => {
           if (!selection || reScan.disabled) return;
           recognizing = true;
           reScan.disabled = true;
+          regionMode.disabled = true;
           frame.style.pointerEvents = 'none';
           insert.disabled = true;
           status.textContent = '正在识别所选区域…';
           try {
-            const image = await prepareScanRaster(await cropScanRaster(preview.src, selection), work);
-            const request = { image, mode: regionMode.value, language: work.language, variant: variant.value };
-            if (work.maxTokens) request.max_tokens = work.maxTokens;
+            const image = await prepareScanRaster(cropScanRaster(preview, selection), settings);
+            const request = { image, mode: regionMode.value, language: settings.language, variant: settings.variant };
+            if (settings.maxTokens) request.max_tokens = settings.maxTokens;
             const reply = await vpost('/api/scan', request, controller.signal);
-            if (!reply.text?.trim()) throw new Error('没有识别到文字。');
+            if (!reply.text?.trim() || !Object.hasOwn(SCAN_FORMATS, reply.kind)) throw new Error('没有取得有效的识别结果。');
+            recognized = { kind: reply.kind, mode: request.mode };
             regionResult.value = reply.text;
             insert.disabled = false;
             status.textContent = '选区已识别。核对后可插入或手动修改校对稿。';
@@ -5482,6 +5683,7 @@
             recognizing = false;
             frame.style.pointerEvents = '';
             reScan.disabled = false;
+            regionMode.disabled = false;
           }
         };
         const regionActions = el('div', 'scan-tools');
@@ -5534,7 +5736,7 @@
       save.onclick = async () => {
         const text = draft.value.trim();
         if (!text) { status.textContent = '校对稿不能留空。'; return; }
-        if (item.kind === 'json') {
+        if (draftKind === 'json') {
           try {
             const value = JSON.parse(text);
             if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error();
@@ -5543,15 +5745,21 @@
             return;
           }
         }
-        save.disabled = true;
+        saving = save.disabled = true;
         close.disabled = true;
-        work.results.set(reviewedPage, { ...item, text });
+        if (!work || reviewedPage < work.first || reviewedPage > work.last) {
+          work = { ...settings, source, mode: draftMode, first: reviewedPage, last: reviewedPage, results: new Map() };
+          taskId = crypto.randomUUID();
+        }
+        work.results.set(reviewedPage, {
+          ...item, text, kind: draftKind, method: item?.method ?? (draftMode === 'chart' ? 'chart' : 'region'),
+        });
         await checkpoint();
         renderResult();
         dialog.close();
-        setStatus('已更新本页校对稿。');
+        setStatus(item ? '已更新本页校对稿。' : '已保存本页选区结果。');
       };
-      dialog.addEventListener('cancel', event => { if (save.disabled) event.preventDefault(); });
+      dialog.addEventListener('cancel', event => { if (saving) event.preventDefault(); });
       columns.append(original, editor);
       dialog.append(header, columns);
       dialog.setAttribute('aria-label', title.textContent);
@@ -5641,9 +5849,10 @@
       }
       source = file;
       if (work) work.source = file;
-      lastPdfImage = null;
+      lastPdfPage = null;
       setStatus('已重新打开原件');
-      showPage(page);
+      if (batch) renderResult();
+      else showPage(page);
       return true;
     }
 
@@ -5701,11 +5910,12 @@
           return { ...reply, method: 'text' };
         }
         if (regions?.length && regions.length <= 24) {
+          const sourceImage = await decodeScanImage(payload.image);
           const segments = [];
           for (const [index, region] of regions.entries()) {
             signal.throwIfAborted();
             setStatus(pageLabel + ' · 正在识别区域 ' + (index + 1) + ' / ' + regions.length);
-            const image = await cropScanRaster(payload.image, region);
+            const image = cropScanRaster(sourceImage, region);
             signal.throwIfAborted();
             try {
               const item = await vpost('/api/scan', { ...payload, mode: region.mode, image }, signal);
@@ -5723,7 +5933,7 @@
         setStatus(pageLabel + ' · 改用整页识别…');
       }
       const reply = await vpost('/api/scan', payload, signal);
-      return { ...reply, method: 'page' };
+      return { ...reply, method: payload.mode === 'chart' ? 'chart' : 'page' };
     }
 
     run.onclick = async () => {
@@ -5764,25 +5974,25 @@
           renderResult();
           setStatus(isPDF() ? '正在识别第 ' + current + ' 页 · ' +
             pendingWork.results.size + ' / ' + (s.last - s.first + 1) + ' 页完成' : '正在识别…');
-          const data = await scanPageForJob(source, current, signal, s.quality === 'fine');
+          const { image: data, text: selectable = '' } = await scanPageForJob(source, current, signal, s);
           signal.throwIfAborted();
-          showRaster(source, current, data);
+          if (data) showRaster(source, current, data);
           const payload = { mode: s.mode, language: s.language, variant: s.variant };
           if (s.maxTokens) payload.max_tokens = s.maxTokens;
           if (s.mode === 'extract') payload.fields = fields;
           if (s.mode === 'ask') payload.question = s.detail;
           // Ordinary text PDFs need no OCR inference. Keep scanned pages and PDFs with only
           // a few selectable marks on the image recognition path.
-          const selectable = s.readMode !== 'ocr' && lastPdfImage?.page === current ? lastPdfText : '';
-          const hasText = s.readMode === 'embedded' ? Boolean(selectable.trim())
-            : (selectable.match(/[\p{L}\p{N}]/gu)?.length ?? 0) >= 20;
+          const hasText = s.readMode !== 'ocr' && !data && Boolean(selectable.trim());
           if (!hasText && s.readMode === 'embedded') {
             throw new Error('本页没有可直接读取的文字。切换到「自动」或「小米 OCR」识别。');
           }
           if (!hasText && (!variantInstalled(s.variant) || !catalog?.runtime_available)) {
             throw new Error('本页是扫描图片。下载扫描模型后可从此页继续。');
           }
-          if (!hasText) payload.image = await prepareScanRaster(data, s);
+          if (!hasText) {
+            payload.image = isPDF() && !s.enhance && !s.rotation ? data : await prepareScanRaster(data, s);
+          }
           signal.throwIfAborted();
           const pageLabel = isPDF() ? '第 ' + current + ' 页' : '当前图片';
           const item = hasText ? { kind: 'text', text: selectable, method: 'embedded' }
@@ -5797,6 +6007,7 @@
           renderResult();
           await checkpoint();
         }
+        if (isPDF() && !raster && !batch) await showPage(page);
         setStatus(isPDF() ? '识别完成 · ' + work.results.size + ' 页' : '识别完成');
       } catch (e) {
         const kept = work.results.size ? ' · 已保留 ' + work.results.size + ' 页结果' : '';
@@ -5840,11 +6051,17 @@
         const requested = exportFormat.value;
         const pdf = requested === 'original' || requested === 'paired';
         const extension = pdf ? 'pdf' : requested === 'auto' ? format : requested;
-        const filename = name + (requested === 'original' ? '-原件' : '') + '.' + extension;
+        let suffix = requested === 'original' ? '-原件' : '';
+        if (requested === 'csv') {
+          if (isPDF()) suffix = '-第' + page + '页';
+          if (result()?.method === 'chart') suffix += '-图表估读';
+        }
+        const filename = name + suffix + '.' + extension;
+        const exportText = requested === 'csv' ? scanTableCSV(result()) : text;
         if (native()) {
           pendingSave = crypto.randomUUID();
           update();
-          const request = { type: 'scanSave', requestId: pendingSave, format: extension, name: filename, text };
+          const request = { type: 'scanSave', requestId: pendingSave, format: extension, name: filename, text: exportText };
           if (pdf) {
             request.sourceId = source.requestId || '';
             request.pages = results.map(([number]) => number);
@@ -5860,7 +6077,7 @@
           shellPost(request);
         } else {
           const payload = requested === 'txt' ? results.map(([number, item]) =>
-            (isPDF() ? '第 ' + number + ' 页\n\n' : '') + scanReadingText(item)).join('\n\n') : text;
+            (isPDF() ? '第 ' + number + ' 页\n\n' : '') + scanReadingText(item)).join('\n\n') : exportText;
           const url = URL.createObjectURL(new Blob([payload], { type: 'text/plain;charset=utf-8' }));
           const link = el('a');
           link.href = url;

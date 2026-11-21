@@ -31,8 +31,12 @@ enum ScanPDFTests {
         precondition(white.prefix(3).allSatisfy { $0 > 245 }, "the blank page background is white")
         let second = try decode(scan.pageDataURL(number: 2))
         precondition(second.width == 2400 && second.height == 1920, "the second page renders independently")
-        let fine = try decode(scan.pageDataURL(number: 1, fine: true))
+        let fine = try decode(scan.pageDataURL(number: 1, resolution: .fine))
         precondition(fine.height == 3400, "high-detail mode renders the PDF at a larger size")
+        let fast = try scan.preparePage(number: 1, resolution: .fast, textSource: .auto)
+        precondition(fast.text.isEmpty && decode(fast.image!).height == 1280, "quick OCR uses a smaller image directly")
+        let textOnly = try scan.preparePage(number: 1, resolution: .standard, textSource: .embedded)
+        precondition(textOnly.image == nil, "text-only requests never rasterize the page")
         let exported = PDFDocument(data: try scan.originalPages([1]))!
         precondition(exported.pageCount == 1 && exported.page(at: 0)?.rotation == 90)
         precondition(exported.page(at: 0)?.bounds(for: .cropBox) == first.bounds(for: .cropBox),

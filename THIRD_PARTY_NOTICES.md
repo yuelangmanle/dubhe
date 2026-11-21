@@ -24,7 +24,7 @@
 
 | 文件 | 来源仓库 | commit | 许可 | 修改说明 |
 | --- | --- | --- | --- | --- |
-| — | — | — | — | 暂无 |
+| `web/vendor/katex-0.19.1.min.js` · `web/vendor/katex.LICENSE` | [KaTeX](https://github.com/KaTeX/KaTeX) · `dist/katex.min.js` | `8000fbd4e29cca2c0cb1e88b745af3ed2f436b66` | MIT | npm 0.19.1 原始发行文件，用于本地公式排版 |
 
 ## 3. 明确排除
 

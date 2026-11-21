@@ -1104,7 +1104,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             }
         case "scanPDFPage":
             if let id = obj["requestId"] as? String, let page = obj["page"] as? Int {
-                renderScanPDFPage(requestId: id, page: page, fine: obj["fine"] as? Bool == true)
+                let quality = ScanPDF.Resolution(rawValue: obj["quality"] as? String ?? "") ?? .standard
+                let textSource = ScanPDF.TextSource(rawValue: obj["textSource"] as? String ?? "") ?? .ocr
+                renderScanPDFPage(requestId: id, page: page, quality: quality, textSource: textSource)
             }
         case "scanClosePDF":
             if let id = obj["requestId"] as? String, id == scanDocument?.requestId { scanDocument = nil }
@@ -1673,24 +1675,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
-    private func renderScanPDFPage(requestId: String, page: Int, fine: Bool) {
-        let reply: (String, String) -> Void = { [weak self] key, value in
-            self?.replyToScan("dubheScanPDFPage", ["requestId": requestId, "page": page, "fine": fine, key: value])
+    private func renderScanPDFPage(requestId: String, page: Int, quality: ScanPDF.Resolution, textSource: ScanPDF.TextSource) {
+        let reply: ([String: Any]) -> Void = { [weak self] result in
+            var payload: [String: Any] = ["requestId": requestId, "page": page, "quality": quality.rawValue,
+                                          "textSource": textSource.rawValue]
+            payload.merge(result) { _, value in value }
+            self?.replyToScan("dubheScanPDFPage", payload)
         }
         guard let selected = scanDocument, selected.requestId == requestId else {
-            reply("error", "请重新打开要扫描的文档。")
+            reply(["error": "请重新打开要扫描的文档。"])
             return
         }
         scanPDFQueue.async {
-            let rendered = Result { try selected.pdf.pageDataURL(number: page, fine: fine) }
-            let selectableText = selected.pdf.selectableText(number: page)
+            let rendered = Result { try selected.pdf.preparePage(number: page, resolution: quality, textSource: textSource) }
             DispatchQueue.main.async {
                 guard self.scanDocument?.requestId == requestId else { return }
                 switch rendered {
-                case .success(let image):
-                    self.replyToScan("dubheScanPDFPage", ["requestId": requestId, "page": page,
-                                                          "image": image, "selectableText": selectableText, "fine": fine])
-                case .failure(let error): reply("error", error.localizedDescription)
+                case .success(let (image, text)):
+                    reply(["image": image ?? "", "selectableText": text, "textOnly": image == nil])
+                case .failure(let error):
+                    reply(["error": error.localizedDescription])
                 }
             }
         }
@@ -1719,7 +1723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             values.merge(result) { _, result in result }
             self?.replyToScan("dubheScanSaved", values)
         }
-        guard let format = message["format"] as? String, ["md", "txt", "tex", "json", "docx", "pdf"].contains(format),
+        guard let format = message["format"] as? String, ["md", "txt", "tex", "json", "csv", "docx", "pdf"].contains(format),
               let text = message["text"] as? String, !text.isEmpty, text.utf8.count <= 16 * 1024 * 1024 else {
             reply(["error": "扫描结果为空、过大或导出格式无效。"])
             return
@@ -1730,7 +1734,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         let name = (message["name"] as? String).map { URL(fileURLWithPath: $0).lastPathComponent }
         let filename = name ?? "扫描结果.\(format)"
-        if ["md", "txt", "tex", "json"].contains(format) {
+        if ["md", "txt", "tex", "json", "csv"].contains(format) {
             saveDocument(Data(text.utf8), format: format, name: filename, reply: reply)
             return
         }

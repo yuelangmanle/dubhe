@@ -14,6 +14,25 @@ inline std::string_view trim(std::string_view text) {
     return first == text.npos ? std::string_view{} : text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
 }
 
+inline std::string formula_source(std::string_view text) {
+    text = trim(text);
+    if (text.starts_with("```") && text.ends_with("```")) {
+        const auto line = text.find('\n');
+        if (line != text.npos && line < text.size() - 3)
+            text = trim(text.substr(line + 1, text.size() - line - 4));
+    }
+    if (text.starts_with("\\begin{align*}") && text.ends_with("\\end{align*}")) {
+        constexpr std::string_view open = "\\begin{align*}";
+        constexpr std::string_view close = "\\end{align*}";
+        const auto inner = trim(text.substr(open.size(), text.size() - open.size() - close.size()));
+        if (inner.find_first_of("&\n") == inner.npos && inner.find("\\\\") == inner.npos) text = inner;
+    }
+    if (text.empty() || text.starts_with("\\begin{") || text.starts_with("\\[") ||
+        text.starts_with("\\(") || text.starts_with("$")) return std::string(text);
+    if (text.ends_with("].") || text.ends_with(").")) text.remove_suffix(1);
+    return "\\(" + std::string(text) + "\\)";
+}
+
 inline bool valid_dimensions(std::string_view bytes, bool png) {
     auto byte = [&](size_t index) { return static_cast<uint32_t>(static_cast<unsigned char>(bytes[index])); };
     auto u16 = [&](size_t index) { return (byte(index) << 8) | byte(index + 1); };
@@ -261,6 +280,7 @@ public:
         if (mode == "document") {
             instruction = "Convert the main body of this page to Markdown. Use reading order, omit running headers and "
                 "footers, and represent formulas as LaTeX and actual tables as OTSL. "
+                "Use \\( and \\) for inline equations, preserving subscripts, interval boundaries and decimal precision. "
                 "Keep figure captions. Do not convert charts, plots or illustrations into tables or infer hidden values.";
             kind = "markdown";
             max_tokens = 6144;
@@ -270,8 +290,17 @@ public:
             instruction = "Parse the table in the image into OTSL.";
             kind = "markdown";
             max_tokens = 4096;
+        } else if (mode == "chart") {
+            instruction = "Extract the readable data in this chart into a Markdown pipe table with a header and "
+                "a separator row. Use the x-axis category or value as the first column and each visible data series "
+                "as its own column. Preserve units. Copy printed data values exactly. Prefix values estimated from "
+                "the position of a mark with ~ and leave unreadable values blank. Never invent missing points or "
+                "series, and do not treat unplotted tick marks as observations. Keep separate charts in separate tables.";
+            kind = "markdown";
+            max_tokens = 4096;
         } else if (mode == "formula") {
-            instruction = "Identify the formula in the image and transcribe it in LaTeX format.";
+            instruction = "Identify the formula in the image and transcribe it as LaTeX only. "
+                "Preserve numerical precision, subscripts, signs, units, and open and closed interval delimiters.";
             kind = "latex";
             max_tokens = 1024;
         } else if (mode == "extract") {
@@ -370,6 +399,7 @@ public:
         std::string result(decoded);
         if (result.empty()) return {422, "未识别到内容，请检查图片清晰度或调整选取范围"};
         if (kind == "markdown") result = document_tables(result);
+        if (kind == "latex") result = formula_source(result);
         if (kind == "json") {
             json::Value parsed;
             auto raw = std::string_view(result);

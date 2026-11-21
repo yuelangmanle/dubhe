@@ -7,6 +7,22 @@ import UniformTypeIdentifiers
 
 /// Keep the document on disk and render one page at a time on the scanner queue.
 final class ScanPDF {
+    enum Resolution: String {
+        case fast, standard, fine
+
+        var side: CGFloat {
+            switch self {
+            case .fast: return 1280
+            case .standard: return ScanImage.maxSide
+            case .fine: return 3400
+            }
+        }
+    }
+
+    enum TextSource: String {
+        case auto, embedded, ocr
+    }
+
     private let document: PDFDocument
     private let temporaryDirectory: URL?
     let workingURL: URL
@@ -107,7 +123,18 @@ final class ScanPDF {
         return data
     }
 
-    func pageDataURL(number: Int, fine: Bool = false) throws -> String {
+    func preparePage(number: Int, resolution: Resolution, textSource: TextSource) throws -> (image: String?, text: String) {
+        guard (1...pageCount).contains(number) else { throw ScanError.invalidPage(number) }
+        let text = textSource == .ocr ? "" : selectableText(number: number)
+        if textSource == .embedded || textSource == .auto && text.unicodeScalars.lazy.filter({
+            CharacterSet.alphanumerics.contains($0)
+        }).prefix(20).count == 20 {
+            return (nil, text)
+        }
+        return (try pageDataURL(number: number, resolution: resolution), text)
+    }
+
+    func pageDataURL(number: Int, resolution: Resolution = .standard) throws -> String {
         guard (1...pageCount).contains(number), let page = document.page(at: number - 1)?.pageRef else {
             throw ScanError.invalidPage(number)
         }
@@ -118,7 +145,7 @@ final class ScanPDF {
         guard crop.minX.isFinite, crop.minY.isFinite, crop.maxX.isFinite, crop.maxY.isFinite,
               width > 0, height > 0 else { throw ScanError.invalidPage(number) }
         let span = max(width, height)
-        let maxSide = fine ? 3400 : ScanImage.maxSide
+        let maxSide = resolution.side
         let w = max(1, Int((width / span * maxSide).rounded()))
         let h = max(1, Int((height / span * maxSide).rounded()))
         let scale = min(CGFloat(w) / width, CGFloat(h) / height)

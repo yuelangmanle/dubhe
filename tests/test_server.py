@@ -269,7 +269,7 @@ class ServiceTest(unittest.TestCase):
                     return result
 
                 self.assertEqual(recognize("text"), {"kind": "text", "text": "Water level 10.2 m"})
-                self.assertEqual(recognize("formula"), {"kind": "latex", "text": "x^2+y^2"})
+                self.assertEqual(recognize("formula"), {"kind": "latex", "text": r"\(x^2+y^2\)"})
                 self.assertEqual(recognize("ask", question="What is the water level?")["kind"], "text")
                 data = recognize("extract", fields=["日期", "地点"])
                 self.assertEqual(data["kind"], "json")
@@ -281,6 +281,7 @@ class ServiceTest(unittest.TestCase):
                 table = recognize("table")["text"]
                 self.assertIn('colspan="2" rowspan="2"', table)
                 self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", table)
+                self.assertIn("| Lake A | ~10.2 |", recognize("chart")["text"])
 
                 host, port = base.removeprefix("http://").split(":")
                 session = http.client.HTTPConnection(host, int(port), timeout=5)

@@ -185,6 +185,24 @@ def gguf_architecture(path):
 
 
 class LlamaModel:
+    @staticmethod
+    def ocr_options(executable, env):
+        try:
+            help_text = subprocess.run([str(executable), "--help"], env=env, timeout=4,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        # Consecutive OCR pages rarely reuse their image tokens. Keep the loaded model
+        # available during a job without keeping a cross-page cache or idle GPU allocation.
+        options = []
+        if b"--cache-ram" in help_text:
+            options.extend(["--cache-ram", "0"])
+            if b"--no-cache-idle-slots" in help_text:
+                options.append("--no-cache-idle-slots")
+        if b"--sleep-idle-seconds" in help_text:
+            options.extend(["--sleep-idle-seconds", "60"])
+        return options
+
     def __init__(self, path, context, threads, llama_server=None, projector=None):
         if not path.is_file():
             raise ValueError("llama.cpp 模型需要本地 GGUF 文件。")
@@ -210,6 +228,7 @@ class LlamaModel:
                        "--no-webui", "--no-context-shift", "--jinja"]
             if projector:
                 command.extend(["--mmproj", str(projector), "--image-max-tokens", "7168", "--reasoning", "off"])
+                command.extend(self.ocr_options(executable, env))
             self.process = subprocess.Popen(
                 command,
                 cwd=self.work.name, env=env, stdin=subprocess.DEVNULL, stdout=sys.stderr,

@@ -2223,8 +2223,18 @@ body[data-glass="off"] .edge::before { display: none; }
   width: min(900px, calc(100vw - 32px)); height: calc(100dvh - 100px); overflow: auto;
   background: var(--fill);
 }
-.scan-image-viewport img { display: block; width: 100%; height: 100%; margin: 0 auto; object-fit: contain; }
-.scan-image-viewport.zoomed img { height: auto; margin: 0; }
+.scan-image-surface {
+  display: grid; place-items: center; width: max-content; min-width: 100%; min-height: 100%;
+  padding: 10px; box-sizing: border-box;
+}
+.scan-image-surface img { display: block; user-select: none; }
+.scan-image-viewport.pannable img { cursor: grab; }
+.scan-image-viewport.dragging { cursor: grabbing; }
+.scan-zoom-tools { justify-content: end; }
+.scan-zoom-tools input { width: clamp(72px, 14vw, 155px); accent-color: var(--brand-1); }
+.scan-zoom-percent { min-width: 4ch; font-size: 12px; text-align: end; font-variant-numeric: tabular-nums; }
+.scan-formula { font-family: math, serif; }
+.scan-formula.display { display: block; overflow-x: auto; margin: 8px 0; }
 .scan-image-dialog h3 { overflow-wrap: anywhere; }
 .scan-blank {
   display: grid; justify-items: center; gap: 9px;
