@@ -1725,8 +1725,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         let original = message["original"] as? Bool == true
         let text = message["text"] as? String ?? ""
+        let notes = message["notes"] as? [String]
         guard let format = message["format"] as? String, ["md", "txt", "tex", "json", "csv", "docx", "pdf"].contains(format),
-              (!text.isEmpty || format == "pdf" && original), text.utf8.count <= 16 * 1024 * 1024 else {
+              (!text.isEmpty || format == "pdf" && (original || notes?.isEmpty == false)),
+              text.utf8.count <= 16 * 1024 * 1024,
+              (notes?.reduce(0) { $0 + $1.utf8.count } ?? 0) <= 16 * 1024 * 1024 else {
             reply(["error": "扫描结果为空、过大或导出格式无效。"])
             return
         }
@@ -1742,7 +1745,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         let selected = scanDocument.flatMap { $0.requestId == message["sourceId"] as? String ? $0.pdf : nil }
         let pages = message["pages"] as? [Int] ?? []
-        let notes = message["notes"] as? [String]
+        let searchable = message["searchable"] as? Bool == true
         let image = message["image"] as? String
         scanPDFQueue.async {
             let rendered = Result {
@@ -1752,6 +1755,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 }
                 if let selected {
                     if original { return try selected.originalPages() }
+                    if searchable { return try selected.searchablePDF(pages: pages, notes: notes ?? []) }
                     if let notes {
                         return try TranslationPDF.rebuildSelectedPages(url: selected.workingURL, pages: pages,
                                                                        translations: notes, label: "识别文字")

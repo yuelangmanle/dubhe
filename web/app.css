@@ -2161,9 +2161,10 @@ body[data-glass="off"] .edge::before { display: none; }
 .translation-ocr-tools, .store-heading {
   display: flex; align-items: center; gap: 8px;
 }
-.store-heading { justify-content: space-between; }
+.store-heading { justify-content: space-between; flex-wrap: wrap; }
 .store-heading a { text-decoration: none; }
-.translation-ocr-tools .vsel, .scan-control .vsel { margin-top: 0; }
+.model-store .vrow[hidden] { display: none; }
+.translation-ocr-tools .vsel, .scan-control .vsel, .store-heading .vsel { margin-top: 0; }
 
 /* ---- 扫描工作区 */
 .scan-pane { max-width: 1360px; margin: 0 auto; }

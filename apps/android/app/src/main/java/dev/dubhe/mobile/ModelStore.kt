@@ -10,11 +10,13 @@ import dev.dubhe.sdk.AttachmentKind
 import dev.dubhe.sdk.ProjectorCapabilities
 import java.io.DataInputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URI
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.ensureActive
@@ -28,6 +30,7 @@ internal data class LocalModel(val file: File, val name: String) {
     val catalog: CatalogModel? get() = mobileCatalog.firstOrNull {
         (it.file == file.name || it.file == name) && it.bytes == file.length()
     }
+    val bundledCatalog: CatalogModel? get() = catalog?.takeIf { it.file == file.name && it.projector != null }
 }
 internal data class LocalAttachment(val attachment: Attachment, val name: String)
 internal data class ModelStorage(val installed: Long, val incomplete: Long, val available: Long)
@@ -45,17 +48,22 @@ internal class ModelStore(context: Context) {
     fun current(slot: ModelSlot): LocalModel? {
         val filename = prefs.getString("${slot.name}.file", null) ?: return null
         val file = File(directory, filename)
-        if (!file.isFile) return null
+        if (!ready(file)) return null
         return LocalModel(file, prefs.getString("${slot.name}.name", null) ?: file.name)
     }
 
     fun library(): List<LocalModel> {
-        val models = prefs.all.mapNotNull { (key, name) ->
+        val catalogModels = mobileCatalog.mapNotNull { item ->
+            val file = File(directory, item.file)
+            LocalModel(file, item.name).takeIf { ready(file) }
+        }
+        val importedModels = prefs.all.mapNotNull { (key, name) ->
             if (!key.startsWith("library.") || name !is String) return@mapNotNull null
             val file = File(directory, key.removePrefix("library."))
-            if (file.isFile) LocalModel(file, name) else null
-        } + listOfNotNull(current(ModelSlot.Language))
-        return models.distinctBy { it.file }.sortedBy { it.name.lowercase() }
+            if (ready(file)) LocalModel(file, name) else null
+        }
+        return (catalogModels + importedModels + listOfNotNull(current(ModelSlot.Language)))
+            .distinctBy { it.file }.sortedBy { it.name.lowercase() }
     }
 
     fun remember(model: LocalModel): Boolean = prefs.edit().putString("library.${model.file.name}", model.name).commit()
@@ -80,8 +88,10 @@ internal class ModelStore(context: Context) {
         return true
     }
 
-    fun remove(model: LocalModel) {
-        if (model.file.exists() && !model.file.delete()) throw IOException("无法删除模型文件。")
+    suspend fun remove(model: LocalModel) = transfers.withLock {
+        val item = mobileCatalog.firstOrNull { it.file == model.file.name }
+        deleteIfExists(model.file, "无法删除模型文件。")
+        item?.projector?.let { deleteIfExists(File(directory, it.file), "无法删除多模态组件。") }
         val edit = prefs.edit().remove("library.${model.file.name}")
         if (prefs.getString("Language.file", null) == model.file.name) {
             val projector = current(ModelSlot.Projector)
@@ -91,24 +101,49 @@ internal class ModelStore(context: Context) {
         check(edit.commit()) { "无法更新模型库。" }
     }
 
+    fun catalogProjector(model: LocalModel): LocalModel? = model.bundledCatalog?.projector?.let { component ->
+        val file = File(directory, component.file)
+        LocalModel(file, component.file).takeIf { matches(file, component.bytes) }
+    }
+
     fun partials(): Set<String> = mobileCatalog.mapNotNullTo(mutableSetOf()) { item ->
-        item.file.takeIf { File(directory, "${item.file}.part").length() > 0 }
+        item.file.takeIf { incompleteFiles(item).any { it.length() > 0 } }
     }
 
     fun storage(): ModelStorage {
-        val files = (library().map { it.file } + listOfNotNull(current(ModelSlot.Projector)?.file)).distinct()
-        val pending = mobileCatalog.sumOf { File(directory, "${it.file}.part").length() }
+        val files = library().flatMap { listOfNotNull(it.file, catalogProjector(it)?.file) }.toSet() +
+            listOfNotNull(current(ModelSlot.Projector)?.file)
+        val pending = mobileCatalog.flatMap(::incompleteFiles).toSet().sumOf(File::length)
         val volume = if (directory.exists()) directory else requireNotNull(directory.parentFile)
         return ModelStorage(files.sumOf { it.length() }, pending, volume.usableSpace)
     }
 
     suspend fun clearPartialDownloads() = transfers.withLock {
         withContext(Dispatchers.IO) {
-            for (item in mobileCatalog) {
-                val partial = File(directory, "${item.file}.part")
-                if (partial.exists() && !partial.delete()) throw IOException("无法清理未完成的下载。")
+            mobileCatalog.flatMap(::incompleteFiles).toSet().forEach {
+                deleteIfExists(it, "无法清理未完成的下载。")
             }
         }
+    }
+
+    private fun matches(file: File, size: Long): Boolean = file.isFile && file.length() == size
+
+    private fun ready(file: File): Boolean {
+        if (!file.isFile) return false
+        val item = mobileCatalog.firstOrNull { it.file == file.name } ?: return true
+        val projector = item.projector
+        return matches(file, item.bytes) && (projector == null || matches(File(directory, projector.file), projector.bytes))
+    }
+
+    private fun incompleteFiles(item: CatalogModel): List<File> {
+        val weights = File(directory, item.file)
+        val names = listOfNotNull(item.file, item.projector?.file)
+        val staging = names.map { File(directory, "$it.part") }
+        return if (ready(weights)) staging else staging + names.map { File(directory, it) }
+    }
+
+    private fun deleteIfExists(file: File, error: String) {
+        if (file.exists() && !file.delete()) throw IOException(error)
     }
 
     suspend fun discardUnreferencedFiles() = withContext(Dispatchers.IO) {
@@ -125,80 +160,98 @@ internal class ModelStore(context: Context) {
     suspend fun download(item: CatalogModel, onProgress: (Float) -> Unit): LocalModel = transfers.withLock {
         withContext(Dispatchers.IO) {
             if (!directory.isDirectory && !directory.mkdirs()) throw IOException("无法创建模型目录。")
-            val part = File(directory, "${item.file}.part")
-            val file = File(directory, item.file)
-            val model = LocalModel(file, item.name)
-            if (file.length() == item.bytes) {
-                check(remember(model)) { "无法更新模型库。" }
-                return@withContext model
+            val weights = CatalogFile(item.file, item.bytes, item.repository, item.revision, item.sha256)
+            val artifacts = listOfNotNull(weights, item.projector)
+            val requiredBytes = artifacts.sumOf { artifact ->
+                val partialBytes = File(directory, "${artifact.file}.part").length()
+                if (matches(File(directory, artifact.file), artifact.bytes)) 0L
+                else artifact.bytes - (partialBytes.takeIf { it <= artifact.bytes } ?: 0L)
             }
-            var offset = part.length()
-            if (offset > item.bytes) {
-                part.delete()
-                offset = 0
-            }
-            val buffer = ByteArray(256 * 1024)
-            if (offset < item.bytes) {
-                if (item.bytes - offset > directory.usableSpace) throw IOException("手机的存储空间不足。")
-                val connection = URI(item.url).toURL().openConnection() as HttpURLConnection
-                try {
-                    connection.connectTimeout = 15_000
-                    connection.readTimeout = 10_000
-                    connection.setRequestProperty("Accept-Encoding", "identity")
-                    if (offset > 0) connection.setRequestProperty("Range", "bytes=$offset-")
-                    when (val status = connection.responseCode) {
-                        HttpURLConnection.HTTP_PARTIAL -> {
-                            val range = "bytes $offset-${item.bytes - 1}/${item.bytes}"
-                            if (offset == 0L || connection.getHeaderField("Content-Range") != range) {
-                                throw IOException("下载源返回了错误的续传范围。")
-                            }
-                        }
-                        HttpURLConnection.HTTP_OK -> offset = 0
-                        else -> throw IOException("下载失败（HTTP $status）。")
-                    }
-                    if (item.bytes - offset > directory.usableSpace) throw IOException("手机的存储空间不足。")
-                    connection.inputStream.use { source ->
-                        java.io.FileOutputStream(part, offset != 0L).buffered().use { output ->
-                            var lastUpdate = 0L
-                            while (true) {
-                                ensureActive()
-                                val read = source.read(buffer)
-                                if (read < 0) break
-                                offset += read
-                                if (offset > item.bytes) throw IOException("下载文件大小与模型清单不符。")
-                                output.write(buffer, 0, read)
-                                val now = SystemClock.elapsedRealtime()
-                                if (now - lastUpdate >= 125L) {
-                                    onProgress((offset.toDouble() / item.bytes).toFloat())
-                                    lastUpdate = now
-                                }
-                            }
-                        }
-                    }
-                } finally {
-                    connection.disconnect()
+            if (requiredBytes > directory.usableSpace) throw IOException("手机的存储空间不足。")
+            var completedBytes = 0L
+            for (artifact in artifacts) {
+                ensureActive()
+                downloadFile(artifact) { bytes ->
+                    onProgress(((completedBytes + bytes).toDouble() / item.totalBytes).toFloat())
                 }
+                completedBytes += artifact.bytes
             }
-            if (part.length() != item.bytes) throw IOException("下载还未完成，可以继续下载。")
-            onProgress(1f)
-            val digest = MessageDigest.getInstance("SHA-256")
-            part.inputStream().use { input ->
-                while (true) {
-                    ensureActive()
-                    val read = input.read(buffer)
-                    if (read < 0) break
-                    digest.update(buffer, 0, read)
-                }
-            }
-            if (digest.digest().joinToString("") { "%02x".format(it) } != item.sha256) {
-                part.delete()
-                throw IOException("模型校验失败，请重新下载。")
-            }
-            ensureActive()
-            if (!part.renameTo(file)) throw IOException("无法保存模型。")
-            check(remember(model)) { "无法更新模型库。" }
-            model
+            LocalModel(File(directory, item.file), item.name)
         }
+    }
+
+    private fun CoroutineScope.downloadFile(item: CatalogFile, onProgress: (Long) -> Unit) {
+        val part = File(directory, "${item.file}.part")
+        val file = File(directory, item.file)
+        if (matches(file, item.bytes)) {
+            onProgress(item.bytes)
+            return
+        }
+        var offset = part.length()
+        if (offset > item.bytes) {
+            deleteIfExists(part, "无法清理不完整的模型文件。")
+            offset = 0
+        }
+        onProgress(offset)
+        val buffer = ByteArray(256 * 1024)
+        if (offset < item.bytes) {
+            if (item.bytes - offset > directory.usableSpace) throw IOException("手机的存储空间不足。")
+            val connection = URI(item.url).toURL().openConnection() as HttpURLConnection
+            try {
+                connection.connectTimeout = 15_000
+                connection.readTimeout = 10_000
+                connection.setRequestProperty("Accept-Encoding", "identity")
+                if (offset > 0) connection.setRequestProperty("Range", "bytes=$offset-")
+                when (val status = connection.responseCode) {
+                    HttpURLConnection.HTTP_PARTIAL -> {
+                        val range = "bytes $offset-${item.bytes - 1}/${item.bytes}"
+                        if (offset == 0L || connection.getHeaderField("Content-Range") != range) {
+                            throw IOException("下载源返回了错误的续传范围。")
+                        }
+                    }
+                    HttpURLConnection.HTTP_OK -> offset = 0
+                    else -> throw IOException("下载失败（HTTP $status）。")
+                }
+                if (item.bytes - offset > directory.usableSpace) throw IOException("手机的存储空间不足。")
+                connection.inputStream.use { source ->
+                    FileOutputStream(part, offset != 0L).buffered().use { output ->
+                        var lastUpdate = 0L
+                        while (true) {
+                            ensureActive()
+                            val read = source.read(buffer)
+                            if (read < 0) break
+                            offset += read
+                            if (offset > item.bytes) throw IOException("下载文件大小与模型清单不符。")
+                            output.write(buffer, 0, read)
+                            val now = SystemClock.elapsedRealtime()
+                            if (now - lastUpdate >= 125L) {
+                                onProgress(offset)
+                                lastUpdate = now
+                            }
+                        }
+                    }
+                }
+            } finally {
+                connection.disconnect()
+            }
+        }
+        if (part.length() != item.bytes) throw IOException("下载还未完成，可以继续下载。")
+        onProgress(item.bytes)
+        val digest = MessageDigest.getInstance("SHA-256")
+        part.inputStream().use { input ->
+            while (true) {
+                ensureActive()
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        if (digest.digest().joinToString("") { "%02x".format(it) } != item.sha256) {
+            part.delete()
+            throw IOException("模型校验失败，请重新下载。")
+        }
+        ensureActive()
+        if (!part.renameTo(file)) throw IOException("无法保存模型。")
     }
 
     suspend fun importAttachment(

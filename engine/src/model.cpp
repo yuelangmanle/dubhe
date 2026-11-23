@@ -283,7 +283,6 @@ bool Model::load(const char* path, int n_ctx, bool use_gpu, std::string* err) {
     gate_.assign(cfg_.n_ff, 0.f);
     up_.assign(cfg_.n_ff, 0.f);
     ffn_out_.assign(cfg_.n_ff, 0.f);
-    logits_.assign(cfg_.n_vocab, 0.f);
 
     // ShortConv 的时序状态：每层存 l_cache-1 个历史 hidden 向量。
     // 13 层 × 6 × 2048 × 4B ≈ 640 KB，可以忽略。
@@ -1487,9 +1486,10 @@ bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* log
                                 sizeof(float) * (size_t)n_embd);
                 }
             }
+            if (!logits || n > 32) logits_.resize(cfg_.n_vocab);
             for (int i = 0; i < n; i += 32) {
                 const int ch = std::min(32, n - i);
-                float* out = (i + ch == n) ? logits : logits_.data();
+                float* out = (i + ch == n && logits) ? logits : logits_.data();
                 if (!metal::q35_prefill(xbatch_.data() + (size_t)i * n_embd, ch,
                                         pos0 + i, out, err)) {
                     if (err && err->empty()) *err = "Qwen3.5 批量 prefill 失败";
@@ -1502,7 +1502,7 @@ bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* log
             return true;
         }
         for (int i = 0; i < n; i++) {
-            float* out = (i == n - 1) ? logits : logits_.data();
+            float* out = (i == n - 1) ? logits : nullptr;
             if (!forward(tokens[i], pos0 + i, out, err)) return false;
         }
         return true;
@@ -1512,7 +1512,8 @@ bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* log
         // CPU 路径和 forward() 都只认"整条序列从 0 开始"，没有槽位概念。
         if (slab0 != 0 || cslot != 0) { if (err) *err = "槽位 prefill 需要 GPU 后端"; return false; }
         for (int i = 0; i < n; i++) {
-            if (!forward(tokens[i], pos0 + i, logits, err)) return false;
+            float* out = (i == n - 1) ? logits : nullptr;
+            if (!forward(tokens[i], pos0 + i, out, err)) return false;
         }
         return true;
     }
@@ -1553,6 +1554,10 @@ bool Model::forward_batch(const int32_t* tokens, int n, int32_t pos0, float* log
         }
     }
 
+    if (!logits) {
+        logits_.resize(cfg_.n_vocab);
+        logits = logits_.data();
+    }
     const bool ok = (slab0 == 0 && cslot == 0)
         ? metal::fwd_batch(xbatch_.data(), n, pos0, logits, err)
         : metal::fwd_batch_at(xbatch_.data(), n, pos0, slab0, cslot, logits, err);
@@ -1641,6 +1646,10 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
     }
 
     if (gpu_fused_) {
+        if (!logits) {
+            logits_.resize(cfg_.n_vocab);
+            logits = logits_.data();
+        }
         if (std::getenv("DUBHE_Q35_DEBUG"))
             std::fprintf(stderr, "[dbg] forward pos=%d q35=%d\n", pos, (int)arch_is_qwen35());
         // 整层前向一次提交、一次同步。失败就整体报错——此时 GPU 的 KV 已经
@@ -1818,9 +1827,11 @@ bool Model::forward(int32_t token, int32_t pos, float* logits, std::string* err)
         }
     }
 
-    // 5) final norm + logits
-    rmsnorm(xb_.data(), x_.data(), out_norm_, n_embd);
-    matvec(logits, xb_.data(), out_w_, cfg_.n_vocab, n_embd);
+    // 5) 只有需要分数时才计算词表投影。
+    if (logits) {
+        rmsnorm(xb_.data(), x_.data(), out_norm_, n_embd);
+        matvec(logits, xb_.data(), out_w_, cfg_.n_vocab, n_embd);
+    }
 
     if (pos != kv_len_) kv_toks_.clear();
     kv_toks_.push_back(token);

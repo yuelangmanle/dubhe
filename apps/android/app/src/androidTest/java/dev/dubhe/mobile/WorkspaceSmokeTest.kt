@@ -15,6 +15,8 @@ import androidx.test.platform.app.InstrumentationRegistry
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.RandomAccessFile
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.zip.ZipInputStream
 import kotlinx.coroutines.runBlocking
@@ -75,6 +77,11 @@ class WorkspaceSmokeTest {
     }
 
     @Test
+    fun usesAttachmentNameAsTheTitleForAudioOnlyMessages() {
+        assertEquals("录音.m4a", Conversation("audio", listOf(ChatTurn("", "录音.m4a"))).title)
+    }
+
+    @Test
     fun restoresTranslationAtNextUnfinishedBlock() {
         val store = TranslationTaskStore(context)
         val input = TranslationState(
@@ -131,6 +138,85 @@ class WorkspaceSmokeTest {
         assertTrue(unrelated.exists())
         assertEquals(0L, store.storage().incomplete)
     }
+
+    @Test
+    fun catalogPairIsReadyOnlyAfterBothFilesArePresent() = runBlocking {
+        val item = mobileCatalog.first { it.projector != null }
+        val component = requireNotNull(item.projector)
+        val models = File(folder, "models").apply { mkdir() }
+        val weights = File(models, item.file)
+        val projector = File(models, component.file)
+        RandomAccessFile(weights, "rw").use { it.setLength(item.bytes) }
+        val model = LocalModel(weights, item.name)
+        val store = ModelStore(context)
+        assertTrue(store.remember(model))
+
+        assertTrue(store.library().isEmpty())
+        assertEquals(setOf(item.file), store.partials())
+        assertEquals(item.bytes, store.storage().incomplete)
+
+        RandomAccessFile(projector, "rw").use { it.setLength(component.bytes) }
+        assertEquals(listOf(model), store.library())
+        assertEquals(item.totalBytes, store.storage().installed)
+        assertEquals(projector, store.catalogProjector(model)?.file)
+        assertTrue(store.retain(ModelSlot.Language, model))
+
+        val other = File(models, "import-other.gguf").apply { writeText("GGUF") }
+        assertTrue(store.retain(ModelSlot.Language, LocalModel(other, "其他模型")))
+        assertTrue(projector.isFile)
+        store.remove(model)
+        assertFalse(weights.exists())
+        assertFalse(projector.exists())
+        assertTrue(other.exists())
+    }
+
+    @Test
+    fun clearingIncompletePairRemovesTheCompletedHalfAndTheRemainingPartial() = runBlocking {
+        val item = mobileCatalog.first { it.projector != null }
+        val component = requireNotNull(item.projector)
+        val models = File(folder, "models").apply { mkdir() }
+        val weights = File(models, item.file)
+        RandomAccessFile(weights, "rw").use { it.setLength(item.bytes) }
+        val remaining = File(models, "${component.file}.part").apply { writeText("GGUF") }
+
+        val store = ModelStore(context)
+        assertEquals(setOf(item.file), store.partials())
+        assertEquals(item.bytes + 4L, store.storage().incomplete)
+        store.clearPartialDownloads()
+        assertFalse(weights.exists())
+        assertFalse(remaining.exists())
+        assertEquals(0L, store.storage().incomplete)
+    }
+
+    @Test
+    fun resumesACompleteWeightsFileAfterItsProjectorFailsVerification() = runBlocking {
+        val weights = "GGUFweights"
+        val projection = "GGUFright"
+        val component = CatalogFile("test-projector.gguf", projection.length.toLong(), "fixture", "revision", sha256(projection))
+        val item = CatalogModel("测试模型", "", "test-weights.gguf", weights.length.toLong(), "fixture", "revision",
+            sha256(weights), projector = component, modality = CatalogModality.IMAGE)
+        val models = File(folder, "models").apply { mkdir() }
+        File(models, "${item.file}.part").writeText(weights)
+        val stagedProjector = File(models, "${component.file}.part").apply { writeText("GGUFwrong") }
+
+        val store = ModelStore(context)
+        val failure = runCatching { store.download(item) {} }.exceptionOrNull()
+        assertEquals("模型校验失败，请重新下载。", failure?.message)
+        val downloadedWeights = File(models, item.file)
+        assertEquals(weights, downloadedWeights.readText())
+        assertFalse(stagedProjector.exists())
+        assertFalse(File(models, component.file).exists())
+
+        stagedProjector.writeText(projection)
+        val progress = mutableListOf<Float>()
+        assertEquals(downloadedWeights, store.download(item) { progress.add(it) }.file)
+        assertEquals(projection, File(models, component.file).readText())
+        assertEquals(item.bytes.toFloat() / item.totalBytes, progress.first())
+        assertEquals(1f, progress.last())
+    }
+
+    private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(value.encodeToByteArray()).joinToString("") { "%02x".format(it) }
 
     @Test
     fun keepsTranslationParagraphsAndWritesReadableDocuments() {

@@ -115,14 +115,7 @@ class MainActivity : ComponentActivity() {
                     chat, sharedInput, onShareHandled = { sharedInput = null },
                     openModel = { select { openModel.launch(arrayOf("*/*")) } },
                     openProjector = { select { openProjector.launch(arrayOf("*/*")) } },
-                    openAttachment = {
-                        val projector = chat.state.projector
-                        val types = buildList {
-                            if (projector?.vision == true) addAll(listOf("image/*", "video/*"))
-                            if (projector?.audio == true) add("audio/*")
-                        }
-                        if (types.isNotEmpty()) select { openAttachment.launch(types.toTypedArray()) }
-                    },
+                    openAttachment = { types -> select { openAttachment.launch(types) } },
                 )
             }
         }
@@ -161,7 +154,7 @@ private fun DubheScreen(
     onShareHandled: () -> Unit,
     openModel: () -> Unit,
     openProjector: () -> Unit,
-    openAttachment: () -> Unit,
+    openAttachment: (Array<String>) -> Unit,
 ) {
     val state = chat.state
     var workspace by rememberSaveable { mutableStateOf(Workspace.Chat) }
@@ -169,6 +162,7 @@ private fun DubheScreen(
     var updateDialog by rememberSaveable { mutableStateOf<Boolean?>(null) }
     var showHistory by rememberSaveable { mutableStateOf(false) }
     var showModelPicker by rememberSaveable { mutableStateOf(false) }
+    var openModelShop by rememberSaveable { mutableStateOf(false) }
     var input by rememberSaveable { mutableStateOf("") }
     val focus = LocalFocusManager.current
     val keyboard = WindowInsets.ime.getBottom(LocalDensity.current) > 0
@@ -184,6 +178,11 @@ private fun DubheScreen(
     fun openTasks() {
         previousWorkspace = workspace
         navigate(Workspace.Tasks)
+    }
+
+    fun openMediaModels() {
+        openModelShop = true
+        navigate(Workspace.Models)
     }
 
     LaunchedEffect(shared, state.activity) {
@@ -231,7 +230,7 @@ private fun DubheScreen(
                                 }
                                 val canAsk = state.modelName != null && idle
                                 val ask = {
-                                    if (canAsk && input.isNotBlank()) {
+                                    if (canAsk && (input.isNotBlank() || state.attachmentName != null)) {
                                         chat.ask(input)
                                         input = ""
                                         focus.clearFocus()
@@ -244,6 +243,7 @@ private fun DubheScreen(
                                         startChat = chat::prepareLightChat, stop = chat::stop,
                                         showTranslation = { navigate(Workspace.Translate) },
                                         showScan = { navigate(Workspace.Scan) },
+                                        showMediaModels = ::openMediaModels,
                                     )
                                 } else {
                                     ChatTranscript(state, body)
@@ -251,7 +251,7 @@ private fun DubheScreen(
                                 if (state.modelName != null) {
                                     Composer(
                                         state, input, { input = it.take(12_000) }, canAsk, ask, chat::stop,
-                                        openAttachment, chat::removeAttachment,
+                                        openAttachment, chat::removeAttachment, ::openMediaModels,
                                     )
                                 }
                             }
@@ -265,7 +265,11 @@ private fun DubheScreen(
                                 }
                             }
                             Workspace.Models -> workspaceState.SaveableStateProvider(Workspace.Models.name) {
-                                ModelsScreen(chat, openModel, openProjector) { navigate(Workspace.Translate) }
+                                ModelsScreen(
+                                    chat, openModel, openProjector, openTranslation = { navigate(Workspace.Translate) },
+                                    openChat = { navigate(Workspace.Chat) },
+                                    openShop = openModelShop, onShopOpened = { openModelShop = false },
+                                )
                             }
                             Workspace.Settings -> SettingsScreen(state, { updateDialog = false }, { updateDialog = true }, ::openTasks)
                             Workspace.Tasks -> TasksScreen(
@@ -379,10 +383,14 @@ private fun NavigationChoice(item: Workspace, selected: Boolean, rail: Boolean, 
 private fun ChatModelBar(state: ChatState, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     val loading = state.activity == Activity.Loading || state.activity == Activity.Connecting
+    val media = buildList {
+        if (state.projector?.vision == true) add("图片 / 视频")
+        if (state.projector?.audio == true) add("音频")
+    }
     val status = when {
         state.activity == Activity.Loading -> "正在加载模型"
         !state.connected -> "正在连接引擎"
-        state.modelName != null -> state.modelDetail ?: "本机运行 · 已加载"
+        state.modelName != null -> (media + (state.modelDetail ?: "本机运行 · 已加载")).joinToString("  ·  ")
         else -> "下载或导入本地模型"
     }
     Surface(
@@ -419,7 +427,7 @@ private fun ChatModelBar(state: ChatState, onClick: () -> Unit) {
 @Composable
 private fun EmptyConversation(
     state: ChatState, modifier: Modifier, startChat: () -> Unit, stop: () -> Unit,
-    showTranslation: () -> Unit, showScan: () -> Unit,
+    showTranslation: () -> Unit, showScan: () -> Unit, showMediaModels: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
     val context = LocalContext.current
@@ -467,6 +475,11 @@ private fun EmptyConversation(
                     Spacer(Modifier.width(7.dp))
                     Text("从图片提取文字")
                 }
+                TextButton(onClick = showMediaModels) {
+                    WorkspaceIcon(Glyph.Attachment, Modifier.size(18.dp), colors.primary)
+                    Spacer(Modifier.width(7.dp))
+                    Text("用图片或音频对话")
+                }
             }
         }
     }
@@ -512,7 +525,7 @@ private fun ChatTranscript(state: ChatState, modifier: Modifier) {
                             turn.attachmentName?.let {
                                 Text(it, style = MaterialTheme.typography.labelMedium)
                             }
-                            Text(turn.prompt, style = MaterialTheme.typography.bodyLarge)
+                            if (turn.prompt.isNotBlank()) Text(turn.prompt, style = MaterialTheme.typography.bodyLarge)
                         }
                     }
                 }
@@ -542,13 +555,24 @@ private fun ChatTranscript(state: ChatState, modifier: Modifier) {
 @Composable
 private fun Composer(
     state: ChatState, input: String, onInput: (String) -> Unit,
-    canAsk: Boolean, ask: () -> Unit, stop: () -> Unit, openAttachment: () -> Unit, removeAttachment: () -> Unit,
+    canAsk: Boolean, ask: () -> Unit, stop: () -> Unit, openAttachment: (Array<String>) -> Unit,
+    removeAttachment: () -> Unit, showMediaModels: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
     val busy = state.activity == Activity.Generating || state.activity == Activity.Importing
-    val enabled = if (busy) !state.stopping else canAsk && input.isNotBlank()
+    val enabled = if (busy) !state.stopping else canAsk && (input.isNotBlank() || state.attachmentName != null)
+    val attachmentName = state.attachmentName
     WorkspaceCard(Modifier.fillMaxWidth().padding(bottom = 7.dp)) {
         Column(Modifier.padding(start = 12.dp, end = 8.dp, top = 12.dp, bottom = 5.dp)) {
+            if (attachmentName != null) {
+                Row(Modifier.fillMaxWidth().padding(start = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    WorkspaceIcon(Glyph.Attachment, Modifier.size(18.dp))
+                    Spacer(Modifier.width(7.dp))
+                    Text(attachmentName, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
+                        color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    IconAction(Glyph.Close, "移除附件", canAsk, removeAttachment)
+                }
+            }
             BasicTextField(
                 value = input, onValueChange = onInput, enabled = canAsk, maxLines = 5,
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = colors.onSurface),
@@ -559,7 +583,8 @@ private fun Composer(
                 decorationBox = { field ->
                     Box {
                         if (input.isEmpty()) Text(
-                            "输入消息", style = MaterialTheme.typography.bodyLarge, color = colors.onSurfaceVariant,
+                            if (attachmentName == null) "输入消息" else "输入问题（可选）",
+                            style = MaterialTheme.typography.bodyLarge, color = colors.onSurfaceVariant,
                         )
                         field()
                     }
@@ -570,18 +595,25 @@ private fun Composer(
                 Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                if (state.projector != null) {
-                    IconAction(Glyph.Attachment, "选择附件", canAsk, openAttachment)
+                if (state.projector?.vision == true) {
+                    TextButton({ openAttachment(arrayOf("image/*", "video/*")) }, enabled = canAsk) { Text("图片 / 视频") }
+                } else if (state.projector?.audio == true) {
+                    TextButton(showMediaModels, enabled = canAsk) { Text("图片") }
+                }
+                if (state.projector?.audio == true) {
+                    TextButton({ openAttachment(arrayOf("audio/*")) }, enabled = canAsk) { Text("音频") }
+                } else if (state.projector?.vision == true) {
+                    TextButton(showMediaModels, enabled = canAsk) { Text("音频") }
+                }
+                if (state.projector == null) {
+                    TextButton(showMediaModels, enabled = canAsk) { Text("图片 / 音频") }
                 }
                 Text(
-                    state.attachmentName ?: state.status.orEmpty(),
+                    state.status.orEmpty(),
                     Modifier.weight(1f),
                     style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     color = colors.onSurfaceVariant,
                 )
-                if (state.attachmentName != null) {
-                    IconAction(Glyph.Close, "移除附件", canAsk, removeAttachment)
-                }
                 val action = if (busy) "停止" else "发送"
                 Surface(
                     onClick = if (busy) stop else ask, enabled = enabled,

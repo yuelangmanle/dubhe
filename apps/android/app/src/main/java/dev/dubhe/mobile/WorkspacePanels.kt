@@ -1,6 +1,7 @@
 package dev.dubhe.mobile
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,6 +14,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -22,6 +24,7 @@ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,15 +41,38 @@ import androidx.compose.ui.unit.dp
 import android.text.format.Formatter
 import java.util.Locale
 
+private enum class StoreCategory(val label: String) {
+    All("全部"), Chat("对话"), Media("多模态"), Translate("翻译");
+
+    fun includes(item: CatalogModel) = when (this) {
+        All -> true
+        Chat -> !item.translation && item.modality == null
+        Media -> item.modality != null
+        Translate -> item.translation
+    }
+}
+
 @Composable
-internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importProjector: () -> Unit, openTranslation: () -> Unit) {
+internal fun ModelsScreen(
+    chat: ChatViewModel, importModel: () -> Unit, importProjector: () -> Unit,
+    openTranslation: () -> Unit, openChat: () -> Unit,
+    openShop: Boolean = false, onShopOpened: () -> Unit = {},
+) {
     val state = chat.state
     val idle = state.activity == Activity.Idle
     val links = LocalUriHandler.current
     val context = LocalContext.current
     val freeMemory = availableMemory()
     var selectedShop by rememberSaveable { mutableStateOf<Boolean?>(null) }
-    val shop = selectedShop ?: state.models.isEmpty()
+    var category by rememberSaveable { mutableStateOf(StoreCategory.All) }
+    val shop = openShop || (selectedShop ?: state.models.isEmpty())
+    LaunchedEffect(openShop) {
+        if (openShop) {
+            selectedShop = true
+            category = StoreCategory.Media
+            onShopOpened()
+        }
+    }
     var deleting by remember { mutableStateOf<LocalModel?>(null) }
 
     Column(
@@ -86,21 +112,29 @@ internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importPr
                     }
                 }) { Text("下载来源") }
             }
-            for (item in mobileCatalog) {
-                val installed = state.models.any { it.catalog?.file == item.file }
-                val downloading = state.downloading == item.file
-                val size = if (item.bytes < 1_000_000_000) {
-                    String.format(Locale.CHINA, "%.0f MB", item.bytes / 1_000_000.0)
-                } else {
-                    String.format(Locale.CHINA, "%.2f GB", item.bytes / 1_000_000_000.0)
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (option in StoreCategory.entries) {
+                    FilterChip(selected = category == option, onClick = { category = option }, label = { Text(option.label) })
                 }
-                val fit = if (freeMemory > 0 && item.bytes >= freeMemory) " · 当前内存较紧" else ""
-                ModelCard(item.name, item.description + " · " + size + fit, if (item.translation) Glyph.Translate else Glyph.Model) {
+            }
+            for (item in mobileCatalog.filter { category.includes(it) || state.downloading == it.file }) {
+                val installed = state.models.firstOrNull { it.file.name == item.file }
+                val downloading = state.downloading == item.file
+                val size = if (item.totalBytes < 1_000_000_000) {
+                    String.format(Locale.CHINA, "%.0f MB", item.totalBytes / 1_000_000.0)
+                } else {
+                    String.format(Locale.CHINA, "%.2f GB", item.totalBytes / 1_000_000_000.0)
+                }
+                val fit = if (freeMemory > 0 && item.totalBytes >= freeMemory) " · 当前内存较紧" else ""
+                ModelCard(item.name, item.description + " · " + size + fit, item.glyph()) {
                     when {
-                        installed -> Text(
-                            "已下载", Modifier.padding(end = 7.dp),
-                            style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary,
-                        )
+                        installed != null -> TextButton({
+                            if (item.translation) openTranslation()
+                            else {
+                                chat.selectModel(installed)
+                                openChat()
+                            }
+                        }, enabled = idle) { Text(if (item.translation) "去翻译" else "去对话") }
                         downloading -> TextButton(chat::stop, enabled = !state.stopping) { Text("取消") }
                         else -> TextButton({ chat.downloadModel(item) }, enabled = idle) {
                             Text(if (item.file in state.partialDownloads) "继续下载" else "下载")
@@ -137,11 +171,19 @@ internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importPr
             for (model in state.models) {
                 val translationModel = model.catalog?.translation == true
                 val active = state.activeModel?.file == model.file
-                val size = Formatter.formatShortFileSize(context, model.file.length())
+                val bundle = model.bundledCatalog
+                val size = Formatter.formatShortFileSize(context, bundle?.totalBytes ?: model.file.length())
+                val description = when {
+                    active -> "正在使用"
+                    bundle?.modality == CatalogModality.IMAGE -> "含视觉组件"
+                    bundle?.modality == CatalogModality.AUDIO -> "含音频组件"
+                    translationModel -> "专用翻译"
+                    else -> "本地 GGUF"
+                }
                 ModelCard(
                     model.catalog?.name ?: model.name,
-                    (if (active) "正在使用" else if (translationModel) "专用翻译" else "本地 GGUF") + " · " + size,
-                    if (translationModel) Glyph.Translate else Glyph.Model,
+                    description + " · " + size,
+                    model.catalog.glyph(),
                 ) {
                     TextButton(
                         onClick = { if (translationModel) openTranslation() else chat.selectModel(model) },
@@ -150,9 +192,13 @@ internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importPr
                     TextButton(onClick = { deleting = model }, enabled = idle) { Text("删除") }
                 }
             }
-            if (state.activeModel != null) {
+            val activeModel = state.activeModel
+            if (activeModel != null) {
+                val bundleProjector = activeModel.bundledCatalog?.projector
                 ModelCard("多模态组件", state.projectorName ?: "为对话模型接入图片、视频或音频", Glyph.Attachment) {
-                    TextButton(importProjector, enabled = idle) { Text(if (state.projectorName == null) "导入" else "更换") }
+                    if (bundleProjector == null) {
+                        TextButton(importProjector, enabled = idle) { Text(if (state.projectorName == null) "导入" else "更换") }
+                    }
                 }
             }
         }
@@ -161,11 +207,22 @@ internal fun ModelsScreen(chat: ChatViewModel, importModel: () -> Unit, importPr
         AlertDialog(
             onDismissRequest = { deleting = null },
             title = { Text("删除模型？") },
-            text = { Text("将移除这台手机里的 " + (model.catalog?.name ?: model.name) + "。") },
+            text = {
+                val bundle = model.bundledCatalog
+                Text("将移除这台手机里的 " + (model.catalog?.name ?: model.name) +
+                    (if (bundle != null) " 及其配套组件。" else "。"))
+            },
             confirmButton = { Button({ chat.deleteModel(model); deleting = null }) { Text("删除") } },
             dismissButton = { TextButton({ deleting = null }) { Text("取消") } },
         )
     }
+}
+
+private fun CatalogModel?.glyph(): Glyph = when {
+    this?.translation == true -> Glyph.Translate
+    this?.modality == CatalogModality.IMAGE -> Glyph.Image
+    this?.modality == CatalogModality.AUDIO -> Glyph.Attachment
+    else -> Glyph.Model
 }
 
 @Composable

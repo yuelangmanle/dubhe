@@ -1,5 +1,113 @@
 [
   {
+    "id": "qwen25-05b-q4",
+    "name": "Qwen2.5 0.5B Instruct",
+    "params": "0.5B",
+    "quant": "Q4_0",
+    "bytes": 428730208,
+    "file": "qwen2.5-0.5b-instruct-q4_0.gguf",
+    "repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+    "sha256": "7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed",
+    "android": {
+      "order": 3,
+      "name": "Qwen2.5 0.5B Instruct",
+      "description": "超轻量文本对话"
+    }
+  },
+  {
+    "id": "qwen35-08b-q4",
+    "name": "Qwen3.5 0.8B",
+    "params": "0.8B",
+    "quant": "Q4_K_M",
+    "bytes": 532517120,
+    "file": "Qwen3.5-0.8B-Q4_K_M.gguf",
+    "repository": "unsloth/Qwen3.5-0.8B-GGUF",
+    "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+    "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
+    "android": {
+      "order": 4,
+      "name": "Qwen3.5 0.8B",
+      "description": "轻量文本对话"
+    }
+  },
+  {
+    "id": "lfm3-17b-q4",
+    "name": "LFM3 1.7B",
+    "params": "1.7B",
+    "quant": "Q4_K_M",
+    "bytes": 1099627808,
+    "file": "LFM3-1.7B-Q4_K_M.gguf",
+    "repository": "LiquidAI/LFM3-1.7B-GGUF",
+    "revision": "cd0c74c575b5c416f3011b5b4c298077f26ca8c2",
+    "sha256": "3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4",
+    "android": {
+      "order": 5,
+      "name": "LFM3 1.7B",
+      "description": "通用文本对话"
+    }
+  },
+  {
+    "id": "qwen35-2b-q4",
+    "name": "Qwen3.5 2B",
+    "params": "2B",
+    "quant": "Q4_K_M",
+    "bytes": 1280835840,
+    "file": "Qwen3.5-2B-Q4_K_M.gguf",
+    "repository": "unsloth/Qwen3.5-2B-GGUF",
+    "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+    "sha256": "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
+    "android": {
+      "order": 6,
+      "name": "Qwen3.5 2B",
+      "description": "通用文本对话"
+    }
+  },
+  {
+    "id": "lfm3-vl-2b-q4",
+    "name": "LFM3 VL 2B",
+    "params": "2B",
+    "quant": "Q4_K_M",
+    "bytes": 1099627808,
+    "file": "LFM3-VL-2B-Q4_K_M.gguf",
+    "repository": "LiquidAI/LFM3-VL-2B-GGUF",
+    "revision": "1add221a5ea6c047fcf1eaaf2d247939d7cf8849",
+    "sha256": "56dac2e192ff0d9ab8507f4f1aeb4aed0463449bbbefaac79497f041c95f21eb",
+    "android": {
+      "order": 7,
+      "name": "LFM3 VL 2B",
+      "description": "图片理解 · 含视觉组件"
+    },
+    "modality": "image",
+    "projector": {
+      "file": "mmproj-LFM3-VL-2B-Q8_0.gguf",
+      "bytes": 203031872,
+      "sha256": "c5c5b58d544a18da919172d2d0368090ea1a4a351b6feb7f8a326a264a5918ab"
+    }
+  },
+  {
+    "id": "lfm3-audio-2b-q4",
+    "name": "LFM3 Audio 2B",
+    "params": "2B",
+    "quant": "Q4_K_M",
+    "bytes": 1099626016,
+    "file": "LFM3-Audio-2B-Q4_K_M.gguf",
+    "repository": "LiquidAI/LFM3-Audio-2B-GGUF",
+    "revision": "b0d3187e4ef8f4befd06e0a0af5c7a84ff51e42d",
+    "sha256": "9a773289bd321ed879cd3a76545f6aca506e403851a45fb315420aee45625be2",
+    "android": {
+      "order": 8,
+      "name": "LFM3 Audio 2B",
+      "description": "音频理解 · 含音频组件"
+    },
+    "modality": "audio",
+    "projector": {
+      "file": "mmproj-LFM3-Audio-2B-Q8_0.gguf",
+      "bytes": 337862080,
+      "sha256": "26601e904245a85bd8f3cf320a629e897cfc01c1d09369e8b4fd951f13024d3e"
+    }
+  },
+  {
     "id": "qwen35-9b-q4",
     "name": "Qwen3.5-9B Instruct",
     "params": "9B",
@@ -21,7 +129,7 @@
     "revision": "e87f176479d0855a907a41277aca2f8ee7a09523",
     "sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
     "android": {
-      "order": 4,
+      "order": 10,
       "name": "Qwen3.5 4B",
       "description": "通用对话 · 建议内存充足的手机"
     }
@@ -37,7 +145,7 @@
     "revision": "e7caca5d835a3901a8e0d63e94009429bafafdfc",
     "sha256": "02a8b7e17487d326e46d68ce0ba24211e1b80a14c4cd0597fa73c1cd697f52ed",
     "android": {
-      "order": 3,
+      "order": 9,
       "name": "LFM2.5 2.6B",
       "description": "对话模型 · 需要更多内存"
     }

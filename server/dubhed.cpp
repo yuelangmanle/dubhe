@@ -3718,6 +3718,11 @@ void scan_models(const std::string& dir, std::vector<ModelEntry>* out, int depth
             // 拿视觉塔去当语言模型加载 —— 必然失败，但用户不知道为什么会失败。
             // 这里直接排除，改成挂到同目录的模型上（见 mmproj 字段）。
             if (n.compare(0, 6, "mmproj") == 0 || store::scan_file(n)) continue;
+            if (const auto tower = store::managed_projector(g.model_dir, full); !tower.empty()) {
+                const auto& bundle = *store::bundle_file(n);
+                if (st.st_size != bundle.bytes || !store::gguf_header(full) ||
+                    store::file_size(tower) != bundle.projector.bytes || !store::gguf_header(tower)) continue;
+            }
             ModelEntry m;
             m.path = full;
             m.name = n.substr(0, n.size() - 5);
@@ -3773,6 +3778,14 @@ double guess_params(const std::string& n) {
 // 拿错了就是"维度对得上、语义对不上"的静默垃圾。
 std::string find_sibling_mmproj(const std::string& model_path) {
     const std::string dir = path_dir(model_path);
+    const std::string model = path_base(model_path);
+    if (const auto* bundle = store::bundle_file(model)) {
+        const auto exact = path_join(dir, bundle->projector.file);
+        if (!store::managed_projector(g.model_dir, model_path).empty()) {
+            return store::file_size(exact) == bundle->projector.bytes && store::gguf_header(exact) ? exact : "";
+        }
+        if (is_file_p(exact)) return exact;
+    }
     DIR* d = opendir(dir.c_str());
     if (!d) return "";
     std::string best;
@@ -3781,6 +3794,18 @@ std::string find_sibling_mmproj(const std::string& model_path) {
         if (n.size() < 11) continue;
         if (n.compare(0, 6, "mmproj") != 0) continue;
         if (n.compare(n.size() - 5, 5, ".gguf") != 0) continue;
+        // 官方组件可能和多个模型放在同一目录。只跟同型号的权重配对。
+        bool compatible = true;
+        for (const auto& entry : store::catalog) {
+            if (!entry.projector.file) continue;
+            const std::string_view projector = entry.projector.file;
+            const auto prefix = projector.substr(0, projector.rfind('-') + 1);
+            if (n.starts_with(prefix)) {
+                compatible = model.starts_with(prefix.substr(sizeof("mmproj-") - 1));
+                break;
+            }
+        }
+        if (!compatible) continue;
         const std::string full = path_join(dir, n);
         if (!is_file_p(full)) continue;
         // 一个目录里同时有视觉塔和语音塔时，先拿到哪个算哪个：
@@ -4389,7 +4414,7 @@ int main(int argc, char** argv) {
         out.set("name", json::Value::make_str(name));
         conn.send(200, "application/json", json::dump(out));
     });
-    srv.post("/api/models/delete", [&translator, &scanner](const http::Request& req, http::Conn& conn) {
+    srv.post("/api/models/delete", [&translator, &scanner, &downloads](const http::Request& req, http::Conn& conn) {
         json::Value body;
         std::string path = req.param("path");
         if (path.empty() && json::parse(req.body, &body)) path = body.s("path");
@@ -4407,14 +4432,21 @@ int main(int argc, char** argv) {
         }
         std::unique_lock<std::mutex> lock(g.mu, std::try_to_lock);
         if (!lock.owns_lock()) { send_error(conn, 409, "模型正在使用，请稍后重试"); return; }
-        auto same_file = [&](const std::string& other) {
+        auto same_file = [](const std::string& file, const std::string& other) {
             std::error_code ec;
-            return !other.empty() && (full == other || std::filesystem::equivalent(full, other, ec));
+            return !file.empty() && !other.empty() && (file == other || std::filesystem::equivalent(file, other, ec));
         };
         std::istringstream towers(g.mmproj_path);
-        bool in_use = same_file(g.model_path);
-        for (std::string tower; std::getline(towers, tower, ',');) in_use |= same_file(tower);
+        const auto component = store::managed_projector(g.model_dir, full);
+        bool in_use = same_file(full, g.model_path);
+        for (std::string tower; std::getline(towers, tower, ',');)
+            in_use |= same_file(full, tower) || same_file(component, tower);
         if (in_use) { send_error(conn, 409, "这是当前模型的文件，请先卸载或切换模型"); return; }
+        if (const auto bundle = downloads.remove_bundle(full)) {
+            if (!bundle->error.empty()) { send_error(conn, bundle->status, bundle->error); return; }
+            conn.send(200, "application/json", "{\"ok\":true}");
+            return;
+        }
         int result = 0;
         auto remove = [&] { result = unlink(full.c_str()); };
         if (store::scan_file(path_base(full))) {
@@ -4471,6 +4503,7 @@ int main(int argc, char** argv) {
             // 不报具体是视觉还是语音 —— 那要读塔的 GGUF 头，而几十个模型
             // 逐个读头是几百毫秒。真正的 caps 在 /api/state 里，加载后自然知道。
             o.set("mmproj", json::Value::make_str(m.mmproj));
+            o.set("bundle", json::Value::make_bool(!store::managed_projector(g.model_dir, m.path).empty()));
             o.set("mlx", json::Value::make_bool(m.mlx));
             if (const auto* entry = store::translation_file(path_base(m.path))) {
                 o.set("translation", json::Value::make_str(entry->id));

@@ -8,7 +8,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 internal data class Conversation(val id: String, val turns: List<ChatTurn>) {
-    val title: String get() = turns.first().prompt.lineSequence().first().take(48)
+    val title: String get() = turns.first().let { turn ->
+        turn.prompt.lineSequence().first().ifBlank { turn.attachmentName.orEmpty() }.take(48)
+    }
 }
 
 internal data class Conversations(val selected: String? = null, val items: List<Conversation> = emptyList())

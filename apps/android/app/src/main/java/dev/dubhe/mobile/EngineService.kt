@@ -42,6 +42,7 @@ class EngineService : Service() {
     private var chatResident = false
     private var projector: ProjectorCapabilities? = null
     private var projectorFile: File? = null
+    private var projectorModality: CatalogModality? = null
     private val translations by lazy { TranslationTaskStore(this) }
     private val power by lazy { requireNotNull(getSystemService(PowerManager::class.java)) }
     private val thermalListener = PowerManager.OnThermalStatusChangedListener { status ->
@@ -88,15 +89,10 @@ class EngineService : Service() {
         job = scope.launch {
             try {
                 when (action) {
-                    EngineProtocol.LoadModel -> loadModel(File(requireNotNull(data.getString("path"))), id, reply)
+                    EngineProtocol.LoadModel -> loadModel(data, id, reply)
                     EngineProtocol.LoadProjector -> loadProjector(File(requireNotNull(data.getString("path"))), id, reply)
                     EngineProtocol.UnloadModel -> {
-                        engine.unloadModel()
-                        model = null
-                        modelFile = null
-                        projector = null
-                        projectorFile = null
-                        chatResident = false
+                        unloadChatModel()
                         reply.post(EngineProtocol.ModelUnloaded, id, Bundle())
                     }
                     EngineProtocol.Generate -> {
@@ -128,44 +124,42 @@ class EngineService : Service() {
         if (instance.isInitialized()) engine.cancelGeneration()
     }
 
-    private suspend fun loadModel(file: File, id: Int, reply: Messenger) {
-        val previous = modelFile
+    private suspend fun loadModel(data: Bundle, id: Int, reply: Messenger) {
+        val file = File(requireNotNull(data.getString("path")))
+        val component = data.getString("projectorPath")?.let(::File)
+        val modality = data.getString("projectorModality")?.let(CatalogModality::valueOf)
+        val previousFile = modelFile
         val previousProjector = projectorFile
-        model = null
-        modelFile = null
-        projector = null
-        projectorFile = null
-        chatResident = false
+        val previousModality = projectorModality
         val loaded = try {
-            engine.loadModel(file)
+            activateChatModel(file, component, modality)
         } catch (failure: Exception) {
             if (failure is CancellationException) throw failure
-            if (previous != null && previous != file) {
-                try {
-                    model = engine.loadModel(previous)
-                    modelFile = previous
-                    chatResident = true
-                    restoreProjector(previousProjector)
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    // Report the original failure and leave the engine unloaded.
-                }
+            try {
+                if (previousFile == null) unloadChatModel()
+                else activateChatModel(previousFile, previousProjector, previousModality)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                unloadChatModel()
             }
             throw failure
         }
-        model = loaded
-        modelFile = file
-        chatResident = true
         reply.post(EngineProtocol.ModelReady, id, Bundle().apply {
             putString("backend", loaded.backend)
             putString("quantization", loaded.quantization)
             putInt("context", loaded.contextSize)
+            projectorFile?.let { putString("projectorPath", it.absolutePath) }
+            projector?.let {
+                putBoolean("vision", it.vision)
+                putBoolean("audio", it.audio)
+            }
         })
     }
 
     private suspend fun loadProjector(file: File, id: Int, reply: Messenger) {
         ensureChatModel()
+        check(projectorModality == null) { "这个模型已经配套加载了多模态组件。" }
         val previous = projectorFile
         projectorFile = null
         projector = null
@@ -199,15 +193,44 @@ class EngineService : Service() {
     private suspend fun ensureChatModel(): ModelInfo {
         if (chatResident) return checkNotNull(model)
         val file = modelFile ?: error("请先在模型库加载一个对话模型。")
-        val previousProjector = projectorFile
+        return try {
+            activateChatModel(file, projectorFile, projectorModality)
+        } catch (failure: Exception) {
+            if (failure is CancellationException) throw failure
+            unloadChatModel()
+            throw failure
+        }
+    }
+
+    private suspend fun activateChatModel(file: File, component: File?, modality: CatalogModality?): ModelInfo {
+        val loaded = engine.loadModel(file)
+        val capabilities = if (modality == null) null else {
+            val required = if (modality == CatalogModality.AUDIO) AttachmentKind.Audio else AttachmentKind.Image
+            val result = engine.loadProjector(requireNotNull(component))
+            check((if (modality == CatalogModality.AUDIO) result.audio else result.vision) &&
+                engine.tokenize(required.token, addSpecial = false).size == 1) {
+                "多模态组件与模型不匹配，请重新下载模型。"
+            }
+            result
+        }
+        model = loaded
+        modelFile = file
+        projector = capabilities
+        projectorFile = component.takeIf { capabilities != null }
+        projectorModality = modality
+        chatResident = true
+        if (modality == null) restoreProjector(component)
+        return loaded
+    }
+
+    private suspend fun unloadChatModel() {
         model = null
+        modelFile = null
         projector = null
         projectorFile = null
-        val loaded = engine.loadModel(file)
-        model = loaded
-        chatResident = true
-        restoreProjector(previousProjector)
-        return loaded
+        projectorModality = null
+        chatResident = false
+        engine.unloadModel()
     }
 
     private suspend fun generate(data: Bundle, id: Int, reply: Messenger) {
@@ -217,6 +240,7 @@ class EngineService : Service() {
             Attachment(File(path), AttachmentKind.valueOf(requireNotNull(data.getString("attachmentKind"))))
         }
         val maxTokens = minOf(256, maxOf(1, info.contextSize / 4))
+        val transcribing = attachment?.kind == AttachmentKind.Audio && allMessages.lastOrNull().isNullOrBlank()
         var messages = allMessages.takeLast(13)
         val tokens: IntArray
         while (true) {
@@ -237,7 +261,8 @@ class EngineService : Service() {
         }
         var lastUpdate = 0L
         val chunk = StringBuilder()
-        val response = engine.generate(tokens, Sampling(maxTokens = maxTokens), attachment) { text ->
+        val sampling = if (transcribing) Sampling(maxTokens = maxTokens, temperature = 0f) else Sampling(maxTokens = maxTokens)
+        val response = engine.generate(tokens, sampling, attachment) { text ->
             chunk.append(text)
             val now = SystemClock.elapsedRealtime()
             if (chunk.length >= 512 || now - lastUpdate >= 65L) {
@@ -321,6 +346,12 @@ class EngineService : Service() {
 private fun renderPrompt(model: ModelInfo, messages: List<String>, kind: AttachmentKind?): String = buildString {
     if (model.supportsChatML && (model.architecture == "lfm2" || model.architecture == "lfm3")) {
         append("<|startoftext|>")
+    }
+    if (model.architecture == "lfm3" && model.supportsChatML &&
+        kind == AttachmentKind.Audio && messages.lastOrNull().isNullOrBlank()) {
+        append("<|im_start|>system\nPerform ASR.<|im_end|>\n")
+        append("<|im_start|>user\n${kind.token}<|im_end|>\n<|im_start|>assistant\n")
+        return@buildString
     }
     messages.forEachIndexed { index, content ->
         val user = index % 2 == 0

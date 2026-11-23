@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <thread>
@@ -25,6 +26,13 @@
 extern char** environ;
 
 namespace store {
+
+struct Artifact {
+    int64_t bytes = 0;
+    const char* file = nullptr;
+    const char* url = nullptr;
+    const char* sha256 = nullptr;
+};
 
 struct Entry {
     const char* id;
@@ -38,6 +46,8 @@ struct Entry {
     const char* translation = nullptr;
     bool scan = false;
     bool recommended = false;
+    Artifact projector{};
+    const char* modality = nullptr;
 };
 
 // 文件固定到发布方的 Git revision。size 和 SHA-256 来自对应文件的 LFS 元数据。
@@ -57,9 +67,33 @@ inline const Entry* scan_file(std::string_view filename) {
     return nullptr;
 }
 
+inline const Entry* bundle_file(std::string_view filename) {
+    for (const auto& entry : catalog)
+        if (entry.projector.file && filename == entry.file) return &entry;
+    return nullptr;
+}
+
+inline std::filesystem::path install_directory(const std::string& models, const Entry& entry) {
+    const auto root = std::filesystem::path(models);
+    return entry.projector.file ? root / entry.id : root;
+}
+
+inline std::string managed_projector(const std::string& models, const std::filesystem::path& path) {
+    if (const auto* bundle = bundle_file(path.filename().string())) {
+        const auto dir = install_directory(models, *bundle);
+        if (path.parent_path() == dir) return (dir / bundle->projector.file).string();
+    }
+    return {};
+}
+
 inline int64_t file_size(const std::string& path) {
     struct stat info{};
     return lstat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode) ? info.st_size : -1;
+}
+
+inline bool real_directory(const std::filesystem::path& dir) {
+    struct stat info{};
+    return lstat(dir.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
 }
 
 inline bool gguf_header(const std::string& path) {
@@ -124,10 +158,18 @@ public:
         double partial_bytes = 0;
         std::lock_guard<std::mutex> lock(mu_);
         for (const auto& entry : entries_) {
-            const std::string path = models_ + "/" + entry.file;
-            const bool installed = file_size(path) == entry.bytes && gguf_header(path);
-            const auto partial = std::max<int64_t>(0, file_size(path + ".part"));
-            std::string state = installed ? "done" : partial ? "cancelled" : "idle";
+            bool installed = true;
+            int64_t total = 0, got = 0, partial = 0;
+            const bool readable = !entry.projector.file || real_directory(install_directory(models_, entry));
+            for (const auto& file : files(entry)) {
+                const bool ready = readable && file.installed();
+                const auto pending = readable ? std::max<int64_t>(0, file_size(file.part)) : 0;
+                installed &= ready;
+                total += file.artifact.bytes;
+                got += ready ? file.artifact.bytes : std::min(pending, file.artifact.bytes);
+                partial += pending;
+            }
+            std::string state = installed ? "done" : got ? "cancelled" : "idle";
             json::Value item = json::Value::make_obj();
             auto found = jobs_.find(entry.id);
             if (found != jobs_.end()) {
@@ -145,12 +187,15 @@ public:
             item.set("scan", json::Value::make_bool(entry.scan));
             item.set("recommended", json::Value::make_bool(entry.recommended));
             item.set("url", json::Value::make_str(entry.url));
+            if (entry.modality) item.set("modality", json::Value::make_str(entry.modality));
             item.set("note", json::Value::make_str(entry.translation ? "离线翻译 · 在翻译页使用" :
                 entry.scan ? "离线识别 · 在扫描页使用" :
+                entry.modality ? (std::string_view(entry.modality) == "image" ?
+                    "图片和视频理解 · 含视觉组件" : "音频理解 · 含音频组件") :
                 entry.bytes > 16000000000LL ? "权重较大，请预留内存给上下文" : "安装前检查文件完整性"));
-            item.set("bytes", json::Value::make_num((double)entry.bytes));
-            item.set("total", json::Value::make_num((double)entry.bytes));
-            item.set("got", json::Value::make_num((double)(installed ? entry.bytes : partial)));
+            item.set("bytes", json::Value::make_num((double)total));
+            item.set("total", json::Value::make_num((double)total));
+            item.set("got", json::Value::make_num((double)got));
             item.set("installed", json::Value::make_bool(installed));
             item.set("state", json::Value::make_str(state));
             item.set("can_clear_partial", json::Value::make_bool(partial > 0 && !active(state)));
@@ -182,30 +227,30 @@ public:
             }
             if (job->worker.joinable()) job->worker.join();
         }
-        if (!storage::ensure_dir(models_)) return {507, "", "无法创建模型目录"};
-        const std::string target = models_ + "/" + entry->file;
-        const std::string part = target + ".part";
-        if (file_size(target) == entry->bytes && gguf_header(target)) return {200, "done", ""};
-        struct stat st{};
-        if (lstat(target.c_str(), &st) == 0) return {409, "", "同名文件已存在，请先移走"};
-        if (lstat(part.c_str(), &st) == 0 && (!S_ISREG(st.st_mode) || st.st_size > entry->bytes))
-            return {409, "", "现有续传文件无效，请移走后重试"};
+        const auto dir = install_directory(models_, *entry);
+        if (!storage::ensure_dir(dir.string())) return {507, "", "无法创建模型目录"};
+        if (entry->projector.file && !real_directory(dir))
+            return {409, "", "模型套装目录必须是本地文件夹"};
+        const auto artifacts = files(*entry);
+        if (std::all_of(artifacts.begin(), artifacts.end(), [](const auto& file) { return file.installed(); }))
+            return {200, "done", ""};
+        int64_t needed = 0;
+        for (const auto& file : artifacts) {
+            if (file.installed()) continue;
+            if (const auto* error = file.conflict()) return {409, "", error};
+            needed += file.artifact.bytes - std::max<int64_t>(0, file_size(file.part));
+        }
         struct statvfs space{};
-        const int64_t needed = entry->bytes - std::max<int64_t>(0, file_size(part));
-        if (statvfs(models_.c_str(), &space) == 0 &&
+        if (statvfs(dir.c_str(), &space) == 0 &&
             (long double)space.f_bavail * space.f_frsize < (long double)needed)
             return {507, "", "磁盘剩余空间不足"};
 
         auto job = std::make_shared<Job>();
-        std::string url = entry->url;
         const std::string origin = mirror();
-        constexpr std::string_view official = "https://huggingface.co";
-        if (!origin.empty() && url.starts_with(official)) url = origin + url.substr(official.size());
-        const Entry model = *entry;
         jobs_[id] = job;
         try {
-            job->worker = std::thread([job, target, part, model, url] {
-                try { execute(*job, target, part, model, url); }
+            job->worker = std::thread([job, artifacts, origin] {
+                try { execute(*job, artifacts, origin); }
                 catch (const std::exception&) {
                     std::lock_guard<std::mutex> lock(job->mu);
                     job->state = "error";
@@ -238,17 +283,80 @@ public:
             }
             if (job->second->worker.joinable()) job->second->worker.join();
         }
-        const std::string part = models_ + "/" + entry->file + ".part";
-        if (file_size(part) >= 0) {
-            storage::FileLock file_lock(part + ".lock", LOCK_EX | LOCK_NB);
+        const auto artifacts = files(*entry);
+        const bool readable = !entry->projector.file || real_directory(install_directory(models_, *entry));
+        if (readable && std::any_of(artifacts.begin(), artifacts.end(), [](const auto& file) { return file_size(file.part) >= 0; })) {
+            storage::FileLock file_lock(artifacts.back().part + ".lock", LOCK_EX | LOCK_NB);
             if (!file_lock) return {409, "", "另一 Dubhe 进程可能正在下载此模型"};
-            if (unlink(part.c_str()) != 0 && errno != ENOENT) return {507, "", "无法删除未完成的下载"};
+            for (const auto& file : artifacts) {
+                if (file_size(file.part) >= 0 && unlink(file.part.c_str()) != 0 && errno != ENOENT)
+                    return {507, "", "无法删除未完成的下载"};
+            }
         }
         if (job != jobs_.end()) jobs_.erase(job);
         return {200, "idle", ""};
     }
 
+    std::optional<Reply> remove_bundle(const std::filesystem::path& path) {
+        const auto dir = path.parent_path();
+        const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& candidate) {
+            return candidate.projector.file && dir == install_directory(models_, candidate) &&
+                   (path.filename() == candidate.file || path.filename() == candidate.projector.file);
+        });
+        if (entry == entries_.end()) return std::nullopt;
+        if (!real_directory(dir)) return Reply{409, "", "模型套装目录必须是本地文件夹"};
+        if (path.filename() == entry->projector.file)
+            return Reply{409, "", "请从模型列表删除整套模型"};
+
+        std::lock_guard<std::mutex> lock(mu_);
+        auto job = jobs_.find(entry->id);
+        if (job != jobs_.end()) {
+            {
+                std::lock_guard<std::mutex> job_lock(job->second->mu);
+                if (active(job->second->state)) return Reply{409, job->second->state, "请先停止下载"};
+            }
+            if (job->second->worker.joinable()) job->second->worker.join();
+        }
+        const auto artifacts = files(*entry);
+        storage::FileLock file_lock(artifacts.back().part + ".lock", LOCK_EX | LOCK_NB);
+        if (!file_lock) return Reply{409, "", "另一 Dubhe 进程可能正在下载此模型"};
+        for (auto file = artifacts.rbegin(); file != artifacts.rend(); ++file) {
+            if (unlink(file->target.c_str()) != 0 && errno != ENOENT)
+                return Reply{400, "", "无法删除模型套装，请检查模型目录权限"};
+        }
+        if (job != jobs_.end()) jobs_.erase(job);
+        return Reply{200, "idle", ""};
+    }
+
 private:
+    struct DownloadFile {
+        Artifact artifact;
+        std::string target;
+        std::string part;
+
+        bool installed() const { return file_size(target) == artifact.bytes && gguf_header(target); }
+
+        const char* conflict() const {
+            struct stat st{};
+            if (lstat(target.c_str(), &st) == 0) return "同名文件已存在，请先移走";
+            if (lstat(part.c_str(), &st) == 0 && (!S_ISREG(st.st_mode) || st.st_size > artifact.bytes))
+                return "现有续传文件无效，请移走后重试";
+            return nullptr;
+        }
+    };
+
+    std::vector<DownloadFile> files(const Entry& entry) const {
+        const auto dir = install_directory(models_, entry);
+        auto make = [&](Artifact artifact) {
+            const auto target = (dir / artifact.file).string();
+            return DownloadFile{artifact, target, target + ".part"};
+        };
+        std::vector<DownloadFile> result;
+        if (entry.projector.file) result.push_back(make(entry.projector));
+        result.push_back(make({entry.bytes, entry.file, entry.url, entry.sha256}));
+        return result;
+    }
+
     static bool active(std::string_view state) {
         return state == "running" || state == "verifying" || state == "cancelling";
     }
@@ -343,49 +451,73 @@ private:
 #endif
     }
 
-    static void execute(Job& job, const std::string& target, const std::string& part,
-                        const Entry& entry, const std::string& url) {
+    static bool verify(Job& job, const DownloadFile& file) {
+        storage::Sha256 hash;
+        std::ifstream input(file.part, std::ios::binary);
+        std::array<char, 128 * 1024> buffer{};
+        while (!job.cancelled) {
+            input.read(buffer.data(), buffer.size());
+            hash.update(buffer.data(), static_cast<size_t>(input.gcount()));
+            if (!input) break;
+        }
+        return !job.cancelled && input.eof() && !input.bad() &&
+               file_size(file.part) == file.artifact.bytes && gguf_header(file.part) &&
+               hash.finish() == file.artifact.sha256;
+    }
+
+    static void execute(Job& job, const std::vector<DownloadFile>& artifacts, const std::string& origin) {
         auto finish = [&](std::string state, std::string error = {}) {
             std::lock_guard<std::mutex> lock(job.mu);
             job.state = job.cancelled ? "cancelled" : std::move(state);
             job.error = job.cancelled ? "" : std::move(error);
         };
-        storage::FileLock file_lock(part + ".lock", LOCK_EX | LOCK_NB);
+        storage::FileLock file_lock(artifacts.back().part + ".lock", LOCK_EX | LOCK_NB);
         if (!file_lock) { finish("error", "另一个 Dubhe 进程正在下载此模型"); return; }
-        if (file_size(part) != entry.bytes && transfer(job, url, part) != 0) {
-            finish("error", "下载未完成，已保留可续传文件");
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(job.mu);
-            if (job.cancelled) { job.state = "cancelled"; return; }
-            job.state = "verifying";
-        }
-        storage::Sha256 hash;
-        std::ifstream input(part, std::ios::binary);
-        std::array<char, 128 * 1024> buffer{};
-        for (;;) {
-            if (job.cancelled) { finish("cancelled"); return; }
-            input.read(buffer.data(), buffer.size());
-            hash.update(buffer.data(), (size_t)input.gcount());
-            if (!input) break;
+        std::vector<const DownloadFile*> pending;
+        for (const auto& file : artifacts) {
+            if (file.installed()) continue;
+            if (const auto* error = file.conflict()) { finish("error", error); return; }
+            {
+                std::lock_guard<std::mutex> lock(job.mu);
+                if (job.cancelled) { job.state = "cancelled"; return; }
+                job.state = "running";
+            }
+            if (file_size(file.part) != file.artifact.bytes) {
+                std::string url = file.artifact.url;
+                constexpr std::string_view official = "https://huggingface.co";
+                if (!origin.empty() && url.starts_with(official)) url = origin + url.substr(official.size());
+                if (transfer(job, url, file.part) != 0) {
+                    finish("error", "下载未完成，已保留可续传文件");
+                    return;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(job.mu);
+                if (job.cancelled) { job.state = "cancelled"; return; }
+                job.state = "verifying";
+            }
+            if (!verify(job, file)) {
+                std::lock_guard<std::mutex> lock(job.mu);
+                if (job.cancelled) { job.state = "cancelled"; return; }
+                unlink(file.part.c_str());
+                job.state = "error";
+                job.error = "文件完整性校验失败：" + std::string(file.artifact.file);
+                return;
+            }
+            pending.push_back(&file);
         }
         std::lock_guard<std::mutex> lock(job.mu);
         if (job.cancelled) { job.state = "cancelled"; return; }
-        if (!input.eof() || input.bad() || file_size(part) != entry.bytes ||
-            !gguf_header(part) || hash.finish() != entry.sha256) {
-            unlink(part.c_str());
-            job.state = "error";
-            job.error = "文件完整性校验失败，换一个下载源后重试";
-            return;
+        // 两份文件均校验后才安装，主权重最后发布。保留续传文件直至全部安装成功。
+        for (auto file = pending.begin(); file != pending.end(); ++file) {
+            if (link((*file)->part.c_str(), (*file)->target.c_str()) != 0) {
+                for (auto linked = pending.begin(); linked != file; ++linked) unlink((*linked)->target.c_str());
+                job.state = "error";
+                job.error = "模型已验证，但无法安装。请检查同名文件和目录权限";
+                return;
+            }
         }
-        // link 在同一个文件系统内发布完成的文件，保证已有文件不会被覆盖。
-        if (link(part.c_str(), target.c_str()) != 0) {
-            job.state = "error";
-            job.error = "模型已验证，但无法安装。请检查同名文件和目录权限";
-            return;
-        }
-        unlink(part.c_str());
+        for (const auto* file : pending) unlink(file->part.c_str());
         job.state = "done";
     }
 

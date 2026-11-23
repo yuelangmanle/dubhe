@@ -246,7 +246,7 @@ integration-test: $(SRV)
 ifeq ($(PLATFORM),Darwin)
 	swiftc apps/macos/Sources/TranslationPDF.swift apps/macos/Sources/TranslationExport.swift tests/test_translation_pdf.swift -o "$(BUILD)/test_translation_pdf" -framework PDFKit -framework CoreText
 	"$(BUILD)/test_translation_pdf"
-	swiftc apps/macos/Sources/ScanPDF.swift apps/macos/Sources/ScanOCR.swift tests/test_scan_pdf.swift -o "$(BUILD)/test_scan_pdf" -framework PDFKit
+	swiftc apps/macos/Sources/ScanPDF.swift apps/macos/Sources/ScanSearchablePDF.swift apps/macos/Sources/ScanOCR.swift tests/test_scan_pdf.swift -o "$(BUILD)/test_scan_pdf" -framework PDFKit -framework CoreText
 	"$(BUILD)/test_scan_pdf"
 	swiftc apps/macos/Sources/ReleaseUpdates.swift tests/test_release_updates.swift -o "$(BUILD)/test_release_updates"
 	"$(BUILD)/test_release_updates"

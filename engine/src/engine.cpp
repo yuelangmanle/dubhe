@@ -615,7 +615,9 @@ int dubhe_generate_filtered(dubhe_engine* e, const int32_t* prompt, int32_t n_pr
                 return DUBHE_ERR_CANCELLED;
             }
             const int take = std::min<int>(nb, n_prompt - i);
-            if (!e->model.forward_batch(prompt + i, take, i, logits.data(), &err)) {
+            // 只有最后一段的 logits 用于采样，其余段只更新序列状态。
+            float* out = (i + take == n_prompt) ? logits.data() : nullptr;
+            if (!e->model.forward_batch(prompt + i, take, i, out, &err)) {
                 set_err(err);
                 return DUBHE_ERR_STATE;
             }

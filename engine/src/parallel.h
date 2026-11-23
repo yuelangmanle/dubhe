@@ -8,9 +8,8 @@
 // 而且 GCD 的全局队列由系统维护，长期实测比手写池稳。两套实现只藏在这个
 // 函数背后，调用方看不到差异。
 //
-// 非 Apple 平台用常驻线程池 + 原子任务分发（动态负载均衡）。这里不用静态
-// 分块，因为 matvec 各行耗时并不完全均匀（首行带 cache 冷启动），动态取
-// 任务能把尾部拖慢的影响摊平。
+// 非 Apple 平台用常驻线程池。线程动态领取相邻的几行，减少逐行争用，
+// 同时让大小核按各自速度继续取任务。
 #pragma once
 
 #include <cstddef>
@@ -30,6 +29,7 @@ inline void parallel_for(size_t n, void (*fn)(void*, size_t), void* ctx) {
 
 #else  // 非 Apple：自带线程池
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -75,11 +75,14 @@ public:
             for (size_t i = 0; i < n_items; i++) fn(ctx, i);
             return;
         }
+        // 池被多个引擎共享。等上一批结束才能替换回调和上下文。
+        std::lock_guard<std::mutex> run_lock(run_mu_);
         {
             std::lock_guard<std::mutex> lk(mu_);
             fn_ = fn;
             ctx_ = ctx;
             items_ = n_items;
+            grain_ = std::clamp<size_t>(n_items / (4 * n_), 1, 16);
             next_.store(0, std::memory_order_relaxed);
             active_ = (int)th_.size();
             ++gen_;
@@ -93,9 +96,10 @@ public:
 private:
     void drain() {
         for (;;) {
-            const size_t i = next_.fetch_add(1, std::memory_order_relaxed);
-            if (i >= items_) return;
-            fn_(ctx_, i);
+            const size_t begin = next_.fetch_add(grain_, std::memory_order_relaxed);
+            if (begin >= items_) return;
+            const size_t end = std::min(begin + grain_, items_);
+            for (size_t i = begin; i < end; i++) fn_(ctx_, i);
         }
     }
 
@@ -117,12 +121,14 @@ private:
     }
 
     std::vector<std::thread> th_;
+    std::mutex run_mu_;
     std::mutex mu_;
     std::condition_variable cv_;
     std::condition_variable done_;
     void (*fn_)(void*, size_t) = nullptr;
     void* ctx_ = nullptr;
     size_t items_ = 0;
+    size_t grain_ = 1;
     std::atomic<size_t> next_{0};
     int gen_ = 0;
     int active_ = 0;

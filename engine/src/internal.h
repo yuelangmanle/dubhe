@@ -350,10 +350,11 @@ public:
     const GgufFile&    file() const { return file_; }
     bool               loaded() const { return loaded_; }
 
-    // 一次前向：给定最后一个 token 与已有 KV，输出 logits（n_vocab）
+    // 一次前向：给定 token 与已有 KV，更新序列状态。
+    // logits 非空时输出 n_vocab 个分数。
     bool forward(int32_t token, int32_t pos, float* logits, std::string* err);
     // 批量前向（prefill）：tokens[0..n) 连续喂入，pos0 是首 token 的位置。
-    // 只有最后一个 token 的 logits 有效。n==1 时等价于 forward()。
+    // logits 非空时输出最后一个 token 的分数。n==1 时等价于 forward()。
     // slab0 != 0 时整段落到 KV 缓冲的 slab0 号槽位（连续批处理时每条序列一块），
     // cslot 是该序列的 ShortConv 历史槽位。
     bool forward_batch(const int32_t* tokens, int n, int32_t pos0, float* logits,

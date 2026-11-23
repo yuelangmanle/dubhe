@@ -44,6 +44,25 @@ enum ScanPDFTests {
         precondition(exported.pageCount == 1 && exported.page(at: 0)?.rotation == 90)
         precondition(exported.page(at: 0)?.bounds(for: .cropBox) == first.bounds(for: .cropBox),
                      "export preserves the crop box")
+        let note = "Daily river discharge 水位 10.2"
+        let searchableData = try scan.searchablePDF(pages: [1], notes: [note])
+        let searchable = PDFDocument(data: searchableData)!
+        precondition(searchable.pageCount == 2, "export preserves the unprocessed second page")
+        let extracted = searchable.page(at: 0)?.string ?? ""
+        precondition(extracted.split(whereSeparator: \.isWhitespace).joined(separator: " ").contains(note),
+                     "the scanned page has searchable Unicode OCR text: \(extracted.debugDescription)")
+        precondition(searchable.findString("水位").count == 1, "Chinese keywords are findable in the PDF")
+        precondition(searchable.page(at: 1)?.string?.contains(note) != true,
+                     "the OCR text stays on its page")
+        let searchableFile = temp.appendingPathComponent("searchable.pdf")
+        try searchableData.write(to: searchableFile)
+        let searchableScan = try ScanPDF(url: searchableFile)
+        let layered = try decode(searchableScan.pageDataURL(number: 1))
+        precondition(layered.width == rotated.width && layered.height == rotated.height,
+                     "export preserves the visible size and orientation of a rotated crop")
+        precondition(pixel(layered, x: 250, y: 290) == red && pixel(layered, x: 1320, y: 1800) == blue)
+        let unchanged = try searchableScan.searchablePDF(pages: [1], notes: ["Text already present"])
+        precondition(unchanged == searchableData, "never add a duplicate text layer to a searchable page")
         for number in [0, 3] {
             do {
                 _ = try scan.pageDataURL(number: number)

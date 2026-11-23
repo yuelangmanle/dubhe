@@ -17,6 +17,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import dev.dubhe.sdk.AttachmentKind
 import dev.dubhe.sdk.ProjectorCapabilities
 import java.io.File
 import java.util.ArrayList
@@ -132,6 +133,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun importModel(uri: Uri, slot: ModelSlot) {
+        if (slot == ModelSlot.Projector && state.activeModel?.bundledCatalog != null) return
         importFile("正在复制 GGUF 文件") { progress ->
             val model = store.importModel(uri, progress)
             if (slot == ModelSlot.Language && model.catalog?.translation == true) {
@@ -154,7 +156,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         importFile("正在下载 ${item.name}") { update ->
             val model = store.download(item) { update(it) }
             if (loadAfter && !item.translation) load(ModelRequest(ModelSlot.Language, model, saveSelection = true))
-            else state = state.copy(activity = Activity.Idle, progress = null, status = "模型已下载")
+            else state = state.copy(activity = Activity.Idle, progress = null,
+                status = if (item.projector == null) "模型已下载" else "模型和多模态组件已下载")
         }
     }
 
@@ -236,7 +239,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 }
             } catch (cancelled: CancellationException) {
                 if (state.activity == Activity.Importing && state.connected) {
-                    state = state.copy(activity = Activity.Idle, progress = null, status = "已取消导入", stopping = false)
+                    state = state.copy(activity = Activity.Idle, progress = null, stopping = false,
+                        status = if (state.downloading == null) "已取消导入" else "已暂停下载")
                 }
                 throw cancelled
             } catch (failure: Exception) {
@@ -254,20 +258,22 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun ask(value: String) {
-        val prompt = value.trim()
-        if (state.activity != Activity.Idle || state.modelName == null || prompt.isEmpty()) return
+        val attachment = draftAttachment
+        val input = value.trim()
+        if (state.activity != Activity.Idle || state.modelName == null || (input.isEmpty() && attachment == null)) return
+        val prompt = input.ifEmpty { defaultMediaPrompt(attachment?.attachment?.kind) }
         val previous = state.turns.asReversed().asSequence().filter { it.answer.isNotBlank() }
             .take(6).toList().asReversed()
         val history = ArrayList<String>()
         var chars = prompt.length
         for (turn in previous.asReversed()) {
-            chars += turn.prompt.length + turn.answer.length
+            val priorPrompt = turn.prompt.ifEmpty { if (turn.attachmentName != null) "请转写音频。" else "" }
+            chars += priorPrompt.length + turn.answer.length
             if (chars > 32_000) break
             history.add(0, turn.answer)
-            history.add(0, turn.prompt)
+            history.add(0, priorPrompt)
         }
         history.add(prompt)
-        val attachment = draftAttachment
         sentAttachment = attachment
         draftAttachment = null
         state = state.copy(
@@ -534,10 +540,24 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     private fun load(request: ModelRequest) {
+        val bundle = request.model.bundledCatalog
+        val bundledProjector = store.catalogProjector(request.model)
+        if (bundle != null && bundledProjector == null) {
+            refreshLibrary()
+            state = state.copy(activity = Activity.Idle, progress = null, status = null,
+                error = "模型文件不完整，请到模型商店继续下载。")
+            return
+        }
+        val legacyProjector = if (request.slot == ModelSlot.Language &&
+            !request.saveSelection && bundle == null) store.current(ModelSlot.Projector) else null
         pending = request
         state = state.copy(activity = Activity.Loading, progress = null, status = null)
         val action = if (request.slot == ModelSlot.Language) EngineProtocol.LoadModel else EngineProtocol.LoadProjector
-        send(action, Bundle().apply { putString("path", request.model.file.absolutePath) })
+        send(action, Bundle().apply {
+            putString("path", request.model.file.absolutePath)
+            (bundledProjector ?: legacyProjector)?.let { putString("projectorPath", it.file.absolutePath) }
+            putString("projectorModality", bundle?.modality?.name)
+        })
     }
 
     private fun send(what: Int, data: Bundle) {
@@ -555,17 +575,18 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     data.getString("backend"), data.getString("quantization"),
                     "${data.getInt("context")} token 上下文",
                 ).joinToString("  ·  ")
+                val projectorPath = data.getString("projectorPath")
                 state = state.copy(
                     activity = Activity.Idle,
                     modelName = request.model.name, modelDetail = detail, activeModel = request.model,
-                    projector = null, projectorName = null, error = null,
+                    projector = projectorPath?.let { ProjectorCapabilities(data.getBoolean("vision"), data.getBoolean("audio")) },
+                    projectorName = projectorPath?.let { path ->
+                        store.current(ModelSlot.Projector)?.takeIf { it.file.absolutePath == path }?.name ?: File(path).name
+                    },
+                    error = null,
                 )
                 removeAttachment()
-                if (request.saveSelection) {
-                    persist(request)
-                } else {
-                    store.current(ModelSlot.Projector)?.let { load(ModelRequest(ModelSlot.Projector, it)) }
-                }
+                if (request.saveSelection) persist(request)
             }
             EngineProtocol.ProjectorReady -> {
                 val request = pending ?: return true
@@ -710,4 +731,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         val saveSelection: Boolean = false,
         val temporaryFile: Boolean = false,
     )
+}
+
+private fun defaultMediaPrompt(kind: AttachmentKind?): String = when (kind) {
+    AttachmentKind.Image -> "请描述这张图片。"
+    AttachmentKind.Video -> "请描述这段视频。"
+    AttachmentKind.Audio, null -> ""
 }

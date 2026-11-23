@@ -6,13 +6,15 @@ Xiaomi-OCR-0 可在「扫描」页选择 Q4 或 BF16。两种社区 GGUF 权重�
 
 | 模型 | 下载 |
 | --- | --- |
-| LFM3 1.7B GGUF Q8 | [Q8_0](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-Q8_0.gguf) |
+| LFM3 1.7B GGUF | [Q4_K_M](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-Q4_K_M.gguf) · [Q8_0](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-Q8_0.gguf) |
 | LFM3 1.7B GGUF F16 | [F16](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-F16.gguf) |
 | LFM3 1.7B MLX | [4-bit 文件夹](https://huggingface.co/LiquidAI/LFM3-1.7B-MLX-4bit/tree/main) · [8-bit 文件夹](https://huggingface.co/LiquidAI/LFM3-1.7B-MLX-8bit/tree/main) |
 | LFM3 Audio 2B | [Q4_K_M 权重](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF/resolve/b0d3187e4ef8f4befd06e0a0af5c7a84ff51e42d/LFM3-Audio-2B-Q4_K_M.gguf) · [原版 Q8_0 音频组件](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF/resolve/b0d3187e4ef8f4befd06e0a0af5c7a84ff51e42d/mmproj-LFM3-Audio-2B-Q8_0.gguf) |
 | LFM3 VL 2B | [Q4_K_M 权重](https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/resolve/1add221a5ea6c047fcf1eaaf2d247939d7cf8849/LFM3-VL-2B-Q4_K_M.gguf) · [Q8_0 视觉组件](https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/resolve/1add221a5ea6c047fcf1eaaf2d247939d7cf8849/mmproj-LFM3-VL-2B-Q8_0.gguf) |
 | MiMo V2.6 Distill Qwen 9B | [Q4_K_M](https://huggingface.co/bartowski/MiMo-V2.6-Distill-Qwen-9B-GGUF/resolve/main/MiMo-V2.6-Distill-Qwen-9B-Q4_K_M.gguf) |
 | Qwen3.5 4B | [Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf) |
+| Qwen3.5 2B | [Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_K_M.gguf) |
+| Qwen3.5 0.8B | [Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0/Qwen3.5-0.8B-Q4_K_M.gguf) |
 | Qwen2.5 0.5B Instruct | [Q4_0](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q4_0.gguf) · [Q5_0](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q5_0.gguf) |
 | 混元 Hy-MT2 1.8B | [Q4_K_M](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/a0c709d9fac510f2c807aa3af52872340dc37a4a/Hy-MT2-1.8B-Q4_K_M.gguf) |
 | Index-Translate 2B | [Q4_K_M](https://huggingface.co/IndexTeam/Index-Translate-2B-GGUF/resolve/3a0eca6ce931d88d00614d427ab3ed8ff0743902/Index-Translate-2B.Q4_K_M.gguf) |

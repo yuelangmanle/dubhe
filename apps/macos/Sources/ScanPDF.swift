@@ -116,6 +116,15 @@ final class ScanPDF {
         return data
     }
 
+    func searchablePDF(pages: [Int], notes: [String]) throws -> Data {
+        guard !pages.isEmpty, pages.count == notes.count, Set(pages).count == pages.count else {
+            throw ScanError.invalidPDF
+        }
+        let text = Dictionary(uniqueKeysWithValues: zip(pages, notes))
+        if let updated = try ScanSearchablePDF.render(source: document, textByPage: text) { return updated }
+        return try originalPages()
+    }
+
     static func imagePDF(_ image: NSImage) throws -> Data {
         let pdf = PDFDocument()
         guard let page = PDFPage(image: image) else { throw ScanError.image }
@@ -127,12 +136,14 @@ final class ScanPDF {
     func preparePage(number: Int, resolution: Resolution, textSource: TextSource) throws -> (image: String?, text: String) {
         guard (1...pageCount).contains(number) else { throw ScanError.invalidPage(number) }
         let text = textSource == .ocr ? "" : selectableText(number: number)
-        if textSource == .embedded || textSource == .auto && text.unicodeScalars.lazy.filter({
-            CharacterSet.alphanumerics.contains($0)
-        }).prefix(20).count == 20 {
+        if textSource == .embedded || textSource == .auto && Self.hasReadableText(text) {
             return (nil, text)
         }
         return (try pageDataURL(number: number, resolution: resolution), text)
+    }
+
+    static func hasReadableText(_ text: String) -> Bool {
+        text.unicodeScalars.lazy.filter { CharacterSet.alphanumerics.contains($0) }.prefix(20).count == 20
     }
 
     func pageDataURL(number: Int, resolution: Resolution = .standard) throws -> String {

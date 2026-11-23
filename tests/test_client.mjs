@@ -645,6 +645,15 @@ try {
     canvas.width = 80;
     canvas.height = 110;
     window.makeScannerImage = () => canvas.toDataURL('image/jpeg');
+    const documentPage = document.createElement('canvas');
+    documentPage.width = 640;
+    documentPage.height = 960;
+    const documentContext = documentPage.getContext('2d');
+    documentContext.fillStyle = '#fff';
+    documentContext.fillRect(0, 0, 640, 960);
+    documentContext.fillStyle = '#000';
+    documentContext.fillRect(150, 300, 340, 210);
+    const originalPage = documentPage.toDataURL('image/jpeg');
     window.scanNativeCalls = [];
     window.webkit = { messageHandlers: { shell: { postMessage: message => {
       window.scanNativeCalls.push(message);
@@ -652,7 +661,7 @@ try {
         requestId: message.requestId, name: 'paper.docx', pageCount: 4, identity: 'paper-identity',
       });
       if (message.type === 'scanPDFPage') window.dubheScanPDFPage({
-        ...message, image: window.makeScannerImage(),
+        ...message, image: originalPage,
       });
       if (message.type === 'scanFindRegions') window.dubheScanRegionsReady({
         requestId: message.requestId, regions: [{ mode: 'table', x: .2, y: .3, width: .6, height: .5 }],
@@ -767,7 +776,7 @@ try {
   await until(() => evaluate('document.querySelector(".scan-card h3").textContent && document.querySelector("#scanResult table") && document.querySelector("#scanStatus").textContent === "识别完成"'),
     'document regions are reassembled');
   assert.equal(scans.at(-1).mode, 'table');
-  assert.match(await evaluate('Array.from(document.querySelectorAll(".scan-source-name")).at(-1).textContent'), /分区识别/);
+  assert.match(await evaluate('document.querySelector("#scanResultPage").textContent'), /分区识别/);
   await evaluate('document.querySelector("#scanLayout").value = "page"');
   await click('#scanExport');
   assert.equal(await evaluate('window.scanNativeCalls.at(-1).name'), 'report-扫描结果.md');
@@ -778,6 +787,7 @@ try {
   await click('#scanOpenPDF');
   await until(() => evaluate('document.querySelector("#scanPage").textContent.includes("1 / 4")'), 'PDF source');
   await evaluate(`(() => {
+    document.querySelector('#scanQuality').value = 'fast';
     document.querySelector('#scanFrom').value = '2';
     document.querySelector('#scanTo').value = '3';
     document.querySelector('#scanTo').dispatchEvent(new Event('input'));
@@ -792,6 +802,18 @@ try {
   assert.equal(scans.length, beforePDF);
   releaseScanSave();
   await until(() => scans.length === pauseAtScan, 'second scan page is running');
+  assert.match(await evaluate('document.querySelector("#scanPage").textContent'), /2 \/ 4/);
+  assert.match(await evaluate('document.querySelector("#scanResult").textContent'), /年度报告/);
+  assert.match(await evaluate('document.querySelector("#scanResultProgress").textContent'), /已完成 1 \/ 2 页 · 正在处理第 3 页/);
+  const sentImage = await evaluate(`(async () => {
+    const image = new Image();
+    image.src = ${JSON.stringify(scans.at(-1).image)};
+    await image.decode();
+    return [image.naturalWidth, image.naturalHeight];
+  })()`);
+  assert.ok(sentImage[0] * sentImage[1] < 640 * 960 * 0.5, 'empty margins are left out of the OCR payload');
+  assert.equal(await evaluate('document.querySelector(".scan-image-frame img").naturalHeight'), 960,
+    'the preview preserves the uncropped original');
   await click('#scanStop');
   await until(() => evaluate('document.querySelector("#scanStatus").textContent.includes("已保留 1 页")'),
     'cancel keeps finished pages');
@@ -809,12 +831,14 @@ try {
   await until(() => evaluate('document.querySelector("#scanPage").textContent.includes("2 / 4")'),
     'reopen original Word document without losing position');
   assert.match(await evaluate('document.querySelector("#scanResult").textContent'), /年度报告/);
-  assert.equal(await evaluate('document.querySelector("#scanExportFormat").value'), 'paired');
+  assert.equal(await evaluate('document.querySelector("#scanExportFormat").value'), 'searchable');
+  assert.equal(await evaluate('document.querySelector(\'#scanExportFormat option[value="paired"]\').hidden'), true);
   await click('#scanExport');
-  const pairedExport = await evaluate('window.scanNativeCalls.at(-1)');
-  assert.equal(pairedExport.format, 'pdf');
-  assert.deepEqual(pairedExport.pages, [2, 3]);
-  assert.match(pairedExport.notes[0], /年度报告/);
+  const searchableExport = await evaluate('window.scanNativeCalls.at(-1)');
+  assert.equal(searchableExport.format, 'pdf');
+  assert.equal(searchableExport.searchable, true);
+  assert.deepEqual(searchableExport.pages, [2, 3]);
+  assert.match(searchableExport.notes[0], /年度报告/);
   await click('#scanOriginalLayout');
   assert.equal(await evaluate('document.querySelector("#scanExportFormat").value'), 'original');
   await click('#scanExport');
@@ -844,6 +868,11 @@ try {
   pauseAtScan = scans.length + 2;
   await click('#scanRun');
   await until(() => scans.length === pauseAtScan, 'the second page is being reprocessed');
+  await click('#scanNext');
+  assert.match(await evaluate('document.querySelector("#scanPage").textContent'), /2 \/ 4/);
+  assert.equal(await evaluate('document.querySelector("#scanFollow").hidden'), false);
+  await click('#scanFollow');
+  assert.match(await evaluate('document.querySelector("#scanPage").textContent'), /1 \/ 4/);
   await click('#scanStop');
   await until(() => evaluate('document.querySelector("#scanStatus").textContent.includes("已保留 3 页")'),
     'stopping a repeated scan keeps the older text');

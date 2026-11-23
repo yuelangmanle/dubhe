@@ -3256,7 +3256,7 @@
     if (!host.isConnected || state.view !== 'models') return;
     let view = storeViews.get(host);
     if (!view) {
-      view = { request: 0, timer: null, active: new Set(), list: el('div'), mirror: null };
+      view = { request: 0, timer: null, active: new Set(), list: el('div'), mirror: null, category: 'all' };
       host.appendChild(view.list);
       storeViews.set(host, view);
     }
@@ -3280,6 +3280,16 @@
       const space = el('span', 'vmeta store-space', '可用 ' + fmtBytes(d.storage.free_bytes));
       heading.appendChild(space);
     }
+    const category = el('select', 'vsel');
+    category.setAttribute('aria-label', '模型用途');
+    for (const [value, label] of [['all', '全部用途'], ['chat', '文字对话'], ['image', '图片和视频'],
+      ['audio', '音频'], ['translation', '翻译'], ['scan', '扫描']]) {
+      const option = el('option', '', label);
+      option.value = value;
+      category.append(option);
+    }
+    category.value = view.category;
+    heading.append(category);
     const sources = el('a', 'vbtn ghost', '下载来源');
     sources.href = 'https://github.com/yuelangmanle/dubhe/blob/main/docs/model-downloads.md';
     sources.target = '_blank';
@@ -3290,6 +3300,7 @@
     const scannerFiles = d.items.filter(m => m.scan);
     if (scannerFiles.length) {
       const row = el('div', 'vrow');
+      row.dataset.category = 'scan';
       const symbol = el('div', 'vico');
       symbol.appendChild(iconNode('scan'));
       const description = el('div', 'vmain');
@@ -3306,6 +3317,7 @@
     }
     d.items.filter(m => !m.scan).forEach((m) => {
       const row = el('div', 'vrow');
+      row.dataset.category = m.modality || (m.translation ? 'translation' : 'chat');
       const ico = el('div', 'vico');
       ico.appendChild(iconNode('cube'));
       row.appendChild(ico);
@@ -3393,6 +3405,12 @@
       }
       card.appendChild(row);
     });
+    const filterRows = () => {
+      view.category = category.value;
+      for (const row of card.children) row.hidden = view.category !== 'all' && view.category !== row.dataset.category;
+    };
+    category.addEventListener('change', filterRows);
+    filterRows();
     view.list.appendChild(card);
 
     if (!view.mirror) view.mirror = createMirrorSetting(host);
@@ -3447,7 +3465,7 @@
   }
 
   // ---------------------------------------------------------------- 模型
-  function confirmModelDeletion(name) {
+  function confirmModelDeletion(name, bundle = false) {
     const dialog = el('dialog', 'delete-confirm');
     const title = el('h3', '', '删除模型？');
     title.id = 'delete-model-title';
@@ -3460,7 +3478,7 @@
     const remove = el('button', 'vbtn', '删除');
     remove.value = 'delete';
     form.append(cancel, remove);
-    dialog.append(title, el('p', '', name + ' 将从模型目录移除。'), form);
+    dialog.append(title, el('p', '', name + (bundle ? ' 及配套组件将一起从模型目录移除。' : ' 将从模型目录移除。')), form);
     document.body.appendChild(dialog);
     return new Promise(resolve => {
       dialog.addEventListener('close', () => {
@@ -3600,7 +3618,7 @@
         del.onclick = async () => {
           del.disabled = true;
           try {
-            if (!await confirmModelDeletion(m.name)) return;
+            if (!await confirmModelDeletion(m.name, m.bundle)) return;
             await vpost('/api/models/delete', { path: m.path });
             if (card.isConnected && state.view === 'models') await viewModels();
           } catch (e) {
@@ -4625,21 +4643,53 @@
     return source;
   }
 
-  async function prepareScanRaster(data, settings) {
+  function scanInkBounds(source) {
+    const width = source.naturalWidth, height = source.naturalHeight;
+    const ratio = Math.min(1, 320 / Math.max(width, height));
+    const probe = el('canvas');
+    probe.width = Math.max(1, Math.round(width * ratio));
+    probe.height = Math.max(1, Math.round(height * ratio));
+    const context = probe.getContext('2d', { alpha: false, willReadFrequently: true });
+    context.drawImage(source, 0, 0, probe.width, probe.height);
+    const pixels = context.getImageData(0, 0, probe.width, probe.height).data;
+    let left = probe.width, top = probe.height, right = -1, bottom = -1;
+    for (let y = 0; y < probe.height; y++) {
+      for (let x = 0; x < probe.width; x++) {
+        const offset = (y * probe.width + x) * 4;
+        if (Math.min(pixels[offset], pixels[offset + 1], pixels[offset + 2]) >= 245) continue;
+        left = Math.min(left, x);
+        right = Math.max(right, x);
+        top = Math.min(top, y);
+        bottom = Math.max(bottom, y);
+      }
+    }
+    if (right < left || bottom < top) return null;
+    const padding = Math.max(6, Math.round(Math.min(probe.width, probe.height) * 0.05));
+    const x = Math.max(0, Math.floor((left - padding) * width / probe.width));
+    const y = Math.max(0, Math.floor((top - padding) * height / probe.height));
+    const croppedWidth = Math.min(width, Math.ceil((right + 1 + padding) * width / probe.width)) - x;
+    const croppedHeight = Math.min(height, Math.ceil((bottom + 1 + padding) * height / probe.height)) - y;
+    if (croppedWidth * croppedHeight >= width * height * 0.77) return null;
+    return { x, y, width: croppedWidth, height: croppedHeight };
+  }
+
+  async function prepareScanRaster(data, settings, trimMargins = false) {
     const source = await decodeScanImage(data);
+    const crop = trimMargins ? scanInkBounds(source) : null;
+    const area = crop ?? { x: 0, y: 0, width: source.naturalWidth, height: source.naturalHeight };
     const limit = SCAN_DETAILS[settings.quality];
-    const scale = Math.min(1, limit / Math.max(source.naturalWidth, source.naturalHeight));
-    if (scale === 1 && !settings.enhance && !settings.rotation) return data;
+    const scale = Math.min(1, limit / Math.max(area.width, area.height));
+    if (!crop && scale === 1 && !settings.enhance && !settings.rotation) return data;
     const canvas = el('canvas');
-    const w = Math.max(1, Math.round(source.naturalWidth * scale));
-    const h = Math.max(1, Math.round(source.naturalHeight * scale));
+    const w = Math.max(1, Math.round(area.width * scale));
+    const h = Math.max(1, Math.round(area.height * scale));
     const sideways = settings.rotation % 180 !== 0;
     canvas.width = sideways ? h : w;
     canvas.height = sideways ? w : h;
     const context = canvas.getContext('2d', { alpha: false });
     context.translate(canvas.width / 2, canvas.height / 2);
     context.rotate(settings.rotation * Math.PI / 180);
-    context.drawImage(source, -w / 2, -h / 2, w, h);
+    context.drawImage(source, area.x, area.y, area.width, area.height, -w / 2, -h / 2, w, h);
     if (settings.enhance) {
       const frame = context.getImageData(0, 0, canvas.width, canvas.height);
       for (let i = 0; i < frame.data.length; i += 4) {
@@ -4823,6 +4873,7 @@
     let catalog, catalogError = '', modelError = '', modelBusy = false;
     let refreshCounter = 0, poll, files = [];
     let source, page = 1, raster, lastPdfPage, drawnPage = 0, loadingImage;
+    let scanProgress, previewTimer;
     let pendingPDF, pendingSave, work, job, taskId, pdfOpened, pendingBatch, batch;
     let relinkingPDF = false, relinkingImage = false;
     const pendingPages = new Map();
@@ -4884,9 +4935,10 @@
     const pagination = el('div', 'scan-paging');
     const prev = button('Previous', '上一页', 'ghost');
     const next = button('Next', '下一页', 'ghost');
+    const follow = button('Follow', '跟随识别', 'ghost');
     const position = el('output', 'scan-page-number');
     position.id = 'scanPage';
-    pagination.append(prev, position, next);
+    pagination.append(prev, position, next, follow);
     inputCard.append(sourceHead, upload, imageFrame, pagination);
 
     const options = el('div', 'scan-options');
@@ -4987,7 +5039,11 @@
     const resultTitle = el('div', 'scan-title');
     const resultHeading = el('h3', '', '识别结果');
     const resultPage = el('p', 'scan-source-name');
-    resultTitle.append(resultHeading, resultPage);
+    resultPage.id = 'scanResultPage';
+    const resultProgress = el('p', 'scan-source-name');
+    resultProgress.id = 'scanResultProgress';
+    resultProgress.setAttribute('role', 'status');
+    resultTitle.append(resultHeading, resultPage, resultProgress);
     const showRaw = button('Raw', '识别文本', 'ghost');
     const showOriginal = button('OriginalLayout', '原版面', 'ghost');
     const resultViews = el('div', 'scan-tools');
@@ -5001,7 +5057,8 @@
     const exportFormat = el('select', 'vsel');
     exportFormat.id = 'scanExportFormat';
     exportFormat.setAttribute('aria-label', '导出格式');
-    for (const [value, label] of [['auto', '识别文字'], ['paired', '原版面 + 识别文字（PDF）'], ['original', '原版面（PDF）'],
+    for (const [value, label] of [['auto', '识别文字'], ['searchable', '可搜索 PDF（保留版面）'],
+      ['paired', '原图 + 识别文字（PDF）'], ['original', '原版面（PDF）'],
       ['docx', '可编辑文字（.docx）'], ['md', 'Markdown（.md）'], ['txt', '纯文本（.txt）'], ['csv', '本页表格（.csv）']]) {
       const option = el('option', '', label);
       option.value = value;
@@ -5101,8 +5158,12 @@
       sourceName.textContent = source?.name || '';
       sourceName.title = source?.name || '';
       position.textContent = isPDF() ? '第 ' + page + ' / ' + source.pageCount + ' 页' : '';
-      prev.disabled = Boolean(job || batch) || page <= 1;
-      next.disabled = Boolean(job || batch) || page >= (source?.pageCount ?? 1);
+      prev.disabled = Boolean(pendingPDF) || page <= 1;
+      next.disabled = Boolean(pendingPDF) || page >= (source?.pageCount ?? 1);
+      follow.hidden = !scanProgress || scanProgress.follow || !scanProgress.last;
+      resultProgress.textContent = scanProgress && isPDF()
+        ? '已完成 ' + scanProgress.done + ' / ' + scanProgress.total + ' 页' +
+          (scanProgress.current ? ' · 正在处理第 ' + scanProgress.current + ' 页' : '') : '';
       blank.hidden = Boolean(source || loadingImage || pendingPDF);
       image.hidden = enlarge.hidden = !raster;
       opening.hidden = !blank.hidden || Boolean(raster) || drawnPage === page;
@@ -5144,29 +5205,34 @@
       question.hidden = translate.hidden;
       question.disabled = Boolean(job || batch);
       const canExportOriginal = Boolean(native() && originalReady());
+      const searchable = canExportOriginal && hasResults && isPDF() && ['document', 'text'].includes(work.mode);
       const autoFormat = hasResults ? resultFormat(work.results.values()) : null;
       exportFormat.options[0].textContent = autoFormat
         ? textFormats[autoFormat] + '（.' + autoFormat + '）' : '识别文字';
       for (const option of exportFormat.options) {
         option.hidden = option.value === 'original' ? !canExportOriginal
-          : option.value === 'paired' ? !canExportOriginal || !hasResults
+          : option.value === 'searchable' ? !searchable
+          : option.value === 'paired' ? !canExportOriginal || !hasResults || isPDF()
           : !hasResults ? true
           : option.value === 'csv' ? item?.kind !== 'markdown' ||
             !/<table\b|^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*\|[ \t]*:?-{3,}/im.test(item.text)
           : option.value === autoFormat || option.value === 'docx' && !native();
       }
       const defaultExport = canExportOriginal && (!hasResults || originalLayout)
-        ? 'original' : canExportOriginal && work?.mode === 'document' ? 'paired' : 'auto';
+        ? 'original' : searchable ? 'searchable'
+        : canExportOriginal && !isPDF() && work?.mode === 'document' ? 'paired' : 'auto';
       exportFormat.value = Array.from(exportFormat.options).some(option => option.value === exportChoice && !option.hidden)
         ? exportChoice : defaultExport;
       exportScope.hidden = !isPDF() || !hasResults && !canExportOriginal;
       exportScope.textContent = exportFormat.value === 'original' ? '全部 ' + (source?.pageCount ?? 1) + ' 页'
+        : exportFormat.value === 'searchable' ? '共 ' + source.pageCount + ' 页 · 已识别 ' + work.results.size + ' 页'
         : exportFormat.value === 'csv' ? '第 ' + page + ' 页' : '已识别 ' + (work?.results.size ?? 0) + ' 页';
       exportFormat.disabled = exportResult.disabled = (!hasResults && !canExportOriginal) || Boolean(pendingSave || batch || job);
-      const extension = ['paired', 'original'].includes(exportFormat.value) ? 'pdf'
+      const extension = ['searchable', 'paired', 'original'].includes(exportFormat.value) ? 'pdf'
         : exportFormat.value === 'auto' ? autoFormat : exportFormat.value;
       exportResult.textContent = extension ? '导出 ' + extension.toUpperCase() : '导出';
       exportResult.title = exportFormat.value === 'original' ? '导出原件全部页面'
+        : exportFormat.value === 'searchable' ? '保留全部页面，并在扫描页加入可搜索文字'
         : exportFormat.value === 'csv' ? '导出本页表格' : isPDF() ? '导出已识别的页面' : '';
     }
     exportFormat.onchange = () => { exportChoice = exportFormat.value; update(); };
@@ -5214,6 +5280,7 @@
     }
 
     function replaceSource(nextSource) {
+      clearTimeout(previewTimer);
       if (source?.requestId) shellPost({ type: 'scanClosePDF', requestId: source.requestId });
       source = nextSource;
       page = 1;
@@ -5280,20 +5347,29 @@
       else update();
     }
 
-    async function showPage(index) {
+    function displayPage(index, data = null) {
       page = index;
-      drawnPage = 0;
-      raster = null;
-      image.removeAttribute('src');
+      drawnPage = data ? index : 0;
+      raster = data;
+      if (data) image.src = data;
+      else image.removeAttribute('src');
       renderResult();
-      if (!source) return;
+    }
+
+    function showPage(index) {
+      clearTimeout(previewTimer);
+      displayPage(index);
+      return loadPreview(source, index);
+    }
+
+    async function loadPreview(file, index) {
+      if (!file || file !== source || index !== page) return;
       if (!originalReady()) {
         drawnPage = page;
         setStatus('已保留结果。重新选择原件后，可继续识别或框选重扫。');
         update();
         return;
       }
-      const file = source;
       try {
         const { image } = await preparedPage(file, index);
         showRaster(file, index, image);
@@ -5612,8 +5688,17 @@
       full.onload = () => setScale(scale);
       setScale(1);
     };
-    prev.onclick = () => showPage(page - 1);
-    next.onclick = () => showPage(page + 1);
+    const browsePage = index => {
+      if (scanProgress) scanProgress.follow = false;
+      return showPage(index);
+    };
+    prev.onclick = () => browsePage(page - 1);
+    next.onclick = () => browsePage(page + 1);
+    follow.onclick = () => {
+      if (!scanProgress?.last) return;
+      scanProgress.follow = true;
+      showPage(scanProgress.last);
+    };
     currentOnly.onclick = () => { from.value = to.value = page; update(); };
     allPages.onclick = () => { from.value = '1'; to.value = source.pageCount; update(); };
     from.oninput = to.oninput = detailValue.oninput = update;
@@ -6073,8 +6158,6 @@
       }
       const { fields, error } = scanInputs(s);
       if (error) { setStatus(error, true); return false; }
-      const previousWork = work;
-      const previousPage = page;
       const reuse = sameTask(s);
       const updatingPage = reuse && work.results.has(page);
       if (!reuse && !fromBatch && !canLeave()) return false;
@@ -6093,6 +6176,7 @@
         taskId = pendingId;
       }
       job = new AbortController();
+      scanProgress = { done: 0, total: targets.length, follow: true };
       const signal = job.signal;
       setStatus('正在准备识别…');
       update();
@@ -6102,15 +6186,11 @@
         for (const [index, number] of targets.entries()) {
           signal.throwIfAborted();
           current = number;
-          page = current;
-          raster = null;
-          drawnPage = 0;
-          image.removeAttribute('src');
-          renderResult();
+          scanProgress.current = current;
+          update();
           setStatus(isPDF() ? '正在识别第 ' + current + ' 页 · ' + (index + 1) + ' / ' + targets.length : '正在识别…');
           const { image: data, text: selectable = '' } = await scanPageForJob(source, current, signal, s);
           signal.throwIfAborted();
-          if (data) showRaster(source, current, data);
           const payload = { mode: s.mode, language: s.language, variant: s.variant };
           if (s.maxTokens) payload.max_tokens = s.maxTokens;
           if (s.mode === 'extract') payload.fields = fields;
@@ -6125,7 +6205,10 @@
             throw new Error('本页是扫描图片。下载扫描模型后可从此页继续。');
           }
           if (!hasText) {
-            payload.image = isPDF() && !s.enhance && !s.rotation ? data : await prepareScanRaster(data, s);
+            const trimMargins = isPDF() && s.quality === 'fast' && s.layout !== 'regions' &&
+              ['document', 'text'].includes(s.mode);
+            payload.image = isPDF() && !trimMargins && !s.enhance && !s.rotation
+              ? data : await prepareScanRaster(data, s, trimMargins);
           }
           signal.throwIfAborted();
           const pageLabel = isPDF() ? '第 ' + current + ' 页' : '当前图片';
@@ -6139,22 +6222,33 @@
           taskId = pendingId;
           work.results.set(current, item);
           if (!single || sameSettings(s)) work.pending.delete(current);
-          renderResult();
+          scanProgress.done++;
+          scanProgress.last = current;
+          scanProgress.current = null;
+          if (scanProgress.follow) {
+            const file = source;
+            clearTimeout(previewTimer);
+            displayPage(current, data || (current === page ? raster : null));
+            if (!raster) previewTimer = setTimeout(() => loadPreview(file, number), 150);
+          } else if (page === current) renderResult({ keepScroll: true });
+          else update();
           await checkpoint();
         }
-        if (isPDF() && !raster && !batch) await showPage(page);
+        clearTimeout(previewTimer);
+        if (isPDF() && !raster && !batch) await loadPreview(source, page);
         const pageStatus = (updatingPage ? '已更新第 ' : '已识别第 ') + current + ' 页';
         setStatus(isPDF() ? (single ? pageStatus : '识别完成 · ' + scope.length + ' 页') : '识别完成');
         return true;
       } catch (e) {
         const kept = work.results.size ? ' · 已保留 ' + work.results.size + ' 页结果' : '';
-        if (work === previousWork && work !== pendingWork && page !== previousPage) await showPage(previousPage);
-        else if (!raster && !batch && isPDF()) await showPage(page);
+        clearTimeout(previewTimer);
+        if (!raster && !batch && isPDF()) await loadPreview(source, page);
         if (signal.aborted) setStatus('已停止识别' + kept);
         else setStatus((isPDF() ? '第 ' + current + ' 页识别失败' : '识别失败') + ' · ' + e.message + kept, true);
         return false;
       } finally {
         job = null;
+        scanProgress = null;
         update();
       }
     }
@@ -6170,13 +6264,13 @@
 
     const scanName = () => source.name.replace(/\.[^.]+$/, '');
 
-    function allResults() {
+    function allResults(assemble = true) {
       const results = [...work.results.entries()].sort((a, b) => a[0] - b[0]);
       const format = resultFormat(results.map(([, item]) => item));
-      let text = results[0][1].text;
-      if (isPDF() && format === 'json') {
+      let text = assemble ? results[0][1].text : '';
+      if (assemble && isPDF() && format === 'json') {
         text = JSON.stringify(results.map(([page, item]) => ({ page, fields: JSON.parse(item.text) })), null, 2);
-      } else if (isPDF() && results.length > 1) {
+      } else if (assemble && isPDF() && results.length > 1) {
         text = results.map(([page, item]) =>
           (format === 'md' ? '## ' : format === 'tex' ? '% ' : '') +
           '第 ' + page + ' 页\n\n' + item.text
@@ -6198,9 +6292,9 @@
       try {
         const requested = exportFormat.value;
         const original = requested === 'original';
+        const pdf = ['searchable', 'paired', 'original'].includes(requested);
         const { format, name, text, results } = original
-          ? { format: 'pdf', name: scanName(), text: '', results: [] } : allResults();
-        const pdf = requested === 'original' || requested === 'paired';
+          ? { format: 'pdf', name: scanName(), text: '', results: [] } : allResults(!pdf);
         const extension = pdf ? 'pdf' : requested === 'auto' ? format : requested;
         let suffix = requested === 'original' ? '-原件' : '';
         if (requested === 'csv') {
@@ -6216,9 +6310,12 @@
           if (pdf) {
             request.sourceId = source.requestId || '';
             request.original = original;
+            if (requested === 'searchable') request.searchable = true;
             if (!original) request.pages = results.map(([number]) => number);
             if (!isPDF()) request.image = source.image;
-            if (requested === 'paired') request.notes = results.map(([, item]) => scanReadingText(item));
+            if (requested === 'paired' || requested === 'searchable') {
+              request.notes = results.map(([, item]) => scanReadingText(item));
+            }
           } else if (requested === 'docx' || requested === 'txt') {
             request.blocks = results.flatMap(([number, item]) => {
               const blocks = scanExportBlocks(item);

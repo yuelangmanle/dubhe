@@ -20,11 +20,21 @@
 #define DUBHE_NEON 1
 #endif
 
+#if defined(__ANDROID__) && defined(__aarch64__) && !defined(__ARM_FEATURE_DOTPROD)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#define DUBHE_RUNTIME_DOTPROD 1
+#endif
+
 namespace dubhe {
 
 namespace {
 
-void quantize_row_q8_0(const float* x, block_q8_0* y, int64_t n) {
+bool act_q8_has_sums(uint32_t wtype) {
+    return wtype == T_Q4_1 || wtype == T_Q5_1 || wtype == T_Q4_K || wtype == T_Q5_K;
+}
+
+void quantize_row_q8_0(const float* x, block_q8_0* y, int64_t n, uint8_t* sums) {
     for (int64_t i = 0; i < n / 32; i++) {
         const float* xb = x + i * 32;
         float amax = 0.f;
@@ -35,11 +45,14 @@ void quantize_row_q8_0(const float* x, block_q8_0* y, int64_t n) {
         const float d = amax / 127.f;
         const float id = d > 0.f ? 1.f / d : 0.f;
         y[i].d = fp32_to_fp16(d);
+        int16_t sum = 0;
         for (int j = 0; j < 32; j++) {
             int v = (int)std::lround(xb[j] * id);
             v = v < -128 ? -128 : (v > 127 ? 127 : v);
             y[i].qs[j] = (int8_t)v;
+            sum += v;
         }
+        if (sums) std::memcpy(sums + i * sizeof(sum), &sum, sizeof(sum));
     }
 }
 
@@ -61,13 +74,15 @@ bool act_q8_supported(uint32_t wtype) {
 }
 
 size_t act_q8_bytes(uint32_t wtype, int64_t n) {
-    (void)wtype;
-    return (size_t)(n / 32) * sizeof(block_q8_0);
+    const size_t bytes = sizeof(block_q8_0) + (act_q8_has_sums(wtype) ? sizeof(int16_t) : 0);
+    return (size_t)(n / 32) * bytes;
 }
 
 void quantize_act(uint32_t wtype, const float* x, void* dst, int64_t n) {
-    (void)wtype;
-    quantize_row_q8_0(x, (block_q8_0*)dst, n);
+    auto* blocks = static_cast<block_q8_0*>(dst);
+    // 权重有偏置时，额外保存每块激活整数之和，供所有输出行共用。
+    auto* sums = act_q8_has_sums(wtype) ? reinterpret_cast<uint8_t*>(blocks + n / 32) : nullptr;
+    quantize_row_q8_0(x, blocks, n, sums);
 }
 
 // ---------------------------------------------------------------- 内核
@@ -84,20 +99,29 @@ inline int32_t hsum_s32(int32x4_t v) {
 #endif
 }
 
+template <bool UseDotProduct>
 inline int32x4_t dot16(int32x4_t acc, int8x16_t a, int8x16_t b) {
 #if defined(__ARM_FEATURE_DOTPROD)
     return vdotq_s32(acc, a, b);
 #else
+#if defined(DUBHE_RUNTIME_DOTPROD)
+    if constexpr (UseDotProduct) {
+        // 仅运行时确认支持 SDOT 的设备进入此内核，整个二进制仍可运行于 ARMv8.0。
+        asm(".arch_extension dotprod\n\tsdot %0.4s, %1.16b, %2.16b"
+            : "+w"(acc) : "w"(a), "w"(b));
+        return acc;
+    }
+#endif
     int16x8_t p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
     int16x8_t p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
     return vpadalq_s16(vpadalq_s16(acc, p0), p1);
 #endif
 }
 
-inline int32_t sum32(const block_q8_0* a) {
-    int32x4_t s = vpadalq_s16(vdupq_n_s32(0), vpaddlq_s8(vld1q_s8(a->qs)));
-    s = vpadalq_s16(s, vpaddlq_s8(vld1q_s8(a->qs + 16)));
-    return hsum_s32(s);
+inline int16_t load_sum(const uint8_t* sums, int64_t i) {
+    int16_t sum;
+    std::memcpy(&sum, sums + i * sizeof(sum), sizeof(sum));
+    return sum;
 }
 
 // 把一个 32 位 qh 的低 16 位 / 高 16 位分别摊成 16 个 lane 的 bit4
@@ -110,8 +134,8 @@ inline void spread_qh(uint32_t qh, int8x16_t sh, uint8x16_t one, uint8x16_t* lo,
     *hi = vshlq_n_u8(vandq_u8(vshlq_u8(hi_src, sh), one), 4);
 }
 
-template <typename Block>
-float dot_k_affine(const block_q8_0* a, const Block* b, int64_t n) {
+template <bool UseDotProduct, typename Block>
+float dot_k_affine(const block_q8_0* a, const uint8_t* sums, const Block* b, int64_t n) {
     const uint8x16_t nibble = vdupq_n_u8(0x0F);
     const uint8x16_t fifth_bit = vdupq_n_u8(0x10);
     float sum = 0.f;
@@ -142,22 +166,23 @@ float dot_k_affine(const block_q8_0* a, const Block* b, int64_t n) {
             get_scale_min_k4(2 * j + 1, b[i].scales, &sc1, &m1);
             const block_q8_0* a0 = ag + 2 * j;
             const block_q8_0* a1 = a0 + 1;
-            int32x4_t c0 = dot16(vdupq_n_s32(0), vreinterpretq_s8_u8(lo_a), vld1q_s8(a0->qs));
-            c0 = dot16(c0, vreinterpretq_s8_u8(lo_b), vld1q_s8(a0->qs + 16));
-            int32x4_t c1 = dot16(vdupq_n_s32(0), vreinterpretq_s8_u8(hi_a), vld1q_s8(a1->qs));
-            c1 = dot16(c1, vreinterpretq_s8_u8(hi_b), vld1q_s8(a1->qs + 16));
-            bsum += fp16_to_fp32(a0->d) * (d * sc0 * hsum_s32(c0) - dm * m0 * sum32(a0));
-            bsum += fp16_to_fp32(a1->d) * (d * sc1 * hsum_s32(c1) - dm * m1 * sum32(a1));
+            int32x4_t c0 = dot16<UseDotProduct>(vdupq_n_s32(0), vreinterpretq_s8_u8(lo_a), vld1q_s8(a0->qs));
+            c0 = dot16<UseDotProduct>(c0, vreinterpretq_s8_u8(lo_b), vld1q_s8(a0->qs + 16));
+            int32x4_t c1 = dot16<UseDotProduct>(vdupq_n_s32(0), vreinterpretq_s8_u8(hi_a), vld1q_s8(a1->qs));
+            c1 = dot16<UseDotProduct>(c1, vreinterpretq_s8_u8(hi_b), vld1q_s8(a1->qs + 16));
+            const int64_t index = i * 8 + 2 * j;
+            bsum += fp16_to_fp32(a0->d) * (d * sc0 * hsum_s32(c0) - dm * m0 * load_sum(sums, index));
+            bsum += fp16_to_fp32(a1->d) * (d * sc1 * hsum_s32(c1) - dm * m1 * load_sum(sums, index + 1));
         }
         sum += bsum;
     }
     return sum;
 }
 
-}  // namespace
-
-float vec_dot_q8(uint32_t wtype, const void* xq, const void* row, int64_t n) {
+template <bool UseDotProduct>
+float vec_dot_q8_impl(uint32_t wtype, const void* xq, const void* row, int64_t n) {
     const block_q8_0* a = (const block_q8_0*)xq;
+    const auto* sums = reinterpret_cast<const uint8_t*>(a + n / 32);
     float sum = 0.f;
 
     switch (wtype) {
@@ -165,8 +190,8 @@ float vec_dot_q8(uint32_t wtype, const void* xq, const void* row, int64_t n) {
             const block_q8_0* b = (const block_q8_0*)row;
             for (int64_t i = 0; i < n / 32; i++) {
                 int32x4_t c = vdupq_n_s32(0);
-                c = dot16(c, vld1q_s8(a[i].qs), vld1q_s8(b[i].qs));
-                c = dot16(c, vld1q_s8(a[i].qs + 16), vld1q_s8(b[i].qs + 16));
+                c = dot16<UseDotProduct>(c, vld1q_s8(a[i].qs), vld1q_s8(b[i].qs));
+                c = dot16<UseDotProduct>(c, vld1q_s8(a[i].qs + 16), vld1q_s8(b[i].qs + 16));
                 sum += fp16_to_fp32(a[i].d) * fp16_to_fp32(b[i].d) * (float)hsum_s32(c);
             }
             return sum;
@@ -180,8 +205,8 @@ float vec_dot_q8(uint32_t wtype, const void* xq, const void* row, int64_t n) {
                 const int8x16_t q0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q, m4b)), s8);
                 const int8x16_t q1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(q, 4)), s8);
                 int32x4_t c = vdupq_n_s32(0);
-                c = dot16(c, q0, vld1q_s8(a[i].qs));
-                c = dot16(c, q1, vld1q_s8(a[i].qs + 16));
+                c = dot16<UseDotProduct>(c, q0, vld1q_s8(a[i].qs));
+                c = dot16<UseDotProduct>(c, q1, vld1q_s8(a[i].qs + 16));
                 sum += fp16_to_fp32(a[i].d) * fp16_to_fp32(b[i].d) * (float)hsum_s32(c);
             }
             return sum;
@@ -204,8 +229,8 @@ float vec_dot_q8(uint32_t wtype, const void* xq, const void* row, int64_t n) {
                 const int8x16_t q1 =
                     vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q, 4), hi_bit)), s16);
                 int32x4_t c = vdupq_n_s32(0);
-                c = dot16(c, q0, vld1q_s8(a[i].qs));
-                c = dot16(c, q1, vld1q_s8(a[i].qs + 16));
+                c = dot16<UseDotProduct>(c, q0, vld1q_s8(a[i].qs));
+                c = dot16<UseDotProduct>(c, q1, vld1q_s8(a[i].qs + 16));
                 sum += fp16_to_fp32(a[i].d) * fp16_to_fp32(b[i].d) * (float)hsum_s32(c);
             }
             return sum;
@@ -218,11 +243,11 @@ float vec_dot_q8(uint32_t wtype, const void* xq, const void* row, int64_t n) {
                 const int8x16_t q0 = vreinterpretq_s8_u8(vandq_u8(q, m4b));
                 const int8x16_t q1 = vreinterpretq_s8_u8(vshrq_n_u8(q, 4));
                 int32x4_t c = vdupq_n_s32(0);
-                c = dot16(c, q0, vld1q_s8(a[i].qs));
-                c = dot16(c, q1, vld1q_s8(a[i].qs + 16));
+                c = dot16<UseDotProduct>(c, q0, vld1q_s8(a[i].qs));
+                c = dot16<UseDotProduct>(c, q1, vld1q_s8(a[i].qs + 16));
                 const float da = fp16_to_fp32(a[i].d);
                 sum += da * (fp16_to_fp32(b[i].d) * (float)hsum_s32(c) +
-                             fp16_to_fp32(b[i].m) * (float)sum32(&a[i]));
+                             fp16_to_fp32(b[i].m) * (float)load_sum(sums, i));
             }
             return sum;
         }
@@ -241,11 +266,11 @@ float vec_dot_q8(uint32_t wtype, const void* xq, const void* row, int64_t n) {
                 const int8x16_t q0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q, m4b), lo_bit));
                 const int8x16_t q1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q, 4), hi_bit));
                 int32x4_t c = vdupq_n_s32(0);
-                c = dot16(c, q0, vld1q_s8(a[i].qs));
-                c = dot16(c, q1, vld1q_s8(a[i].qs + 16));
+                c = dot16<UseDotProduct>(c, q0, vld1q_s8(a[i].qs));
+                c = dot16<UseDotProduct>(c, q1, vld1q_s8(a[i].qs + 16));
                 const float da = fp16_to_fp32(a[i].d);
                 sum += da * (fp16_to_fp32(b[i].d) * (float)hsum_s32(c) +
-                             fp16_to_fp32(b[i].m) * (float)sum32(&a[i]));
+                             fp16_to_fp32(b[i].m) * (float)load_sum(sums, i));
             }
             return sum;
         }
@@ -293,10 +318,10 @@ float vec_dot_q8(uint32_t wtype, const void* xq, const void* row, int64_t n) {
                         const int8x16_t a3 = vld1q_s8(ab[2].qs + h * 16);
                         const int8x16_t a4 = vld1q_s8(ab[3].qs + h * 16);
 
-                        c[0] = vmlaq_n_s32(c[0], dot16(vdupq_n_s32(0), q1, a1), sc[h + 0]);
-                        c[1] = vmlaq_n_s32(c[1], dot16(vdupq_n_s32(0), q2, a2), sc[h + 2]);
-                        c[2] = vmlaq_n_s32(c[2], dot16(vdupq_n_s32(0), q3, a3), sc[h + 4]);
-                        c[3] = vmlaq_n_s32(c[3], dot16(vdupq_n_s32(0), q4, a4), sc[h + 6]);
+                        c[0] = vmlaq_n_s32(c[0], dot16<UseDotProduct>(vdupq_n_s32(0), q1, a1), sc[h + 0]);
+                        c[1] = vmlaq_n_s32(c[1], dot16<UseDotProduct>(vdupq_n_s32(0), q2, a2), sc[h + 2]);
+                        c[2] = vmlaq_n_s32(c[2], dot16<UseDotProduct>(vdupq_n_s32(0), q3, a3), sc[h + 4]);
+                        c[3] = vmlaq_n_s32(c[3], dot16<UseDotProduct>(vdupq_n_s32(0), q4, a4), sc[h + 6]);
                     }
                     for (int k = 0; k < 4; k++)
                         bsum += fp16_to_fp32(ab[k].d) * (float)hsum_s32(c[k]);
@@ -306,12 +331,26 @@ float vec_dot_q8(uint32_t wtype, const void* xq, const void* row, int64_t n) {
             return sum;
         }
         case T_Q4_K:
-            return dot_k_affine(a, (const block_q4_K*)row, n);
+            return dot_k_affine<UseDotProduct>(a, sums, (const block_q4_K*)row, n);
         case T_Q5_K:
-            return dot_k_affine(a, (const block_q5_K*)row, n);
+            return dot_k_affine<UseDotProduct>(a, sums, (const block_q5_K*)row, n);
         default:
             return 0.f;
     }
+}
+
+}  // namespace
+
+float vec_dot_q8(uint32_t wtype, const void* xq, const void* row, int64_t n) {
+#if defined(DUBHE_RUNTIME_DOTPROD)
+    static const bool has_dot_product = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+    if (has_dot_product) return vec_dot_q8_impl<true>(wtype, xq, row, n);
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+    return vec_dot_q8_impl<true>(wtype, xq, row, n);
+#else
+    return vec_dot_q8_impl<false>(wtype, xq, row, n);
+#endif
 }
 
 #else  // 非 NEON 平台暂时走 f32 路径
