@@ -22,19 +22,12 @@ jobs:
         with:
           node-version: 22
           package-manager-cache: false
-      - uses: browser-actions/setup-chrome@v2
-        if: runner.os == 'Linux'
-        id: chrome
-        with:
-          install-dependencies: true
       - name: Build and run native tests
         run: make -j 2 all test TEST_ALLOW_NO_METAL=1
       - name: Validate synthetic quality cases
         run: python3 -m unittest discover -s tests -p 'test_quality_*.py'
       - name: Run service and browser tests
         timeout-minutes: 5
-        env:
-          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
         run: make integration-test
       - name: Build and verify the macOS package
         if: runner.os == 'macOS'
