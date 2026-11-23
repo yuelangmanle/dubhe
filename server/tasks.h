@@ -7,11 +7,11 @@
 namespace storage {
 
 // One file per document keeps checkpoint updates independent of other jobs.
-class Tasks {
+class FileTasks {
 public:
-    explicit Tasks(std::string data_dir) : dir_(std::move(data_dir) + "/tasks") {}
+    explicit FileTasks(std::string data_dir) : dir_(std::move(data_dir) + "/tasks") {}
 
-    enum Result { OK, INVALID, MISSING, TOO_LARGE, IO };
+    enum Result { OK, INVALID, MISSING, TOO_LARGE, CONFLICT, IO };
     static constexpr size_t max_payload_bytes = 8 * 1024 * 1024;
 
     Result list(json::Value* result) const {
@@ -54,7 +54,7 @@ public:
         return item->s("id") == id ? OK : IO;
     }
 
-    Result apply(const json::Value& change) const {
+    Result apply(const json::Value& change, double* = nullptr) const {
         const auto* upsert = change.get("upsert");
         const auto* remove = change.get("delete");
         if (change.type != json::Value::OBJ || (upsert == nullptr) == (remove == nullptr)) return INVALID;
@@ -95,3 +95,9 @@ private:
 };
 
 }  // namespace storage
+
+#ifdef DUBHE_SQLITE
+#include "task_sqlite.h"
+#else
+namespace storage { using Tasks = FileTasks; }
+#endif

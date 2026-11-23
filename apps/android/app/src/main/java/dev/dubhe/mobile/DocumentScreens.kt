@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.net.Uri
 import android.text.format.Formatter
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -24,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -36,10 +38,17 @@ internal fun recommendedChatModel() = mobileCatalog.firstOrNull { it.recommended
 @Composable
 internal fun ScanScreen(chat: ChatViewModel, translate: (String) -> Unit) {
     val context = LocalContext.current
-    val state = chat.state
-    val idle = state.activity == Activity.Idle
-    val openImage = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) chat.scanImage(uri)
+    val progress = chat.scanProgress
+    val editing = progress == null && !chat.scanSaving
+    var captureUri by rememberSaveable { mutableStateOf<String?>(null) }
+    val openFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments(), chat::scanInputs)
+    val takePhoto = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { succeeded ->
+        val uri = captureUri?.let(Uri::parse)
+        captureUri = null
+        if (uri != null) {
+            if (succeeded) chat.scanInputs(listOf(uri), captured = uri)
+            else chat.discardScanPhoto(uri)
+        }
     }
     Column(
         Modifier.verticalScroll(rememberScrollState()).padding(bottom = 16.dp),
@@ -47,31 +56,47 @@ internal fun ScanScreen(chat: ChatViewModel, translate: (String) -> Unit) {
     ) {
         WorkspaceCard(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                SectionTitle("图片转文字")
+                SectionTitle("图片与 PDF 转文字")
                 Text(
-                    "可从相册选照片或截图。中文和拉丁字母可在手机本机识别。",
+                    "可选多张图片、拍照或打开 PDF，文字会在手机上逐页识别。",
                     style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Button(
-                    onClick = {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Button(onClick = {
                         try {
-                            openImage.launch(arrayOf("image/*"))
+                            openFiles.launch(arrayOf("image/*", "application/pdf"))
                         } catch (_: ActivityNotFoundException) {
                             chat.showError("这台设备没有可用的文件选择器。")
                         }
-                    },
-                    enabled = idle,
-                ) { Text(if (chat.scanText.isEmpty()) "选择图片" else "换一张图片") }
+                    }, enabled = editing) { Text("选择图片或 PDF") }
+                    TextButton(onClick = {
+                        try {
+                            val uri = createScanPhoto(context)
+                            captureUri = uri.toString()
+                            takePhoto.launch(uri)
+                        } catch (error: Exception) {
+                            captureUri?.let { chat.discardScanPhoto(Uri.parse(it)) }
+                            captureUri = null
+                            chat.showError(if (error is ActivityNotFoundException) "这台设备没有可用的相机。"
+                                else error.localizedMessage ?: "无法打开相机。")
+                        }
+                    }, enabled = editing && captureUri == null) { Text("拍照") }
+                }
             }
         }
-        if (state.activity == Activity.Importing && state.downloading == null) {
-            TransferProgress(state.progress)
-            state.status?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+        if (progress != null) {
+            TransferProgress(if (progress.pages > 0) (progress.page - 1f) / progress.pages else null)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(if (progress.pages == 0) "正在打开第 ${progress.source}/${progress.sources} 个文件" else
+                    "第 ${progress.source}/${progress.sources} 个文件 · 识别第 ${progress.page}/${progress.pages} 页",
+                    Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                TextButton(chat::stopScan) { Text("停止扫描") }
+            }
         }
         if (chat.hasSavedScan || chat.scanText.isNotEmpty()) {
             OutlinedTextField(
                 chat.scanText, chat::editScanText, Modifier.fillMaxWidth(),
-                enabled = idle, minLines = 5, maxLines = 15,
+                enabled = editing, minLines = 5, maxLines = 15,
                 label = { Text("识别结果 · 可编辑") },
                 shape = MaterialTheme.shapes.large,
             )
@@ -85,12 +110,12 @@ internal fun ScanScreen(chat: ChatViewModel, translate: (String) -> Unit) {
                         context.getSystemService(ClipboardManager::class.java)
                             ?.setPrimaryClip(ClipData.newPlainText("扫描", chat.scanText))
                     }
-                    TextButton(onClick = chat::saveScan, enabled = idle) { Text("保存校对") }
+                    TextButton(onClick = chat::saveScan, enabled = editing) { Text("保存校对") }
                 }
-                Button(onClick = { translate(chat.scanText) }, enabled = idle && chat.scanText.isNotBlank()) { Text("送去翻译") }
+                Button(onClick = { translate(chat.scanText) }, enabled = editing && chat.scanText.isNotBlank()) { Text("送去翻译") }
             }
-            state.status?.takeIf { it == "识别结果已保存" }?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
         }
+        chat.scanStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
     }
 }
 
@@ -100,7 +125,7 @@ internal fun TasksScreen(
 ) {
     val context = LocalContext.current
     val state = chat.state
-    val idle = state.activity == Activity.Idle
+    val translating = state.activity == Activity.Translating
     var clearDownloads by remember { mutableStateOf(false) }
     var clearScan by remember { mutableStateOf(false) }
     var deleteTask by remember { mutableStateOf<TranslationTask?>(null) }
@@ -117,14 +142,14 @@ internal fun TasksScreen(
                 TextButton(openModelLibrary) { Text("管理模型") }
             }
             ModelCard("未完成下载 $partials", "清理后，下次下载将从头开始。", Glyph.Download) {
-                TextButton({ clearDownloads = true }, enabled = idle && storage.incomplete > 0) { Text("清理") }
+                TextButton({ clearDownloads = true }, enabled = state.downloading == null && !state.storageBusy && storage.incomplete > 0) { Text("清理") }
             }
         }
         SectionTitle("最近任务", Modifier.padding(top = 6.dp))
         if (chat.hasSavedScan || chat.scanText.isNotEmpty()) {
             ModelCard("最近一次扫描", "查看或校对本机识别文字", Glyph.Image) {
-                TextButton(openScan, enabled = idle) { Text("打开") }
-                IconAction(Glyph.Close, "清除扫描结果", enabled = idle) { clearScan = true }
+                TextButton(openScan) { Text("打开") }
+                IconAction(Glyph.Close, "清除扫描结果", enabled = chat.scanProgress == null && !chat.scanSaving) { clearScan = true }
             }
         }
         if (chat.translationTasks.isEmpty() && !chat.hasSavedScan && chat.scanText.isEmpty()) {
@@ -133,8 +158,8 @@ internal fun TasksScreen(
         for (task in chat.translationTasks) {
             val progress = if (task.finished) "已完成" else "已翻译 ${task.completed} / ${task.total} 段"
             ModelCard(task.title, "$progress · ${task.input.from.label} → ${task.input.to.label}", Glyph.Translate) {
-                TextButton({ openTranslation(task) }, enabled = idle) { Text(if (task.finished) "查看" else "继续") }
-                IconAction(Glyph.Close, "删除这条翻译任务", enabled = idle) { deleteTask = task }
+                TextButton({ openTranslation(task) }, enabled = !translating) { Text(if (task.finished) "查看" else "继续") }
+                IconAction(Glyph.Close, "删除这条翻译任务", enabled = !translating || chat.translationTask?.id != task.id) { deleteTask = task }
             }
         }
     }

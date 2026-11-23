@@ -87,6 +87,65 @@ def conversation(key):
 
 
 class ServiceTest(unittest.TestCase):
+    def test_shared_memory_migration_and_deltas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = {"id": "memory-1", "scope": "conv:local-chat", "text": "a remembered item", "at": 1}
+            second = {"id": "memory-2", "scope": "global", "text": "a global item", "at": 2}
+            with server(root) as a, server(root) as b:
+                self.assertEqual(request(a, "/api/memory"), (200, {
+                    "revision": 0, "items": [], "removed": [], "full": True,
+                }))
+                status, result = request(a, "/api/memory", {"import": [first]})
+                self.assertEqual((status, result["items"], result["revision"]), (200, [first], 1))
+                self.assertEqual(request(b, "/api/memory?since=0"), (200, {
+                    "revision": 1, "items": [first], "removed": [], "full": False,
+                }))
+                self.assertEqual(request(b, "/api/memory", {"upsert": [second], "remove": [first["id"]]})[0], 200)
+                self.assertEqual(request(a, "/api/memory?since=1"), (200, {
+                    "revision": 2, "items": [second], "removed": [first["id"]], "full": False,
+                }))
+                status, result = request(a, "/api/memory", {"import": [first]})
+                self.assertEqual((status, result["items"], result["revision"]), (200, [second], 2))
+                self.assertEqual(request(b, "/api/memory", {"upsert": [{**second, "scope": "other"}]})[0], 400)
+                self.assertEqual(request(a, "/api/memory?since=-1")[0], 400)
+            with server(root) as base:
+                self.assertEqual(request(base, "/api/memory")[1]["items"], [second])
+
+    def test_chat_rejects_custom_tool_schemas_before_inference(self):
+        with tempfile.TemporaryDirectory() as tmp, server(Path(tmp)) as base:
+            for extra, field in [({"tools": [{"type": "function", "function": {"name": "weather"}}]}, "tools"),
+                                 ({"tool_choice": {"type": "function", "function": {"name": "weather"}}}, "tool_choice")]:
+                status, result = request(base, "/v1/chat/completions", {"messages": [], **extra})
+                self.assertEqual(status, 400)
+                self.assertEqual(result["error"]["param"], field)
+
+    def test_kb_migrates_and_updates_incrementally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = root / "存档.md"
+            old.write_text("本地推理配置与水库调度。", encoding="utf-8")
+            kb = root / "data/kb"
+            kb.mkdir(parents=True)
+            (kb / "docs.tsv").write_text(f"{old}\t0\t0\n", encoding="utf-8")
+            new = root / "additional.md"
+            new.write_text("spillway manual", encoding="utf-8")
+            with server(root) as base:
+                result = request(base, "/api/kb/search", {"q": "推理"})[1]
+                self.assertEqual(result["hits"][0]["name"], old.name)
+                self.assertEqual(request(base, "/api/kb/add", {"path": str(new)})[1]["added"], 1)
+                self.assertEqual(request(base, "/api/kb/add", {"path": str(new)})[1]["updated"], 0)
+                new.write_text("reservoir operating rules", encoding="utf-8")
+                self.assertEqual(request(base, "/api/kb/add", {"path": str(new)})[1]["updated"], 1)
+                self.assertEqual(request(base, "/api/kb/search", {"q": "spillway"})[1]["hits"], [])
+                self.assertEqual(request(base, "/api/kb/rag", {"on": False})[1]["rag"], False)
+            with server(root) as base:
+                self.assertEqual(request(base, "/api/kb")[1]["rag"], False)
+                self.assertEqual(request(base, "/api/kb/search", {"q": "水库"})[1]["hits"][0]["name"], old.name)
+                self.assertEqual(request(base, "/api/kb/clear", {})[1]["n_docs"], 0)
+            with server(root) as base:
+                self.assertEqual(request(base, "/api/kb")[1]["n_docs"], 0)
+
     @unittest.skipUnless(QWEN35_MODEL, "DUBHE_TEST_QWEN35_MODEL is unset")
     def test_qwen35_search_uses_one_short_tool_prompt(self):
         body = {
@@ -131,6 +190,65 @@ class ServiceTest(unittest.TestCase):
                 self.assertEqual(code, 200)
                 text = result["choices"][0]["message"]["content"]
                 self.assertRegex(text, r"坝.*闸.*关")
+
+    def test_failed_startup_model_keeps_the_service_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "damaged.gguf"
+            model.write_bytes(b"not a GGUF")
+            with server(root, "--restore-model", str(model)) as base:
+                deadline = time.monotonic() + 5
+                while True:
+                    code, state = request(base, "/api/state")
+                    self.assertEqual(code, 200)
+                    self.assertFalse(state["loaded"])
+                    if state.get("model_restore_error") or time.monotonic() > deadline:
+                        break
+                    time.sleep(0.05)
+                self.assertIn("damaged", state.get("model_restore_error", ""))
+                self.assertNotIn("model_restoring", state)
+                self.assertEqual(request(base, "/api/history")[0], 200)
+
+    @unittest.skipUnless(sys.platform == "darwin", "model worker requires the macOS runtime")
+    def test_startup_model_restores_without_waiting_to_serve_requests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "model outside the workspace.gguf"
+            key, arch = b"general.architecture", b"gemma3"
+            model.write_bytes(struct.pack("<4sIQQQ", b"GGUF", 3, 0, 1, len(key)) + key
+                              + struct.pack("<IQ", 8, len(arch)) + arch)
+            wrapper = root / "worker"
+            wrapper.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+                import json, os, sys, time
+                from pathlib import Path
+                until = time.monotonic() + 10
+                while not Path(os.environ['DUBHE_TEST_RESTORE_GATE']).exists():
+                    if time.monotonic() > until:
+                        sys.exit(1)
+                    time.sleep(0.02)
+                print(json.dumps({'ready': True, 'arch': 'gemma3', 'backend': 'llama.cpp'}), flush=True)
+                sys.stdin.read()
+            """))
+            wrapper.chmod(0o700)
+            gate = root / "release-restore"
+            env = dict(os.environ, DUBHE_LLAMA_SERVER=str(wrapper), DUBHE_BACKEND_PYTHON=str(wrapper),
+                       DUBHE_TEST_RESTORE_GATE=str(gate))
+            with server(root, "--restore-model", str(model), env=env) as base:
+                code, pending = request(base, "/api/state", timeout=2)
+                self.assertEqual(code, 200)
+                self.assertEqual(pending.get("model_restoring"), model.stem)
+                self.assertFalse(pending["loaded"])
+                self.assertEqual(request(base, "/api/history", timeout=2)[0], 200)
+                self.assertEqual(request(base, "/api/unload", {}, timeout=2)[0], 409)
+                self.assertEqual(request(base, "/api/load", {"path": str(model)}, timeout=2)[0], 409)
+                gate.touch()
+                deadline = time.monotonic() + 5
+                while not (state := request(base, "/api/state")[1])["loaded"] and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertEqual(state["model"], str(model))
+                self.assertEqual(state["info"]["backend"], "llama.cpp")
+                self.assertNotIn("model_restoring", state)
+                self.assertEqual(request(base, "/api/unload", {})[0], 200)
 
     def test_translation_catalog_and_missing_weights(self):
         with tempfile.TemporaryDirectory() as tmp, server(Path(tmp)) as base:
@@ -190,6 +308,37 @@ class ServiceTest(unittest.TestCase):
                 self.assertEqual(request(base, "/api/store/clear-partial", {"id": row["id"]})[0], 200)
                 self.assertFalse(part.exists())
                 self.assertTrue(weight.is_file())
+
+    def test_large_scan_checkpoints_migrate_and_reject_stale_updates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = {"id": "large-scan", "kind": "scan", "title": "长文档"}
+            first = [1, {"text": "已经保存的第 1 页"}]
+            with server(root) as base:
+                legacy = {**task, "payload": {"source": None, "results": [first]}}
+                self.assertEqual(request(base, "/api/tasks", {"upsert": legacy})[0], 200)
+                parts = {"meta": {"source": None}, "p/00000001": first}
+                patch = {**task, "parts": parts, "removed": []}
+                code, saved = request(base, "/api/tasks", {"checkpoint": patch})
+                self.assertEqual(code, 200)
+                self.assertEqual(request(base, "/api/tasks", {"checkpoint": patch})[1], saved)
+                old = {**patch, "base": saved["revision"]}
+                block = "x" * (260 * 1024)
+                for page in range(2, 35):
+                    updated = {**old, "base": saved["revision"],
+                               "parts": {f"p/{page:08d}": [page, {"text": block}]}}
+                    code, saved = request(base, "/api/tasks", {"checkpoint": updated})
+                    self.assertEqual(code, 200)
+                stale = {**old, "parts": {"p/00000001": [1, {"text": "过期结果"}]}}
+                self.assertEqual(request(base, "/api/tasks", {"checkpoint": stale})[0], 409)
+            with server(root) as base:
+                status, result = request(base, "/api/tasks?id=large-scan")
+                self.assertEqual(status, 200)
+                self.assertEqual(result["task"]["updated"], saved["revision"])
+                pages = result["task"]["payload"]["results"]
+                self.assertEqual((len(pages), pages[0], pages[-1]), (34, first, [34, {"text": block}]))
+                self.assertEqual(request(base, "/api/tasks", {"delete": "large-scan"})[0], 200)
+                self.assertEqual(request(base, "/api/tasks?id=large-scan")[0], 404)
 
     def test_scan_catalog_and_safe_input(self):
         # A valid 1 x 1 PNG keeps the regression independent of image libraries.

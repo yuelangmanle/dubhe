@@ -22,6 +22,8 @@ const scanFiles = [
 const scannerInstalled = file => scanInstalled && file.id !== 'xiaomi-ocr-0-bf16';
 const history = new Map();
 const tasks = new Map();
+const taskParts = new Map();
+const checkpoints = [];
 let holdNextScanSave = false;
 let releaseScanSave;
 let failNextScanSave = false;
@@ -69,20 +71,39 @@ const handler = async (req, res) => {
       return json({ tasks: [...tasks.values()].reverse().map(({ payload, ...summary }) => summary) });
     }
     const data = await collect(req);
-    if (data.upsert) {
-      const task = data.upsert;
+    if (data.upsert || data.checkpoint) {
+      const task = data.upsert || data.checkpoint;
       if (task.kind === 'scan' && failNextScanSave) {
         failNextScanSave = false;
         return json({ error: '模拟本机写入失败' }, 507);
       }
-      tasks.set(task.id, { ...task, updated: Date.now(), bytes: JSON.stringify(task.payload).length });
+      if (data.checkpoint) {
+        const packed = taskParts.get(task.id) || {};
+        for (const key of task.removed) delete packed[key];
+        Object.assign(packed, task.parts);
+        taskParts.set(task.id, packed);
+        const group = prefix => Object.keys(packed).sort().filter(key => key.startsWith(prefix)).map(key => packed[key]);
+        task.payload = { ...packed.meta };
+        if (task.kind === 'scan') task.payload.results = group('p/');
+        else {
+          task.payload.source = packed.source;
+          task.payload.text = group('i/').join('');
+          task.payload.translated = group('t/');
+          if (task.payload.segment) task.payload.segment = { ...task.payload.segment, result: group('s/').join('') };
+        }
+        checkpoints.push({ id: task.id, keys: Object.keys(task.parts) });
+      }
+      const now = Date.now();
+      tasks.set(task.id, { id: task.id, kind: task.kind, title: task.title, payload: task.payload,
+        updated: now, incremental: Boolean(data.checkpoint), bytes: JSON.stringify(task.payload).length });
       if (task.kind === 'scan' && holdNextScanSave) {
         holdNextScanSave = false;
-        releaseScanSave = () => json({ ok: true });
+        releaseScanSave = () => json({ ok: true, revision: now });
         return;
       }
+      return json({ ok: true, revision: now });
     }
-    if (data.delete) tasks.delete(data.delete);
+    if (data.delete) { tasks.delete(data.delete); taskParts.delete(data.delete); }
     return json({ ok: true });
   }
   if (path === '/api/state') return json(state());

@@ -54,6 +54,7 @@ internal fun TranslationScreen(chat: ChatViewModel, openModels: () -> Unit, open
     val translation = chat.translation
     val active = state.activity == Activity.Translating
     val idle = state.activity == Activity.Idle
+    val editable = !active && chat.translationImportStatus == null
     val dedicated = state.models.firstOrNull { it.catalog?.translation == true }
     val canTranslate = state.modelName != null || dedicated != null
     val task = chat.translationTask?.takeUnless { it.finished }
@@ -89,7 +90,7 @@ internal fun TranslationScreen(chat: ChatViewModel, openModels: () -> Unit, open
     }
     val source: @Composable (Modifier, Int) -> Unit = { modifier, minLines ->
         TranslationSource(
-            translation = translation, editable = !active && state.activity != Activity.Importing, idle = idle,
+            translation = translation, editable = editable, idle = editable,
             modifier = modifier, minLines = minLines, edit = { chat.setTranslationSource(it) },
             openImage = { launchPicker { image.launch(arrayOf("image/*")) } },
             openFile = {
@@ -132,21 +133,21 @@ internal fun TranslationScreen(chat: ChatViewModel, openModels: () -> Unit, open
                 Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         TextButton(openTasks) { Text("最近任务") }
-                        TextButton({ showGlossary = true }, enabled = idle) { Text("常用术语") }
+                        TextButton({ showGlossary = true }, enabled = editable) { Text("常用术语") }
                         Spacer(Modifier.weight(1f))
-                        TextButton(chat::newTranslation, enabled = idle) { Text("新翻译") }
+                        TextButton(chat::newTranslation, enabled = editable) { Text("新翻译") }
                     }
                     if (task != null && selectedTaskModel == null && !active) {
                         Text("继续翻译需要原来的模型 ${task.modelName}。", Modifier.padding(horizontal = 8.dp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                         Row {
                             TextButton(openModels) { Text("管理模型") }
-                            TextButton(chat::changeTranslationModel, enabled = idle) { Text("换模型重新翻译") }
+                            TextButton(chat::changeTranslationModel, enabled = editable) { Text("换模型重新翻译") }
                         }
                     } else if (canTranslate || active) {
                         TranslationControls(
                             state.modelName, dedicated?.name, translation.preferDedicated, active,
-                            canRun = idle && translation.source.isNotBlank(), stopping = state.stopping,
+                            canRun = idle && editable && translation.source.isNotBlank(), stopping = state.stopping,
                             action = when {
                                 task != null -> "继续翻译"
                                 chat.translationTask?.finished == true -> "重新翻译"
@@ -165,19 +166,25 @@ internal fun TranslationScreen(chat: ChatViewModel, openModels: () -> Unit, open
                                 color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall,
                             )
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                TextButton({ chat.downloadModel(recommended) }, enabled = idle) {
+                                TextButton({ chat.downloadModel(recommended) }, enabled = state.downloading == null && !state.storageBusy) {
                                     Text(if (recommended.file in state.partialDownloads) "继续下载" else "下载翻译模型")
                                 }
                                 TextButton(openModels) { Text("选用对话模型") }
                                 if (state.downloading == recommended.file) {
-                                    TextButton(chat::stop, enabled = !state.stopping) { Text("暂停") }
+                                    TextButton(chat::pauseDownload, enabled = !state.downloadStopping) { Text("暂停下载") }
                                 }
                             }
                         } else {
                             TextButton(openModels) { Text("选择翻译模型") }
                         }
                     }
-                    if (active || state.activity == Activity.Importing) {
+                    chat.translationImportStatus?.let { label ->
+                        TransferProgress(null)
+                        Text(label, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(5.dp))
+                    }
+                    if (chat.queuedTranslation) Text("已收到新原文，当前翻译停止或完成后打开。",
+                        style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(5.dp))
+                    if (active) {
                         TransferProgress(state.progress)
                         state.status?.let { Text(it, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(5.dp)) }
                     } else if (task != null && task.completed > 0) {

@@ -38,7 +38,10 @@ jobs:
         run: make integration-test
       - name: Build and verify the macOS package
         if: runner.os == 'macOS'
-        run: make dmg
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          make dmg
       - name: Test the Swift SDK
         if: runner.os == 'macOS'
         run: swift test --package-path sdk/swift -j 2

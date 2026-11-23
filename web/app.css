@@ -2486,3 +2486,15 @@ body[data-glass="off"] .edge::before { display: none; }
   .scan-review-editor textarea { min-height: 32vh; }
   .task-save-status { margin-inline-start: 0; }
 }
+
+.tool-trial {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  gap: 8px 12px;
+  padding: 0 14px 12px;
+  align-items: end;
+}
+.tool-trial[hidden], .tool-trial .vcode[hidden] { display: none; }
+.tool-trial-field { display: grid; gap: 4px; color: var(--text-2); font-size: 12px; }
+.tool-trial > .vbtn { justify-self: start; }
+.tool-trial > .vcode { grid-column: 1 / -1; margin: 0; }

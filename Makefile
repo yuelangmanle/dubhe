@@ -1,4 +1,4 @@
-# Dubhe 构建（零外部依赖，只用系统 clang）
+# Dubhe 构建（桌面服务使用系统 SQLite）
 #
 # 关键：-MMD -MP 生成头文件依赖。改 internal.h 会改结构体布局，
 # 任何一个 .o 漏重编都会造成 ABI 错位（表现为诡异段错误）。
@@ -104,6 +104,10 @@ LIB   := $(BUILD)/libdubhe.a
 ENGINE_OBJS := $(patsubst %.cpp,$(BUILD)/%.o,$(patsubst %.mm,$(BUILD)/%.o,$(ENGINE_SRCS)))
 CLI_OBJ     := $(BUILD)/cli/main.o
 SRV_OBJ     := $(BUILD)/server/dubhed.o
+ifneq ($(PLATFORM),android)
+  $(SRV_OBJ): CXXFLAGS += -DDUBHE_SQLITE=1
+  SRV_LIBS := -lsqlite3
+endif
 PORTABLE_TOOLS := $(addprefix $(BUILD)/,selftest ggufdump tokprobe vlprobe audprobe batchcheck)
 ifeq ($(PLATFORM),Darwin)
   METAL_TOOLS := $(addprefix $(BUILD)/,optest mma_probe mm2_check mvbench)
@@ -143,7 +147,7 @@ $(BIN): $(CLI_OBJ) $(LIB)
 	@echo "✓ $@"
 
 $(SRV): $(SRV_OBJ) $(LIB)
-	$(CXX) $^ -o $@ $(LDFLAGS)
+	$(CXX) $^ -o $@ $(LDFLAGS) $(SRV_LIBS)
 	@echo "✓ $@"
 
 $(BUILD)/selftest: $(BUILD)/tools/selftest.o $(LIB)

@@ -77,12 +77,22 @@ STAGED_IMAGE="$STAGE/$NAME.dmg"
 
 # ---------------------------------------------------------------- 编译外壳
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Helpers" "$CONTENTS/Resources"
+SWIFT_TARGET="$(uname -m)-apple-macos$MIN_OS"
+SWIFT_DEFINES=()
+if printf '%s\n' 'import Vision' '@available(macOS 26, *)' \
+    'func check() { _ = RecognizeDocumentsRequest() }' | swiftc -typecheck -target "$SWIFT_TARGET" - 2>/dev/null; then
+  SWIFT_DEFINES+=(-D DUBHE_VISION_DOCUMENTS)
+  echo "   Vision 段落和表格检测可用（运行需要 macOS 26）"
+else
+  echo "   当前 SDK 不支持 Vision 段落和表格检测，可手动选区"
+fi
 
 echo "==> 编译外壳"
 swiftc -O -whole-module-optimization \
-       -target "$(uname -m)-apple-macos$MIN_OS" \
+       -target "$SWIFT_TARGET" ${SWIFT_DEFINES[@]+"${SWIFT_DEFINES[@]}"} \
        -o "$CONTENTS/MacOS/$NAME" \
        apps/macos/Sources/main.swift apps/macos/Sources/ReleaseUpdates.swift \
+       apps/macos/Sources/MarkItDown.swift \
        apps/macos/Sources/TranslationPDF.swift apps/macos/Sources/TranslationExport.swift \
        apps/macos/Sources/OneShotScreenCapture.swift \
        apps/macos/Sources/ScanPDF.swift apps/macos/Sources/ScanSearchablePDF.swift apps/macos/Sources/ScanOCR.swift apps/macos/Sources/ScanRegions.swift \

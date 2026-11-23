@@ -209,7 +209,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var logHandle: FileHandle?
     private var titleObserver: NSKeyValueObservation?
     private var stateTimer: DispatchSourceTimer?
-    private var usedRememberedModel = false
+    private var stateRequest: URLSessionDataTask?
+    private var stateWatchRevision = 0
+    private var restoringModelPath: String?
+    private var failedStartupModelPath: String?
     private var logInitialized = false
     private var pendingModelURL: URL?
     // 引擎在界面已经起来之后挂掉，自动拉起的次数与上次时间。
@@ -236,6 +239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var capturingScreenshot: Bool { capture != nil || oneShotCapture.isActive }
     private let scanPDFQueue = DispatchQueue(label: "com.dubhe.scan-pdf", qos: .userInitiated)
     private var openingScanPDF = false
+    private var importingMarkdown = false
     private var scanDocument: (requestId: String, pdf: ScanPDF)?
     private var overlay: NSPanel?
     private var overlayText: NSTextView?
@@ -251,14 +255,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     // 上次在界面里加载过的模型。存路径而不是名字：同名模型可能在两个目录里。
     private static let lastModelKey = "lastModelPath"
-
-    private func rememberedModel() -> String? {
-        guard let p = UserDefaults.standard.string(forKey: Self.lastModelKey), !p.isEmpty else {
-            return nil
-        }
-        // 文件被删了就别再拿它去启动，否则每次开都失败一次。
-        return FileManager.default.fileExists(atPath: p) ? p : nil
-    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         dbg("launch pid \(getpid()) bundle \(Bundle.main.bundleIdentifier ?? "?")")
@@ -377,6 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func applicationDidBecomeActive(_ note: Notification) {
         // 用户回来了，角标就该消失——它表达的是"有你没看的东西"
         NSApp.dockTile.badgeLabel = nil
+        reportTranslationPermissions()
     }
 
     // 把 .gguf 拖到 Dock 图标上（或在 Finder 里"打开方式 → Dubhe"）。
@@ -403,7 +400,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             return
         }
         UserDefaults.standard.set(gguf.path, forKey: Self.lastModelKey)
-        usedRememberedModel = false
         restartEngine()
     }
 
@@ -553,7 +549,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             guard let self, resp == .OK, let url = panel.url else { return }
             dbg("open model \(url.path)")
             UserDefaults.standard.set(url.path, forKey: Self.lastModelKey)
-            self.usedRememberedModel = false
             self.restartEngine()
         }
         if let w = window { panel.beginSheetModal(for: w, completionHandler: handler) }
@@ -773,7 +768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         menu.addItem(withTitle: "翻译选中文字　⌃⇧T", action: #selector(translateSelection), keyEquivalent: "").target = self
         menu.addItem(withTitle: "翻译剪贴板图片", action: #selector(translateClipboardImage), keyEquivalent: "").target = self
         if !unavailableTranslationHotKeys.isEmpty {
-            menu.addItem(withTitle: "快捷键被占用：\(unavailableTranslationHotKeys.joined(separator: "、"))",
+            menu.addItem(withTitle: "全局快捷键不可用：\(unavailableTranslationHotKeys.joined(separator: "、"))",
                          action: nil, keyEquivalent: "")
         }
         menu.addItem(.separator())
@@ -855,7 +850,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                          box-shadow:inset 0 0 0 1px rgba(232,234,237,.28); }
         </style>
         <div class="box">\(spinner)<div>\(text)</div>
-        <div class="sub">首次启动要加载权重，可能要几秒</div>
         \(buttons)</div>
         <script>
           function post(m){ try { window.webkit.messageHandlers.shell.postMessage(m); } catch (e) {} }
@@ -890,19 +884,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         if let web = resolveWebRoot() {
             args += ["--web", web]
         }
-        // 模型可以不指定：UI 会用 /api/models 列目录、/api/load 换模型。
-        // 但每次打开都从"未加载"开始太烦 —— 记住上次在界面里选的那个，
-        // 下次直接加载。DUBHE_MODEL 优先（调试/多模型切换时用）。
-        var modelArg: String?
-        if let m = ProcessInfo.processInfo.environment["DUBHE_MODEL"], !m.isEmpty {
-            modelArg = m
-        } else if let m = rememberedModel() {
-            modelArg = m
-            usedRememberedModel = true
-            dbg("remembered model \(m)")
-        }
-        if let m = modelArg {
-            args += ["-m", m]
+        let configuredModel = ProcessInfo.processInfo.environment["DUBHE_MODEL"]
+        let model = (configuredModel?.isEmpty == false ? configuredModel : nil)
+            ?? UserDefaults.standard.string(forKey: Self.lastModelKey)
+        restoringModelPath = nil
+        if let model, !model.isEmpty, model != failedStartupModelPath {
+            restoringModelPath = model
+            args += ["--restore-model", model]
         }
 
         let proc = Process()
@@ -949,6 +937,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 self.stopPolling()
                 self.stopStateWatch()
                 self.engine = nil
+                self.finishRestoringModel(failed: true)
 
                 // ① 界面上跑着跑着引擎没了：OOM、崩溃、被外部 kill。
                 //    自己拉起来，但要有上限 —— 一个必然 OOM 的模型会变成
@@ -975,18 +964,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                                         + "多半是模型太大、文件损坏，或者内存不够。",
                                         retry: true)
                     }
-                    return
-                }
-
-                // ② 启动阶段就挂了，而且用的是"上次记住的模型"——多半是那个
-                //    模型文件坏了/不兼容。忘掉它，退回到无模型状态再来一次，
-                //    别让用户卡在一个永远起不来的循环里。只退一次。
-                if self.usedRememberedModel {
-                    self.usedRememberedModel = false
-                    UserDefaults.standard.removeObject(forKey: Self.lastModelKey)
-                    dbg("remembered model failed (exit \(code)), forgetting it")
-                    self.showSplash("上次用的模型没能加载（退出码 \(code)），已重置。正在重新启动…")
-                    self.startEngine()
                     return
                 }
 
@@ -1023,6 +1000,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         // 人主动点重启（或点了错误页的重试）：崩溃计数重新开始。
         // 自动重启那条路不经过这里，所以不会被它绕开上限。
         crashCount = 0
+        failedStartupModelPath = nil
         stopEngine()
         uiLoaded = false
         showSplash("正在重启本地引擎…")
@@ -1071,18 +1049,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
                 NSWorkspace.shared.open(u)
             }
-        case "axStatus":
-            let ok = AXIsProcessTrusted()
-            webView.evaluateJavaScript(
-                "window.dubheAxStatus && window.dubheAxStatus(\(ok ? "true" : "false"))") { _, _ in }
+        case "translationPermissionStatus":
+            reportTranslationPermissions()
         case "openScreenCapture":
             openScreenCaptureSettings()
         case "translateClipboardImage":
             translateClipboardImage()
-        case "translationHotKeyStatus":
-            webView.callAsyncJavaScript("window.dubheTranslationHotKeyStatus?.(unavailable)",
-                                       arguments: ["unavailable": unavailableTranslationHotKeys],
-                                       in: nil, in: .page, completionHandler: nil)
         case "overlay":
             if !capturingScreenshot, !recognizingScreenshot, let text = obj["text"] as? String {
                 showOverlay(text, title: (obj["title"] as? String) ?? "译文", source: obj["source"] as? String ?? "")
@@ -1090,10 +1062,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         case "historyExport":
             if let text = obj["text"] as? String { saveHistory(text) }
         case "modelUnloaded":
-            usedRememberedModel = false
+            stateWatchRevision += 1
+            stateRequest?.cancel()
+            stateRequest = nil
             UserDefaults.standard.removeObject(forKey: Self.lastModelKey)
         case "translationDocument":
             handleTranslationDocument(obj)
+        case "importMarkdownDocument":
+            if let id = obj["requestId"] as? String, UUID(uuidString: id) != nil {
+                importMarkdownDocument(requestId: id)
+            }
         case "scanOpenPDF":
             if let id = obj["requestId"] as? String { openScanPDF(requestId: id) }
         case "scanBatchOpen":
@@ -1192,6 +1170,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    private func reportTranslationPermissions() {
+        guard uiLoaded else { return }
+        replyToScan("dubheTranslationPermissionStatus", ["accessibility": AXIsProcessTrusted(),
+                                                        "screenCapture": CGPreflightScreenCaptureAccess(),
+                                                        "unavailable": unavailableTranslationHotKeys])
     }
 
     @objc private func translateClipboardImage() {
@@ -1560,6 +1545,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         webView.callAsyncJavaScript("window[callback]?.(result)",
                                    arguments: ["callback": callback, "result": result],
                                    in: nil, in: .page, completionHandler: nil)
+    }
+
+    private func importMarkdownDocument(requestId: String) {
+        let reply: ([String: Any]) -> Void = { [weak self] result in
+            var values = result
+            values["requestId"] = requestId
+            self?.replyToScan("dubheMarkdownDocumentReady", values)
+        }
+        guard !importingMarkdown, window.attachedSheet == nil else {
+            reply(["error": "请先完成当前的文档操作。"])
+            return
+        }
+        guard let executable = MarkItDown.executable() else {
+            reply(["error": "导入 Office、PDF 等文档需要本机 MarkItDown。也可以先转为 Markdown，再用路径索引。"])
+            return
+        }
+        importingMarkdown = true
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = MarkItDown.extensions.compactMap { UTType(filenameExtension: $0) }
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "选择要在本机转换的文档"
+        panel.prompt = "导入"
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            guard response == .OK, let file = panel.url else {
+                self.importingMarkdown = false
+                reply(["cancelled": true])
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result: [String: Any]
+                do {
+                    result = ["name": file.lastPathComponent, "markdown": try MarkItDown.convert(file, with: executable)]
+                } catch {
+                    result = ["error": error.localizedDescription]
+                }
+                DispatchQueue.main.async { [weak self] in
+                    self?.importingMarkdown = false
+                    reply(result)
+                }
+            }
+        }
     }
 
     private func openScanPDF(requestId: String) {
@@ -1952,8 +1980,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // 计时器用 DispatchSourceTimer 而不是 Timer：后者的触发依赖 run loop
     // 模式，启动阶段 schedule 进去有被挂起的风险。
     //
-    // 引擎是「先加载模型、再监听端口」，所以大模型下这段时间会很长。
-    // 30 秒后不判死刑，只是把转圈页的文案换掉，一直等到 5 分钟。
+    // 本地服务监听端口后，模型在后台加载。
     private func waitForReady() {
         pollsLeft = 6000                        // 50 ms × 6000 = 5 分钟
         var ticks = 0
@@ -1969,7 +1996,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 return
             }
             if ticks == 600 {                   // 30 秒
-                self.showSplash("还在加载模型…")
+                self.showSplash("还在等待本地引擎…")
             }
             if self.portAccepts(self.port) {
                 self.stopPolling()
@@ -2027,13 +2054,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     // ------------------------------------------------------------ 记住模型
     //
-    // 界面里换模型走的是 /api/load，外壳不知道。与其把 web/app.js 和外壳
-    // 耦合起来，不如每 10 秒问一次 /api/state —— 本地请求，200 字节，
-    // 而且顺带能发现"引擎还活着但模型掉了"这类情况。
+    // 状态来自此引擎。重启或卸载后，丢弃早先发出的请求结果。
     private func startStateWatch() {
-        stateTimer?.cancel()
+        stopStateWatch()
         let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now() + 2, repeating: 10)
+        t.schedule(deadline: .now() + 0.2, repeating: 2)
         t.setEventHandler { [weak self] in self?.captureModel() }
         stateTimer = t
         t.resume()
@@ -2042,24 +2067,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private func stopStateWatch() {
         stateTimer?.cancel()
         stateTimer = nil
+        stateWatchRevision += 1
+        stateRequest?.cancel()
+        stateRequest = nil
     }
 
     private func captureModel() {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/api/state") else { return }
+        guard stateRequest == nil, let url = URL(string: "http://127.0.0.1:\(port)/api/state") else { return }
+        let revision = stateWatchRevision
         var req = URLRequest(url: url)
         req.timeoutInterval = 3
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            guard let self, let data,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  obj["loaded"] as? Bool == true,
-                  let m = obj["model"] as? String, !m.isEmpty else { return }
-            // 走到这儿说明"上次记住的模型"这次也加载成功了，不用再退。
-            self.usedRememberedModel = false
-            if UserDefaults.standard.string(forKey: Self.lastModelKey) != m {
-                UserDefaults.standard.set(m, forKey: Self.lastModelKey)
-                dbg("remember model \(m)")
+        stateRequest = URLSession.shared.dataTask(with: req) { [weak self] data, response, _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, revision == self.stateWatchRevision else { return }
+                self.stateRequest = nil
+                guard let data, (response as? HTTPURLResponse)?.statusCode == 200,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+                if obj["model_restoring"] == nil {
+                    self.finishRestoringModel(failed: obj["model_restore_error"] != nil)
+                }
+                if obj["loaded"] as? Bool == true, let model = obj["model"] as? String, !model.isEmpty,
+                   UserDefaults.standard.string(forKey: Self.lastModelKey) != model {
+                    UserDefaults.standard.set(model, forKey: Self.lastModelKey)
+                    dbg("remember model \(model)")
+                }
             }
-        }.resume()
+        }
+        stateRequest?.resume()
+    }
+
+    private func finishRestoringModel(failed: Bool) {
+        guard let model = restoringModelPath else { return }
+        restoringModelPath = nil
+        guard failed else { return }
+        failedStartupModelPath = model
+        if UserDefaults.standard.string(forKey: Self.lastModelKey) == model {
+            UserDefaults.standard.removeObject(forKey: Self.lastModelKey)
+        }
+        dbg("could not restore startup model \(model)")
     }
 
     // 验收用：界面加载完后走与 ⌘Q 相同的应用退出路径。

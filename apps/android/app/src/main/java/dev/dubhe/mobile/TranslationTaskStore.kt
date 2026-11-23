@@ -43,7 +43,7 @@ internal class TranslationTaskStore(context: Context) {
     private val scan = AtomicFile(File(context.filesDir, "last-scan.txt"))
 
     fun readScan(): String = try {
-        scan.readFully().decodeToString().take(translationLimit)
+        scan.readFully().decodeToString()
     } catch (_: IOException) {
         ""
     }

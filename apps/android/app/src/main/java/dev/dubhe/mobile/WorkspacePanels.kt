@@ -89,7 +89,7 @@ internal fun ModelsScreen(
                 shape = SegmentedButtonDefaults.itemShape(1, 2),
             ) { Text("模型商店") }
         }
-        if (state.activity == Activity.Importing && state.downloading == null) {
+        if (state.activity == Activity.Importing) {
             ModelCard(state.status ?: "正在导入", null, Glyph.File) {
                 TextButton(chat::stop, enabled = !state.stopping) { Text("取消") }
             }
@@ -134,19 +134,19 @@ internal fun ModelsScreen(
                                 chat.selectModel(installed)
                                 openChat()
                             }
-                        }, enabled = idle) { Text(if (item.translation) "去翻译" else "去对话") }
-                        downloading -> TextButton(chat::stop, enabled = !state.stopping) { Text("取消") }
-                        else -> TextButton({ chat.downloadModel(item) }, enabled = idle) {
+                        }, enabled = item.translation || idle) { Text(if (item.translation) "去翻译" else "去对话") }
+                        downloading -> TextButton(chat::pauseDownload, enabled = !state.downloadStopping) { Text("暂停") }
+                        else -> TextButton({ chat.downloadModel(item) }, enabled = state.downloading == null && !state.storageBusy) {
                             Text(if (item.file in state.partialDownloads) "继续下载" else "下载")
                         }
                     }
                 }
                 if (downloading) {
-                    TransferProgress(state.progress)
-                    val progress = state.progress
+                    TransferProgress(state.downloadProgress)
+                    val progress = state.downloadProgress
                     Text(
-                        if (state.stopping) "正在取消" else if (progress == 1f) "正在校验模型" else
-                            progress?.let { "已下载 " + (it * 100).toInt() + "%" } ?: "正在连接下载源",
+                        if (state.downloadStopping) "正在暂停" else if (progress == 1f) "正在校验模型" else
+                            progress?.let { "已下载 " + (it * 100).toInt() + "%" } ?: "等待连接下载源",
                         style = MaterialTheme.typography.labelMedium,
                     )
                 }

@@ -4,6 +4,7 @@ import Vision
 
 enum ScanRegions {
     static func detect(_ image: Data) async throws -> [[String: Any]] {
+#if DUBHE_VISION_DOCUMENTS
         guard #available(macOS 26, *) else { throw Failure.unavailable }
         var request = RecognizeDocumentsRequest()
         request.textRecognitionOptions.automaticallyDetectLanguage = true
@@ -35,11 +36,14 @@ enum ScanRegions {
             guard !rect.isNull, rect.width >= 0.025, rect.height >= 0.006 else { return nil }
             return ["x": rect.minX, "y": 1 - rect.maxY, "width": rect.width, "height": rect.height, "mode": mode]
         }
+#else
+        throw Failure.unavailable
+#endif
     }
 
     private enum Failure: LocalizedError {
         case unavailable
 
-        var errorDescription: String? { "自动找段落和表格需要 macOS 26。也可以手动拖出选区。" }
+        var errorDescription: String? { "自动找段落和表格需要 macOS 26 和支持此功能的 Dubhe 版本。也可以手动拖出选区。" }
     }
 }

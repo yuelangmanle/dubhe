@@ -19,6 +19,7 @@ internal object EngineProtocol {
     const val ProjectorReady = 15
     const val StoppingForHeat = 16
     const val ModelUnloaded = 17
+    const val GenerationPlan = 18
 }
 
 internal fun Messenger.post(what: Int, id: Int, data: Bundle, reply: Messenger? = null): Boolean =

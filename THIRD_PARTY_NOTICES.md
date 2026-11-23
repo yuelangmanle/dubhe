@@ -26,6 +26,8 @@
 | --- | --- | --- | --- | --- |
 | `web/vendor/katex-0.19.1.min.js` · `web/vendor/katex.LICENSE` | [KaTeX](https://github.com/KaTeX/KaTeX) · `dist/katex.min.js` | `8000fbd4e29cca2c0cb1e88b745af3ed2f436b66` | MIT | npm 0.19.1 原始发行文件，用于本地公式排版 |
 
+系统 SQLite 用于桌面知识库全文检索和任务存档，采用 [公有领域授权](https://www.sqlite.org/copyright.html)。Android 使用 [Room](https://developer.android.com/jetpack/androidx/releases/room)、[WorkManager](https://developer.android.com/jetpack/androidx/releases/work) 和 [Multiplatform Markdown Renderer](https://github.com/mikepenz/multiplatform-markdown-renderer)，均采用 Apache-2.0 许可证。Mac 的可选文档导入调用用户本机安装的 [MarkItDown](https://github.com/microsoft/markitdown)，采用 MIT 许可证。
+
 ## 3. 明确排除
 
 以下许可的代码**不得**进入本仓库或任何交付二进制：

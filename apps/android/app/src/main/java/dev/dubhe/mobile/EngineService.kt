@@ -239,12 +239,15 @@ class EngineService : Service() {
         val attachment = data.getString("attachmentPath")?.let { path ->
             Attachment(File(path), AttachmentKind.valueOf(requireNotNull(data.getString("attachmentKind"))))
         }
-        val maxTokens = minOf(256, maxOf(1, info.contextSize / 4))
+        val wanted = data.getInt("outputLimit", 256).coerceIn(128, 1024)
         val transcribing = attachment?.kind == AttachmentKind.Audio && allMessages.lastOrNull().isNullOrBlank()
-        var messages = allMessages.takeLast(13)
-        val tokens: IntArray
+        var dropped = data.getInt("droppedTurns")
+        var messages = allMessages.toList()
+        val previousAnswer = data.getString("assistantPrefix").orEmpty()
+        var prefix = previousAnswer
+        var tokens: IntArray
         while (true) {
-            val candidate = engine.tokenize(renderPrompt(info, messages, attachment?.kind))
+            tokens = engine.tokenize(renderPrompt(info, messages, attachment?.kind, prefix))
             if (stopRequested) {
                 reply.post(EngineProtocol.Complete, id, Bundle().apply {
                     putBoolean("cancelled", true)
@@ -252,13 +255,31 @@ class EngineService : Service() {
                 })
                 return
             }
-            if (candidate.size + maxTokens <= info.contextSize) {
-                tokens = candidate
-                break
+            val free = info.contextSize - tokens.size
+            when {
+                free >= wanted -> break
+                messages.size > 1 -> {
+                    messages = messages.drop(2)
+                    dropped++
+                }
+                // Keep the end of the answer in context when a long answer is continued.
+                prefix.length > 256 -> {
+                    var start = prefix.length / 3
+                    if (prefix[start].isLowSurrogate()) start++
+                    prefix = prefix.substring(start)
+                }
+                free >= 24 -> break
+                else -> error("这轮输入需 ${tokens.size} token，上下文共 ${info.contextSize} token，留给回答的空间不足。请缩短消息后重试。")
             }
-            if (messages.size <= 1) error("这条消息太长了，请缩短后再发。")
-            messages = messages.drop(2)
         }
+        val maxTokens = minOf(wanted, info.contextSize - tokens.size)
+        reply.post(EngineProtocol.GenerationPlan, id, Bundle().apply {
+            putInt("promptTokens", tokens.size)
+            putInt("context", info.contextSize)
+            putInt("outputLimit", maxTokens)
+            putInt("droppedTurns", dropped)
+            putBoolean("shortenedPrefix", prefix.length < previousAnswer.length)
+        })
         var lastUpdate = 0L
         val chunk = StringBuilder()
         val sampling = if (transcribing) Sampling(maxTokens = maxTokens, temperature = 0f) else Sampling(maxTokens = maxTokens)
@@ -275,7 +296,13 @@ class EngineService : Service() {
             putString("text", response.text)
             putBoolean("cancelled", response.cancelled)
             putBoolean("thermal", response.cancelled && thermalStop)
+            putInt("promptTokens", response.stats.promptTokens.takeIf { it > 0 } ?: tokens.size)
+            putInt("generatedTokens", response.stats.generatedTokens)
+            putInt("reusedTokens", response.stats.reusedTokens)
+            putDouble("prefillMs", response.stats.prefillMilliseconds)
             putDouble("speed", response.stats.decodeTokensPerSecond)
+            putBoolean("hitLimit", !response.cancelled && (response.stats.generatedTokens >= maxTokens ||
+                response.stats.promptTokens + response.stats.generatedTokens >= info.contextSize))
         })
     }
 
@@ -343,7 +370,9 @@ class EngineService : Service() {
     }
 }
 
-private fun renderPrompt(model: ModelInfo, messages: List<String>, kind: AttachmentKind?): String = buildString {
+private fun renderPrompt(
+    model: ModelInfo, messages: List<String>, kind: AttachmentKind?, assistantPrefix: String = "",
+): String = buildString {
     if (model.supportsChatML && (model.architecture == "lfm2" || model.architecture == "lfm3")) {
         append("<|startoftext|>")
     }
@@ -366,4 +395,5 @@ private fun renderPrompt(model: ModelInfo, messages: List<String>, kind: Attachm
         }
     }
     append(if (model.supportsChatML) "<|im_start|>assistant\n" else "Assistant: ")
+    append(assistantPrefix)
 }

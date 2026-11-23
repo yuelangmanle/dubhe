@@ -4,6 +4,7 @@
 
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -49,7 +50,8 @@ inline bool read_json(const std::string& path, json::Value* out) {
     return !file.bad() && json::parse(text, out) && out->type == json::Value::OBJ;
 }
 
-inline bool write_bytes(const std::string& path, const std::string& text) {
+inline bool write_bytes(const std::string& path, const std::string& text, bool replace = true,
+                        mode_t mode = 0600) {
     std::string temp = path + ".tmp.XXXXXX";
     const int fd = mkstemp(temp.data());
     if (fd < 0) return false;
@@ -61,12 +63,14 @@ inline bool write_bytes(const std::string& path, const std::string& text) {
         if (n <= 0) break;
         pos += (size_t)n;
     }
-    const bool saved = pos == text.size() && fsync(fd) == 0;
+    const bool saved = pos == text.size() && fchmod(fd, mode) == 0 && fsync(fd) == 0;
     const int closed = close(fd);
-    if (!saved || closed != 0 || std::rename(temp.c_str(), path.c_str()) != 0) {
+    if (!saved || closed != 0 || (replace ? std::rename(temp.c_str(), path.c_str())
+                                          : link(temp.c_str(), path.c_str())) != 0) {
         unlink(temp.c_str());
         return false;
     }
+    if (!replace) unlink(temp.c_str());
     const auto parent = std::filesystem::path(path).parent_path();
     const int dir = open(parent.empty() ? "." : parent.c_str(), O_RDONLY | O_CLOEXEC);
     if (dir >= 0) { fsync(dir); close(dir); }

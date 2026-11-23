@@ -17,6 +17,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.ExistingWorkPolicy
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import dev.dubhe.sdk.AttachmentKind
 import dev.dubhe.sdk.ProjectorCapabilities
 import java.io.File
@@ -25,10 +28,22 @@ import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-internal data class ChatTurn(val prompt: String, val attachmentName: String? = null, val answer: String = "")
+internal data class ChatTurn(
+    val prompt: String, val attachmentName: String? = null, val answer: String = "", val canContinue: Boolean = false,
+)
+
+internal val responseLimits = listOf(128, 256, 512, 1024)
+internal const val chatInputLimit = 32_000
+
+internal data class ChatMetrics(
+    val promptTokens: Int, val context: Int, val outputLimit: Int, val droppedTurns: Int,
+    val shortenedPrefix: Boolean, val generatedTokens: Int? = null, val reusedTokens: Int = 0,
+    val prefillMs: Double = 0.0, val speed: Double = 0.0,
+)
 
 internal enum class Activity { Connecting, Idle, Importing, Loading, Generating, Translating }
 
@@ -42,6 +57,9 @@ internal data class ChatState(
     val attachmentName: String? = null,
     val turns: List<ChatTurn> = emptyList(),
     val progress: Float? = null,
+    val acceptedMessages: Int = 0,
+    val outputLimit: Int = 256,
+    val metrics: ChatMetrics? = null,
     val status: String? = null,
     val error: String? = null,
     val stopping: Boolean = false,
@@ -49,6 +67,10 @@ internal data class ChatState(
     val models: List<LocalModel> = emptyList(),
     val partialDownloads: Set<String> = emptySet(),
     val downloading: String? = null,
+    val downloadProgress: Float? = null,
+    val downloadStopping: Boolean = false,
+    val readyDownload: LocalModel? = null,
+    val storageBusy: Boolean = false,
     val modelStorage: ModelStorage? = null,
 )
 
@@ -67,11 +89,24 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         private set
     var hasSavedScan by mutableStateOf(false)
         private set
+    var scanProgress by mutableStateOf<ScanProgress?>(null)
+        private set
+    var scanStatus by mutableStateOf<String?>(null)
+        private set
+    var scanSaving by mutableStateOf(false)
+        private set
+    var translationImportStatus by mutableStateOf<String?>(null)
+        private set
+    var queuedTranslation by mutableStateOf(false)
+        private set
 
     private val store = ModelStore(application)
     private val historyStore = ConversationStore(application)
     private val translationStore = TranslationTaskStore(application)
     private val translationPrefs = application.getSharedPreferences("dubhe-translation", Context.MODE_PRIVATE)
+    private val work = WorkManager.getInstance(application)
+    private val downloads = application.getSharedPreferences("dubhe-downloads", Context.MODE_PRIVATE)
+    private var downloadId = downloads.getString("request", null)?.let(UUID::fromString)
     private val historyIO = Dispatchers.IO.limitedParallelism(1)
     private val responses = Messenger(Handler(Looper.getMainLooper(), ::receive))
     private var engine: Messenger? = null
@@ -80,8 +115,16 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     private var pendingRemoval: LocalModel? = null
     private var draftAttachment: LocalAttachment? = null
     private var sentAttachment: LocalAttachment? = null
+    private var previousAnswer: String? = null
+    private var awaitingPlan = false
+    private val chatPrefs = application.getSharedPreferences("dubhe-chat-settings", Context.MODE_PRIVATE)
     private var fileJob: Job? = null
     private var persistJob: Job? = null
+    private var scanJob: Job? = null
+    private var scanTouched = false
+    private var translationReadJob: Job? = null
+    private var translationReadId = 0
+    private var pendingTranslationSource: Pair<String, String?>? = null
     private var bound = false
 
     private val connection = object : ServiceConnection {
@@ -113,6 +156,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     init {
         viewModelScope.launch {
+            work.getWorkInfosForUniqueWorkFlow(ModelDownloadWorker.WorkName).collect(::observeDownloads)
+        }
+        state = state.copy(outputLimit = chatPrefs.getInt("output-limit", 256).takeIf { it in responseLimits } ?: 256)
+        viewModelScope.launch {
             store.discardUnreferencedFiles()
             refreshLibrary()
             try {
@@ -124,8 +171,11 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 showError("无法读取本地对话历史。")
             }
             withContext(Dispatchers.IO) { translationStore.list() }.let { translationTasks = it }
-            scanText = withContext(Dispatchers.IO) { translationStore.readScan() }
-            hasSavedScan = scanText.isNotEmpty()
+            val storedScan = withContext(Dispatchers.IO) { translationStore.readScan() }
+            if (!scanTouched) {
+                scanText = storedScan
+                hasSavedScan = scanText.isNotEmpty()
+            }
             val terms = withContext(Dispatchers.IO) { translationPrefs.getString("glossary", "").orEmpty() }
             translation = translation.copy(glossary = terms)
             bind()
@@ -151,14 +201,57 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun downloadModel(item: CatalogModel, loadAfter: Boolean = false) {
-        if (!state.connected || state.activity != Activity.Idle) return
-        state = state.copy(downloading = item.file)
-        importFile("正在下载 ${item.name}") { update ->
-            val model = store.download(item) { update(it) }
-            if (loadAfter && !item.translation) load(ModelRequest(ModelSlot.Language, model, saveSelection = true))
-            else state = state.copy(activity = Activity.Idle, progress = null,
-                status = if (item.projector == null) "模型已下载" else "模型和多模态组件已下载")
+        if (state.downloading != null || state.storageBusy) return
+        val request = ModelDownloadWorker.request(item)
+        downloadId = request.id
+        downloads.edit().putString("request", request.id.toString())
+            .putBoolean("load", loadAfter && !item.translation).apply()
+        state = state.copy(downloading = item.file, downloadProgress = null, error = null)
+        work.enqueueUniqueWork(ModelDownloadWorker.WorkName, ExistingWorkPolicy.KEEP, request)
+    }
+
+    fun pauseDownload() {
+        val id = downloadId ?: return
+        if (state.downloading == null || state.downloadStopping) return
+        state = state.copy(downloadStopping = true)
+        work.cancelWorkById(id)
+    }
+
+    private fun observeDownloads(infos: List<WorkInfo>) {
+        val active = infos.firstOrNull { !it.state.isFinished }
+        if (active != null) {
+            if (active.id != downloadId) {
+                downloadId = active.id
+                downloads.edit().putString("request", active.id.toString()).putBoolean("load", false).apply()
+            }
+            state = state.copy(
+                downloading = active.catalogFile(),
+                downloadProgress = active.progress.getInt(ModelDownloadWorker.Percent, -1).takeIf { it >= 0 }?.div(100f),
+            )
+            return
         }
+        val done = infos.firstOrNull { it.id == downloadId } ?: return
+        refreshLibrary()
+        val loadAfter = downloads.getBoolean("load", false)
+        downloadId = null
+        downloads.edit().remove("request").remove("load").apply()
+        state = state.copy(downloading = null, downloadProgress = null, downloadStopping = false)
+        if (done.state == WorkInfo.State.SUCCEEDED && loadAfter) {
+            state = state.copy(readyDownload = state.models.firstOrNull { it.file.name == done.catalogFile() })
+        }
+        if (done.state == WorkInfo.State.FAILED) {
+            showError(done.outputData.getString(ModelDownloadWorker.Error) ?: "下载失败，可以继续下载。")
+        }
+    }
+
+    private fun WorkInfo.catalogFile() = tags.firstOrNull { it.startsWith(ModelDownloadWorker.ModelTag) }
+        ?.removePrefix(ModelDownloadWorker.ModelTag)
+
+    fun loadReadyDownload() {
+        if (state.activity != Activity.Idle) return
+        val model = state.readyDownload ?: return
+        state = state.copy(readyDownload = null)
+        selectModel(model)
     }
 
     fun prepareLightChat() {
@@ -204,10 +297,19 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun clearPartialDownloads() {
-        importFile("正在清理未完成的下载") {
-            store.clearPartialDownloads()
-            refreshLibrary()
-            state = state.copy(activity = Activity.Idle, status = "已清理未完成的下载")
+        if (state.downloading != null || state.storageBusy) return
+        state = state.copy(storageBusy = true)
+        viewModelScope.launch {
+            try {
+                store.clearPartialDownloads()
+                refreshLibrary()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                showError(failure.localizedMessage ?: "无法清理未完成的下载。")
+            } finally {
+                state = state.copy(storageBusy = false)
+            }
         }
     }
 
@@ -239,8 +341,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 }
             } catch (cancelled: CancellationException) {
                 if (state.activity == Activity.Importing && state.connected) {
-                    state = state.copy(activity = Activity.Idle, progress = null, stopping = false,
-                        status = if (state.downloading == null) "已取消导入" else "已暂停下载")
+                    state = state.copy(activity = Activity.Idle, progress = null, stopping = false, status = "已取消导入")
                 }
                 throw cancelled
             } catch (failure: Exception) {
@@ -248,47 +349,75 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     activity = Activity.Idle, status = null, stopping = false,
                     error = failure.localizedMessage ?: "导入失败。",
                 )
-            } finally {
-                if (state.downloading != null) {
-                    refreshLibrary()
-                    state = state.copy(downloading = null)
-                }
             }
         }
+    }
+
+    fun setOutputLimit(limit: Int) {
+        if (limit !in responseLimits || state.activity != Activity.Idle) return
+        state = state.copy(outputLimit = limit)
+        chatPrefs.edit().putInt("output-limit", limit).apply()
     }
 
     fun ask(value: String) {
         val attachment = draftAttachment
         val input = value.trim()
         if (state.activity != Activity.Idle || state.modelName == null || (input.isEmpty() && attachment == null)) return
+        if (input.length > chatInputLimit) {
+            showError("这条消息有 ${input.length} 个字符，一次最多发送 $chatInputLimit 个。请分段发送。")
+            return
+        }
         val prompt = input.ifEmpty { defaultMediaPrompt(attachment?.attachment?.kind) }
-        val previous = state.turns.asReversed().asSequence().filter { it.answer.isNotBlank() }
-            .take(6).toList().asReversed()
+        generate(ChatTurn(prompt, attachment?.name), attachment, continuation = false)
+    }
+
+    fun continueAnswer() {
+        if (state.activity != Activity.Idle || state.activeModel == null) return
+        val turn = state.turns.lastOrNull()?.takeIf { it.canContinue } ?: return
+        generate(turn, null, continuation = true)
+    }
+
+    private fun generate(turn: ChatTurn, attachment: LocalAttachment?, continuation: Boolean) {
+        val previous = (if (continuation) state.turns.dropLast(1) else state.turns).filter { it.answer.isNotBlank() }
         val history = ArrayList<String>()
-        var chars = prompt.length
-        for (turn in previous.asReversed()) {
-            val priorPrompt = turn.prompt.ifEmpty { if (turn.attachmentName != null) "请转写音频。" else "" }
-            chars += priorPrompt.length + turn.answer.length
-            if (chars > 32_000) break
-            history.add(0, turn.answer)
+        var chars = turn.prompt.length + (if (continuation) turn.answer.length else 0)
+        for (prior in previous.asReversed().take(6)) {
+            val priorPrompt = prior.prompt.ifEmpty { if (prior.attachmentName != null) "请转写音频。" else "" }
+            chars += priorPrompt.length + prior.answer.length
+            if (chars > chatInputLimit) break
+            history.add(0, prior.answer)
             history.add(0, priorPrompt)
         }
-        history.add(prompt)
+        val dropped = previous.size - history.size / 2
+        history.add(turn.prompt)
+        awaitingPlan = true
+        previousAnswer = turn.answer.takeIf { continuation }
         sentAttachment = attachment
-        draftAttachment = null
+        if (attachment != null) draftAttachment = null
         state = state.copy(
-            activity = Activity.Generating, turns = state.turns + ChatTurn(prompt, attachment?.name),
-            stopping = false, status = if (attachment == null) "正在回答" else "正在读取附件",
-            error = null, attachmentName = null,
+            activity = Activity.Generating, turns = if (continuation) state.turns else state.turns + turn,
+            stopping = false, status = if (attachment == null) "正在检查上下文" else "正在读取附件",
+            error = null, attachmentName = draftAttachment?.name, metrics = null,
         )
-        saveCurrentConversation()
         send(EngineProtocol.Generate, Bundle().apply {
             putStringArrayList("messages", history)
+            putInt("outputLimit", state.outputLimit)
+            putInt("droppedTurns", dropped)
+            putString("assistantPrefix", previousAnswer)
             attachment?.attachment?.let {
                 putString("attachmentPath", it.file.absolutePath)
                 putString("attachmentKind", it.kind.name)
             }
         })
+    }
+
+    private fun rejectUnplannedMessage() {
+        if (!awaitingPlan) return
+        awaitingPlan = false
+        if (previousAnswer != null) return
+        draftAttachment = sentAttachment
+        sentAttachment = null
+        state = state.copy(turns = state.turns.dropLast(1), attachmentName = draftAttachment?.name)
     }
 
     fun stop() {
@@ -305,7 +434,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         if (state.activity != Activity.Idle) return
         removeAttachment()
         conversations = conversations.copy(selected = null)
-        state = state.copy(turns = emptyList(), status = null, error = null)
+        state = state.copy(turns = emptyList(), status = null, error = null, metrics = null)
         writeHistory()
     }
 
@@ -313,7 +442,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         if (state.activity != Activity.Idle) return
         removeAttachment()
         conversations = conversations.copy(selected = chat.id)
-        state = state.copy(turns = chat.turns, status = null, error = null)
+        state = state.copy(turns = chat.turns, status = null, error = null, metrics = null)
         writeHistory()
     }
 
@@ -322,7 +451,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         if (conversations.selected == chat.id) {
             removeAttachment()
             conversations = conversations.copy(selected = null)
-            state = state.copy(turns = emptyList())
+            state = state.copy(turns = emptyList(), metrics = null)
         }
         conversations = conversations.copy(items = conversations.items.filterNot { it.id == chat.id })
         writeHistory()
@@ -357,64 +486,129 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
-    fun setTranslationSource(text: String, label: String? = null) {
+    fun setTranslationSource(text: String, label: String? = null): Boolean {
         if (text.length > translationLimit) {
             showError("一次最多翻译 $translationLimit 个字符，请分段输入。")
-            return
+            return false
         }
-        updateTranslation { it.copy(source = text, result = "", inputLabel = label) }
+        if (state.activity == Activity.Translating) {
+            pendingTranslationSource = text to label
+            queuedTranslation = true
+        } else {
+            updateTranslation { it.copy(source = text, result = "", inputLabel = label) }
+        }
+        return true
+    }
+
+    private fun applyQueuedTranslation() {
+        val pending = pendingTranslationSource ?: return
+        pendingTranslationSource = null
+        queuedTranslation = false
+        setTranslationSource(pending.first, pending.second)
     }
 
     fun importTranslation(uri: Uri, image: Boolean) {
-        importFile(if (image) "正在识别图片文字" else "正在读取文件") {
-            val text = readTranslationInput(getApplication(), uri, image)
-            setTranslationSource(text, if (image) "来自图片" else "来自文件")
-            state = state.copy(activity = Activity.Idle, status = null)
+        val id = ++translationReadId
+        translationReadJob?.cancel()
+        translationImportStatus = if (image) "正在识别图片文字" else "正在读取文件"
+        translationReadJob = viewModelScope.launch {
+            try {
+                val text = readTranslationInput(getApplication(), uri, image)
+                setTranslationSource(text, if (image) "来自图片" else "来自文件")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                showError(failure.localizedMessage ?: "无法读取文件。")
+            } finally {
+                if (id == translationReadId) translationImportStatus = null
+            }
         }
     }
 
-    fun scanImage(uri: Uri) {
-        importFile("正在本机识别图片") {
-            val text = readTranslationInput(getApplication(), uri, image = true)
-            withContext(Dispatchers.IO) { translationStore.writeScan(text) }
-            scanText = text
-            hasSavedScan = true
-            state = state.copy(activity = Activity.Idle, status = null)
+    fun scanInputs(uris: List<Uri>, captured: Uri? = null) {
+        if (uris.isEmpty() || scanProgress != null || scanSaving) return
+        scanTouched = true
+        scanProgress = ScanProgress(1, uris.size, 0, 0)
+        scanStatus = null
+        scanJob = viewModelScope.launch {
+            val recognized = StringBuilder()
+            try {
+                scanDocuments(getApplication(), uris, onProgress = { progress ->
+                    withContext(Dispatchers.Main.immediate) { scanProgress = progress }
+                }, onText = { page ->
+                    ensureActive()
+                    if (page.isNotBlank()) {
+                        if (recognized.isNotEmpty()) recognized.append("\n\n")
+                        recognized.append(page.trim())
+                        val text = recognized.toString()
+                        translationStore.writeScan(text)
+                        withContext(Dispatchers.Main.immediate) {
+                            scanText = text
+                            hasSavedScan = true
+                        }
+                    }
+                })
+                check(recognized.isNotBlank()) { "所选文件中没有识别到文字。" }
+            } catch (cancelled: CancellationException) {
+                scanStatus = if (recognized.isNotBlank()) "扫描已停止，已保留识别结果。" else "扫描已停止。"
+                throw cancelled
+            } catch (failure: Exception) {
+                showError(failure.localizedMessage ?: "扫描失败。")
+            } finally {
+                scanProgress = null
+                captured?.let(::discardScanPhoto)
+            }
         }
+    }
+
+    fun discardScanPhoto(uri: Uri) {
+        val app = getApplication<Application>()
+        if (uri.authority == "${app.packageName}.scan") {
+            viewModelScope.launch(Dispatchers.IO) { app.contentResolver.delete(uri, null, null) }
+        }
+    }
+
+    fun stopScan() {
+        scanJob?.cancel()
     }
 
     fun editScanText(text: String) {
-        if (state.activity == Activity.Idle) scanText = text.take(translationLimit)
+        if (scanProgress == null && !scanSaving) scanText = text
     }
 
-    fun saveScan() {
-        if (state.activity != Activity.Idle) return
-        val text = scanText
-        importFile("正在保存识别结果") {
-            withContext(Dispatchers.IO) { translationStore.writeScan(text) }
-            hasSavedScan = text.isNotEmpty()
-            state = state.copy(activity = Activity.Idle, status = "识别结果已保存")
-        }
-    }
+    fun saveScan() = writeScan(scanText)
 
-    fun clearScan() {
-        importFile("正在清除扫描结果") {
-            withContext(Dispatchers.IO) { translationStore.writeScan("") }
-            scanText = ""
-            hasSavedScan = false
-            state = state.copy(activity = Activity.Idle, status = null)
+    fun clearScan() = writeScan("")
+
+    private fun writeScan(text: String) {
+        if (scanProgress != null || scanSaving) return
+        scanTouched = true
+        scanSaving = true
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { translationStore.writeScan(text) }
+                scanText = text
+                hasSavedScan = text.isNotEmpty()
+                scanStatus = if (hasSavedScan) "识别结果已保存" else null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                showError(failure.localizedMessage ?: "无法保存识别结果。")
+            } finally {
+                scanSaving = false
+            }
         }
     }
 
     fun selectTranslationTask(task: TranslationTask) {
-        if (state.activity != Activity.Idle) return
+        if (state.activity == Activity.Translating) return
         translationTask = task
         translation = task.input
         state = state.copy(error = null, status = null)
     }
 
     fun newTranslation() {
-        if (state.activity != Activity.Idle) return
+        if (state.activity == Activity.Translating || translationImportStatus != null) return
         translationTask = null
         translation = translation.copy(
             source = "", result = "", inputLabel = null,
@@ -424,14 +618,14 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun changeTranslationModel() {
-        if (state.activity != Activity.Idle) return
+        if (state.activity == Activity.Translating) return
         translationTask = null
         translation = translation.copy(result = "")
         state = state.copy(error = null, status = null)
     }
 
     fun saveTranslationGlossary(value: String): String? {
-        if (state.activity != Activity.Idle) return "请等当前任务结束后再修改术语。"
+        if (state.activity == Activity.Translating) return "请等当前翻译结束后再修改术语。"
         val normalized = value.trim()
         return try {
             readTranslationGlossary(normalized)
@@ -444,11 +638,17 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun deleteTranslationTask(task: TranslationTask) {
-        importFile("正在删除任务") {
-            withContext(Dispatchers.IO) { translationStore.remove(task.id) }
-            translationTasks = translationTasks.filterNot { it.id == task.id }
-            if (translationTask?.id == task.id) translationTask = null
-            state = state.copy(activity = Activity.Idle, status = null)
+        if (state.activity == Activity.Translating && translationTask?.id == task.id) return
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { translationStore.remove(task.id) }
+                translationTasks = translationTasks.filterNot { it.id == task.id }
+                if (translationTask?.id == task.id) translationTask = null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                showError(failure.localizedMessage ?: "无法删除翻译任务。")
+            }
         }
     }
 
@@ -460,7 +660,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun translate() {
         val input = translation
-        if (state.activity != Activity.Idle || input.source.isBlank()) return
+        if (state.activity != Activity.Idle || translationImportStatus != null || input.source.isBlank()) return
         val resumed = translationTask?.takeUnless { it.finished }
         val dedicated = if (resumed != null) {
             state.models.firstOrNull { resumed.dedicated && it.translationKey == resumed.modelKey }
@@ -495,6 +695,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 if (engine !== endpoint || state.activity != Activity.Translating) return@launch
                 if (state.stopping) {
                     state = state.copy(activity = Activity.Idle, stopping = false, status = "已暂停翻译")
+                    applyQueuedTranslation()
                     return@launch
                 }
                 send(EngineProtocol.Translate, Bundle().apply {
@@ -504,9 +705,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                if (state.activity == Activity.Translating) state = state.copy(
-                    activity = Activity.Idle, stopping = false, status = null, error = "无法保存翻译任务。",
-                )
+                if (state.activity == Activity.Translating) {
+                    state = state.copy(activity = Activity.Idle, stopping = false, status = null, error = "无法保存翻译任务。")
+                    applyQueuedTranslation()
+                }
             }
         }
     }
@@ -608,6 +810,19 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 )
                 deleteModelFile(model)
             }
+            EngineProtocol.GenerationPlan -> {
+                if (state.activity != Activity.Generating) return true
+                awaitingPlan = false
+                state = state.copy(
+                    acceptedMessages = state.acceptedMessages + if (previousAnswer == null) 1 else 0,
+                    metrics = ChatMetrics(
+                        data.getInt("promptTokens"), data.getInt("context"), data.getInt("outputLimit"),
+                        data.getInt("droppedTurns"), data.getBoolean("shortenedPrefix"),
+                    ),
+                    status = if (state.stopping) state.status else "正在回答",
+                )
+                saveCurrentConversation()
+            }
             EngineProtocol.Text -> {
                 val text = data.getString("text").orEmpty()
                 if (state.activity == Activity.Translating) {
@@ -632,23 +847,42 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             }
             EngineProtocol.Complete -> {
                 val translating = state.activity == Activity.Translating
+                val cancelled = data.getBoolean("cancelled")
+                val reachedLimit = data.getBoolean("hitLimit")
+                val media = sentAttachment != null
                 if (!translating) {
+                    if (awaitingPlan) {
+                        rejectUnplannedMessage()
+                    } else {
+                        val answer = previousAnswer.orEmpty() + data.getString("text").orEmpty()
+                        replaceAnswer(answer, canContinue = !media && answer.isNotBlank() && (cancelled || reachedLimit))
+                        state = state.copy(metrics = state.metrics?.copy(
+                            promptTokens = data.getInt("promptTokens"), generatedTokens = data.getInt("generatedTokens"),
+                            reusedTokens = data.getInt("reusedTokens"), prefillMs = data.getDouble("prefillMs"),
+                            speed = data.getDouble("speed"),
+                        ))
+                        saveCurrentConversation()
+                    }
                     clearSentAttachment()
-                    replaceAnswer(data.getString("text").orEmpty())
-                    saveCurrentConversation()
+                    previousAnswer = null
                 }
-                val speed = data.getDouble("speed")
                 val status = when {
                     data.getBoolean("thermal") -> "设备温度过高，已停止。降温后再试。"
-                    data.getBoolean("cancelled") -> "已停止"
+                    cancelled -> if (translating) "已暂停翻译" else "已停止"
                     translating -> "翻译完成"
-                    speed > 0 -> "%.1f token/s".format(speed)
+                    reachedLimit && media -> "已达到输出上限，可重新附上文件继续提问。"
+                    reachedLimit -> "已达到本次输出上限"
                     else -> null
                 }
                 state = state.copy(activity = Activity.Idle, stopping = false, status = status)
+                applyQueuedTranslation()
             }
             EngineProtocol.Failed -> {
-                if (state.activity == Activity.Generating) saveCurrentConversation()
+                if (state.activity == Activity.Generating) {
+                    rejectUnplannedMessage()
+                    saveCurrentConversation()
+                    previousAnswer = null
+                }
                 discardPending()
                 pendingRemoval = null
                 clearSentAttachment()
@@ -664,6 +898,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     projector = state.projector.takeIf { projectorReady },
                     projectorName = state.projectorName.takeIf { projectorReady },
                 )
+                applyQueuedTranslation()
             }
         }
         return true
@@ -682,13 +917,17 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
-    private fun replaceAnswer(text: String) {
+    private fun replaceAnswer(text: String, canContinue: Boolean? = null) {
         val latest = state.turns.lastOrNull() ?: return
-        state = state.copy(turns = state.turns.dropLast(1) + latest.copy(answer = text))
+        state = state.copy(turns = state.turns.dropLast(1) + latest.copy(answer = text, canContinue = canContinue ?: latest.canContinue))
     }
 
     private fun disconnected() {
-        if (state.activity == Activity.Generating) saveCurrentConversation()
+        if (state.activity == Activity.Generating) {
+            rejectUnplannedMessage()
+            saveCurrentConversation()
+            previousAnswer = null
+        }
         engine = null
         requestId++
         fileJob?.cancel()
@@ -701,6 +940,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             projector = null, projectorName = null,
             error = "推理引擎已断开，正在尝试重连。", stopping = false, status = null,
         )
+        applyQueuedTranslation()
     }
 
     private fun discardPending() {

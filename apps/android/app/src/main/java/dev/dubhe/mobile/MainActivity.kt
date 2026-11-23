@@ -51,6 +51,8 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -79,6 +81,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.mikepenz.markdown.m3.Markdown
 
 class MainActivity : ComponentActivity() {
     private val chat by viewModels<ChatViewModel>()
@@ -122,21 +125,29 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private data class SharedInput(val text: String? = null, val image: Uri? = null)
+private data class SharedInput(val text: String? = null, val files: List<Uri> = emptyList(), val scan: Boolean = false)
 
+@Suppress("DEPRECATION")
 private fun readShare(intent: Intent): SharedInput? {
     if (intent.action == Intent.ACTION_PROCESS_TEXT) {
         return intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()?.let { SharedInput(text = it) }
     }
-    if (intent.action != Intent.ACTION_SEND) return null
-    if (intent.type?.startsWith("image/") == true) {
-        val uri = if (Build.VERSION.SDK_INT >= 33) {
-            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+    val multiple = intent.action == Intent.ACTION_SEND_MULTIPLE
+    if (!multiple && intent.action != Intent.ACTION_SEND) return null
+    if (intent.type?.startsWith("image/") == true || intent.type == "application/pdf") {
+        val uris = if (multiple) {
+            if (Build.VERSION.SDK_INT >= 33) intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
+            else intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM).orEmpty()
         } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+            listOfNotNull(if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                else intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM))
         }
-        return uri?.takeIf { it.scheme == "content" }?.let { SharedInput(image = it) }
+        val clip = intent.clipData
+        val sources = (uris + List(clip?.itemCount ?: 0) { index -> clip?.getItemAt(index)?.uri }.filterNotNull())
+            .filter { it.scheme == "content" }.distinct()
+        return sources.takeIf { it.isNotEmpty() }?.let {
+            SharedInput(files = it, scan = multiple || intent.type == "application/pdf")
+        }
     }
     return intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.let { SharedInput(text = it) }
 }
@@ -164,6 +175,7 @@ private fun DubheScreen(
     var showModelPicker by rememberSaveable { mutableStateOf(false) }
     var openModelShop by rememberSaveable { mutableStateOf(false) }
     var input by rememberSaveable { mutableStateOf("") }
+    var lastAccepted by rememberSaveable { mutableStateOf(state.acceptedMessages) }
     val focus = LocalFocusManager.current
     val keyboard = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val idle = state.activity == Activity.Idle
@@ -185,14 +197,23 @@ private fun DubheScreen(
         navigate(Workspace.Models)
     }
 
-    LaunchedEffect(shared, state.activity) {
+    LaunchedEffect(shared, chat.scanProgress, chat.scanSaving) {
         if (shared == null) return@LaunchedEffect
-        workspace = Workspace.Translate
-        if (idle) {
+        if (shared.scan) {
+            workspace = Workspace.Scan
+            if (chat.scanProgress != null || chat.scanSaving) return@LaunchedEffect
+            chat.scanInputs(shared.files)
+        } else {
+            workspace = Workspace.Translate
             shared.text?.let { chat.setTranslationSource(it, "来自其他应用") }
-            shared.image?.let { chat.importTranslation(it, image = true) }
-            onShareHandled()
+            shared.files.firstOrNull()?.let { chat.importTranslation(it, image = true) }
         }
+        onShareHandled()
+    }
+    LaunchedEffect(state.activity, state.readyDownload) { chat.loadReadyDownload() }
+    LaunchedEffect(state.acceptedMessages) {
+        if (state.acceptedMessages > lastAccepted) input = ""
+        lastAccepted = state.acceptedMessages
     }
     BackHandler(workspace != Workspace.Chat) { navigate(if (workspace == Workspace.Tasks) previousWorkspace else Workspace.Chat) }
 
@@ -232,7 +253,6 @@ private fun DubheScreen(
                                 val ask = {
                                     if (canAsk && (input.isNotBlank() || state.attachmentName != null)) {
                                         chat.ask(input)
-                                        input = ""
                                         focus.clearFocus()
                                     }
                                 }
@@ -240,18 +260,21 @@ private fun DubheScreen(
                                 if (state.turns.isEmpty()) {
                                     EmptyConversation(
                                         state, body,
-                                        startChat = chat::prepareLightChat, stop = chat::stop,
+                                        startChat = chat::prepareLightChat, stop = chat::pauseDownload,
                                         showTranslation = { navigate(Workspace.Translate) },
                                         showScan = { navigate(Workspace.Scan) },
                                         showMediaModels = ::openMediaModels,
                                     )
                                 } else {
-                                    ChatTranscript(state, body)
+                                    ChatTranscript(state, body, chat::continueAnswer)
                                 }
                                 if (state.modelName != null) {
                                     Composer(
-                                        state, input, { input = it.take(12_000) }, canAsk, ask, chat::stop,
-                                        openAttachment, chat::removeAttachment, ::openMediaModels,
+                                        state, input, { value ->
+                                            if (value.length <= chatInputLimit) input = value
+                                            else chat.showError("一次最多输入 $chatInputLimit 个字符，请分段粘贴或发送。")
+                                        }, canAsk, ask, chat::stop,
+                                        openAttachment, chat::removeAttachment, ::openMediaModels, chat::setOutputLimit,
                                     )
                                 }
                             }
@@ -260,8 +283,7 @@ private fun DubheScreen(
                             }
                             Workspace.Scan -> workspaceState.SaveableStateProvider(Workspace.Scan.name) {
                                 ScanScreen(chat) { text ->
-                                    chat.setTranslationSource(text, "来自扫描")
-                                    navigate(Workspace.Translate)
+                                    if (chat.setTranslationSource(text, "来自扫描")) navigate(Workspace.Translate)
                                 }
                             }
                             Workspace.Models -> workspaceState.SaveableStateProvider(Workspace.Models.name) {
@@ -458,8 +480,8 @@ private fun EmptyConversation(
                     )
                 }
                 if (state.downloading != null) {
-                    TransferProgress(state.progress)
-                    TextButton(stop, enabled = !state.stopping) { Text("暂停下载") }
+                    TransferProgress(state.downloadProgress)
+                    TextButton(stop, enabled = !state.downloadStopping) { Text("暂停下载") }
                 } else {
                     Button(startChat, enabled = state.activity == Activity.Idle) {
                         Text(if (hasModel) "开始本机对话" else "下载模型并开始对话")
@@ -499,7 +521,7 @@ private fun ErrorBanner(message: String, dismiss: () -> Unit) {
 }
 
 @Composable
-private fun ChatTranscript(state: ChatState, modifier: Modifier) {
+private fun ChatTranscript(state: ChatState, modifier: Modifier, continueAnswer: () -> Unit) {
     val scroll = rememberLazyListState()
     val colors = MaterialTheme.colorScheme
     LaunchedEffect(state.turns.size, state.turns.lastOrNull()?.answer) {
@@ -539,9 +561,20 @@ private fun ChatTranscript(state: ChatState, modifier: Modifier) {
                                 style = MaterialTheme.typography.labelLarge, color = colors.onSurfaceVariant,
                             )
                             if (turn.answer.isNotBlank()) {
-                                SelectionContainer { Text(turn.answer, style = MaterialTheme.typography.bodyLarge) }
+                                SelectionContainer {
+                                    if (generating) Text(turn.answer, style = MaterialTheme.typography.bodyLarge)
+                                    else Markdown(content = turn.answer, modifier = Modifier.fillMaxWidth())
+                                }
                             } else {
                                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                            }
+                            if (index == state.turns.lastIndex) {
+                                state.metrics?.let { ChatMetricsText(it) }
+                                if (turn.canContinue && !generating) {
+                                    TextButton(continueAnswer, enabled = state.activity == Activity.Idle && state.activeModel != null) {
+                                        Text("继续生成")
+                                    }
+                                }
                             }
                         }
                     }
@@ -553,15 +586,34 @@ private fun ChatTranscript(state: ChatState, modifier: Modifier) {
 }
 
 @Composable
+private fun ChatMetricsText(metrics: ChatMetrics) {
+    val details = buildList {
+        add("上下文 ${metrics.promptTokens}/${metrics.context} token")
+        add(metrics.generatedTokens?.let { "本次输出 $it/${metrics.outputLimit} token" } ?: "最多输出 ${metrics.outputLimit} token")
+        if (metrics.reusedTokens > 0) add("复用 ${metrics.reusedTokens} token")
+        if (metrics.prefillMs > 0) add("预填充 ${metrics.prefillMs.toLong()} ms")
+        if (metrics.speed > 0) add("%.1f token/s".format(metrics.speed))
+    }
+    val omissions = buildList {
+        if (metrics.droppedTurns > 0) add("上下文未带入 ${metrics.droppedTurns} 轮较早的对话")
+        if (metrics.shortenedPrefix) add("续写使用上一段答复的末尾")
+    }
+    Text(details.joinToString(" · "), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    if (omissions.isNotEmpty()) Text(omissions.joinToString(" · "), style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+@Composable
 private fun Composer(
     state: ChatState, input: String, onInput: (String) -> Unit,
     canAsk: Boolean, ask: () -> Unit, stop: () -> Unit, openAttachment: (Array<String>) -> Unit,
-    removeAttachment: () -> Unit, showMediaModels: () -> Unit,
+    removeAttachment: () -> Unit, showMediaModels: () -> Unit, setOutputLimit: (Int) -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
     val busy = state.activity == Activity.Generating || state.activity == Activity.Importing
     val enabled = if (busy) !state.stopping else canAsk && (input.isNotBlank() || state.attachmentName != null)
     val attachmentName = state.attachmentName
+    var showLimits by rememberSaveable { mutableStateOf(false) }
     WorkspaceCard(Modifier.fillMaxWidth().padding(bottom = 7.dp)) {
         Column(Modifier.padding(start = 12.dp, end = 8.dp, top = 12.dp, bottom = 5.dp)) {
             if (attachmentName != null) {
@@ -591,6 +643,19 @@ private fun Composer(
                 },
             )
             if (state.activity == Activity.Importing) TransferProgress(state.progress)
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Box {
+                    TextButton({ showLimits = true }, enabled = canAsk) { Text("输出上限 ${state.outputLimit}") }
+                    DropdownMenu(expanded = showLimits, onDismissRequest = { showLimits = false }) {
+                        for (limit in responseLimits) DropdownMenuItem(
+                            text = { Text("$limit token") },
+                            onClick = { setOutputLimit(limit); showLimits = false },
+                        )
+                    }
+                }
+                state.status?.let { Text(it, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
+                    color = colors.onSurfaceVariant) }
+            }
             Row(
                 Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -608,12 +673,7 @@ private fun Composer(
                 if (state.projector == null) {
                     TextButton(showMediaModels, enabled = canAsk) { Text("图片 / 视频 / 音频") }
                 }
-                Text(
-                    state.status.orEmpty(),
-                    Modifier.weight(1f),
-                    style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    color = colors.onSurfaceVariant,
-                )
+                Spacer(Modifier.weight(1f))
                 val action = if (busy) "停止" else "发送"
                 Surface(
                     onClick = if (busy) stop else ask, enabled = enabled,

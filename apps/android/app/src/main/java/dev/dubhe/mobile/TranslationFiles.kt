@@ -1,19 +1,13 @@
 package dev.dubhe.mobile
 
 import android.content.Context
-import android.graphics.ImageDecoder
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
 import android.util.Xml
-import com.google.android.gms.tasks.Tasks
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import java.io.OutputStream
-import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.Dispatchers
@@ -23,15 +17,7 @@ internal suspend fun readTranslationInput(context: Context, uri: Uri, image: Boo
     withContext(Dispatchers.IO) {
         require(uri.scheme == "content") { "请选择设备中的文件。" }
         val text = if (image) {
-            val bitmap = ImageDecoder.decodeBitmap(ImageDecoder.createSource(context.contentResolver, uri)) { decoder, info, _ ->
-                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-                val size = info.size
-                val scale = maxOf(size.width, size.height).toFloat() / 2400
-                if (scale > 1) decoder.setTargetSize(maxOf(1, (size.width / scale).toInt()), maxOf(1, (size.height / scale).toInt()))
-            }
-            TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build()).use { recognizer ->
-                Tasks.await(recognizer.process(InputImage.fromBitmap(bitmap, 0)), 25, TimeUnit.SECONDS).text
-            }
+            readImageText(context, uri)
         } else {
             val stream = context.contentResolver.openInputStream(uri) ?: error("无法打开文件。")
             val bytes = ByteArray(translationLimit * 4 + 4)

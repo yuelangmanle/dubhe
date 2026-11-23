@@ -2,13 +2,15 @@
 
 Apple Silicon 和 Android 上的本地模型运行工具。原生引擎读取 GGUF，包含命令行、HTTP 服务和 macOS 客户端。
 
-当前版本 **0.36.1**。macOS 和 Android 均提供本机对话、离线翻译、扫描、任务恢复和应用内更新。Mac 支持扫描图片、多页 PDF 与 Word。Android 支持照片和截图转文字，安装对应套装后也可在对话中使用图片、视频或音频。两个客户端的安装包见 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。
+当前版本 **0.37.0**。macOS 和 Android 均提供本机对话、离线翻译、扫描、任务恢复和应用内更新。Mac 支持扫描图片、多页 PDF 与 Word。Android 支持照片、截图和 PDF 转文字，安装对应套装后也可在对话中使用图片、视频或音频。两个客户端的安装包见 [GitHub Releases](https://github.com/yuelangmanle/dubhe/releases/latest)。
 
 已下载过的模型和配套组件可以从[模型下载来源](docs/model-downloads.md)找回。
 
 第一次使用可以从「对话」「翻译」或「扫描」开始。做过的扫描和翻译可以从「最近任务」打开，也可在「任务与存储」查看模型和未完成下载。开发与发布可参考[质量验收说明](tools/quality.md)。
 
 Mac 扫描页的「打开 PDF / Word」支持 DOCX，通过本机 LibreOffice 保留原页图表和分页。文档默认先读取已有文字。图片页可以用「系统 OCR」快速提取印刷文字，或者用小米 OCR 重建表格与公式。macOS 26 及以上可在「识别设置」中使用分区识别。扫描每完成一页就能查看。「可搜索 PDF」保留原页、图表与版面，并给本次识别的图片页添加按位置对齐的文字层。
+
+Mac 可在「资料 → 知识库」索引 Markdown 和文本。需要直接导入 Office 或 PDF 时，可先用 `uv tool install 'markitdown[docx,xlsx,xls,pptx,pdf]==0.1.7'` 安装 [Microsoft MarkItDown](https://github.com/microsoft/markitdown)，再选择「导入文档」。文档在本机转成可搜索的 Markdown，扫描版 PDF 可在扫描页提取文字。
 
 ---
 
