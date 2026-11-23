@@ -6070,9 +6070,9 @@ int main(int argc, char** argv) {
     if (!g.api_key.empty()) std::fprintf(stderr, "  API Key      %s\n", g.api_key.c_str());
     std::fprintf(stderr, "\n");
     if (!srv.listen(host, port)) return 1;
-    std::jthread restore_worker;
+    std::thread restore_worker;
     if (!restore_model.empty()) {
-        restore_worker = std::jthread([&] {
+        restore_worker = std::thread([&] {
             std::lock_guard lock(g.mu);
             std::string error;
             if (load_initial_model(restore_model, &error)) {
@@ -6083,5 +6083,6 @@ int main(int argc, char** argv) {
         });
     }
     srv.run();
+    if (restore_worker.joinable()) restore_worker.join();
     return 0;
 }

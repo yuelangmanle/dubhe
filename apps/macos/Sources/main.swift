@@ -1575,7 +1575,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 reply(["cancelled": true])
                 return
             }
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
                 let result: [String: Any]
                 do {
                     result = ["name": file.lastPathComponent, "markdown": try MarkItDown.convert(file, with: executable)]
