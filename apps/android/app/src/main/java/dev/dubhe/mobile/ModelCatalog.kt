@@ -62,7 +62,7 @@ internal val mobileCatalog = listOf(
         "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
     ),
     CatalogModel(
-        "LFM3 VL 2B", "图片理解 · 含视觉组件", "LFM3-VL-2B-Q4_K_M.gguf",
+        "LFM3 VL 2B", "图片与视频理解 · 含视觉组件", "LFM3-VL-2B-Q4_K_M.gguf",
         1099627808L, "LiquidAI/LFM3-VL-2B-GGUF", "1add221a5ea6c047fcf1eaaf2d247939d7cf8849",
         "56dac2e192ff0d9ab8507f4f1aeb4aed0463449bbbefaac79497f041c95f21eb",
         projector = CatalogFile(

@@ -1745,6 +1745,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         let selected = scanDocument.flatMap { $0.requestId == message["sourceId"] as? String ? $0.pdf : nil }
         let pages = message["pages"] as? [Int] ?? []
+        let reviewedPages = Set(message["reviewedPages"] as? [Int] ?? [])
         let searchable = message["searchable"] as? Bool == true
         let image = message["image"] as? String
         scanPDFQueue.async {
@@ -1755,7 +1756,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 }
                 if let selected {
                     if original { return try selected.originalPages() }
-                    if searchable { return try selected.searchablePDF(pages: pages, notes: notes ?? []) }
+                    if searchable {
+                        return try selected.searchablePDF(pages: pages, notes: notes ?? [], reviewedPages: reviewedPages)
+                    }
                     if let notes {
                         return try TranslationPDF.rebuildSelectedPages(url: selected.workingURL, pages: pages,
                                                                        translations: notes, label: "识别文字")

@@ -786,6 +786,8 @@ try {
   await click('[data-view="scan"]');
   await click('#scanOpenPDF');
   await until(() => evaluate('document.querySelector("#scanPage").textContent.includes("1 / 4")'), 'PDF source');
+  assert.equal(await evaluate('document.querySelector("#scanReadMode").value'), 'auto',
+    'a new document should try the text layer even with the OCR model installed');
   await evaluate(`(() => {
     document.querySelector('#scanQuality').value = 'fast';
     document.querySelector('#scanFrom').value = '2';
@@ -949,10 +951,12 @@ try {
         bookmark: 'test-bookmark', identity: 'test-identity',
       });
       if (message.type === 'scanPDFPage') window.dubheScanPDFPage({
-        ...message, image: message.page === 20 && message.textSource === 'auto' ? '' : image,
-        textOnly: message.page === 20 && message.textSource === 'auto',
-        selectableText: message.page === 20 ? 'This last page has selectable text and uses no OCR inference.' : '',
+        ...message, image: message.textSource === 'system' || message.page === 20 && message.textSource === 'auto' ? '' : image,
+        textOnly: message.textSource === 'system' || message.page === 20 && message.textSource === 'auto',
+        selectableText: message.textSource === 'system' ? 'Station Delta reading 18.25' :
+          message.page === 20 ? 'This last page has selectable text and uses no OCR inference.' : '',
       });
+      if (message.type === 'scanSave') window.dubheScanSaved({ requestId: message.requestId, saved: true });
     } } } };
   })()`);
   await bridgeForLargePDF();
@@ -1011,6 +1015,11 @@ try {
   assert.equal(saved.payload.results.length, 20);
   assert.match(saved.payload.results.find(([page]) => page === 1)[1].text, /年度报告/);
   assert.equal(saved.payload.results.find(([page]) => page === 20)[1].text, 'Manual correction, page 20.');
+  await chooseExport('searchable');
+  await click('#scanExport');
+  const editedExport = await evaluate('window.scanNativeCalls.at(-1)');
+  assert.deepEqual(editedExport.reviewedPages, [20]);
+  assert.equal(editedExport.notes.at(-1), 'Manual correction, page 20.');
   assert.equal(JSON.stringify(saved.payload).includes('data:image'), false, 'journal stores result text and a file reference only');
 
   await evaluate(`(() => {
@@ -1048,6 +1057,23 @@ try {
   assert.equal(scans.length, batchBefore);
   assert.deepEqual(await evaluate('window.scanNativeCalls.filter(m => m.type === "scanRestorePDF" && m.bookmark.startsWith("batch-")).map(restore => window.scanNativeCalls.filter(m => m.type === "scanPDFPage" && m.requestId === restore.requestId).map(m => m.textSource))'),
     [['auto'], ['auto', 'ocr']], 'text-only batch renders just the final preview');
+
+  await click('#scanOpenPDF');
+  await until(() => evaluate('document.querySelector("#scanPage").textContent.includes("1 / 20")'), 'open system OCR document');
+  await evaluate(`(() => {
+    const source = document.querySelector('#scanReadMode');
+    source.value = 'system';
+    source.dispatchEvent(new Event('change'));
+    const end = document.querySelector('#scanTo');
+    end.value = '1';
+    end.dispatchEvent(new Event('input'));
+  })()`);
+  const beforeSystem = scans.length;
+  await click('#scanRun');
+  await until(() => evaluate('document.querySelector("#scanResult").textContent.includes("Station Delta reading 18.25")'),
+    'native OCR text appears in scan results');
+  assert.equal(scans.length, beforeSystem, 'system OCR needs no request to the model worker');
+  assert.match(await evaluate('document.querySelector("#scanResultPage").textContent'), /系统 OCR/);
 
   shareOnly = true;
   await navigate(otherOrigin + '/?share');

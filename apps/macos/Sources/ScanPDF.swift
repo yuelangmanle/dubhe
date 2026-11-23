@@ -20,11 +20,12 @@ final class ScanPDF {
     }
 
     enum TextSource: String {
-        case auto, embedded, ocr
+        case auto, embedded, ocr, system
     }
 
     private let document: PDFDocument
     private let temporaryDirectory: URL?
+    private var locatedPages: [Int: [ScanTextLine]] = [:]
     let workingURL: URL
     let pageCount: Int
 
@@ -116,12 +117,16 @@ final class ScanPDF {
         return data
     }
 
-    func searchablePDF(pages: [Int], notes: [String]) throws -> Data {
+    func searchablePDF(pages: [Int], notes: [String], reviewedPages: Set<Int> = []) throws -> Data {
         guard !pages.isEmpty, pages.count == notes.count, Set(pages).count == pages.count else {
             throw ScanError.invalidPDF
         }
         let text = Dictionary(uniqueKeysWithValues: zip(pages, notes))
-        if let updated = try ScanSearchablePDF.render(source: document, textByPage: text) { return updated }
+        if let updated = try ScanSearchablePDF.render(source: document, textByPage: text, locate: { number in
+            if reviewedPages.contains(number) { return [] }
+            if let lines = locatedPages[number] { return lines }
+            return (try? locateText(number: number, resolution: .standard)) ?? []
+        }) { return updated }
         return try originalPages()
     }
 
@@ -135,6 +140,11 @@ final class ScanPDF {
 
     func preparePage(number: Int, resolution: Resolution, textSource: TextSource) throws -> (image: String?, text: String) {
         guard (1...pageCount).contains(number) else { throw ScanError.invalidPage(number) }
+        if textSource == .system {
+            let lines = try locateText(number: number, resolution: resolution)
+            locatedPages[number] = lines
+            return (nil, lines.map(\.text).joined(separator: "\n"))
+        }
         let text = textSource == .ocr ? "" : selectableText(number: number)
         if textSource == .embedded || textSource == .auto && Self.hasReadableText(text) {
             return (nil, text)
@@ -147,6 +157,14 @@ final class ScanPDF {
     }
 
     func pageDataURL(number: Int, resolution: Resolution = .standard) throws -> String {
+        try ScanImage.encodeJPEG(rasterImage(number: number, resolution: resolution))
+    }
+
+    private func locateText(number: Int, resolution: Resolution) throws -> [ScanTextLine] {
+        try autoreleasepool { try ScanTextLine.recognize(in: rasterImage(number: number, resolution: resolution)) }
+    }
+
+    private func rasterImage(number: Int, resolution: Resolution) throws -> CGImage {
         guard (1...pageCount).contains(number), let page = document.page(at: number - 1)?.pageRef else {
             throw ScanError.invalidPage(number)
         }
@@ -171,7 +189,7 @@ final class ScanPDF {
         context.concatenate(transform)
         context.drawPDFPage(page)
         guard let image = context.makeImage() else { throw ScanError.invalidPage(number) }
-        return try ScanImage.encodeJPEG(image)
+        return image
     }
 }
 

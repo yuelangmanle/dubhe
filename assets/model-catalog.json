@@ -76,7 +76,7 @@
     "android": {
       "order": 7,
       "name": "LFM3 VL 2B",
-      "description": "图片理解 · 含视觉组件"
+      "description": "图片与视频理解 · 含视觉组件"
     },
     "modality": "image",
     "projector": {

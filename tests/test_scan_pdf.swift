@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreText
 import Foundation
 import ImageIO
 import PDFKit
@@ -63,6 +64,29 @@ enum ScanPDFTests {
         precondition(pixel(layered, x: 250, y: 290) == red && pixel(layered, x: 1320, y: 1800) == blue)
         let unchanged = try searchableScan.searchablePDF(pages: [1], notes: ["Text already present"])
         precondition(unchanged == searchableData, "never add a duplicate text layer to a searchable page")
+
+        let imageOnly = temp.appendingPathComponent("image-only.pdf")
+        try rasterTextPDF().write(to: imageOnly)
+        let imageScanner = try ScanPDF(url: imageOnly)
+        precondition(imageScanner.selectableText(number: 1).isEmpty)
+        let systemText = try imageScanner.preparePage(number: 1, resolution: .fast, textSource: .system)
+        precondition(systemText.image == nil && systemText.text.contains("Station Delta reading 18.25"),
+                     "system OCR returns real page text without a JPEG or model request")
+        let located = PDFDocument(data: try imageScanner.searchablePDF(pages: [1], notes: [
+            "Station Delta reading 18.25\nRiver level verified",
+        ]))!
+        let locatedPage = located.page(at: 0)!
+        let hit = located.findString("Station Delta")
+        precondition(hit.count == 1)
+        let bounds = hit[0].bounds(for: locatedPage)
+        precondition(abs(bounds.minX - 147) < 8 && abs(bounds.minY - 65) < 8,
+                     "search highlight should point to the words on the scanned page: \(bounds)")
+        precondition(located.findString("River level").count == 1, "keep text from separate areas of the page")
+        let reviewed = PDFDocument(data: try imageScanner.searchablePDF(pages: [1], notes: [
+            "Manually corrected station reading 18.26",
+        ], reviewedPages: [1]))!
+        precondition(reviewed.findString("18.26").count == 1 && reviewed.findString("18.25").isEmpty,
+                     "export keeps the correction when the scan and review differ")
         for number in [0, 3] {
             do {
                 _ = try scan.pageDataURL(number: number)
@@ -122,6 +146,29 @@ enum ScanPDFTests {
         context.fill(CGRect(x: 160, y: 130, width: 20, height: 20))
         context.endPDFPage()
         context.beginPDFPage(nil)
+        context.endPDFPage()
+        context.closePDF()
+        return buffer as Data
+    }
+
+    private static func rasterTextPDF() -> Data {
+        let canvas = CGContext(data: nil, width: 960, height: 720, bitsPerComponent: 8,
+                               bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                               bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        canvas.setFillColor(gray: 1, alpha: 1)
+        canvas.fill(CGRect(x: 0, y: 0, width: 960, height: 720))
+        let font = CTFontCreateWithName("Helvetica" as CFString, 42, nil)
+        for (value, x, y) in [("Station Delta reading 18.25", 441, 195), ("River level verified", 90, 510)] {
+            let attributes: [NSAttributedString.Key: Any] = [.init(kCTFontAttributeName as String): font]
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: value, attributes: attributes))
+            canvas.textPosition = CGPoint(x: x, y: y)
+            CTLineDraw(line, canvas)
+        }
+        let buffer = NSMutableData()
+        var box = CGRect(x: 0, y: 0, width: 320, height: 240)
+        let context = CGContext(consumer: CGDataConsumer(data: buffer as CFMutableData)!, mediaBox: &box, nil)!
+        context.beginPDFPage(nil)
+        context.draw(canvas.makeImage()!, in: box)
         context.endPDFPage()
         context.closePDF()
         return buffer as Data

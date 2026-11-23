@@ -478,7 +478,7 @@ private fun EmptyConversation(
                 TextButton(onClick = showMediaModels) {
                     WorkspaceIcon(Glyph.Attachment, Modifier.size(18.dp), colors.primary)
                     Spacer(Modifier.width(7.dp))
-                    Text("用图片或音频对话")
+                    Text("用图片、视频或音频对话")
                 }
             }
         }
@@ -598,7 +598,7 @@ private fun Composer(
                 if (state.projector?.vision == true) {
                     TextButton({ openAttachment(arrayOf("image/*", "video/*")) }, enabled = canAsk) { Text("图片 / 视频") }
                 } else if (state.projector?.audio == true) {
-                    TextButton(showMediaModels, enabled = canAsk) { Text("图片") }
+                    TextButton(showMediaModels, enabled = canAsk) { Text("图片 / 视频") }
                 }
                 if (state.projector?.audio == true) {
                     TextButton({ openAttachment(arrayOf("audio/*")) }, enabled = canAsk) { Text("音频") }
@@ -606,7 +606,7 @@ private fun Composer(
                     TextButton(showMediaModels, enabled = canAsk) { Text("音频") }
                 }
                 if (state.projector == null) {
-                    TextButton(showMediaModels, enabled = canAsk) { Text("图片 / 音频") }
+                    TextButton(showMediaModels, enabled = canAsk) { Text("图片 / 视频 / 音频") }
                 }
                 Text(
                     state.status.orEmpty(),

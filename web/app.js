@@ -4968,7 +4968,8 @@
       return field;
     }
     const readMode = optionSetting('ReadMode', '文档文字来源', [
-      ['auto', '自动 · 优先读取文字'], ['ocr', '小米 OCR · 整页识别'], ['embedded', '只读取文档文字'],
+      ['auto', '自动 · 优先读取文字'], ['ocr', '小米 OCR · 重建表格和公式'],
+      ['system', '系统 OCR · 提取印刷文字'], ['embedded', '只读取文档文字'],
     ]);
     const layout = optionSetting('Layout', '版面识别', [['page', '整页 · 手写和复杂版面'],
       ['regions', '分区 · 印刷段落、表格']]);
@@ -5076,14 +5077,16 @@
     body.append(modelBar, workspace);
 
     const isPDF = () => source?.kind === 'pdf';
+    const usesSystemOCR = () => isPDF() && mode.value === 'document' && readMode.value === 'system';
     const originalReady = () => Boolean(source?.image || source?.requestId);
     const selection = () => ({
       mode: mode.value, first: isPDF() ? from.valueAsNumber : 1, last: isPDF() ? to.valueAsNumber : 1,
       readMode: isPDF() && mode.value === 'document' ? readMode.value : 'ocr',
       detail: /^(extract|ask)$/.test(mode.value) ? detailValue.value.trim() : '',
-      language: language.value, quality: quality.value, enhance: enhance.checked,
-      rotation: Number(rotation.value), maxTokens: Number(length.value),
-      variant: variant.value, layout: native() && mode.value === 'document' ? layout.value : 'page',
+      language: usesSystemOCR() ? 'auto' : language.value, quality: quality.value,
+      enhance: !usesSystemOCR() && enhance.checked, rotation: usesSystemOCR() ? 0 : Number(rotation.value),
+      maxTokens: usesSystemOCR() ? 0 : Number(length.value), variant: variant.value,
+      layout: native() && mode.value === 'document' && !usesSystemOCR() ? layout.value : 'page',
     });
     const validRange = value => Number.isInteger(value.first) && Number.isInteger(value.last) &&
       value.first >= 1 && value.first <= value.last && value.last <= (source?.pageCount ?? 1);
@@ -5154,7 +5157,9 @@
         control.disabled = Boolean(job || batch);
       }
       readMode.parentElement.hidden = !isPDF() || mode.value !== 'document';
-      layout.parentElement.hidden = !native() || mode.value !== 'document' || isPDF() && readMode.value === 'embedded';
+      layout.parentElement.hidden = !native() || mode.value !== 'document' ||
+        isPDF() && ['embedded', 'system'].includes(readMode.value);
+      for (const control of [language, rotation, length, enhance]) control.parentElement.hidden = usesSystemOCR();
       sourceName.textContent = source?.name || '';
       sourceName.title = source?.name || '';
       position.textContent = isPDF() ? '第 ' + page + ' / ' + source.pageCount + ' 页' : '';
@@ -5169,6 +5174,7 @@
       opening.hidden = !blank.hidden || Boolean(raster) || drawnPage === page;
       const s = selection();
       modeTip.textContent = !validRange(s) ? '请输入有效页码范围。'
+        : usesSystemOCR() ? '直接提取印刷文字。需要重建表格或输出 LaTeX 时，选择小米 OCR。'
         : SCAN_MODES.find(item => item[0] === s.mode)[2];
       detail.hidden = s.mode !== 'extract' && s.mode !== 'ask';
       presets.hidden = s.mode !== 'extract';
@@ -5230,7 +5236,7 @@
       exportFormat.disabled = exportResult.disabled = (!hasResults && !canExportOriginal) || Boolean(pendingSave || batch || job);
       const extension = ['searchable', 'paired', 'original'].includes(exportFormat.value) ? 'pdf'
         : exportFormat.value === 'auto' ? autoFormat : exportFormat.value;
-      exportResult.textContent = extension ? '导出 ' + extension.toUpperCase() : '导出';
+      exportResult.textContent = pendingSave ? '正在导出…' : extension ? '导出 ' + extension.toUpperCase() : '导出';
       exportResult.title = exportFormat.value === 'original' ? '导出原件全部页面'
         : exportFormat.value === 'searchable' ? '保留全部页面，并在扫描页加入可搜索文字'
         : exportFormat.value === 'csv' ? '导出本页表格' : isPDF() ? '导出已识别的页面' : '';
@@ -5239,7 +5245,7 @@
 
     function renderResult({ keepScroll = false } = {}) {
       const item = result();
-      const method = { embedded: '原文件文字', regions: '分区识别', page: '整页识别',
+      const method = { embedded: '原文件文字', system: '系统 OCR', regions: '分区识别', page: '整页识别',
         text: '文字识别', region: '框选识别', chart: '图表读数 · 需对照原图' }[item?.method];
       resultHeading.textContent = originalLayout ? '原版面' : '识别结果';
       resultPage.textContent = [isPDF() ? '第 ' + page + ' 页' : '', originalLayout ? '' : method].filter(Boolean).join(' · ');
@@ -5298,7 +5304,7 @@
       from.max = to.max = String(source?.pageCount ?? 1);
       from.value = '1';
       to.value = to.max;
-      if (nextSource?.kind === 'pdf') readMode.value = readPreference || (variantInstalled() ? 'ocr' : 'auto');
+      if (nextSource?.kind === 'pdf') readMode.value = readPreference || 'auto';
       setStatus('');
       showPage(1);
     }
@@ -5332,7 +5338,8 @@
           }
         };
       });
-      const timeout = setTimeout(() => finish(null, new Error('读取文档页超时。')), 30000);
+      const timeout = setTimeout(() => finish(null, new Error('读取文档页超时。')),
+        textSource === 'system' ? 120000 : 30000);
       pendingPages.set(key, { promise, finish });
       shellPost({ type: 'scanPDFPage', requestId: file.requestId, page: index, quality, textSource });
       return promise;
@@ -5928,6 +5935,7 @@
         }
         work.results.set(reviewedPage, {
           ...item, text, kind: draftKind, method: item?.method ?? (draftMode === 'chart' ? 'chart' : 'region'),
+          reviewed: item?.reviewed || item?.text !== text,
         });
         work.pending.delete(reviewedPage);
         const saved = await checkpoint();
@@ -6062,7 +6070,7 @@
       mode.value = data.mode;
       variant.value = data.variant === 'bf16' ? 'bf16' : 'q4';
       layout.value = data.layout === 'regions' ? 'regions' : 'page';
-      readMode.value = ['auto', 'ocr', 'embedded'].includes(data.readMode) ? data.readMode
+      readMode.value = ['auto', 'ocr', 'system', 'embedded'].includes(data.readMode) ? data.readMode
         : data.preferText ? 'auto' : 'ocr';
       language.value = SCAN_LANGUAGES.some(([code]) => code === data.language) ? data.language : 'auto';
       quality.value = Object.hasOwn(SCAN_DETAILS, data.quality) ? data.quality : 'standard';
@@ -6188,7 +6196,8 @@
           current = number;
           scanProgress.current = current;
           update();
-          setStatus(isPDF() ? '正在识别第 ' + current + ' 页 · ' + (index + 1) + ' / ' + targets.length : '正在识别…');
+          const action = s.readMode === 'system' ? '系统 OCR 正在识别' : '正在识别';
+          setStatus(isPDF() ? action + '第 ' + current + ' 页 · ' + (index + 1) + ' / ' + targets.length : '正在识别…');
           const { image: data, text: selectable = '' } = await scanPageForJob(source, current, signal, s);
           signal.throwIfAborted();
           const payload = { mode: s.mode, language: s.language, variant: s.variant };
@@ -6201,6 +6210,9 @@
           if (!hasText && s.readMode === 'embedded') {
             throw new Error('本页没有可直接读取的文字。切换到「自动」或「小米 OCR」识别。');
           }
+          if (!hasText && s.readMode === 'system') {
+            throw new Error('系统 OCR 未读到文字。可试用更高的清晰度或切换到小米 OCR。');
+          }
           if (!hasText && (!variantInstalled(s.variant) || !catalog?.runtime_available)) {
             throw new Error('本页是扫描图片。下载扫描模型后可从此页继续。');
           }
@@ -6212,7 +6224,7 @@
           }
           signal.throwIfAborted();
           const pageLabel = isPDF() ? '第 ' + current + ' 页' : '当前图片';
-          const item = hasText ? { kind: 'text', text: selectable, method: 'embedded' }
+          const item = hasText ? { kind: 'text', text: selectable, method: s.readMode === 'system' ? 'system' : 'embedded' }
             : await recognizePage(payload, s, signal, pageLabel);
           signal.throwIfAborted();
           if (typeof item.text !== 'string' || !item.text.trim() || !Object.hasOwn(SCAN_FORMATS, item.kind)) {
@@ -6310,7 +6322,10 @@
           if (pdf) {
             request.sourceId = source.requestId || '';
             request.original = original;
-            if (requested === 'searchable') request.searchable = true;
+            if (requested === 'searchable') {
+              request.searchable = true;
+              request.reviewedPages = results.filter(([, item]) => item.reviewed).map(([number]) => number);
+            }
             if (!original) request.pages = results.map(([number]) => number);
             if (!isPDF()) request.image = source.image;
             if (requested === 'paired' || requested === 'searchable') {

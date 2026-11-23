@@ -3,9 +3,31 @@ import CoreGraphics
 import CoreText
 import Foundation
 import PDFKit
+import Vision
+
+struct ScanTextLine {
+    let text: String
+    let bounds: CGRect
+
+    static func recognize(in image: CGImage) throws -> [ScanTextLine] {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.automaticallyDetectsLanguage = true
+        request.usesLanguageCorrection = false
+        if let supported = try? request.supportedRecognitionLanguages() {
+            request.recognitionLanguages = ["en-US", "zh-Hans", "zh-Hant", "ja-JP", "ko-KR"].filter(supported.contains)
+        }
+        try VNImageRequestHandler(cgImage: image).perform([request])
+        return (request.results ?? []).compactMap { observation in
+            guard let text = observation.topCandidates(1).first?.string, !text.isEmpty else { return nil }
+            return ScanTextLine(text: text, bounds: observation.boundingBox)
+        }
+    }
+}
 
 enum ScanSearchablePDF {
-    static func render(source: PDFDocument, textByPage: [Int: String]) throws -> Data? {
+    static func render(source: PDFDocument, textByPage: [Int: String],
+                       locate: (Int) -> [ScanTextLine]) throws -> Data? {
         var overlays: [(index: Int, page: CGPDFPage, text: String)] = []
         for (number, text) in textByPage.sorted(by: { $0.key < $1.key }) {
             guard number >= 1, number <= source.pageCount,
@@ -23,7 +45,9 @@ enum ScanSearchablePDF {
         guard let consumer = CGDataConsumer(data: buffer as CFMutableData),
               let context = CGContext(consumer: consumer, mediaBox: nil, nil) else { throw Failure.output }
         for (index, page, text) in overlays {
-            try addPage(page, text: text, number: index + 1, context: context)
+            try autoreleasepool {
+                try addPage(page, text: text, lines: locate(index + 1), number: index + 1, context: context)
+            }
         }
         context.closePDF()
         guard let recognized = PDFDocument(data: buffer as Data), recognized.pageCount == overlays.count else {
@@ -42,7 +66,8 @@ enum ScanSearchablePDF {
         return data
     }
 
-    private static func addPage(_ page: CGPDFPage, text: String, number: Int, context: CGContext) throws {
+    private static func addPage(_ page: CGPDFPage, text: String, lines: [ScanTextLine], number: Int,
+                                context: CGContext) throws {
         let crop = page.getBoxRect(.cropBox)
         var unit: CGFloat = 1
         if let dictionary = page.dictionary { CGPDFDictionaryGetNumber(dictionary, "UserUnit", &unit) }
@@ -61,28 +86,53 @@ enum ScanSearchablePDF {
         context.drawPDFPage(page)
         context.restoreGState()
 
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.textMatrix = .identity
+        context.setTextDrawingMode(.invisible)
+        if !lines.isEmpty {
+            for line in lines { draw(line, width: width, height: height, context: context) }
+            return
+        }
+        // Keep the recognized notes searchable when the system cannot locate any lines.
         let margin = min(18, min(width, height) * 0.04)
         let path = CGPath(rect: bounds.insetBy(dx: margin, dy: margin), transform: nil)
         var pointSize = min(11, min(width, height) / 8)
         let content = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Fit the reading-order text to the existing page. Its glyph positions are not a geometric OCR map.
         for _ in 0..<20 {
-            // Arial Unicode keeps the Chinese glyphs mapped to CJK code points in the PDF's ToUnicode table.
-            let font = CTFontCreateWithName("ArialUnicodeMS" as CFString, pointSize, nil)
-            let attributed = NSAttributedString(string: content, attributes: [.font: font])
+            let attributed = attributedText(content, size: pointSize)
             let setter = CTFramesetterCreateWithAttributedString(attributed)
             let frame = CTFramesetterCreateFrame(setter, CFRange(location: 0, length: 0), path, nil)
             if CTFrameGetVisibleStringRange(frame).length == attributed.length {
-                context.saveGState()
-                context.textMatrix = .identity
-                context.setTextDrawingMode(.invisible)
                 CTFrameDraw(frame, context)
-                context.restoreGState()
                 return
             }
             pointSize *= 0.78
         }
         throw Failure.invalidPage(number)
+    }
+
+    private static func draw(_ located: ScanTextLine, width: CGFloat, height: CGFloat, context: CGContext) {
+        let rect = CGRect(x: located.bounds.minX * width, y: located.bounds.minY * height,
+                          width: located.bounds.width * width, height: located.bounds.height * height)
+        let line = CTLineCreateWithAttributedString(attributedText(located.text, size: max(1, rect.height)))
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        let advance = CTLineGetTypographicBounds(line, &ascent, &descent, nil)
+        guard advance > 0, ascent + descent > 0, rect.width > 0, rect.height > 0 else { return }
+        let yScale = rect.height / (ascent + descent)
+        context.saveGState()
+        context.translateBy(x: rect.minX, y: rect.minY + descent * yScale)
+        context.scaleBy(x: rect.width / advance, y: yScale)
+        context.textPosition = .zero
+        CTLineDraw(line, context)
+        context.restoreGState()
+    }
+
+    private static func attributedText(_ text: String, size: CGFloat) -> NSAttributedString {
+        // This font keeps Chinese characters mapped to their original Unicode values in PDF search.
+        let font = CTFontCreateWithName("ArialUnicodeMS" as CFString, size, nil)
+        return NSAttributedString(string: text, attributes: [.font: font])
     }
 
     private enum Failure: LocalizedError {
